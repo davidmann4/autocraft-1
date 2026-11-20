@@ -8,5 +8,5 @@ export const connectModule: FeatureModule = {
   id: "connect",
   permission: "viewer",
   commands: [],
-  routes: [{ path: "connect", view: { id: "connect", title: "Connect", panels: [{ id: "main", title: "Connect", component: ConnectView, defaultSize: 100 }] } }],
+  routes: [{ path: "connect/:tab?", view: { id: "connect", title: "Connect", panels: [{ id: "main", title: "Connect", component: ConnectView, defaultSize: 100 }] } }],
 };

@@ -1,7 +1,10 @@
+import { ListNumbersIcon } from "@phosphor-icons/react";
 import { useState } from "react";
 import { cn } from "../../ui/cn";
 import { CodeBlock } from "../../ui/molecules/CodeBlock";
 import { Segmented } from "../../ui/molecules/Segmented";
+import { Block } from "../../ui/molecules/Block";
+import { SectionTitle } from "./SectionTitle";
 
 type Alt = { key: string; label: string; text: string };
 type Step = { label: string; alts: Alt[] };
@@ -54,5 +57,14 @@ export function RunnerSetup({ className }: { className?: string }) {
         );
       })}
     </ol>
+  );
+}
+
+/** The setup guide as a block of its own: its own view at /connect/setup, and the whole page while the user has no Task Runner. */
+export function RunnerGuide() {
+  return (
+    <Block dense flush className="mt-4" title={<SectionTitle icon={ListNumbersIcon}>Set up a Task Runner</SectionTitle>}>
+      <RunnerSetup />
+    </Block>
   );
 }

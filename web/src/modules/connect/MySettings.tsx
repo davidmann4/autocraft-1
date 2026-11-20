@@ -1,5 +1,5 @@
-import { SlidersHorizontalIcon } from "@phosphor-icons/react";
-import { useEffect, useState } from "react";
+import { CheckIcon, SlidersHorizontalIcon } from "@phosphor-icons/react";
+import { useEffect, useRef, useState } from "react";
 import { useApi, useQuery } from "../../api/client";
 import { ErrorLine } from "../../ui/atoms/ErrorLine";
 import { Input } from "../../ui/atoms/Input";
@@ -19,6 +19,21 @@ export function MySettings() {
   const [picks, setPicks] = useState<string[]>([]);
   const [maxCalls, setMaxCalls] = useState("");
   const [manual, setManual] = useState(false);
+  // When the last change was saved: the header says "Saved" for a few seconds after each save.
+  const [savedAt, setSavedAt] = useState<number | null>(null);
+  // Saves still running (the header says Saving… until all are done), and the number of the latest change: only the
+  // save of the latest change may say Saved, so one that ends after a newer edit or save does not.
+  const [saving, setSaving] = useState(0);
+  const latest = useRef(0);
+  const edited = () => {
+    latest.current++;
+    setSavedAt(null);
+  };
+  useEffect(() => {
+    if (savedAt === null) return;
+    const t = setTimeout(() => setSavedAt(null), 3000);
+    return () => clearTimeout(t);
+  }, [savedAt]);
   useEffect(() => {
     if (!data) return;
     setManual(data.manualOnly);
@@ -27,10 +42,20 @@ export function MySettings() {
     setMaxCalls(data.maxCalls === null ? "" : String(data.maxCalls));
   }, [data]);
   if (!data || !vals) return error ? <ErrorLine error={error.message} className="mt-4" /> : null;
+  /** Saves through the shared write state and marks the time it succeeded. */
+  const saveRun = (key: string, f: () => Promise<unknown>) => {
+    edited();
+    const n = latest.current;
+    setSaving((c) => c + 1);
+    void write.run(key, f).then((ok) => {
+      setSaving((c) => c - 1);
+      if (ok && n === latest.current) setSavedAt(Date.now());
+    });
+  };
   const savePicks = (next: string[]) => {
     const was = picks;
     setPicks(next);
-    void write.run("repos", async () => {
+    saveRun("repos", async () => {
       try {
         setPicks((await api.me.settings.put({ repos: next })).repos);
       } catch (e) {
@@ -51,7 +76,7 @@ export function MySettings() {
     setProblem(null);
     const body = { reserve: { fiveHour: Number(next.fiveHour), weekly: Number(next.weekly) } };
     if (body.reserve.fiveHour === data.reserve.fiveHour && body.reserve.weekly === data.reserve.weekly) return;
-    void write.run("settings", () => api.me.settings.put(body));
+    saveRun("settings", () => api.me.settings.put(body));
   };
   const validMax = (v: string) => v.trim() === "" || (/^\d+$/.test(v.trim()) && Number(v) >= 1 && Number(v) <= 64);
   const saveMax = (v: string) => {
@@ -62,11 +87,11 @@ export function MySettings() {
     setProblem(null);
     const next = v.trim() === "" ? null : Number(v);
     if (next === data.maxCalls) return;
-    void write.run("max-calls", () => api.me.settings.put({ maxCalls: next }));
+    saveRun("max-calls", () => api.me.settings.put({ maxCalls: next }));
   };
   const saveManual = (on: boolean) => {
     setManual(on);
-    void write.run("manual-only", async () => {
+    saveRun("manual-only", async () => {
       try {
         setManual((await api.me.settings.put({ manualOnly: on })).manualOnly);
       } catch (e) {
@@ -89,6 +114,7 @@ export function MySettings() {
         onChange={(e) => {
           const next = { ...vals, [key]: e.target.value };
           setVals(next);
+          edited();
         }}
         onBlur={() => save(vals)}
         onKeyDown={(e) => {
@@ -102,7 +128,22 @@ export function MySettings() {
   );
   const item = "flex items-center gap-3 max-sm:justify-between";
   return (
-    <Block dense className="mt-4" title={<SectionTitle icon={SlidersHorizontalIcon}>My settings</SectionTitle>}>
+    <Block
+      dense
+      className="mt-4"
+      title={<SectionTitle icon={SlidersHorizontalIcon}>My settings</SectionTitle>}
+      aside={
+        <span role="status" aria-live="polite" className="flex items-center gap-1">
+          {saving > 0 ? "Saving…" : savedAt !== null ? (
+            <span className="flex items-center gap-1 font-medium text-ok">
+              <CheckIcon aria-hidden weight="bold" /> Saved
+            </span>
+          ) : (
+            "Changes save on their own"
+          )}
+        </span>
+      }
+    >
       <div className="flex flex-col gap-2 text-sm sm:flex-row sm:flex-wrap sm:items-center sm:gap-x-8">
         <div className={item}>
           <span className="whitespace-nowrap text-ink/80">Keep free</span>
@@ -122,7 +163,10 @@ export function MySettings() {
             placeholder="None"
             value={maxCalls}
             invalid={!validMax(maxCalls)}
-            onChange={(e) => setMaxCalls(e.target.value)}
+            onChange={(e) => {
+              setMaxCalls(e.target.value);
+              edited();
+            }}
             onBlur={() => saveMax(maxCalls)}
             onKeyDown={(e) => {
               if (e.key === "Enter") saveMax(maxCalls);
