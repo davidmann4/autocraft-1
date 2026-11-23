@@ -324,6 +324,8 @@ export const ADDED_COLUMNS: [table: string, column: string, type: string][] = [
   ["build_sizes", "memory_source", "TEXT NOT NULL DEFAULT 'operator'"],
   // Who started a build through the MCP build tools (src/build/mcp-builds.ts); null for the pipeline's own tasks.
   ["build_tasks", "started_by", "TEXT"],
+  // Who queued a workspace call through the MCP Connector's workspace tools (src/build/agent-workspaces.ts); the runner's agent server runs only these.
+  ["workspace_calls", "agent_login", "TEXT"],
 ];
 
 // Indexes on added columns: they can only be created once the column exists.

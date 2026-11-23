@@ -729,13 +729,17 @@ export async function createApp(opts: AppOptions & { routes: Route[] }) {
     }
     if (!msg || typeof msg !== "object" || Array.isArray(msg)) return reply(400, rpcError(-32600, "send one JSON-RPC message as an object; batches are not supported"));
     const m = msg as McpMsg;
+    // A tool call may wait minutes (a workspace's shell command): its reply keeps the request open with leading spaces.
+    const waiting = m.method === "tools/call" ? waitingJson(res) : null;
     const out = await handleMcp({
       db, baseUrl: config.baseUrl, limiter: mcpFeedback, expensive: () => mcpExpensive.take(caller.login.toLowerCase()), canAnswer: answering.enabled && caller.canAnswer && (caller.role === "operator" || (caller.role === "maintainer" && await maintainerWritesOn(db))),
       user: async (forWrite) => await userForLogin(db, box, provider, caller.login, caller.role, forWrite),
       // The task tools are offered while one of the login's Task Runners reports in; they never lease.
       ...(await inferenceMode(db) === "user-local" && { userLocal: true, ...(await hasFreshRunner(db, caller.login) && { run: { canWrite: (await claimPermission(caller.login, caller.role)).canWrite } }) }),
+      ...(waiting && { wait: waiting.opts }),
     }, m);
     if (mcpWrites(m)) await live.poke();
+    if (waiting && res.headersSent) return waiting.send(out ?? { jsonrpc: "2.0", id: null, result: {} });
     // A notification or a response from the client: accepted, nothing to say.
     if (!out) return reply(202, null);
     return reply(200, out);

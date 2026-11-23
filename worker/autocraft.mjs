@@ -4829,6 +4829,7 @@ const answerWhy = (has) => (has.has("set_weight")
   : "only operators, and maintainers who answer decisions (an answering Task Runner while maintainer writes are on), approve merges");
 /** Withdrawing an approved merge stays with operators, also where a maintainer may approve one. @param {Set<string>} has */
 const cancelWhy = (has) => (has.has("set_weight") ? answerWhy(has) : "only operators withdraw an approved merge");
+const WS_WHY = "only operators, and maintainers with write access to the repo, open workspaces, and only where a kubernetes environment takes them";
 const LOCAL_WHY = "model calls run on the server's accounts here: the server is not in the user-local inference mode";
 /** @param {Set<string>} has */
 const pickWhy = (has) => (has.has("list_model_calls") ? "only maintainers and operators pick model calls" : LOCAL_WHY);
@@ -4857,6 +4858,11 @@ export const CLI_COMMANDS = [
   { path: ["build", "base"], tool: "build_base", args: ["repo"], usage: "<repo>", summary: "the default-branch commit a build starts from", why: () => "only operators, and maintainers with write access to the repo, start builds" },
   { path: ["build", "status"], tool: "build_status", args: ["id"], usage: "<id> [--log-lines N]", summary: "a build's phase, each line's state and exit code, and the end of its log", why: () => "only operators, and maintainers with write access to the repo, start builds" },
   { path: ["build", "cancel"], tool: "cancel_build", args: ["id"], usage: "<id>", summary: "stop a queued or running build", why: () => "only operators, and maintainers with write access to the repo, start builds" },
+  { path: ["workspace"], tool: "list_workspaces", usage: "[--repo R] [--all] [--mine] [--limit N]", summary: "live workspaces opened through the agent tools (--all adds ended ones)", why: () => WS_WHY },
+  { path: ["workspace", "open"], tool: "workspace_open", args: ["repo"], usage: "<repo> [--base SHA] [--hours N] [--env ID]", summary: "open a workspace on a default-branch commit (an agent sends a patch with it)", why: () => WS_WHY },
+  { path: ["workspace", "status"], tool: "workspace_status", args: ["workspace"], usage: "<id>", summary: "a workspace's state, patch and last calls", why: () => WS_WHY },
+  { path: ["workspace", "diff"], tool: "workspace_diff", args: ["workspace"], usage: "<id> [--format json]", summary: "its changes against the base, as a patch", why: () => WS_WHY },
+  { path: ["workspace", "close"], tool: "workspace_close", args: ["workspace"], usage: "<id>", summary: "end it; what workspace diff did not save is lost", why: () => WS_WHY },
   { path: ["repos"], tool: "list_repos", usage: "", summary: "tracked repositories with their open decisions and fix-ups" },
   { path: ["fixups"], tool: "list_fixups", usage: "[--repo R] [--limit N]", summary: "PRs whose review fixes the pipeline could not apply" },
 ];
@@ -4864,9 +4870,11 @@ export const CLI_COMMANDS = [
 /**
  * Server tools without a command: the task tools tell an MCP agent to run this runner's own commands, and answering is
  * the operator's call on the dashboard until it opens to agents, start_build takes a patch and command lines, which an
- * agent or a script sends better than a command line, and build_artifact returns images, which a terminal does not show. `autocraft call <tool>` still reaches each one.
+ * agent or a script sends better than a command line, build_artifact returns images, which a terminal does not show, and the
+ * workspace tools are an agent's working tools, whose results (images among them) an agent reads. `autocraft call <tool>` still reaches each one.
  */
-export const MCP_ONLY = ["next_task", "task_status", "answer_decision", "undo_answer", "start_build", "build_artifact"];
+export const MCP_ONLY = ["next_task", "task_status", "answer_decision", "undo_answer", "start_build", "build_artifact", "workspace_result",
+  ...["shell", "shell_status", "shell_kill", "read", "write", "edit", "glob", "grep", "app_start", "app_stop", "screenshot", "fetch_dependencies"].map((t) => `workspace_${t}`)];
 
 const SERVER_GROUPS = new Set(CLI_COMMANDS.map((c) => c.path[0]));
 
@@ -5228,7 +5236,7 @@ const TASK_HELP = [
   ["autocraft config reserve <5h> <weekly> | off", "runner reserve"],
 ];
 
-const GROUP_TITLES = /** @type {const} */ ({ inbox: "Inbox", queue: "Merge queue", calls: "Model calls", settings: "Settings", build: "Builds" });
+const GROUP_TITLES = /** @type {const} */ ({ inbox: "Inbox", queue: "Merge queue", calls: "Model calls", settings: "Settings", build: "Builds", workspace: "Workspaces" });
 
 /** @param {string} group @returns {HelpLine[]} */
 const serverHelp = (group) => CLI_COMMANDS.filter((c) => c.path[0] === group).map((c) => [`autocraft ${[...c.path, c.usage].filter(Boolean).join(" ")}`, c.summary]);

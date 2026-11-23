@@ -95,7 +95,7 @@ export async function currentBase(db: Db, repo: string): Promise<Base | null> {
 }
 
 /** Whether `sha` is a default-branch commit of `repo` that AutoCraft recorded (main_ci keeps the recent heads). */
-async function knownBase(db: Db, repo: string, sha: string): Promise<boolean> {
+export async function knownBase(db: Db, repo: string, sha: string): Promise<boolean> {
   return !!await db.prepare("SELECT 1 FROM main_ci WHERE repo = ? AND head_sha = ? LIMIT 1").get(repo, sha);
 }
 
