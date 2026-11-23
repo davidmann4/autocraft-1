@@ -1,4 +1,4 @@
-// Operators' own builds through the MCP server: only operators get the tools, a build starts only from a default-branch
+// Operators' and maintainers' own builds through the MCP server: only they get the tools (a maintainer where they write), a build starts only from a default-branch
 // commit AutoCraft recorded, no confidential or signing environment takes one, and the status reads each line's own exit code.
 import assert from "node:assert/strict";
 import { writeFileSync } from "node:fs";
@@ -28,9 +28,9 @@ async function fresh(): Promise<World> {
   return w;
 }
 
-const envOf = (w: World, role: Role): McpEnv => ({
+const envOf = (w: World, role: Role, canWrite = true): McpEnv => ({
   db: w.db, baseUrl: null, limiter: new RateLimiter(60, 3600_000), canAnswer: false, expensive: () => 0,
-  user: async () => ({ login: role === "operator" ? OPERATOR : "someone", role, canWrite: async () => true, canRead: async () => true }),
+  user: async () => ({ login: role === "operator" ? OPERATOR : "someone", role, canWrite: async () => canWrite, canRead: async () => true }),
 });
 
 let id = 0;
@@ -42,19 +42,24 @@ async function call(env: McpEnv, name: string, args: Record<string, unknown>): P
 const buildId = (text: string): number => Number(/Queued build (\d+)/.exec(text)![1]);
 const CAPS = { os: "linux", arch: "x86_64", cpus: 8, memGb: 32, diskGb: 200, display: false, gpu: false, toolchains: ["rust-stable"] };
 
-test("only operators are offered and allowed the build tools", async () => {
+test("operators, and maintainers with write access to the repo, may build; viewers and maintainers without write access may not", async () => {
   const w = await fresh();
   const tools = ["build_base", "start_build", "build_status", "cancel_build"];
   const listed = async (env: McpEnv) => (await rpc(env, "tools/list")).tools.map((t: { name: string }) => t.name).filter((n: string) => tools.includes(n));
+  const start = { repo: "app", base: MAIN, steps: ["cargo test"] };
   assert.deepEqual(await listed(envOf(w, "operator")), tools);
-  for (const role of ["maintainer", "viewer"] as const) {
-    const env = envOf(w, role);
-    assert.deepEqual(await listed(env), [], role);
-    const r = await call(env, "start_build", { repo: "app", base: MAIN, steps: ["cargo test"] });
-    assert.equal(r.isError, true, role);
-    assert.match(r.text, /only operators/);
+  assert.deepEqual(await listed(envOf(w, "maintainer")), tools);
+  assert.deepEqual(await listed(envOf(w, "viewer")), []);
+  const id = buildId((await call(envOf(w, "maintainer"), "start_build", start)).text);
+  for (const env of [envOf(w, "viewer"), envOf(w, "maintainer", false)]) {
+    for (const [name, args] of [["start_build", start], ["build_status", { id }], ["cancel_build", { id }]] as const) {
+      const r = await call(env, name, args);
+      assert.equal(r.isError, true, name);
+      assert.match(r.text, /only operators, and maintainers with write access/, name);
+    }
   }
-  assert.equal((await w.db.prepare("SELECT COUNT(*) AS n FROM build_tasks").get() as { n: number }).n, 0);
+  assert.equal((await w.db.prepare("SELECT COUNT(*) AS n FROM build_tasks").get() as { n: number }).n, 1);
+  assert.equal((await getTask(w.db, id))!.state, "queued");
 });
 
 test("a build starts from a recorded default-branch commit only", async () => {

@@ -181,9 +181,9 @@ export async function cancelIds(db: Db, envId: string): Promise<number[]> {
   return (await db.all(db.k.selectFrom("build_tasks").select("id").where("env_id", "=", envId).where("cancel_requested_at", ">", since).orderBy("id"))).map((r) => r.id);
 }
 
-/** Builds an operator starts from their agent (src/build/mcp-builds.ts): their own command lines and patch. */
+/** Builds an operator or maintainer starts from their agent (src/build/mcp-builds.ts): their own command lines and patch. */
 export const MCP_BUILD_STEP = "mcp-build";
-/** The task builds code from a PR (its head, or an integration branch of PRs) or an operator's own build, which may be a PR's code too. */
+/** The task builds code from a PR (its head, or an integration branch of PRs) or a build an operator or maintainer started from their agent, which may be a PR's code too. */
 const runsPrCode = (t: { step: string; number: number | null }): boolean => t.step === "pr-build" || t.step === "merge-batch" || t.step === MCP_BUILD_STEP || t.number !== null;
 
 /**
@@ -232,7 +232,7 @@ export async function claim(db: Db, envId: string, free: number, nowMs: number =
           if (t.step === "pr-build" && !await featureOn(db, "pr-builds", t.repo)) continue;
           if (t.step === "nightly" && !await featureOn(db, "nightly", t.repo)) continue;
           if (t.step === "screenshot" && !await featureOn(db, "screenshots", t.repo)) continue;
-          // Operator smoke tests, operators' own builds and the security fix's builds (an operator's request, under the finding's real repo) run anywhere; pipeline builds only for repos in scope, or for fast-tracked items of any repo.
+          // Operator smoke tests, builds operators and maintainers start from their agents and the security fix's builds (an operator's request, under the finding's real repo) run anywhere; pipeline builds only for repos in scope, or for fast-tracked items of any repo.
           if (t.step !== "smoke-test" && t.step !== "fix-check" && t.step !== MCP_BUILD_STEP && !scope.has(t.repo) && !await fastTask(db, t)) continue;
           // A warm build waits for its repo's interval and takes the newest default-branch head, with the plan this environment runs.
           let head = t.head_sha, base = t.base_sha;

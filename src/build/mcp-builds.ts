@@ -1,4 +1,4 @@
-// Builds an operator starts from their own agent (MCP tools start_build, build_status, cancel_build, build_base): their
+// Builds an operator or maintainer starts from their own agent (MCP tools start_build, build_status, cancel_build, build_base): their
 // command lines run as a build task on the registered build environments, the same queue the pipeline's builds use.
 // The source is a default-branch commit AutoCraft has seen (so the CI gate it reads is upstream's) plus an optional patch
 // that turns it into the caller's working tree. The task counts as untrusted code: no confidential environment and no
@@ -15,7 +15,7 @@ export { MCP_BUILD_STEP };
 /** Command lines one build may run (the plan's 20 steps less the dependency fetch). */
 export const MAX_LINES = 19;
 const MAX_LINE = 4000;
-/** Open (queued or running) operator builds at once, over all operators. */
+/** Open (queued or running) builds from the MCP tools at once, over all users. */
 export const MAX_OPEN = 8;
 export const DEFAULT_STEP_MIN = 60;
 const MAX_STEP_MIN = 120;
@@ -85,14 +85,14 @@ export async function startBuild(db: Db, i: StartInput): Promise<number> {
   if (!head) throw new BuildError(409, `AutoCraft has recorded no default-branch commit of ${i.repo} yet`);
   if (i.base !== head.sha && !await knownBase(db, i.repo, i.base)) throw new BuildError(400, `base must be a default-branch commit AutoCraft has seen; the current one is ${head.sha} (${head.branch}). Make the patch against it.`);
   const open = (await db.prepare(`SELECT COUNT(*) AS n FROM build_tasks WHERE step = ? AND state IN (${OPEN_STATES.map(() => "?").join(", ")})`).get(MCP_BUILD_STEP, ...OPEN_STATES) as { n: number }).n;
-  if (open >= MAX_OPEN) throw new BuildError(429, `${MAX_OPEN} operator builds are already queued or running; wait for one to end`);
+  if (open >= MAX_OPEN) throw new BuildError(429, `${MAX_OPEN} builds from agents are already queued or running; wait for one to end`);
   return await createTask(db, {
     step: MCP_BUILD_STEP, repo: i.repo, headSha: i.base, baseSha: i.base, requires: { os: "linux", toolchains: ["rust-stable"] },
     plan: buildPlan(i.steps, i.stepMinutes), ...(i.patch !== undefined && { patch: i.patch }), warm: { key: warmKeyOf(i.repo), role: "use" },
   });
 }
 
-/** An operator build by id; 404 for any other task, so these tools reach nothing else. */
+/** A build from these tools by id; 404 for any other task, so these tools reach nothing else. */
 export async function ownBuild(db: Db, id: unknown): Promise<BuildTask> {
   const n = typeof id === "number" ? id : typeof id === "string" && /^\d{1,12}$/.test(id) ? Number(id) : NaN;
   const t = Number.isInteger(n) ? await getTask(db, n) : null;
@@ -127,7 +127,7 @@ export async function buildStatus(db: Db, t: BuildTask, logLines: number = LOG_L
 
 export const MAX_LOG_LINES = LOG_LINES.max;
 
-/** Cancels an open operator build. */
+/** Cancels an open build from these tools. */
 export async function cancelBuild(db: Db, t: BuildTask, by: string): Promise<BuildTask> {
   if (TERMINAL.includes(t.state)) throw new BuildError(409, `build ${t.id} already ended (${t.state})`);
   return await cancelTask(db, t.id, by);
