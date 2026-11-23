@@ -393,7 +393,7 @@ export async function loadPrFacts(db: Db, opts: LoadOptions = {}): Promise<PrFac
     base.pushable = pushable(r.head_repo, r.repo, checksAtHead ? r.c_can : r.i_can, r.head_ref, rf.longLived, false, sameRepo(r.head_repo, r.repo) && authorWrites(r.repo, r, (t) => refresh.soon(ref, t)) !== "no");
     const ow = operator.get(ref);
     if (ow && r.state === "OPEN") {
-      base.operator = { fix: head && ow.fixHeads.has(head) && await queuedOperatorFix(db, r.repo, r.number, head, now) ? { attempts: await operatorTries(db, r.repo, r.number) } : null, hold: ow.hold, premerge: !!head && ow.premergeHeads.has(head), preapproved: ow.preapproved };
+      base.operator = { fix: head && ow.fixHeads.has(head) && await queuedOperatorFix(db, r.repo, r.number, head, now) ? { attempts: await operatorTries(db, r.repo, r.number) } : null, hold: ow.hold, premerge: !!head && ow.premergeHeads.has(head), preapproved: ow.preapproved, ...(ow.bypass ? { bypass: true } : {}) };
       refresh.soon(ref, ow.settleUntil);
     }
     // A fix-up request holds the PR's merge only while the planner can work it: same head, pushable, approved, not conflicting, not a draft, tries left.

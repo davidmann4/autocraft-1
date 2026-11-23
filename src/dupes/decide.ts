@@ -77,10 +77,18 @@ async function answeredKeepsLoader(db: Db, repo?: string): Promise<(repo: string
   };
 }
 
+/** The items fast-tracked with bypass checks (src/fasttrack.ts) as `repo#number`, of one repo or every repo. */
+async function fastTracked(db: Db, repo?: string): Promise<Set<string>> {
+  const rows = await db.all(db.k.selectFrom("fast_track").select(["repo", "number"]).where("bypass", "=", 1).$if(!!repo, (q) => q.where("repo", "=", repo!)));
+  return new Set(rows.map((r) => `${r.repo}#${r.number}`));
+}
+
 /** Plans for the groups whose comparisons are all current. `closing` is false for a group with nothing to close. */
 export async function groupPlans(db: Db, repo?: string): Promise<GroupPlan[]> {
   const out: GroupPlan[] = [];
   const groups = await duplicateGroups(db, repo), setsOf = await kindSetsLoader(db, groups), stored = await storedComparisons(db, repo), answeredKeeps = await answeredKeepsLoader(db, repo);
+  // An item queued with bypass checks is wanted as it is: it is never closed as a duplicate, so it and the item kept stay open and are both worked.
+  const fast = await fastTracked(db, repo);
   for (const g of groups) {
     const sets = await filterSeq(setsOf(g), async (s) => await someSeq(s.members, async (m) => m.state === "OPEN" && await setsOf.inPilot(s.repo, m.number)));
     if (!sets.length) continue;
@@ -101,7 +109,7 @@ export async function groupPlans(db: Db, repo?: string): Promise<GroupPlan[]> {
         if (settled.has(m.number)) continue;
         const other = cmp.result?.others.find((o) => o.number === m.number);
         const dup = set.kind === "issue" || other?.duplicate !== false;
-        const role: Role = m.state === "OPEN" && dup && await setsOf.inPilot(set.repo, m.number) ? "close" : "stay";
+        const role: Role = m.state === "OPEN" && dup && !fast.has(`${set.repo}#${m.number}`) && await setsOf.inPilot(set.repo, m.number) ? "close" : "stay";
         items.push({ number: m.number, kind: set.kind, role, target: role === "close" ? kept : null, detail: other ? { ...other } : null });
       }
     }

@@ -251,7 +251,7 @@ export type PrFacts = {
    * `premerge` is true when the PR's pre-approved merge waits for the pre-merge review of this head.
    * `preapproved` is true while a person's pre-approved merge is live (fix-up, review, ci or queued): the PR's label does not gate its review.
    */
-  operator?: { fix: { attempts: number } | null; hold: boolean; premerge: boolean; preapproved: boolean };
+  operator?: { fix: { attempts: number } | null; hold: boolean; premerge: boolean; preapproved: boolean; /** The live pre-approved merge was queued with bypass checks: the pre-merge review's fixes are the pipeline's to make. */ bypass?: boolean };
   /** Stored model patches at the reviewed head whose lint task is queued, oldest first: `ended` once the task has a final state. A CI fix's source is `review`. */
   lint: LintFact[];
   /** CI fix state at the reviewed head, loaded while CI fails. */

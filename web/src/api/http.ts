@@ -388,7 +388,7 @@ export function createHttpApi(): Api {
       fastTrackAdd: (item) => post("/api/fast-track", { item }),
       fastTrackRemove: (item) => post("/api/fast-track/remove", { item }),
       fastTrackWeight: (item, weight) => post("/api/fast-track/weight", { item, weight }),
-      add: (item, weight) => post("/api/queue/add", { item, weight }),
+      add: (item, weight, bypassChecks) => post("/api/queue/add", { item, weight, ...(bypassChecks ? { bypassChecks: true } : {}) }),
       hold: async (item) => void (await post("/api/merge/hold", { item })),
       release: async (item) => void (await post("/api/merge/release", { item })),
       batchRemove: async (item) => void (await post("/api/merge/batch-remove", { item })),

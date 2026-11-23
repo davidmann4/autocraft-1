@@ -45,6 +45,18 @@ export const statementsList = (d: readonly OwnerStatement[] | undefined): string
   ? JSON.stringify(d.map((x) => ({ id: x.id, where: x.where, kind: x.kind, item_title: x.title, date: x.at.slice(0, 10), text: x.text.replace(/\s+/g, " ").trim().slice(0, STATEMENT_PROMPT_CHARS) })), null, 1).replace(/</g, "\\u003c")
   : "(none)");
 
+/** What the review is told about a PR queued with bypass checks (src/review/queued.ts). */
+export type QueuedSpec = { ref: string; title: string; body: string };
+export type Queued = {
+  /** "queued": a live pre-approved merge with bypass checks (it merges once the checks pass); "fast-tracked": fast-tracked with bypass checks, no merge queued. */
+  how: "queued" | "fast-tracked";
+  by: string;
+  /** The queuer's own instructions for a fix-up, when they gave any. */
+  instructions: string | null;
+  /** The issues the PR closes, else the issues its title names, open or closed. */
+  spec: QueuedSpec[];
+};
+
 /** One PR as the Opus prompt shows it. Every string field is untrusted or derived from untrusted text. */
 export type OpusPr = {
   ref: string;
@@ -69,6 +81,8 @@ export type OpusPr = {
   unapplied_fixes?: UnappliedFix[];
   /** Present only when a person's keep-in-core scope answer stands for this PR: the review does not reopen scope. */
   scope_settled?: { answer: string; by: string | null; note: string | null };
+  /** Present only when a person queued the PR with bypass checks: scope and design are accepted, the spec issues are what it must build (src/review/queued.ts). */
+  queued?: Queued;
   /** Present only when our pipeline pushed commits to the PR since `earlier_opus`'s head: kind, sha, note and the fixes each was meant to make. */
   pipeline_commits?: { kind: string; sha: string; note: string; fixes_meant: string[] }[];
   diff: string;

@@ -43,6 +43,9 @@ import * as kx from "../db/kx.ts";
 import { readSeqs } from "../live.ts";
 import { INPUT_TOPICS } from "../runner/autopilot.ts";
 
+/** What bypass checks does, for the PR's thread. */
+const BYPASS_LINE = "the reviews take its scope and design as settled, the pipeline makes the fixes they ask for and merges or resolves conflicts itself, and each of its pushes is reviewed again.";
+
 export type PipelineStep = Extract<Step, { kind: "review" | "fixup" }>;
 
 const ACTOR = "pipeline";
@@ -54,7 +57,7 @@ const iso = () => new Date().toISOString();
 const short = (sha: string | null) => (sha ?? "").slice(0, 7);
 const oneLine = (s: string, n = 200) => s.replace(/\s+/g, " ").trim().slice(0, n);
 
-type Row = { id: number; repo: string; number: number; by: string; at: string; instructions: string; state: Preapproval["state"]; from_head: string; head: string | null; reason: string | null; updated_at: string; fix_id: number | null };
+type Row = { id: number; repo: string; number: number; by: string; at: string; instructions: string; state: Preapproval["state"]; from_head: string; head: string | null; reason: string | null; updated_at: string; fix_id: number | null; /** 1: queued with bypass checks. */ bypass: number };
 type PrRow = { state: string; head_oid: string | null; kind: string; head_repo: string | null; head_ref: string | null };
 
 const prRow = async (db: Db, repo: string, n: number): Promise<PrRow | undefined> =>
@@ -232,7 +235,7 @@ export class PreapprovalRefused extends Error {
  * The PR's label does not matter (the pre-approval lifts the label gate); a draft, the backlog, a duplicate hold or a scope question still refuse it.
  * `head`, when given, is the only head it may pre-approve: the head the person saw (a command's comment-time head).
  */
-export async function preapproveMerge(db: Db, o: { repo: string; number: number; by: string; via?: string; head?: string }): Promise<{ label: string }> {
+export async function preapproveMerge(db: Db, o: { repo: string; number: number; by: string; via?: string; head?: string; bypass?: boolean }): Promise<{ label: string }> {
   const { repo, number, by, via } = o;
   const ref = `${repo}#${number}`;
   const it = await prRow(db, repo, number);
@@ -246,17 +249,25 @@ export async function preapproveMerge(db: Db, o: { repo: string; number: number;
   if (!head) throw new Error(`${ref} has no head commit in the mirror yet`);
   if (o.head !== undefined && head !== o.head) throw new Error(HEAD_CHANGED);
   if (!await mergeApprovalOf(db, repo)) throw new PreapprovalRefused(`merging is not approved for ${repo}`);
-  const active = async () => await db.get(db.k.selectFrom("preapprovals").select((eb) => eb.lit(1).as("one")).where("repo", "=", repo).where("number", "=", number).where("state", "in", ACTIVE));
-  if (await active()) throw new PreapprovalRefused(`${ref} already has a pre-approved merge in progress`, true);
+  const active = async () => await db.get(db.k.selectFrom("preapprovals").select(["id", "bypass"]).where("repo", "=", repo).where("number", "=", number).where("state", "in", ACTIVE));
+  const running = await active();
+  // Queuing again with bypass checks turns it on for the merge already in progress.
+  if (running && o.bypass && !running.bypass) {
+    await db.run(db.k.updateTable("preapprovals").set({ bypass: 1 }).where("id", "=", running.id));
+    await audit(db, by, "preapproval-bypass", ref, { id: running.id, ...(via ? { via } : {}) });
+    await say(db, repo, number, `${by} set the merge already in progress to bypass checks: ${BYPASS_LINE}`);
+    return { label: "The merge already in progress now bypasses checks" };
+  }
+  if (running) throw new PreapprovalRefused(`${ref} already has a pre-approved merge in progress`, true);
   const at = iso();
   await db.write(async () => {
     // Checked again under the write lock: another writer may have started one since the first check.
     if (await active()) throw new PreapprovalRefused(`${ref} already has a pre-approved merge in progress`, true);
-    const id = (await db.get(db.k.insertInto("preapprovals").values({ repo, number, by, at, instructions: "", state: "review", from_head: head, head, updated_at: at, fix_id: null }).returning("id")))!.id;
-    await audit(db, by, "preapproval", ref, { id, state: "review", head, queued: "merge-queue", ...(via ? { via } : {}) });
+    const id = (await db.get(db.k.insertInto("preapprovals").values({ repo, number, by, at, instructions: "", state: "review", from_head: head, head, updated_at: at, fix_id: null, bypass: o.bypass ? 1 : 0 }).returning("id")))!.id;
+    await audit(db, by, "preapproval", ref, { id, state: "review", head, queued: "merge-queue", ...(o.bypass ? { bypass: true } : {}), ...(via ? { via } : {}) });
   });
-  await say(db, repo, number, `${by} added the PR to the merge queue at ${short(head)}: it merges once the review there says take, the pre-merge review is clean and CI is green.`);
-  return { label: "Added to the merge queue; it merges once the review says take and CI is green" };
+  await say(db, repo, number, `${by} added the PR to the merge queue at ${short(head)}: it merges once the review there says take, the pre-merge review is clean and CI is green.${o.bypass ? ` It bypasses checks: ${BYPASS_LINE}` : ""}`);
+  return { label: `Added to the merge queue${o.bypass ? " with bypass checks" : ""}; it merges once the review says take and CI is green` };
 }
 
 // ---- the state machine ---------------------------------------------------------------------------------------------------
@@ -366,12 +377,18 @@ async function noteOnce(db: Db, p: Row, head: string, note: string, line: string
 /**
  * "base merge", "autorepin", "fix-up for the review's fixes" or the implementation session's revision when the pipeline itself pushed `cur` on top of the row's head, else null.
  * The review's fix-up counts for every row: the merge approval says the change is wanted, and the fix-up's push gets a fresh review.
+ * A row queued with bypass checks also goes on across the pipeline's other model-written pushes (a conflict resolution, a CI fix, a
+ * fix-up of the pre-merge review's fixes): each gets a fresh review, a clean pre-merge review and green CI, so none merges unseen.
  */
 async function ownPush(db: Db, p: Row, cur: string): Promise<string | null> {
-  if (await db.get(db.k.selectFrom("fixups").select((eb) => eb.lit(1).as("one")).where("repo", "=", p.repo).where("number", "=", p.number).where("from_head", "=", p.head).where("to_head", "=", cur)
-    .where((eb) => eb(eb.fn.coalesce("source", eb.val("review")), "=", "review")).where("state", "in", ["pushing", "pushed"]))) return "fix-up for the review's fixes";
-  // Only a base merge that left the PR's own diff unchanged continues an answer; a CI fix or a resolved conflict is model-written code nobody saw.
-  if (await db.get(db.k.selectFrom("conflict_merges").select((eb) => eb.lit(1).as("one")).where("repo", "=", p.repo).where("number", "=", p.number).where("from_head", "=", p.head).where("to_head", "=", cur).where("state", "=", "merged").where("own_diff", "=", "same"))) return "base merge";
+  const fix = await db.get(db.k.selectFrom("fixups").select((eb) => eb.fn.coalesce("source", eb.val("review")).as("source")).where("repo", "=", p.repo).where("number", "=", p.number).where("from_head", "=", p.head).where("to_head", "=", cur)
+    .where((eb) => eb(eb.fn.coalesce("source", eb.val("review")), "in", p.bypass ? ["review", "premerge"] : ["review"])).where("state", "in", ["pushing", "pushed"]));
+  if (fix) return fix.source === "premerge" ? "fix-up for the pre-merge review's fixes" : "fix-up for the review's fixes";
+  // Without bypass checks only a base merge that left the PR's own diff unchanged continues an answer; a CI fix or a resolved conflict is model-written code nobody saw.
+  const merge = await db.get(db.k.selectFrom("conflict_merges").select("own_diff").where("repo", "=", p.repo).where("number", "=", p.number).where("from_head", "=", p.head).where("to_head", "=", cur).where("state", "=", "merged")
+    .$if(!p.bypass, (q) => q.where("own_diff", "=", "same")));
+  if (merge) return merge.own_diff === "same" ? "base merge" : "conflict resolution";
+  if (p.bypass && await db.get(db.k.selectFrom("ci_fixes").select((eb) => eb.lit(1).as("one")).where("repo", "=", p.repo).where("number", "=", p.number).where("head", "=", p.head).where("to_head", "=", cur).where("state", "in", ["pushing", "pushed"]))) return "CI fix";
   // A revision of our implementation PR by the session that wrote it: the PR is the queuer's implementation, and the push gets a fresh review.
   if (await db.get(db.k.selectFrom("push_outcomes").select((eb) => eb.lit(1).as("one")).where("repo", "=", p.repo).where("number", "=", p.number).where("action", "=", "implement-push").where("from_oid", "=", p.head).where("to_oid", "=", cur))) return "implementation session's revision";
   // An autorepin (src/repin) is no model's code either: the revs of a dependency moved to a merge commit on its default branch, as someone who may queue the PR asked.
@@ -518,8 +535,20 @@ async function advance(db: Db, p: Row, held: ReadonlySet<string>, factOf: () => 
     if (!pm || (pm.findings === null && pm.tries < PREMERGE_MAX_TRIES)) return;
     if (pm.findings === null) return await stop("asked", `the pre-merge review of ${headName(p)} failed`, head);
     const defects = findingsOf(pm).filter((x) => x.severity === "defect").length;
-    if (defects) return await stop("asked", `the pre-merge review found ${defects} defect${defects === 1 ? "" : "s"}`, head);
-    if (pm.unsure === 1) return await stop("asked", "the pre-merge review is unsure", head);
+    if (defects && !p.bypass) return await stop("asked", `the pre-merge review found ${defects} defect${defects === 1 ? "" : "s"}`, head);
+    if (pm.unsure === 1 && !p.bypass) return await stop("asked", "the pre-merge review is unsure", head);
+    if (defects) {
+      // Defects with fixes are the pipeline's fix-up to make, as a take-fix review's are; its push is reviewed again (ownPush). Only defects it cannot fix stop the row.
+      const f = await factOf();
+      if (f && decidePr(f).actions.some((a) => a.kind === "fixup" && a.params?.source === "premerge")) return await noteOnce(db, p, head, "premerge-fixup", `The pre-merge review of ${headName(p)} found ${defects} defect${defects === 1 ? "" : "s"} with fixes; ${approvedAhead(p)}, so the fix-up makes them.`);
+      if (f?.lint.some((l) => l.source === "premerge" && !l.ended)) return;
+      // Its push may not be in the mirror yet: the new head then carries the row on (ownPush).
+      if (await db.get(db.k.selectFrom("fixups").select((eb) => eb.lit(1).as("one")).where("repo", "=", p.repo).where("number", "=", p.number).where("from_head", "=", head)
+        .where("source", "=", "premerge").where("state", "in", ["pushing", "pushed"]))) return;
+      return await stop("asked", `the pre-merge review found ${defects} defect${defects === 1 ? "" : "s"} the fix-up cannot make`, head);
+    }
+    // An unsure pre-merge review with no defect is no reason to stop a queued PR: queuing it accepted the change, and the review found nothing wrong.
+    if (pm.unsure === 1) await noteOnce(db, p, head, "premerge-unsure", `The pre-merge review of ${headName(p)} is unsure but found no defect; ${approvedAhead(p)}, so it goes on.`);
     const h = await handOver(db, p, head, held);
     if ("stop" in h) {
       if (await move(db, p, "asked", { reason: h.stop, line: `The pre-approved merge stopped: ${h.stop}.` }) && !h.stop.includes("was answered")) await askMerge(db, p, head, h.stop, [h.stop]);

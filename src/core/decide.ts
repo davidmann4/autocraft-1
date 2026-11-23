@@ -137,6 +137,15 @@ const refusedAsBefore = (f: PrFacts, e: Entry): boolean => {
 
 const rereadDue = (f: PrFacts, pass: PassFacts): boolean => pass.rereadPaceAt <= f.now && (f.diffPending?.lastRead == null || f.now - f.diffPending.lastRead >= RETRY_AFTER_MS);
 
+/**
+ * A PR queued with bypass checks (a live pre-approved merge waiting for the pre-merge review of its head) whose pre-merge review found
+ * defects that all have fixes: the pipeline makes them, once, as it does on the rule path. The push is reviewed again (src/preapproval ownPush).
+ */
+const preapprovedPremergeFix = (f: PrFacts): boolean => {
+  const row = f.premerge;
+  return !!f.operator?.premerge && !!f.operator.bypass && !!row && row.hasFindings && row.defects > 0 && row.defectsAllFixable && !f.premergeFixUsed && f.repoFacts.pushApproved && f.pushable;
+};
+
 const premergeRetryDue = (f: PrFacts): boolean => {
   const row = f.premerge;
   if (!row) return true;
@@ -496,7 +505,7 @@ export function decidePr(f: PrFacts, pass: PassFacts = NO_PASS): Plan {
   if (f.operator?.fix) { /* the operator's fix-up above */ }
   else if (fx) {
     if (fx.bucket === "ask" || (!fx.done && (fx.bucket === "cannot-push" || fx.bucket === "fix"))) actions.push(act("fixup", f.head, { bucket: fx.bucket, source: "review" }));
-  } else if (e && e.state === "needs-fix-up" && e.premerge === "fix" && f.premerge?.fixesSafe && f.mergeable !== "CONFLICTING" && !f.mergeHeld && !f.draft && !f.lint.some((l) => l.source === "premerge")) {
+  } else if (((e && e.state === "needs-fix-up" && e.premerge === "fix") || preapprovedPremergeFix(f)) && f.premerge?.fixesSafe && f.mergeable !== "CONFLICTING" && !f.mergeHeld && !f.draft && !f.lint.some((l) => l.source === "premerge")) {
     actions.push(act("fixup", f.head, { bucket: "fix", source: "premerge" }));
   }
 

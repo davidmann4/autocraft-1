@@ -41,6 +41,10 @@ export function dataDir(env: NodeJS.ProcessEnv = process.env): string {
 export const ADDED_COLUMNS: [table: string, column: string, type: string][] = [
   ["opus_reviews", "base_ref", "TEXT"],
   ["fast_track", "weight", "INTEGER NOT NULL DEFAULT 5"],
+  // Queued with "bypass checks" (src/fasttrack.ts, src/preapproval): the item is wanted as it is, so the reviews take scope and design as settled, the pipeline's own fixes carry the merge on and Duplicates never closes it.
+  ["fast_track", "bypass", "INTEGER NOT NULL DEFAULT 0"],
+  ["preapprovals", "bypass", "INTEGER NOT NULL DEFAULT 0"],
+  ["github_commands", "bypass", "INTEGER NOT NULL DEFAULT 0"],
   ["items", "reactions_count", "INTEGER"],
   // src/core/open-prs.ts textRefs(): the issue numbers a PR's text names, so the planner does not read every open PR's body.
   ["items", "text_refs", "TEXT"],

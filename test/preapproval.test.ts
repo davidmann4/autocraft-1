@@ -5,7 +5,7 @@ import { actionable } from "../src/decisions.ts";
 import { mergeDecisionId } from "../src/core/rules.ts";
 import { reviewHolds } from "../src/review/gate.ts";
 import { advancePreapprovals, cancelPreapproval, preapprovalOf, preapproveMerge, runPipelineStep } from "../src/preapproval/index.ts";
-import { addFastTrack, fastScoreOf, fastTrackList, setFastTrackWeight, workScores } from "../src/fasttrack.ts";
+import { addFastTrack, fastScoreOf, fastTrackList, setFastTrackBypass, setFastTrackWeight, workScores } from "../src/fasttrack.ts";
 import { operatorEditable, splitChanges } from "../src/fixup/patch.ts";
 import { operatorCommentText } from "../src/fixup/template.ts";
 import { scopeToTracked } from "../src/repos.ts";
@@ -15,6 +15,7 @@ import { queueAdd, queueOrigins, queuePage } from "../src/dash/api/queue-page.ts
 import type { Req } from "../src/dash/types.ts";
 import type { CachedEntry } from "../src/core/plan-read.ts";
 import { refreshPlanCache } from "../src/core/plan-cache.ts";
+import { queuedField } from "../src/review/queued.ts";
 
 let current: World | null = null;
 const fresh = async (): Promise<World> => (current = await (await world()).repo());
@@ -34,6 +35,11 @@ const inCi = async (w: World, n: number) => {
   await (await w.synced(n, `sha${n}b`)).review(n, { head: `sha${n}b` });
   await settle(w);
   assert.equal((await preapprovalOf(w.db, "app", n))?.state, "ci");
+};
+/** inCi, for a pre-approved merge queued with bypass checks. */
+const bypassed = async (w: World, n: number) => {
+  await inCi(w, n);
+  await w.db.run(w.db.k.updateTable("preapprovals").set({ bypass: 1 }).where("number", "=", n));
 };
 const answerOf = async (w: World, n: number, head: string) => await w.db.all(w.db.k.selectFrom("decisions").select("answer").where("id", "=", mergeDecisionId("app", n, head)));
 const settle = async (w: World) => { for (let i = 0; i < 5; i++) await advancePreapprovals(w.db); };
@@ -234,6 +240,58 @@ describe("pre-approved merge", () => {
     assert.equal((await preapprovalOf(w.db, "app", 17))?.state, "cancelled");
   });
 
+  test("with bypass checks, the pipeline's own CI fix and conflict resolution carry the pre-approval to a fresh review; a foreign push still cancels it", async () => {
+    const w = await (await (await (await (await (await (await fresh()).pr(16)).review(16, { verdict: "take-fix" })).pr(17)).review(17, { verdict: "take-fix" })).pr(19)).review(19, { verdict: "take-fix" });
+    await bypassed(w, 16);
+    await w.db.run(w.db.k.insertInto("ci_fixes").values({ repo: "app", number: 16, head: "sha16b", to_head: "sha16c", kind: "format", state: "pushed", attempt: 1, created_at: T0 }));
+    await w.synced(16, "sha16c");
+    await settle(w);
+    const p16 = (await preapprovalOf(w.db, "app", 16))!;
+    assert.deepEqual([p16.state, p16.head], ["review", "sha16c"]);
+
+    // A resolution that changed the PR's own diff is model-written code too: it is reviewed again, not merged on the earlier review.
+    await bypassed(w, 19);
+    await w.db.run(w.db.k.insertInto("conflict_merges").values({ repo: "app", number: 19, from_head: "sha19b", to_head: "sha19m", state: "merged", attempt: 1, created_at: T0, own_diff: "changed" }));
+    await w.synced(19, "sha19m");
+    await settle(w);
+    const p19 = (await preapprovalOf(w.db, "app", 19))!;
+    assert.deepEqual([p19.state, p19.head], ["review", "sha19m"]);
+    assert.deepEqual(await answerOf(w, 19, "sha19m"), []);
+
+    await bypassed(w, 17);
+    await w.synced(17, "foreign17");
+    await settle(w);
+    assert.equal((await preapprovalOf(w.db, "app", 17))?.state, "cancelled");
+  });
+
+  test("pre-merge defects with fixes ask without bypass checks; with it the fix-up makes them and its push is reviewed again, and an unsure review without a defect hands over", async () => {
+    const w = await (await (await (await (await (await (await fresh()).pr(20)).review(20, { verdict: "take-fix" })).pr(21)).review(21, { verdict: "take-fix" })).pr(22)).review(22, { verdict: "take-fix" });
+    await inCi(w, 22);
+    await w.premerge(22, "defect");
+    await settle(w);
+    assert.equal((await preapprovalOf(w.db, "app", 22))?.state, "asked");
+
+    await bypassed(w, 20);
+    await w.premerge(20, "defect");
+    await settle(w);
+    assert.equal((await preapprovalOf(w.db, "app", 20))?.state, "ci");
+    assert.ok((await kindsOf(w, 20)).includes("fixup:premerge"), (await kindsOf(w, 20)).join());
+    await w.db.run(w.db.k.insertInto("fixups").values({ repo: "app", number: 20, from_head: "sha20b", to_head: "sha20c", state: "pushed", attempt: 1, created_at: T0, source: "premerge" }));
+    // Before the mirror shows the push, the fix-up is no longer planned; the row waits for the new head instead of asking.
+    await settle(w);
+    assert.equal((await preapprovalOf(w.db, "app", 20))?.state, "ci");
+    await w.synced(20, "sha20c");
+    await settle(w);
+    const p = (await preapprovalOf(w.db, "app", 20))!;
+    assert.deepEqual([p.state, p.head], ["review", "sha20c"]);
+
+    await bypassed(w, 21);
+    await w.premerge(21, "clean");
+    await w.db.run(w.db.k.updateTable("premerge_reviews").set({ unsure: 1 }).where("number", "=", 21));
+    await settle(w);
+    assert.equal((await preapprovalOf(w.db, "app", 21))?.state, "queued");
+  });
+
   test("cancelling a queued PR that is in a batch removes it from the batch and takes the answer back", async () => {
     const w = await (await (await fresh()).pr(18)).review(18, { verdict: "take-fix" });
     await inCi(w, 18);
@@ -315,6 +373,24 @@ describe("add to merge queue (a pre-approved merge without a fix-up)", () => {
     assert.equal(plan.state, "needs-decision");
     assert.ok(!(await kindsOf(w, 12)).includes("ask-merge:"), (await kindsOf(w, 12)).join());
     assert.deepEqual(await answerOf(w, 12, "sha12b"), []);
+  });
+
+  test("only bypass checks tells the review the PR was queued, with the issue it closes as the spec; queuing again with it turns it on", async () => {
+    const w = await (await (await (await fresh()).pr(13)).pr(14)).issue(50, { title: "Undo restores the aligned layers", body: "the measured table" });
+    await w.db.run(w.db.k.updateTable("items").set({ closing_issues: "[50]" }).where("number", "=", 13));
+    await preapproveMerge(w.db, { repo: "app", number: 13, by: OPERATOR });
+    assert.deepEqual(await queuedField(w.db, "app", 13), {});
+    await preapproveMerge(w.db, { repo: "app", number: 13, by: OPERATOR, bypass: true });
+    assert.equal((await w.db.all(w.db.k.selectFrom("preapprovals").select("id").where("number", "=", 13))).length, 1);
+    const q = (await queuedField(w.db, "app", 13)).queued!;
+    assert.deepEqual([q.how, q.by, q.spec.map((s) => [s.ref, s.body])], ["queued", OPERATOR, [["app#50", "the measured table"]]]);
+    // Fast-tracked only: the spec comes from the issue the title names.
+    await w.db.run(w.db.k.updateTable("items").set({ title: "Photomerge: one History step (#50)" }).where("number", "=", 14));
+    await addFastTrack(w.db, OPERATOR, "app#14");
+    assert.deepEqual(await queuedField(w.db, "app", 14), {});
+    await setFastTrackBypass(w.db, OPERATOR, "app#14");
+    const f = (await queuedField(w.db, "app", 14)).queued!;
+    assert.deepEqual([f.how, f.spec.map((s) => s.ref)], ["fast-tracked", ["app#50"]]);
   });
 
   test("the add asks for no review of its own: running CI still holds the review of the PR's head", async () => {

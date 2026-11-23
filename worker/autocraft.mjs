@@ -42,7 +42,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { gzipSync } from "node:zlib";
 import { fileURLToPath } from "node:url";
 
-export const HELPER_VERSION = "1.4.0";
+export const HELPER_VERSION = "1.4.1";
 
 // ---------------------------------------------------------------------------
 // Wire format: a copy of src/remote/protocol.ts (the helper is served alone, so it keeps its own).
@@ -4844,7 +4844,7 @@ export const CLI_COMMANDS = [
   { path: ["inbox", "show"], tool: "get_inbox_item", args: ["id"], usage: "<id>", summary: "one decision: question, options, summary, item text, feedback" },
   { path: ["inbox", "feedback"], tool: "send_feedback", args: ["id"], flags: { pick: "option", note: "text" }, usage: "<id> --pick <key> --note \"...\"", summary: "your pick of one option and/or a note; an operator answers" },
   { path: ["queue"], tool: "list_merge_queue", usage: "[--repo R] [--limit N] [--cursor C]", summary: "each PR's state, weight and what it waits for" },
-  { path: ["queue", "add"], tool: "queue_pr", args: ["item"], usage: "<pr> [--weight N]", summary: "approve a PR's merge ahead and fast-track it", why: answerWhy },
+  { path: ["queue", "add"], tool: "queue_pr", args: ["item"], flags: { "bypass-checks": "bypassChecks" }, usage: "<pr> [--weight N] [--bypass-checks]", summary: "approve a PR's merge ahead and fast-track it; --bypass-checks: the reviews take it as wanted and the pipeline repairs it instead of asking", why: answerWhy },
   { path: ["queue", "weight"], tool: "set_weight", args: ["item", "weight"], usage: "<item> <N>", summary: "set an item's fast-track weight; --remove takes it off", why: () => "only operators steer the merge queue" },
   { path: ["queue", "remove"], tool: "cancel_queued", args: ["item"], usage: "<pr>", summary: "withdraw a PR's approved merge", why: cancelWhy },
   { path: ["calls"], tool: "list_model_calls", usage: "", summary: "model calls waiting for a Task Runner, and why each waits", why: () => LOCAL_WHY },

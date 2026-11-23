@@ -612,7 +612,8 @@ CREATE TABLE IF NOT EXISTS github_commands (
   reply TEXT,                         -- posted | failed | none (no answer is given); null while the answer is still to post
   ref_repo TEXT,                      -- autorepin: the repository of the pull request it names, as written (`owner/name` or `name`); null with ref_number: autorepin off
   ref_number INTEGER,
-  ref_branch TEXT                     -- autorepin `via <branch>`: the dependency's branch to pin from; null: its default branch
+  ref_branch TEXT,                    -- autorepin `via <branch>`: the dependency's branch to pin from; null: its default branch
+  bypass INTEGER NOT NULL DEFAULT 0   -- 1: `merge queue bypass`: queued with bypass checks
 );
 CREATE INDEX IF NOT EXISTS github_commands_state ON github_commands(state, reply);
 -- Autorepin (src/repin): once the pull request `ref_repo#ref_number` is merged, the pull request `repo#number` gets a commit that
@@ -1630,6 +1631,8 @@ CREATE TABLE IF NOT EXISTS fast_track (
   added_at TEXT NOT NULL,
   -- 1 to 10: heavier items go first; equal weights keep the order added.
   weight INTEGER NOT NULL DEFAULT 5,
+  -- 1: queued with "bypass checks" (src/fasttrack.ts): wanted as it is, never closed as a duplicate
+  bypass INTEGER NOT NULL DEFAULT 0,
   UNIQUE (repo, number)
 );
 
@@ -2213,7 +2216,8 @@ CREATE TABLE IF NOT EXISTS preapprovals (
   head TEXT,
   reason TEXT,
   updated_at TEXT NOT NULL,
-  fix_id INTEGER
+  fix_id INTEGER,
+  bypass INTEGER NOT NULL DEFAULT 0   -- 1: queued with "bypass checks": the pipeline's own fixes carry it on (src/preapproval)
 );
 CREATE INDEX IF NOT EXISTS preapprovals_item ON preapprovals(repo, number, id);
 

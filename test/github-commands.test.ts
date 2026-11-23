@@ -47,8 +47,8 @@ function ghFake(code = 0) {
 }
 /** GitHub as the stubs answer it: the comment as written (by its stored commenter and weight), each PR at its mirror head, opened long ago and unchanged. */
 const stillThere = (w: World) => async (_repo: string, id: number): Promise<CommentNow> => {
-  const r = (await w.db.get(w.db.k.selectFrom("github_commands").select(["github_id", "weight"]).where("comment_id", "=", id)))!;
-  return { kind: "ok", authorId: r.github_id, body: `@${SLUG} merge queue${r.weight === null ? "" : ` ${r.weight}`}` };
+  const r = (await w.db.get(w.db.k.selectFrom("github_commands").select(["github_id", "weight", "bypass"]).where("comment_id", "=", id)))!;
+  return { kind: "ok", authorId: r.github_id, body: `@${SLUG} merge queue${r.weight === null ? "" : ` ${r.weight}`}${r.bypass ? " lgtm" : ""}` };
 };
 const unchanged = (w: World) => async (_q: unknown, _repo: string, n: number): Promise<PrNow | null> =>
   ({ head: (await w.db.get(w.db.k.selectFrom("items").select("head_oid").$narrowType<{ head_oid: string }>().where("repo", "=", "app").where("number", "=", n)))!.head_oid, opened: "2020-01-01T00:00:00Z", changed: false });
@@ -70,11 +70,19 @@ const drained = async (w: World, o: Parameters<typeof deps>[1] = {}) => {
 
 describe("parseCommand", () => {
   test("a line of its own addressed to the app, any case and spelling, with an optional weight", () => {
-    assert.deepEqual(parseCommand(`@${SLUG} merge queue`, SLUG), { command: "merge-queue", weight: null });
-    assert.deepEqual(parseCommand(`Looks good.\n\n  @Autocraft-Bot Merge-Queue!  \nthanks`, SLUG), { command: "merge-queue", weight: null });
-    assert.deepEqual(parseCommand(`@${SLUG} mergequeue 8`, SLUG), { command: "merge-queue", weight: 8 });
-    assert.deepEqual(parseCommand(`@${SLUG}[bot]: merge queue weight 3`, SLUG), { command: "merge-queue", weight: 3 });
-    assert.deepEqual(parseCommand(`@${SLUG} merge queue 42`, SLUG), { command: "merge-queue", weight: 42 }, "the range is checked when it is carried out");
+    assert.deepEqual(parseCommand(`@${SLUG} merge queue`, SLUG), { command: "merge-queue", weight: null, bypass: false });
+    assert.deepEqual(parseCommand(`Looks good.\n\n  @Autocraft-Bot Merge-Queue!  \nthanks`, SLUG), { command: "merge-queue", weight: null, bypass: false });
+    assert.deepEqual(parseCommand(`@${SLUG} mergequeue 8`, SLUG), { command: "merge-queue", weight: 8, bypass: false });
+    assert.deepEqual(parseCommand(`@${SLUG}[bot]: merge queue weight 3`, SLUG), { command: "merge-queue", weight: 3, bypass: false });
+    assert.deepEqual(parseCommand(`@${SLUG} merge queue 42`, SLUG), { command: "merge-queue", weight: 42, bypass: false }, "the range is checked when it is carried out");
+  });
+
+  test("bypass, bypass checks or lgtm before or after the weight queues with bypass checks; mq is short for merge queue", () => {
+    assert.deepEqual(parseCommand(`@${SLUG} mq lgtm`, SLUG), { command: "merge-queue", weight: null, bypass: true });
+    assert.deepEqual(parseCommand(`@${SLUG} mq`, SLUG), { command: "merge-queue", weight: null, bypass: false });
+    assert.deepEqual(parseCommand(`@${SLUG} merge queue bypass checks 8`, SLUG), { command: "merge-queue", weight: 8, bypass: true });
+    assert.deepEqual(parseCommand(`@${SLUG} merge queue weight 3 bypass`, SLUG), { command: "merge-queue", weight: 3, bypass: true });
+    for (const body of [`@${SLUG} mq lgtm lgtm`, `@${SLUG} mq bypass 3 lgtm`, `@${SLUG} mq looks good`, `@${SLUG} mqlgtm`]) assert.equal(parseCommand(body, SLUG), null, body);
   });
 
   test("other apps, other words, quotes, code and text around the command do not count", () => {
@@ -435,6 +443,16 @@ describe("comment-time checks", () => {
     assert.match(gh.posted[0]!.body, /@op Not added to the merge queue: could not check your access; comment again\.$/);
     await drained(w, { exec: gh.exec, now: () => new Date(Date.now() + 3600_000) });
     assert.equal(gh.posted.length, 1);
+  });
+
+  test("mq lgtm queues with bypass checks; a plain command does not", async () => {
+    const w = await (await (await fresh()).pr(1)).pr(2);
+    await deliver(w, payload({ body: `@${SLUG} mq lgtm`, number: 1, comment: 5001 }));
+    await deliver(w, payload({ body: `@${SLUG} merge queue`, number: 2, comment: 5002 }));
+    await drained(w, { exec: ghFake().exec });
+    assert.deepEqual((await rows(w)).map((r) => r.state), ["done", "done"]);
+    const bypassOf = async (n: number) => (await w.db.get(w.db.k.selectFrom("preapprovals").select("bypass").where("number", "=", n)))?.bypass;
+    assert.deepEqual([await bypassOf(1), await bypassOf(2)], [1, 0]);
   });
 
   test("a quiet PR: a maintainer's command is refused without an answer, an operator's is carried out without one", async () => {

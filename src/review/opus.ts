@@ -10,6 +10,7 @@ import { Client, type Querier } from "../mirror.ts";
 import { checksOf, refreshChecks } from "./checks.ts";
 import { openBlockers } from "./blockers.ts";
 import { isScopeQuestion, settledScope } from "./candidates.ts";
+import { queuedField } from "./queued.ts";
 import { recordReviewFailure, reviewHolds } from "./gate.ts";
 import { MAX_RERUNS_PER_DAY, countRerun, discussionOf, ensurePipelineLogin, liveDiscussion, markedStaleSince, staleReviews, withRetry, type Snapshot } from "./discussion.ts";
 import { withdrawHoldQuestion, withdrawMergeQuestion } from "../merge/withdraw.ts";
@@ -198,7 +199,7 @@ export async function prepareOpusInput(db: Db, repo: string, c: OpusCandidate, d
       mode: "full", earlier_opus: null, diff: cd.text,
       related_open: await relatedOpen(db, repo, c.number, cd.files), review_history: await latestReview(db, repo, c.number, c.head_oid),
     };
-    return { kind: "ready", input: { ...input, statements: await relatedStatements(db, repo, c.number), ...await scopeSettledField(db, repo, c.number) }, snap: { seen: now(), hash: null }, mode: "full", base: null, baseRef };
+    return { kind: "ready", input: { ...input, statements: await relatedStatements(db, repo, c.number), ...await scopeSettledField(db, repo, c.number), ...await queuedField(db, repo, c.number) }, snap: { seen: now(), hash: null }, mode: "full", base: null, baseRef };
   }
   let mode: "full" | "delta" = "full", diff = cd.text, base: string | null = null;
   // A delta stands on the earlier review only when that review read the PR against the same base branch; after a retarget the whole diff is reviewed.
@@ -239,6 +240,7 @@ export async function prepareOpusInput(db: Db, repo: string, c: OpusCandidate, d
     related_open: await relatedOpen(db, repo, c.number, cd.files),
     statements: await relatedStatements(db, repo, c.number),
     ...await scopeSettledField(db, repo, c.number),
+    ...await queuedField(db, repo, c.number),
   };
   return { kind: "ready", input, snap, mode, base, baseRef, ...(maintDropped ? { maintDropped } : {}) };
 }

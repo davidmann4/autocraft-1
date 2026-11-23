@@ -520,7 +520,7 @@ export interface Api {
      * One "Queue items" line: a PR is pre-approved at its current head and fast-tracked with `weight`; an issue is fast-tracked, and the one open PR that closes it is queued too.
      * `weight` is an operator's; a maintainer's line goes without one and gets the default weight for an item not fast-tracked yet.
      */
-    add(item: string, weight?: number): Promise<{ label: string; fast: string[] }>;
+    add(item: string, weight?: number, bypassChecks?: boolean): Promise<{ label: string; fast: string[] }>;
     hold(item: string): Promise<void>;
     release(item: string): Promise<void>;
     batchRemove(item: string): Promise<void>;

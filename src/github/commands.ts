@@ -1,6 +1,8 @@
 // Commands to the GitHub App in a GitHub comment. Someone who may use Queue items on the repo writes, on a line of its own,
 //
-//   @<app-slug> merge queue            (also merge-queue, mergequeue; optional weight: `@<app-slug> merge queue 8`)
+//   @<app-slug> merge queue            (also merge-queue, mergequeue, mq; optional weight: `@<app-slug> merge queue 8`;
+//                                      optional `bypass`, `bypass checks` or `lgtm` before or after it: queue with bypass
+//                                      checks, so `@<app-slug> mq lgtm` queues with bypass checks)
 //
 // on a pull request or an issue, and the item goes into the merge queue as "Queue items" on the Queue page puts it there
 // (queueAdd: a PR is pre-approved and fast-tracked; an issue is fast-tracked and its one closing PR queued). A PR is pre-approved at
@@ -56,7 +58,7 @@ const NO_ACCESS_READ = "could not check your access; comment again";
 const NOT_QUEUED = "it could not be queued";
 const NOT_SET = "it could not be set";
 
-export type Command = { command: "merge-queue"; weight: number | null } | {
+export type Command = { command: "merge-queue"; weight: number | null; /** `bypass` (or `bypass checks`): queue with bypass checks. */ bypass: boolean } | {
   command: "autorepin";
   /** The pull request to wait for; null: `off`. */ ref: PrRef | null;
   /** `via <branch>`: the dependency's branch the pin must come from; null: its default branch. */ branch: string | null;
@@ -69,13 +71,14 @@ const escape = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 /**
  * The command in a comment addressed to the app, or null. The command is a line of its own: `@<slug> merge queue`, with an
- * optional weight (`8` or `weight 8`). Quoted lines (`> ...`), fenced and indented code and HTML comments are skipped, so quoting or
+ * optional weight (`8` or `weight 8`) and an optional `bypass` / `bypass checks` / `lgtm` before or after it; `mq` is short for `merge queue`. Quoted lines (`> ...`), fenced and indented code and HTML comments are skipped, so quoting or
  * hiding a command runs nothing. A fence closes as CommonMark closes it: the opening character, at least as many of it, and nothing
  * after but spaces. `@<slug> autorepin <pull request>` names the pull request as `owner/name#12`, `name#12` or its URL; `off` drops it.
  */
 export function parseCommand(body: unknown, slug: string): Command | null {
   if (typeof body !== "string" || !slug) return null;
-  const re = new RegExp(`^@${escape(slug)}(?:\\[bot\\])?[\\s,:]+merge[-\\s]?queue(?:\\s+(?:weight\\s+)?(\\d{1,2}))?\\s*[.!]?$`, "i");
+  const bypass = "(bypass(?:[-\\s]?checks)?|lgtm)";
+  const re = new RegExp(`^@${escape(slug)}(?:\\[bot\\])?[\\s,:]+(?:merge[-\\s]?queue|mq)(?:\\s+${bypass})?(?:\\s+(?:weight\\s+)?(\\d{1,2}))?(?:\\s+${bypass})?\\s*[.!]?$`, "i");
   const repin = new RegExp(`^@${escape(slug)}(?:\\[bot\\])?[\\s,:]+auto[-\\s]?repin\\s+(\\S+)(?:\\s+via\\s+(\\S+))?$`, "i");
   let fence: { ch: string; len: number } | null = null;
   let comment = false;
@@ -102,7 +105,7 @@ export function parseCommand(body: unknown, slug: string): Command | null {
     // Indented code: four columns of leading space, a tab counting up to the next multiple of four.
     if (/^(?: {4}| {0,3}\t)/.test(text)) continue;
     const m = re.exec(line);
-    if (m) return { command: "merge-queue", weight: m[1] === undefined ? null : Number(m[1]) };
+    if (m && !(m[1] && m[3])) return { command: "merge-queue", weight: m[2] === undefined ? null : Number(m[2]), bypass: !!(m[1] ?? m[3]) };
     const rm = repin.exec(line);
     const a = rm?.[1];
     if (a === undefined) continue;
@@ -145,20 +148,20 @@ export async function queueCommand(db: Db, repo: string, event: string, payload:
   const branch = cmd.command === "autorepin" ? cmd.branch : null;
   const r = await db.run(db.k.insertInto("main.github_commands").values({
     comment_id: commentId, repo, number, pr: issue.pull_request ? 1 : 0, command: cmd.command, weight: cmd.command === "merge-queue" ? cmd.weight : null,
-    ref_repo: ref ? refText(ref) : null, ref_number: ref ? ref.number : null, ref_branch: branch, login, github_id: githubId,
+    bypass: cmd.command === "merge-queue" && cmd.bypass ? 1 : 0, ref_repo: ref ? refText(ref) : null, ref_number: ref ? ref.number : null, ref_branch: branch, login, github_id: githubId,
     created_at: new Date(created).toISOString(), requested_at: now.toISOString(), state: "queued",
   }).onConflict((oc) => oc.doNothing()));
   return r.changes > 0;
 }
 
-type Row = { comment_id: number; repo: string; number: number; pr: number; command: string; weight: number | null; ref_repo: string | null; ref_number: number | null; ref_branch: string | null; login: string; github_id: number; created_at: string; requested_at: string; state: string; result: string | null; retries: number; allowed: number | null; reply: string | null };
-const COLS = ["comment_id", "repo", "number", "pr", "command", "weight", "ref_repo", "ref_number", "ref_branch", "login", "github_id", "created_at", "requested_at", "state", "result", "retries", "allowed", "reply"] as const;
+type Row = { comment_id: number; repo: string; number: number; pr: number; command: string; weight: number | null; bypass: number; ref_repo: string | null; ref_number: number | null; ref_branch: string | null; login: string; github_id: number; created_at: string; requested_at: string; state: string; result: string | null; retries: number; allowed: number | null; reply: string | null };
+const COLS = ["comment_id", "repo", "number", "pr", "command", "weight", "bypass", "ref_repo", "ref_number", "ref_branch", "login", "github_id", "created_at", "requested_at", "state", "result", "retries", "allowed", "reply"] as const;
 
 /**
  * What carries out a queued merge-queue command: the Queue page's queueAdd, as the commenter. `canWrite`: GitHub's answer for `repo`,
  * read just before. `heads`: the head each PR may be pre-approved at, null for one opened or pushed to after the comment. Injectable for tests.
  */
-export type QueueFn = (db: Db, o: { login: string; role: Role; canWrite: boolean; repo: string; item: string; weight: number | null; heads: ReadonlyMap<number, string | null> }) => Promise<string>;
+export type QueueFn = (db: Db, o: { login: string; role: Role; canWrite: boolean; repo: string; item: string; weight: number | null; bypass: boolean; heads: ReadonlyMap<number, string | null> }) => Promise<string>;
 
 type QueuePage = typeof import("../dash/api/queue-page.ts");
 
@@ -170,7 +173,7 @@ const userOf = (o: { login: string; role: Role; repo: string; canWrite: boolean 
 
 /** queueAdd from a module loaded beforehand, so nothing but the handler's own checks runs between the freshness check and its write. */
 const queueVia = ({ queueAdd }: QueuePage): QueueFn => async (db, o) => {
-  const req = { method: "POST" as const, path: "/webhooks/github", params: {}, query: new URLSearchParams(), form: new URLSearchParams(), json: { item: o.item, ...(o.weight === null ? {} : { weight: o.weight }) }, user: userOf(o), csrf: "", nonce: "" };
+  const req = { method: "POST" as const, path: "/webhooks/github", params: {}, query: new URLSearchParams(), form: new URLSearchParams(), json: { item: o.item, ...(o.weight === null ? {} : { weight: o.weight }), ...(o.bypass ? { bypassChecks: true } : {}) }, user: userOf(o), csrf: "", nonce: "" };
   return (await queueAdd(db, req, "github", (n) => o.heads.get(n) ?? null)).label;
 };
 
@@ -359,7 +362,7 @@ async function carryOut(db: Db, r: Row, deps: CommandDeps, now: Date, qp: QueueP
   if (await refusal(db, r, role, perm === "ok", qp)) return refuse(db, r, now, role, perm === "ok", qp);
   const quiet = await quietFor(db, r, qp);
   try {
-    const label = await (deps.queue ?? queueVia(qp))(db, { login: r.login, role, canWrite: perm === "ok", repo: r.repo, item: refOf(r), weight: r.weight, heads });
+    const label = await (deps.queue ?? queueVia(qp))(db, { login: r.login, role, canWrite: perm === "ok", repo: r.repo, item: refOf(r), weight: r.weight, bypass: r.bypass === 1, heads });
     const f = (await fastPositions(db)).get(refOf(r));
     await settle(db, r, "done", `${oneLine(label)}.${f ? ` Fast-tracked with weight ${f.weight}, ${f.position} of ${f.of}.` : ""}`, now, { reply: !quiet, allowed: true });
   } catch (e) {
@@ -370,10 +373,10 @@ async function carryOut(db: Db, r: Row, deps: CommandDeps, now: Date, qp: QueueP
   return "settled";
 }
 
-/** The command a comment holds now is the stored one: an edit that names another pull request or weight runs nothing. */
+/** The command a comment holds now is the stored one: an edit that names another pull request, weight or bypass runs nothing. */
 function sameCommand(cmd: Command, r: Row): boolean {
   if (cmd.command !== r.command) return false;
-  if (cmd.command === "merge-queue") return cmd.weight === r.weight;
+  if (cmd.command === "merge-queue") return cmd.weight === r.weight && cmd.bypass === (r.bypass === 1);
   if (cmd.branch !== r.ref_branch) return false;
   return cmd.ref === null ? r.ref_repo === null && r.ref_number === null : refText(cmd.ref) === r.ref_repo && cmd.ref.number === r.ref_number;
 }

@@ -5,7 +5,7 @@ import { prBuildView } from "../../prbuild/view.ts";
 import { canSeeInternals } from "./staff.ts";
 import type { FastPosition, MergeWait, NextMerge, QueueMergeRow, QueueOrigin, QueuePage, QueuePendingRow, QueueRepos, QueueTab, QueueWorkRow, TypeLabel } from "../../../web/src/api/types.ts";
 import { cachedQueue, openViews, type CachedEntry } from "../../core/plan-read.ts";
-import { addFastTrack, fastPositions, fastTrackList, FastTrackError, parseItemRef, parseWeight, removeFastTrack, setFastTrackWeight, WEIGHT_DEFAULT } from "../../fasttrack.ts";
+import { addFastTrack, fastPositions, fastTrackList, FastTrackError, parseItemRef, parseWeight, removeFastTrack, setFastTrackBypass, setFastTrackWeight, WEIGHT_DEFAULT } from "../../fasttrack.ts";
 import { HEAD_CHANGED, preapproveMerge } from "../../preapproval/index.ts";
 import { requireSettle } from "../../settlers.ts";
 import type { Exec } from "../../fixup/git.ts";
@@ -349,10 +349,21 @@ export async function fastTrackWeight(db: Db, req: Req): Promise<string[]> {
  * Fast-tracks an item with weight `w`; one already fast-tracked keeps a heavier weight it has, so this only ever moves it up. `w` null is a
  * maintainer's line: an item not on the list gets the default weight and an existing weight stays, since weights are set by operators.
  */
-async function markFast(db: Db, by: string, repo: string, number: number, w: number | null, via?: string): Promise<void> {
+async function markFast(db: Db, by: string, repo: string, number: number, w: number | null, via?: string, bypass = false): Promise<void> {
   const ref = `${repo}#${number}`;
   const had = (await db.get(db.k.selectFrom("main.fast_track").select("weight").where("repo", "=", repo).where("number", "=", number)))?.weight;
   await guarded(async () => (had === undefined ? await addFastTrack(db, by, ref, w ?? WEIGHT_DEFAULT, via) : w !== null && w > had ? await setFastTrackWeight(db, by, ref, w, via) : null));
+  // Bypass checks is only ever turned on by a queue line; a line without it leaves an earlier one in place.
+  if (bypass) await guarded(async () => await setFastTrackBypass(db, by, ref, via));
+}
+
+/** The optional `bypassChecks` of the JSON body: true queues the item with bypass checks (src/fasttrack.ts, src/preapproval). */
+export function bypassOf(req: Req): boolean {
+  const b = req.json;
+  const v = b && typeof b === "object" && !Array.isArray(b) ? (b as { bypassChecks?: unknown }).bypassChecks : undefined;
+  if (v === undefined || v === null || v === false) return false;
+  if (v === true) return true;
+  throw new HttpError(400, "bypassChecks must be true or false");
 }
 
 /**
@@ -360,9 +371,9 @@ async function markFast(db: Db, by: string, repo: string, number: number, w: num
  * when an ended one was queued again after it ended: issue-facts.ts requeuedAfterEnd). With no implementation under way the
  * person queueing it becomes its queuer, whose Task Runner runs its model calls.
  */
-async function queueIssue(db: Db, by: string, repo: string, number: number, w: number | null, via?: string): Promise<void> {
+async function queueIssue(db: Db, by: string, repo: string, number: number, w: number | null, via?: string, bypass = false): Promise<void> {
   const had = await db.get(db.k.selectFrom("main.fast_track").select("added_by").where("repo", "=", repo).where("number", "=", number));
-  await markFast(db, by, repo, number, w, via);
+  await markFast(db, by, repo, number, w, via, bypass);
   if (!had) return;
   await guarded(async () => {
     const current = await currentImplementation(db, repo, number);
@@ -444,6 +455,8 @@ export const queueWhat = (repo: string): string => `queues items on ${repo}`;
  * and CI is green) and fast-tracked with the weight, so its review, checks and merge come first. An issue is fast-tracked, so Fix works it
  * first; when exactly one open PR closes it, that PR is queued as above. Several closing PRs are only listed: a person picks one.
  * Weights stay with operators: a maintainer's line fast-tracks with the default weight and ignores a weight it names.
+ * `bypassChecks: true` queues with bypass checks: the items are marked on the fast-track list and the pre-approval, so the reviews
+ * take scope and design as settled, the pipeline's own fixes carry the merge on, and Duplicates never closes them (docs/pipeline.md).
  * `pin` (a command in a comment) names the one head each PR may be pre-approved at, or null for a PR that may not be queued: one
  * opened or pushed to after the comment.
  */
@@ -451,6 +464,7 @@ export async function queueAdd(db: Db, req: Req, via?: string, pin?: (pr: number
   const r = item(req);
   const operator = req.user.role === "operator";
   const w = operator ? weightOf(req) : null;
+  const bypass = bypassOf(req);
   const raw = rawWeight(req);
   const ignored = !operator && raw !== undefined && raw !== null && raw !== "" ? ". The weight was ignored: only operators set fast-track weights" : "";
   await needVisible(db, req, r.repo);
@@ -459,7 +473,7 @@ export async function queueAdd(db: Db, req: Req, via?: string, pin?: (pr: number
   const by = req.user.login;
   const kind = (await db.get(db.k.selectFrom("main.items").select("kind").where("repo", "=", r.repo).where("number", "=", r.number)))?.kind;
   if (kind === "issue") {
-    await queueIssue(db, by, r.repo, r.number, w, via);
+    await queueIssue(db, by, r.repo, r.number, w, via, bypass);
     const prs = await openPrsClosing(db, r.repo, r.number);
     const scope = await takeScope(db, by, r.repo, r.number, via);
     if (!prs.length) {
@@ -471,9 +485,9 @@ export async function queueAdd(db: Db, req: Req, via?: string, pin?: (pr: number
     else if (pin && pin(prs[0]!) === null) rest = `#${prs[0]} closes it but was opened or pushed to after your comment, so it was not queued; comment on #${prs[0]} to queue it`;
     else {
       try {
-        await preapproveMerge(db, { repo: r.repo, number: prs[0]!, by, via, ...(pin ? { head: pin(prs[0]!)! } : {}) });
+        await preapproveMerge(db, { repo: r.repo, number: prs[0]!, by, via, bypass, ...(pin ? { head: pin(prs[0]!)! } : {}) });
         try {
-          await markFast(db, by, r.repo, prs[0]!, w, via);
+          await markFast(db, by, r.repo, prs[0]!, w, via, bypass);
           rest = `queued #${prs[0]}, which closes it`;
         } catch (e) {
           rest = `queued #${prs[0]}, which closes it, but did not fast-track it: ${(e as Error).message}`;
@@ -488,11 +502,11 @@ export async function queueAdd(db: Db, req: Req, via?: string, pin?: (pr: number
   const head = pin ? pin(r.number) : undefined;
   if (head === null) throw new HttpError(409, HEAD_CHANGED);
   try {
-    done = await preapproveMerge(db, { repo: r.repo, number: r.number, by, via, ...(head === undefined ? {} : { head }) });
+    done = await preapproveMerge(db, { repo: r.repo, number: r.number, by, via, bypass, ...(head === undefined ? {} : { head }) });
   } catch (e) {
     throw new HttpError(409, (e as Error).message);
   }
-  await markFast(db, by, r.repo, r.number, w, via);
+  await markFast(db, by, r.repo, r.number, w, via, bypass);
   return { label: `${done.label}${ignored}`, fast: await fastTrackRefs(db, req) };
 }
 

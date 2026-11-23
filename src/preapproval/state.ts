@@ -33,6 +33,7 @@ export async function queuedOperatorFix(db: Db, repo: string, number: number, he
 
 export type OperatorWork = {
   fixHeads: Set<string>; hold: boolean; /** The pushed head of a pre-approved merge waiting for its pre-merge review (state `ci`). */ premergeHeads: Set<string>; /** A pre-approved merge is live (fixup, review, ci or queued). */ preapproved: boolean;
+  /** The live pre-approved merge was queued with bypass checks. */ bypass?: boolean;
   /** When the first of `fixHeads`' requests stops counting with the clock alone: its maintainer's cached write permission ages out (ms). */
   settleUntil?: number;
 };
@@ -54,10 +55,11 @@ export async function operatorWork(db: Db, repo?: string, nowMs: number = Date.n
     w.fixHeads.add(o.from_head);
     if (o.checked_at) { const until = Date.parse(o.checked_at) + PERM_READ_TTL; if (!(w.settleUntil! <= until)) w.settleUntil = until; }
   }
-  for (const p of await db.all(db.k.selectFrom("preapprovals").select(["repo", "number", "state", "head"]).where("state", "in", ["fixup", "review", "ci", "queued"])
+  for (const p of await db.all(db.k.selectFrom("preapprovals").select(["repo", "number", "state", "head", "bypass"]).where("state", "in", ["fixup", "review", "ci", "queued"])
     .$if(!!repo, (q) => q.where("repo", "=", repo!)))) {
     const w = get(p.repo, p.number);
     w.preapproved = true;
+    if (p.bypass) w.bypass = true;
     if (p.state === "queued") continue;
     w.hold = true;
     if (p.state === "ci" && p.head) w.premergeHeads.add(p.head);

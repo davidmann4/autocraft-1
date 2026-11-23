@@ -2,6 +2,7 @@
 // line. A PR is pre-approved at its current head and fast-tracked with the chosen weight; an issue is fast-tracked, and the one open PR
 // that closes it is queued too. For operators, and for maintainers who settle decisions (maintainer writes on, write access to a repo);
 // the server checks each line's repo. Weights are set by operators, so a maintainer's dialog has no weight and the server uses the default.
+// "Bypass checks" queues the lines with bypass checks: the reviews take the items as wanted and the pipeline repairs instead of asking.
 import { useState } from "react";
 import { CheckCircleIcon, PlusIcon, XCircleIcon } from "@phosphor-icons/react";
 import { useApi } from "../../api/client";
@@ -22,6 +23,7 @@ function QueueDialog({ onClose }: { onClose: () => void }) {
   const operator = useUser().role === "operator";
   const [text, setText] = useState("");
   const [weight, setWeight] = useState(WEIGHT_DEFAULT);
+  const [bypass, setBypass] = useState(false);
   const [busy, setBusy] = useState(false);
   const [results, setResults] = useState<Result[]>([]);
   const items = linesOf(text);
@@ -32,7 +34,7 @@ function QueueDialog({ onClose }: { onClose: () => void }) {
     // One at a time, so each line gets its own answer and a refusal does not stop the rest.
     for (const item of items) {
       try {
-        out.push({ item, ok: true, text: (await api.queueControl.add(item, operator ? weight : undefined)).label });
+        out.push({ item, ok: true, text: (await api.queueControl.add(item, operator ? weight : undefined, bypass)).label });
       } catch (e) {
         out.push({ item, ok: false, text: (e as Error).message });
       }
@@ -76,6 +78,13 @@ function QueueDialog({ onClose }: { onClose: () => void }) {
               </Select>
             </label>
           )}
+          <label className="flex items-center gap-2 text-xs text-ink/65" title="The reviews take scope and design as settled; the pipeline makes pre-merge fixes and repairs red CI and conflicts itself, each push reviewed again, instead of asking; never closed as a duplicate.">
+            <input type="checkbox" checked={bypass} onChange={(e) => setBypass(e.target.checked)} className="size-4" aria-describedby="queue-bypass-help" />
+            Bypass checks
+          </label>
+          <span id="queue-bypass-help" className="sr-only">
+            The reviews take scope and design as settled; the pipeline makes pre-merge fixes and repairs red CI and conflicts itself, each push reviewed again, instead of asking; never closed as a duplicate.
+          </span>
           <Button type="submit" className="ml-auto max-md:h-11" loading={busy} disabled={!items.length}>
             Queue items
           </Button>

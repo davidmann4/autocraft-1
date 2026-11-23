@@ -748,6 +748,7 @@ export interface FastTrack {
   added_by: string;
   added_at: string;
   weight: Generated<number>;
+  bypass: Generated<number>;
 }
 
 export interface FinalReviews {
@@ -858,6 +859,7 @@ export interface GithubCommands {
   ref_repo: string | null;
   ref_number: number | null;
   ref_branch: string | null;
+  bypass: Generated<number>;
 }
 
 export interface GithubSetupLinks {
@@ -1620,6 +1622,7 @@ export interface Preapprovals {
   reason: string | null;
   updated_at: string;
   fix_id: number | null;
+  bypass: Generated<number>;
 }
 
 export interface PremergeReviews {
@@ -2719,14 +2722,14 @@ export const COLUMNS = {
   duplicate_pairs: ["repo", "a", "b", "a_hash", "b_hash", "similarity", "jev_p", "haiku", "verdict", "canonical", "by_operator", "created_at", "checked_at"],
   duplicate_scans: ["repo", "number", "hash", "at"],
   ever_tracked_repos: ["name"],
-  fast_track: ["id", "repo", "number", "added_by", "added_at", "weight"],
+  fast_track: ["id", "repo", "number", "added_by", "added_at", "weight", "bypass"],
   final_reviews: ["repo", "number", "head_oid", "run_id", "at", "model", "verdict", "reason", "fixes", "risks", "sure", "mode", "base_head", "seen_at", "disc_hash"],
   fix_attempts: ["repo", "number", "main_sha", "text_hash", "state", "round", "files", "crate", "crate_dir", "patch", "test_patch", "head_task_id", "base_task_id", "retries", "push_tries", "summary", "pr_url", "reason", "created_at", "updated_at", "size", "format_diff"],
   fixups: ["repo", "number", "from_head", "to_head", "state", "reason", "files", "attempt", "created_at", "source", "patch", "lint_task", "lint_round", "lint_state", "carry_decision", "operator_fix", "changes", "session"],
   flow_summary: ["repo", "counts", "counted_at", "stale", "decisions_sig"],
   github_app: ["id", "app_id", "slug", "keys_enc", "updated_at"],
   github_app_states: ["state", "login", "session_hash", "created_at"],
-  github_commands: ["comment_id", "repo", "number", "pr", "command", "weight", "login", "github_id", "created_at", "requested_at", "state", "result", "done_at", "tried_at", "retries", "allowed", "reply", "ref_repo", "ref_number", "ref_branch"],
+  github_commands: ["comment_id", "repo", "number", "pr", "command", "weight", "login", "github_id", "created_at", "requested_at", "state", "result", "done_at", "tried_at", "retries", "allowed", "reply", "ref_repo", "ref_number", "ref_branch", "bypass"],
   github_setup_links: ["id", "org", "created_by", "hash", "created_at", "expires_at", "revoked_at", "used_at", "used_by", "installation_id"],
   held_followups: ["id", "card_id", "choice_id", "decision_id", "answer_seq", "preapproval_id", "repo", "number", "issue_repo", "title", "body", "by", "at", "state", "issue_number", "url", "reason", "attempts", "updated_at"],
   implementation_rounds: ["id", "implementation_id", "kind", "call_id", "result", "at"],
@@ -2788,7 +2791,7 @@ export const COLUMNS = {
   pr_commits: ["repo", "number", "oid", "committed_at", "author", "first_seen_at", "co_authors", "message"],
   pr_files: ["repo", "number", "head", "path", "additions", "deletions", "change_type"],
   pr_status_comments: ["repo", "number", "comment_id", "author", "line", "steps", "final", "failures", "retry_at", "updated_at"],
-  preapprovals: ["id", "repo", "number", "by", "at", "instructions", "state", "from_head", "head", "reason", "updated_at", "fix_id"],
+  preapprovals: ["id", "repo", "number", "by", "at", "instructions", "state", "from_head", "head", "reason", "updated_at", "fix_id", "bypass"],
   premerge_reviews: ["repo", "number", "head_oid", "at", "run_id", "model", "findings", "searched", "error", "tries", "conflicts", "base_ref", "unsure", "claims"],
   push_outcomes: ["id", "at", "stage", "action", "repo", "number", "from_oid", "to_oid", "before_res", "after_res", "outcome", "resolved_at"],
   release_apps: ["repo", "name", "stars", "updated_at"],

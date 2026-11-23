@@ -77,6 +77,13 @@ export async function addFastTrack(db: Db, by: string, input: unknown, weight: u
   return { ref, added: r.changes > 0 };
 }
 
+/** Marks a fast-tracked item as queued with bypass checks (src/dash/api/queue-page.ts queueAdd); once on, it stays on while the item is on the list. */
+export async function setFastTrackBypass(db: Db, by: string, input: unknown, via?: string): Promise<void> {
+  const ref = parseItemRef(input);
+  const r = await db.run(db.k.updateTable("main.fast_track").set({ bypass: 1 }).where("repo", "=", ref.repo).where("number", "=", ref.number).where("bypass", "=", 0));
+  if (r.changes) await audit(db, by, "fasttrack-bypass", refText(ref), via ? { via } : undefined);
+}
+
 /** Changes the weight of a fast-tracked item; among items of its new weight it keeps its place by when it was added. */
 export async function setFastTrackWeight(db: Db, by: string, input: unknown, weight: unknown, via?: string): Promise<{ ref: FastRef; weight: number }> {
   const ref = parseItemRef(input);
