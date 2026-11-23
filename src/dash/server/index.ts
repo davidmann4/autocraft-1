@@ -171,6 +171,9 @@ async function readBody(req: IncomingMessage): Promise<URLSearchParams> {
   return new URLSearchParams(raw.toString("utf8"));
 }
 
+/** An MCP message's body cap: start_build and workspace_open take a patch of up to 1 MiB, which JSON escaping can grow. */
+const MCP_BODY_LIMIT = 4 * 1024 * 1024;
+
 async function readJson(req: IncomingMessage, limit: number = BODY_LIMIT): Promise<unknown> {
   const raw = await readRaw(req, limit);
   if (raw.length === 0) return undefined;
@@ -722,7 +725,7 @@ export async function createApp(opts: AppOptions & { routes: Route[] }) {
     if (!mcpLimitToken.allow(caller.login.toLowerCase())) return reply(429, rpcError(-32000, "too many requests for this login; wait a minute"), { "retry-after": "60" });
     let msg: unknown;
     try {
-      msg = await readJson(req);
+      msg = await readJson(req, MCP_BODY_LIMIT);
     } catch (e) {
       if (e instanceof HttpError) return reply(e.status, rpcError(e.status === 400 ? -32700 : -32600, e.message));
       throw e;

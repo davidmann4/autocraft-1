@@ -7,6 +7,7 @@
 // WorkspaceSession, the same code a model session's calls run through. The launcher creates, parks, resumes and ends the
 // pod as for any workspace: an idle one parks after IDLE_PARK_MS and the next call resumes it.
 import type { Db } from "../db/index.ts";
+import { audit } from "../dash/audit.ts";
 import { patchProblem } from "../worker/patch.ts";
 import { workspaceDiff } from "../implement/diff.ts";
 import { BuildError } from "./envs.ts";
@@ -81,6 +82,7 @@ export async function openWorkspace(db: Db, i: OpenInput): Promise<number> {
     if (mine.length >= MAX_PER_LOGIN) throw new BuildError(429, `${i.by} already has ${mine.length} live workspaces (${mine.map((m) => m.id).join(", ")}); close one with workspace_close`);
     const id = await createWorkspace(db, { repo: i.repo, baseSha: base, envId, limits: { deadlineSec: i.hours * 3600 }, owner: ownerOf(i.by) });
     if (i.patch) await queueCall(db, id, SETUP_TOOL, { patch: i.patch }, i.by);
+    await audit(db, i.by, "mcp-workspace-open", i.repo, { workspace: id, base, patchBytes: i.patch ? Buffer.byteLength(i.patch) : 0, hours: i.hours, via: "mcp" });
     return id;
   });
 }
@@ -150,16 +152,20 @@ const firstLine = (result: string | null): string => {
   try { return String((JSON.parse(result) as { text?: unknown }).text ?? "").split("\n", 1)[0]!.slice(0, 160); } catch { return ""; }
 };
 
+/** What a workspace's last setup row says about its patch. */
+export function patchState(setup: { state: string; result: string | null } | undefined): WorkspaceView["patch"] {
+  if (!setup) return "none";
+  if (setup.state === "queued" || setup.state === "running") return "queued";
+  const r = setup.result ? parseResult(setup.result) : null;
+  // The shell tool's first line is its status: `exited 0 after 0.2 s` when git applied the patch.
+  return r && !r.isError && r.text.startsWith("exited 0 ") ? "applied" : `failed: ${(r?.text ?? "no result").replace(/\s+/g, " ").slice(0, 300)}`;
+}
+
 export async function viewOf(db: Db, w: WorkspaceRow & { login: string }): Promise<WorkspaceView> {
   const calls = await db.all(db.k.selectFrom("workspace_calls").select(["id", "tool", "state", "created_at", "finished_at", "result"])
     .where("workspace_id", "=", w.id).where("agent_login", "is not", null).orderBy("id", "desc").limit(10));
   const setup = await db.get(db.k.selectFrom("workspace_calls").select(["state", "result"]).where("workspace_id", "=", w.id).where("tool", "=", SETUP_TOOL).orderBy("id", "desc").limit(1));
-  let patch: WorkspaceView["patch"] = "none";
-  if (setup) {
-    const r = setup.result ? parseResult(setup.result) : null;
-    // The shell tool's first line is its status: `exited 0 after 0.2 s` when git applied the patch.
-    patch = setup.state === "queued" || setup.state === "running" ? "queued" : r && !r.isError && r.text.startsWith("exited 0 ") ? "applied" : `failed: ${(r?.text ?? "no result").replace(/\s+/g, " ").slice(0, 300)}`;
-  }
+  const patch = patchState(setup);
   let deadlineSec = 4 * 3600;
   try { deadlineSec = (JSON.parse(w.limits) as { deadlineSec?: number }).deadlineSec ?? deadlineSec; } catch { /* the default */ }
   return {
@@ -261,13 +267,20 @@ export class AgentWorkspaceServer {
       .select(["c.id", "c.workspace_id", "c.tool", "c.args"]).where("c.state", "=", "queued").where("c.agent_login", "is not", null)
       .where("w.owner", "like", `${OWNER_PREFIX}%`).orderBy("c.id"));
     if (!rows.length) return 0;
-    const setups = new Set((await db.all(db.k.selectFrom("workspace_calls").select("workspace_id").where("tool", "=", SETUP_TOOL).where("state", "in", ["queued", "running"])
-      .where("workspace_id", "in", [...new Set(rows.map((r) => r.workspace_id))]))).map((r) => r.workspace_id));
+    // Each workspace's newest setup: its other calls wait while it runs, and are refused when the patch did not apply, so
+    // nothing builds or tests a tree that is not the caller's.
+    const setups = new Map<number, WorkspaceView["patch"]>();
+    for (const r of await db.all(db.k.selectFrom("workspace_calls").select(["workspace_id", "state", "result"]).where("tool", "=", SETUP_TOOL)
+      .where("workspace_id", "in", [...new Set(rows.map((r) => r.workspace_id))]).orderBy("id"))) setups.set(r.workspace_id, patchState(r));
     let started = 0;
     for (const r of rows) {
       if (this.#running.has(r.id)) continue;
-      // The patch goes in before anything else reads or builds the tree.
-      if (r.tool !== SETUP_TOOL && setups.has(r.workspace_id)) continue;
+      const patch = setups.get(r.workspace_id) ?? "none";
+      if (r.tool !== SETUP_TOOL && patch === "queued") continue;
+      if (r.tool !== SETUP_TOOL && r.tool !== DIFF_TOOL && patch.startsWith("failed")) {
+        if (await this.#settle(r.id, "failed", refusal(`the workspace's patch did not apply (${patch.slice("failed: ".length, 200)}); close it and open a new one with a patch against its base`))) await db.notify(REPLY_CHANNEL, String(r.id));
+        continue;
+      }
       const claimed = await db.run(db.k.updateTable("workspace_calls").set({ state: "running", started_at: iso(), args: JSON.stringify(capJson(parseArgs(r.args) ?? {})) })
         .where("id", "=", r.id).where("state", "=", "queued"));
       if (Number(claimed.changes) !== 1) continue;
@@ -285,13 +298,13 @@ export class AgentWorkspaceServer {
         if (r.tool === SETUP_TOOL) {
           const patch = (args as { patch?: unknown } | null)?.patch;
           if (typeof patch !== "string") await this.#settle(r.id, "failed", refusal("the setup has no patch"));
-          // The session settles the row: the shell result says whether git applied it.
-          else await this.sessionOf(r.workspace_id).call("shell", { command: "git apply --whitespace=nowarn -", stdin: patch, timeout_sec: 300 }, r.id);
+          // The shell result says whether git applied it. A WorkspaceSession has settled the row already; the conditional settle keeps its result.
+          else await this.#settle(r.id, "done", await this.sessionOf(r.workspace_id).call("shell", { command: "git apply --whitespace=nowarn -", stdin: patch, timeout_sec: 300 }, r.id));
         } else if (r.tool === DIFF_TOOL) {
           const d = this.api ? await workspaceDiff(this.db, this.api, r.workspace_id) : { ok: false as const, reason: "the runner is not in the cluster, so it cannot reach the workspace" };
           await this.#settle(r.id, d.ok ? "done" : "failed", d.ok ? { text: d.diff } : { text: `failed: ${d.reason}`, isError: true });
         } else {
-          await this.sessionOf(r.workspace_id).call(r.tool, args, r.id);
+          await this.#settle(r.id, "done", await this.sessionOf(r.workspace_id).call(r.tool, args, r.id));
         }
       } catch (e) {
         await this.#settle(r.id, "failed", { text: `failed: ${String((e as Error)?.message ?? e).slice(0, 200)}`, isError: true });

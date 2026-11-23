@@ -471,7 +471,7 @@ export const WORKSPACE_TOOLS = [
   },
   {
     name: "workspace_diff",
-    description: "Every change in the workspace against its base commit, untracked files included, as one patch (git diff --binary, at most 5 MiB) to apply in a local checkout of the base.",
+    description: "Every change in the workspace against its base commit, untracked files included, as one patch (git diff --binary, at most 5 MiB) to apply in a local checkout of the base. Use format json for the exact patch: the text form is for reading.",
     inputSchema: { type: "object", additionalProperties: false, required: ["workspace"], properties: { workspace: WS_ID, format: FORMAT } },
     annotations: { readOnlyHint: true },
   },
@@ -733,7 +733,6 @@ async function startBuildTool(env: McpEnv, raw: unknown): Promise<ToolResult> {
   await requireBuilder(user, repo);
   const input = await asHttp(async () => parseStart(repo, o));
   const id = await asHttp(async () => await startBuild(env.db, input, user.login));
-  await audit(env.db, user.login, "mcp-build", `${repo}@${input.base}`, { task: id, steps: input.steps.length, patchBytes: input.patch ? Buffer.byteLength(input.patch) : 0, via: "mcp" });
   if (format === "json") return asJson(await viewOf(env.db, (await getTask(env.db, id))!));
   return { text: `Queued build ${id} of ${repo} at ${input.base}${input.patch ? " with your patch" : ""}. build_status {"id": ${id}} follows it.` };
 }
@@ -835,7 +834,6 @@ async function workspaceOpenTool(env: McpEnv, raw: unknown): Promise<ToolResult>
   await requireBuilder(user, repo);
   const input = await asHttp(async () => aw.parseOpen(repo, o, user.login));
   const id = await asHttp(async () => await aw.openWorkspace(env.db, input));
-  await audit(env.db, user.login, "mcp-workspace-open", repo, { workspace: id, patchBytes: input.patch ? Buffer.byteLength(input.patch) : 0, hours: input.hours, via: "mcp" });
   const v = await aw.viewOf(env.db, await aw.agentWorkspace(env.db, id));
   return format === "json" ? asJson(v) : { text: `${workspaceText(v)}\nIt starts when a slot is free; the first workspace_* call waits for it.` };
 }
@@ -909,7 +907,8 @@ async function workspaceDiffTool(env: McpEnv, raw: unknown): Promise<ToolResult>
   if (!r) return stillRunning(w.id, call);
   if (r.isError) return { text: r.text, isError: true };
   if (format === "json") return asJson({ workspace: w.id, base: w.base_commit ?? w.base_sha, diff: r.text });
-  return { text: r.text.trim() ? `Changes in workspace ${w.id} against ${w.base_commit ?? w.base_sha}:\n\n${frame(`workspace ${w.id} diff`, r.text)}` : `Workspace ${w.id} has no changes against ${w.base_sha}.` };
+  // The frame spaces out runs of three or more < or > (Rust's `Vec<Vec<u8>>>`), so this form is for reading; format json is the exact patch.
+  return { text: r.text.trim() ? `Changes in workspace ${w.id} against ${w.base_commit ?? w.base_sha} (to apply them, call again with format "json": this text form may space out runs of three or more < or >):\n\n${frame(`workspace ${w.id} diff`, r.text)}` : `Workspace ${w.id} has no changes against ${w.base_sha}.` };
 }
 
 async function workspaceCloseTool(env: McpEnv, raw: unknown): Promise<ToolResult> {

@@ -42,7 +42,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { gzipSync } from "node:zlib";
 import { fileURLToPath } from "node:url";
 
-export const HELPER_VERSION = "1.4.0";
+export const HELPER_VERSION = "1.5.0";
 
 // ---------------------------------------------------------------------------
 // Wire format: a copy of src/remote/protocol.ts (the helper is served alone, so it keeps its own).
@@ -4917,7 +4917,8 @@ export function mcpClient(server, credential) {
         ...(session && { "Mcp-Session-Id": session, "MCP-Protocol-Version": MCP_PROTOCOL }),
       },
       body: JSON.stringify({ jsonrpc: "2.0", ...(id !== undefined && { id }), method, ...(params !== undefined && { params }) }),
-      signal: AbortSignal.timeout(10 * 60_000),
+      // A workspace tool call may wait up to 15 minutes on the server (wait_sec) while it keeps the reply open.
+      signal: AbortSignal.timeout(16 * 60_000),
     });
     session = res.headers.get("mcp-session-id") ?? session;
     const text = await res.text();

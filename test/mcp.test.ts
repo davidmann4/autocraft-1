@@ -208,6 +208,15 @@ describe("agent tokens", () => {
 });
 
 describe("transport", () => {
+  test("a tool call may carry a patch of up to 1 MiB, past the dashboard's usual body cap", async () => {
+    await addLogin(db, "cli", "patcher", "maintainer", null);
+    const t = await tokenFor("patcher");
+    // The tool refuses the arguments; the point is that the body reaches it instead of a 413.
+    const r = await rpc(t, "tools/call", { name: "start_build", arguments: { repo: "app", base: "x", steps: ["true"], patch: "+".repeat(900 * 1024) } });
+    assert.equal(r.status, 200, JSON.stringify(r.body).slice(0, 300));
+    assert.equal(r.body.result.isError, true);
+  });
+
   test("no token, a wrong token, or a session cookie alone is refused with 401", async () => {
     assert.equal((await rpc(null, "ping")).status, 401);
     const bad = await rpc("acmcp_nope", "ping");

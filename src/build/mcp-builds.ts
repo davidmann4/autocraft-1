@@ -9,6 +9,7 @@ import { patchProblem } from "../worker/patch.ts";
 import { FETCH_SCRIPT } from "../worker/rust.ts";
 import { BuildError } from "./envs.ts";
 import { mainCiRepos } from "../mainci/index.ts";
+import { audit } from "../dash/audit.ts";
 import { cancelTask, createTask, getTask, logTail, MAX_PATCH_BYTES, MCP_BUILD_STEP, TERMINAL, warmKeyOf } from "./tasks.ts";
 import type { Db } from "../db/index.ts";
 
@@ -80,7 +81,8 @@ export function buildPlan(steps: string[], stepMinutes: number, artifacts: strin
     { name: FETCH, cmd: ["sh", "-c", FETCH_SCRIPT], network: "fetch", timeoutSec: 900 },
     ...steps.map((line, i): TaskStep => ({
       name: `step ${i + 1}`,
-      cmd: ["sh", "-c", `CARGO_NET_OFFLINE=true sh -c "$1"; echo $? > /out/${exitName(i)}; true`, `step-${i + 1}`, line],
+      // The marker is the step's first output, so its log rows (and build_status's "running") start with the line, even one that prints nothing.
+      cmd: ["sh", "-c", `echo "### line ${i + 1}"; CARGO_NET_OFFLINE=true sh -c "$1"; echo $? > /out/${exitName(i)}; true`, `step-${i + 1}`, line],
       network: "none", timeoutSec: stepMinutes * 60, artifacts: [exitName(i), ...(i === steps.length - 1 ? artifacts : [])],
     })),
   ];
@@ -99,7 +101,7 @@ export async function knownBase(db: Db, repo: string, sha: string): Promise<bool
   return !!await db.prepare("SELECT 1 FROM main_ci WHERE repo = ? AND head_sha = ? LIMIT 1").get(repo, sha);
 }
 
-/** Queues the build for `by`; returns its task id. The open-build count and the insert are one write, so the cap holds under parallel calls. */
+/** Queues the build for `by`; returns its task id. The open-build count, the insert and the audit row are one write, so the cap holds under parallel calls and no build is queued without its audit row. */
 export async function startBuild(db: Db, i: StartInput, by: string): Promise<number> {
   const head = await currentBase(db, i.repo);
   if (!head) throw new BuildError(409, `AutoCraft has recorded no default-branch commit of ${i.repo} yet`);
@@ -112,6 +114,7 @@ export async function startBuild(db: Db, i: StartInput, by: string): Promise<num
       plan: buildPlan(i.steps, i.stepMinutes, i.artifacts), ...(i.patch !== undefined && { patch: i.patch }), warm: { key: warmKeyOf(i.repo), role: "use" },
     });
     await db.prepare("UPDATE build_tasks SET started_by = ? WHERE id = ?").run(by, id);
+    await audit(db, by, "mcp-build", `${i.repo}@${i.base}`, { task: id, steps: i.steps.length, patchBytes: i.patch ? Buffer.byteLength(i.patch) : 0, display: i.display, via: "mcp" });
     return id;
   });
 }

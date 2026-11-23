@@ -135,6 +135,33 @@ test("the patch is applied before any other call, results and images come back, 
   assert.equal(r.content.find((c: { type: string }) => c.type === "image")?.data, png);
 });
 
+test("a patch that did not apply refuses the workspace's other calls, and a session that cannot reach the cluster still answers", async () => {
+  const w = await fresh();
+  const maint = envOf(w, "maintainer");
+  const ws = (await json(maint, "workspace_open", { repo: "app", patch: "diff --git a/x b/x\n" })).id;
+  const { server, ran } = fakeServer(w, () => ({ text: "exited 1 after 0.1 s\nerror: patch failed: x:1" }));
+  await server.serve();
+  await settle(server);
+  assert.match((await json(maint, "workspace_status", { workspace: ws })).patch, /^failed: exited 1/);
+  const shell = call(maint, "workspace_shell", { workspace: ws, command: "cargo test", wait_sec: 5 });
+  await new Promise((r) => setTimeout(r, 20));
+  await server.serve();
+  const r = await shell;
+  assert.equal(r.isError, true);
+  assert.match(r.text, /patch did not apply/);
+  assert.deepEqual(ran.map((x) => x.args.command), ["git apply --whitespace=nowarn -"], "the build never ran on the unpatched tree");
+
+  // Outside the cluster the session only refuses, without settling its row: the server stores that answer.
+  const plain = (await json(maint, "workspace_open", { repo: "app" })).id;
+  const offline = new AgentWorkspaceServer(w.db, null, () => {});
+  const read = call(maint, "workspace_read", { workspace: plain, path: "Cargo.toml", wait_sec: 5 });
+  await new Promise((r) => setTimeout(r, 20));
+  await offline.serve();
+  const out = await read;
+  assert.equal(out.isError, true);
+  assert.match(out.text, /not in the cluster/);
+});
+
 test("rows the server does not own are left alone, a closed workspace refuses its queued calls, and a restart fails calls of unknown outcome", async () => {
   const w = await fresh();
   const maint = envOf(w, "maintainer");
