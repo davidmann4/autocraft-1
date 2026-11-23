@@ -156,6 +156,34 @@ test("start_build refuses a patch the worker would refuse, and the open-build ca
   assert.equal((await w.db.prepare("SELECT COUNT(*) AS n FROM build_tasks").get() as { n: number }).n, queued);
 });
 
+test("a display build runs only on a worker with a display, and the files its lines write come back, a PNG as an image", async () => {
+  const w = await fresh();
+  const op = envOf(w, "operator");
+  await createEnv(w.db, { id: "plain", label: "plain", kind: "local-sandbox", slots: 2 }, OPERATOR);
+  await createEnv(w.db, { id: "screen", label: "screen", kind: "local-sandbox", slots: 2 }, OPERATOR);
+  await hello(w.db, "plain", { version: "1", capabilities: CAPS, slots: 2 });
+  await hello(w.db, "screen", { version: "1", capabilities: { ...CAPS, display: true }, slots: 2 });
+  const id = (await json(op, "start_build", { repo: "app", base: MAIN, display: true, artifacts: ["shots/*.png"], steps: ["cargo build", "cargo run --example shot -- /out/shots/a.png"] })).id;
+  const task = (await getTask(w.db, id))!;
+  assert.ok(task.plan.at(-1)!.artifacts!.includes("shots/*.png"), "the caller's globs are collected after the last line");
+  assert.ok(!task.plan.at(-2)!.artifacts!.includes("shots/*.png"));
+  assert.deepEqual((await claim(w.db, "plain", 2)).tasks, []);
+  assert.deepEqual((await claim(w.db, "screen", 2)).tasks.map((t) => t.id), [id]);
+  await startTask(w.db, "screen", id);
+  await exitArtifact(w, id, 1, 0);
+  const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==", "base64");
+  const tmp = tempPath(id);
+  writeFileSync(tmp, png);
+  await storeArtifact(w.db, id, "shots__a.png", tmp);
+  const view = await json(op, "build_status", { id, log_lines: 0 });
+  assert.deepEqual(view.artifacts.map((a: { name: string }) => a.name), ["shots__a.png"], "exit codes are not listed as files");
+  const r = await rpc(op, "tools/call", { name: "build_artifact", arguments: { id, name: "shots__a.png" } });
+  const image = r.content.find((c: { type: string }) => c.type === "image");
+  assert.equal(Buffer.from(image.data, "base64").equals(png), true);
+  assert.equal(Buffer.from((await json(op, "build_artifact", { id, name: "shots__a.png" })).data, "base64").equals(png), true);
+  assert.equal((await call(op, "build_artifact", { id, name: "step-1.exit" })).isError, true);
+});
+
 test("the build tools reach no other build task", async () => {
   const w = await fresh();
   const op = envOf(w, "operator");

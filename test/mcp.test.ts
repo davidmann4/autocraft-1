@@ -248,7 +248,7 @@ describe("transport", () => {
     assert.match(init.body.result.instructions, /untrusted/);
     assert.equal((await rpc(t, "initialize", { protocolVersion: "1999-01-01" })).body.result.protocolVersion, "2025-06-18");
     const tools = (await rpc(t, "tools/list")).body.result.tools.map((x: { name: string }) => x.name).sort();
-    assert.deepEqual(tools, ["build_base", "build_status", "cancel_build", "get_inbox_item", "list_builds", "list_fixups", "list_inbox", "list_merge_queue", "list_repos", "my_settings", "send_feedback", "set_my_settings", "set_weight", "start_build"]);
+    assert.deepEqual(tools, ["build_artifact", "build_base", "build_status", "cancel_build", "get_inbox_item", "list_builds", "list_fixups", "list_inbox", "list_merge_queue", "list_repos", "my_settings", "send_feedback", "set_my_settings", "set_weight", "start_build"]);
     assert.equal((await rpc(t, "no/such")).body.error.code, -32601);
   });
 });

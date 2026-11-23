@@ -4863,10 +4863,10 @@ export const CLI_COMMANDS = [
 
 /**
  * Server tools without a command: the task tools tell an MCP agent to run this runner's own commands, and answering is
- * the operator's call on the dashboard until it opens to agents, and start_build takes a patch and command lines, which an
- * agent or a script sends better than a command line. `autocraft call <tool>` still reaches each one.
+ * the operator's call on the dashboard until it opens to agents, start_build takes a patch and command lines, which an
+ * agent or a script sends better than a command line, and build_artifact returns images, which a terminal does not show. `autocraft call <tool>` still reaches each one.
  */
-export const MCP_ONLY = ["next_task", "task_status", "answer_decision", "undo_answer", "start_build"];
+export const MCP_ONLY = ["next_task", "task_status", "answer_decision", "undo_answer", "start_build", "build_artifact"];
 
 const SERVER_GROUPS = new Set(CLI_COMMANDS.map((c) => c.path[0]));
 

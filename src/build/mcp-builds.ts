@@ -27,11 +27,16 @@ const SHA_RE = /^[0-9a-f]{40}$/;
 const OPEN_STATES = ["queued", "claimed", "running"] as const;
 const FETCH = "fetch deps";
 
-export type StartInput = { repo: string; base: string; patch?: string; steps: string[]; stepMinutes: number };
+export type StartInput = { repo: string; base: string; patch?: string; steps: string[]; stepMinutes: number; display: boolean; artifacts: string[] };
+/** Globs under /out a build may return (the last line's step also returns its exit code). */
+export const MAX_ARTIFACT_GLOBS = 19;
+const GLOB_RE = /^[A-Za-z0-9._*?/{},-]{1,200}$/;
+/** Exit-code artifacts are the tools' own bookkeeping, not the caller's files. */
+export const isExitArtifact = (name: string): boolean => /^step-\d{1,2}\.exit$/.test(name);
 
 /** The tool's arguments, or a BuildError(400) that says what is wrong. `repo` is already checked by the caller. */
 export function parseStart(repo: string, raw: Record<string, unknown>): StartInput {
-  for (const k of Object.keys(raw)) if (!["repo", "base", "patch", "steps", "step_minutes", "format"].includes(k)) throw new BuildError(400, `unknown argument "${k}"`);
+  for (const k of Object.keys(raw)) if (!["repo", "base", "patch", "steps", "step_minutes", "display", "artifacts", "format"].includes(k)) throw new BuildError(400, `unknown argument "${k}"`);
   if (typeof raw.base !== "string" || !SHA_RE.test(raw.base)) throw new BuildError(400, "base must be a full lowercase commit id (build_base gives the current one)");
   const steps = raw.steps;
   if (!Array.isArray(steps) || steps.length < 1 || steps.length > MAX_LINES) throw new BuildError(400, `steps must list 1 to ${MAX_LINES} command lines`);
@@ -52,7 +57,13 @@ export function parseStart(repo: string, raw: Record<string, unknown>): StartInp
     if (!Number.isInteger(raw.step_minutes) || (raw.step_minutes as number) < 1 || (raw.step_minutes as number) > MAX_STEP_MIN) throw new BuildError(400, `step_minutes must be a whole number from 1 to ${MAX_STEP_MIN}`);
     stepMinutes = raw.step_minutes as number;
   }
-  return { repo, base: raw.base, ...(patch !== undefined && { patch }), steps: steps as string[], stepMinutes };
+  if (raw.display !== undefined && raw.display !== null && typeof raw.display !== "boolean") throw new BuildError(400, "display must be true or false");
+  const artifacts = raw.artifacts ?? [];
+  if (!Array.isArray(artifacts) || artifacts.length > MAX_ARTIFACT_GLOBS) throw new BuildError(400, `artifacts must list up to ${MAX_ARTIFACT_GLOBS} globs under /out`);
+  for (const g of artifacts) {
+    if (typeof g !== "string" || !GLOB_RE.test(g) || g.startsWith("/") || g.split("/").includes("..")) throw new BuildError(400, "each artifact must be a glob relative to /out, such as \"shots/*.png\"");
+  }
+  return { repo, base: raw.base, ...(patch !== undefined && { patch }), steps: steps as string[], stepMinutes, display: raw.display === true, artifacts: artifacts as string[] };
 }
 
 const exitName = (i: number): string => `step-${i + 1}.exit`;
@@ -60,15 +71,17 @@ const exitName = (i: number): string => `step-${i + 1}.exit`;
 /**
  * The task's plan: the dependency fetch (the only step with network), then one offline step per line. Each line runs in
  * `sh` with cargo offline; its exit code is kept as an artifact and the step itself always succeeds, so every line runs
- * even after one fails. A line that runs out of time still ends the task.
+ * even after one fails. A line that runs out of time still ends the task. The caller's artifact globs are collected once,
+ * after the last line (a worker collects a step's artifacts after it; collecting them after every line would return a
+ * file once per line).
  */
-export function buildPlan(steps: string[], stepMinutes: number): TaskStep[] {
+export function buildPlan(steps: string[], stepMinutes: number, artifacts: string[] = []): TaskStep[] {
   return [
     { name: FETCH, cmd: ["sh", "-c", FETCH_SCRIPT], network: "fetch", timeoutSec: 900 },
     ...steps.map((line, i): TaskStep => ({
       name: `step ${i + 1}`,
       cmd: ["sh", "-c", `CARGO_NET_OFFLINE=true sh -c "$1"; echo $? > /out/${exitName(i)}; true`, `step-${i + 1}`, line],
-      network: "none", timeoutSec: stepMinutes * 60, artifacts: [exitName(i)],
+      network: "none", timeoutSec: stepMinutes * 60, artifacts: [exitName(i), ...(i === steps.length - 1 ? artifacts : [])],
     })),
   ];
 }
@@ -95,8 +108,8 @@ export async function startBuild(db: Db, i: StartInput, by: string): Promise<num
     const open = (await db.prepare(`SELECT COUNT(*) AS n FROM build_tasks WHERE step = ? AND state IN (${OPEN_STATES.map(() => "?").join(", ")})`).get(MCP_BUILD_STEP, ...OPEN_STATES) as { n: number }).n;
     if (open >= MAX_OPEN) throw new BuildError(429, `${MAX_OPEN} builds from agents are already queued or running; wait for one to end`);
     const id = await createTask(db, {
-      step: MCP_BUILD_STEP, repo: i.repo, headSha: i.base, baseSha: i.base, requires: { os: "linux", toolchains: ["rust-stable"] },
-      plan: buildPlan(i.steps, i.stepMinutes), ...(i.patch !== undefined && { patch: i.patch }), warm: { key: warmKeyOf(i.repo), role: "use" },
+      step: MCP_BUILD_STEP, repo: i.repo, headSha: i.base, baseSha: i.base, requires: { os: "linux", toolchains: ["rust-stable"], ...(i.display && { display: true }) },
+      plan: buildPlan(i.steps, i.stepMinutes, i.artifacts), ...(i.patch !== undefined && { patch: i.patch }), warm: { key: warmKeyOf(i.repo), role: "use" },
     });
     await db.prepare("UPDATE build_tasks SET started_by = ? WHERE id = ?").run(by, id);
     return id;
@@ -128,6 +141,10 @@ export type BuildView = {
   /** Seconds since it started (to its end once over); null before it starts. */
   elapsedSec: number | null;
   linesDone: number; lines: LineResult[];
+  /** Whether it renders with the software GPU (requires a worker with a display). */
+  display: boolean;
+  /** The files it returned (build_artifact reads one), without the exit codes. */
+  artifacts: { name: string; bytes: number; contentType: string }[];
   summary: string | null;
 };
 
@@ -191,6 +208,8 @@ export async function viewOf(db: Db, t: BuildTask, nowMs: number = Date.now()): 
     queuedAt: t.queuedAt, startedAt: started, endedAt: t.endedAt,
     elapsedSec: started ? Math.max(0, Math.round((end - Date.parse(started)) / 1000)) : null,
     linesDone: lines.filter((l) => l.state !== "running" && l.state !== "waiting" && l.state !== "not run").length, lines,
+    display: t.requires.display === true,
+    artifacts: t.artifacts.filter((a) => !isExitArtifact(a.name)).map((a) => ({ name: a.name, bytes: a.bytes, contentType: a.contentType })),
     summary: t.summary,
   };
 }
