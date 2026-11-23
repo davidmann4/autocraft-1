@@ -394,6 +394,28 @@ CREATE TABLE IF NOT EXISTS discord_filed (
   at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS discord_filed_at ON discord_filed (at);
+-- Counters of the public issue flow, for the Discord page's usage: one row per event, no text and no Discord ids. Rows older than 8 days are pruned.
+CREATE TABLE IF NOT EXISTS discord_events (
+  at TEXT NOT NULL,
+  kind TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS discord_events_at ON discord_events (at);
+-- Public repos of any owner the Discord issue bot files into without tracking them: no sync, no pipeline, no search.
+-- A name here is never a tracked repo or a `repos` row of another owner (repo names are unique across owners).
+CREATE TABLE IF NOT EXISTS discord_filing_repos (
+  name TEXT PRIMARY KEY,
+  owner TEXT NOT NULL,
+  added_by TEXT NOT NULL,
+  added_at TEXT NOT NULL
+);
+
+-- Tracked public repos the Discord issue bot does not offer in its repo select. No row: offered. Search, pings and
+-- channel defaults are unaffected.
+CREATE TABLE IF NOT EXISTS discord_hidden_repos (
+  name TEXT PRIMARY KEY,
+  hidden_by TEXT,
+  hidden_at TEXT
+);
 
 -- One row per started GitHub App registration: the manifest flow's single-use state nonce.
 CREATE TABLE IF NOT EXISTS github_app_states (
@@ -535,7 +557,8 @@ CREATE TABLE IF NOT EXISTS jobs (
   repo TEXT,                          -- params.repo, for the autopilot's per-repo lookups
   items INTEGER,                      -- items the job handled (classified, asked, reviewed, merged ...), for the daily limits
   acted INTEGER,                      -- other progress the job made (a batch advanced or opened, a decision asked ...); with items 0, the job was idle
-  resumes INTEGER NOT NULL DEFAULT 0  -- times a runner stop or restart put the running job back in the queue (src/runner/resuming.ts)
+  resumes INTEGER NOT NULL DEFAULT 0, -- times a runner stop or restart put the running job back in the queue (src/runner/resuming.ts)
+  crash_resumes INTEGER NOT NULL DEFAULT 0 -- the resumes after an unclean stop (a crash or kill without the stop signal)
 );
 CREATE INDEX IF NOT EXISTS jobs_state ON jobs(state, id);
 -- The end of each job's log, copied by the runner from the job's log file in chunks of whole lines (src/runner/job-log.ts),

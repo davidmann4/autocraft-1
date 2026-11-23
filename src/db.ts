@@ -280,6 +280,8 @@ export const ADDED_COLUMNS: [table: string, column: string, type: string][] = [
   ["build_envs", "health_at", "TEXT"],
   // Times the job went back to the queue after a runner stop or restart (src/runner/resuming.ts).
   ["jobs", "resumes", "INTEGER NOT NULL DEFAULT 0"],
+  // Of those, the resumes after an unclean stop; only these count against MAX_RESUMES.
+  ["jobs", "crash_resumes", "INTEGER NOT NULL DEFAULT 0"],
   // sha256 of the stored bundle: a resumed job adopts its earlier run's call with the same bundle instead of asking again.
   ["remote_calls", "bundle_hash", "TEXT"],
   // When the caller read the done reply; a done call not yet read can still be adopted.

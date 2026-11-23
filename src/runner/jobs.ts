@@ -11,7 +11,7 @@ import { shownLookup } from "../dash/api/shown.ts";
 import { blankIfHidden } from "../dash/api/visible.ts";
 import { withdrawJobCalls } from "../remote/calls.ts";
 import { untakenTest, type UntakenTest } from "./concurrency.ts";
-import { MAX_RESUMES } from "./resuming.ts";
+import { MAX_RESUMES, MAX_TOTAL_RESUMES } from "./resuming.ts";
 
 export const JOB_STATES: JobState[] = ["queued", "running", "done", "failed", "cancelled"];
 /** Error text of jobs a runner stop or restart ended without resuming them (resumeJob); the autopilot does not count them as failures. */
@@ -239,24 +239,25 @@ export async function jobDetail(db: Db, id: number, view: { hidden?: HiddenRepos
  * Puts a running job that a runner stop or restart interrupted back in the queue under the same id: it runs again from the
  * start, with a fresh deadline. Its remote calls stay for the resumed run to adopt (enqueueCall), with their agent runs;
  * the stopped process's local model calls, model-queue waits and work leases end. False, and nothing changes, when it may
- * not resume: a cancel was asked, it was told to stop at its deadline, it resumed MAX_RESUMES times already, or it is a
+ * not resume: a cancel was asked, it was told to stop at its deadline, it resumed MAX_TOTAL_RESUMES times already (or, after an unclean stop, MAX_RESUMES crash resumes), or it is a
  * command-line run (`requested_by` cli: its process belongs to the command, which records its end). A job a command only
  * queues (CLI_QUEUE_BY) runs under the runner like any other, so it resumes.
  */
-export async function resumeJob(db: Db, id: number, why: string): Promise<boolean> {
+export async function resumeJob(db: Db, id: number, why: string, kind: "graceful" | "crash"): Promise<boolean> {
+  const crash = kind === "crash";
   const r = await db.get(db.k.updateTable("jobs")
-    .set((eb) => ({ state: "queued", resumes: eb("resumes", "+", 1), started_at: null, ended_at: null, pid: null, progress: null, error: null }))
-    .where("id", "=", id).where("state", "=", "running").where("cancel_requested_at", "is", null).where("resumes", "<", MAX_RESUMES).where("requested_by", "<>", "cli")
+    .set((eb) => ({ state: "queued", resumes: eb("resumes", "+", 1), crash_resumes: crash ? eb("crash_resumes", "+", 1) : eb.ref("crash_resumes"), started_at: null, ended_at: null, pid: null, progress: null, error: null }))
+    .where("id", "=", id).where("state", "=", "running").where("cancel_requested_at", "is", null).where("resumes", "<", MAX_TOTAL_RESUMES).$if(crash, (q) => q.where("crash_resumes", "<", MAX_RESUMES)).where("requested_by", "<>", "cli")
     .where((eb) => eb.or([eb("error", "is", null), eb.and([
       eb.not(like(db, "error", eb.val("stopped: ran past %"))), eb.not(like(db, "error", eb.val("stopped: no progress for %"))),
     ])]))
-    .returning(["resumes", "log_path"]));
+    .returning(["resumes", "crash_resumes", "log_path"]));
   if (!r) return false;
   await failRunning(db, "The runner stopped during this call.", id);
   await db.run(db.k.deleteFrom("model_waits").where("job_id", "=", id));
   await releaseJob(db, id);
   if (r.log_path) {
-    try { appendFileSync(r.log_path, `${now()} ${why}; the job is queued to resume after the restart (resume ${r.resumes} of ${MAX_RESUMES})\n`); } catch { /* the log is gone */ }
+    try { appendFileSync(r.log_path, `${now()} ${why}; the job is queued to resume after the restart (resume ${r.resumes}${crash ? `; crash resume ${r.crash_resumes} of ${MAX_RESUMES}` : ""})\n`); } catch { /* the log is gone */ }
   }
   return true;
 }
@@ -271,7 +272,7 @@ export async function endJob(db: Db, id: number, code: number | null, signal: No
   const finished = code === 0 && !DEADLINE_ERROR.test(row.error ?? "");
   // Stopped by the stop: the process exited on the stop signal (exec.ts exits 143) or was killed. Another exit is the job's own result.
   const stopped = stopping && (code === 143 || signal !== null);
-  if (stopped && !finished && !row.cancel_requested_at && await resumeJob(db, id, "the runner stopped")) return { state: "queued", error: null };
+  if (stopped && !finished && !row.cancel_requested_at && await resumeJob(db, id, "the runner stopped", "graceful")) return { state: "queued", error: null };
   let state: "done" | "failed" | "cancelled";
   let error: string | null = row.error;
   if (row.cancel_requested_at) state = "cancelled";

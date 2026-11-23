@@ -370,6 +370,9 @@ export interface Api {
     setContact(contact: string): Promise<DiscordSetup>;
     setReact(on: boolean): Promise<DiscordSetup>;
     removeLink(id: string): Promise<DiscordSetup>;
+    addFilingRepo(repo: string): Promise<DiscordSetup>;
+    removeFilingRepo(repo: string): Promise<DiscordSetup>;
+    setOffer(repo: string, on: boolean): Promise<DiscordSetup>;
     account(): Promise<DiscordAccount>;
     unlinkOwn(): Promise<DiscordAccount>;
     linkCode(): Promise<DiscordLinkCode>;

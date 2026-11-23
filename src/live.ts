@@ -105,8 +105,8 @@ export const TOPIC_TABLES: Record<string, Source[]> = {
   verify: [{ table: "verifications" }, { table: "fixups" }, { table: "ci_fixes" }],
   // Pre-approved merges and the operator fix-ups behind them: the planner works them, so the topic is planner input.
   preapprovals: [{ table: "preapprovals" }, { table: "operator_fixups" }],
-  // Discord mention counts and the bot's channel list; not planner input.
-  discord: [{ table: "discord_mentions" }, { table: "discord_channels" }, { table: "discord_categories" }, { table: "discord_status" }],
+  // Discord mention counts, the bot's channel list and its filing-only repos; not planner input.
+  discord: [{ table: "discord_mentions" }, { table: "discord_channels" }, { table: "discord_categories" }, { table: "discord_status" }, { table: "discord_events" }, { table: "discord_filing_repos" }, { table: "discord_hidden_repos" }],
   "discord-links": [{ table: "discord_links" }],
   downloads: [{ table: "release_assets" }, { table: "release_apps" }, { table: "download_deltas" }, { table: "star_samples" }],
   // Operator and maintainer pages only; not planner input.

@@ -53,7 +53,9 @@ export type Call = {
 
 const nameOf = (i: Interaction): string | null => {
   const u = i.member?.user ?? i.user;
-  return i.member?.nick || u?.global_name || u?.username || null;
+  // The unique handle, never the nickname or display name, which users can change at will.
+  if (u?.username) return `@${u.username}`;
+  return u?.id ? `Discord user ${u.id}` : null;
 };
 
 export type Handler = (call: Call) => Promise<void>;

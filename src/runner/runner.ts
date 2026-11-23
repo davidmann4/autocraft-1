@@ -166,7 +166,7 @@ export class Runner {
         try { process.kill(r.pid, "SIGKILL"); } catch { /* gone with its group */ }
       }
       const cancelled = r.cancel_requested_at !== null;
-      if (!cancelled && await resumeJob(this.db, r.id, "the runner restarted")) {
+      if (!cancelled && await resumeJob(this.db, r.id, "the runner restarted", "crash")) {
         this.o.log(`job ${r.id}: left running by an earlier runner, queued to resume`);
         continue;
       }

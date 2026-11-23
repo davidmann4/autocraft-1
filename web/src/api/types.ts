@@ -975,6 +975,10 @@ export interface DiscordSetup {
   channels: DiscordChannel[];
   /** Tracked repos a channel's default can be. */
   repos: string[];
+  /** Public repos of any owner the bot files issues into without tracking them. */
+  filingRepos: { owner: string; name: string; addedBy: string; addedAt: string }[];
+  /** Every public tracked repo with whether the bot offers it in its repo select; `used` of `max` places are filled (offered repos plus filing-only ones). */
+  offer: { repos: { name: string; label: string; offered: boolean }[]; used: number; max: number };
   contact: string;
   /** Whether the bot adds a reaction to messages it recorded against items. */
   reactOn: boolean;
@@ -982,6 +986,19 @@ export interface DiscordSetup {
   privacyPath: string;
   /** Linked Discord accounts: the opaque row id, the dashboard login and when. */
   links: { id: string; login: string; linkedAt: string }[];
+  usage: DiscordUsage;
+}
+
+/** What the public issue bot did, for the Discord page. */
+export interface DiscordUsage {
+  /** Events over the last 24 hours and 7 days: reports started, refused as junk, filed by the bot, sent to GitHub after the bot refused, offered only the link by the filing limits. */
+  counts: Record<"started" | "junk" | "filed" | "link" | "limits", { day: number; week: number }>;
+  /** Model calls and cost of each discord.* prompt. */
+  prompts: { prompt: string; day: { calls: number; usd: number }; week: { calls: number; usd: number } }[];
+  /** Issues filed from Discord in the last 24 hours, newest first. `githubUrl`: the issue on GitHub for a filing-only repo (no item page); null for a tracked repo. */
+  filed: { repo: string; number: number; login: string; at: string; githubUrl: string | null }[];
+  /** Whether a Task Runner takes Discord calls now, and why not; null when Discord calls do not use Task Runners. */
+  capacity: { ready: boolean; why: string | null } | null;
 }
 
 /** A single-use code to type into the bot in Discord, and when it stops working. */
