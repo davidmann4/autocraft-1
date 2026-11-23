@@ -7,7 +7,7 @@ import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { after, describe, test } from "node:test";
-import { botRefusal, fileAsBot, fileIssue, forgetReporter, type FileHooks } from "../src/discord/file-issue.ts";
+import { botRefusal, creditName, fileAsBot, fileIssue, forgetReporter, type FileHooks } from "../src/discord/file-issue.ts";
 import { setGithubIdentity } from "../src/github/identity.ts";
 import { readReporter } from "../src/discord/reporter.ts";
 import { TokenBox } from "../src/dash/server/crypto.ts";
@@ -111,7 +111,7 @@ describe("Submit for me", () => {
       judge: hooks.judge, mint: async () => "ghs_install",
       exec: (async (_cmd, args, opts) => { ran.push({ args, input: opts?.input, token: opts?.env?.GH_TOKEN }); return { code: 0, stdout: args[1] === "create" ? "https://github.com/storytold/photocraft/issues/77\n" : "", stderr: "" }; }) as NonNullable<FileHooks["exec"]>,
     };
-    const ask = { ...req, reporter: "rep2", reporterName: "Ana @everyone [x](https://evil.example)", drafted: true };
+    const ask = { ...req, reporter: "rep2", reporterName: "@ana_1", drafted: true };
     assert.equal((await fileAsBot(deps, ask, bot)).status, "refused", "the box account never files for Discord");
     assert.equal(ran.length, 0);
 
@@ -119,8 +119,8 @@ describe("Submit for me", () => {
     assert.equal(await botRefusal(db, "rep2", "photocraft"), null);
     assert.deepEqual(await fileAsBot(deps, ask, bot), { status: "filed", number: 77, url: "https://github.com/storytold/photocraft/issues/77" });
     assert.equal(ran[0]!.token, "ghs_install");
-    assert.match(ran[0]!.input!, /\n\nReported on Discord by Ana everyone x\. Filed by AutoCraft on their behalf\.$/);
-    assert.doesNotMatch(ran[0]!.input!, /@|:\/\//, "no mention or link from the name");
+    assert.match(ran[0]!.input!, /\n\nReported on Discord by `@ana_1`\. Filed by AutoCraft on their behalf\.$/);
+    assert.equal(creditName("Ana @everyone [x](https://evil.example)"), "Ana everyone x", "a free-form name carries no mention or link");
     const a = (await db.get(db.k.selectFrom("audit").select(["details"]).where("action", "=", "discord-issue-bot")))!;
     assert.equal(JSON.parse(a.details!).identity, "app");
 

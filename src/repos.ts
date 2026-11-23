@@ -26,6 +26,9 @@ export async function trackRepo(db: Db, by: string, input: string): Promise<bool
   const { owner, name } = splitSlug(input);
   if (!NAME.test(name)) throw new RepoError("Not a repo name.");
   if (!OWNER.test(owner)) throw new RepoError("Not an owner name.");
+  // A filing-only repo of the Discord bot holds its name (and owner) outside `repos`; tracking would give one name two owners.
+  const filing = await db.get(db.k.selectFrom("discord_filing_repos").select(["owner", "name"]).where((eb) => eb(eb.fn("lower", ["name"]), "=", name.toLowerCase())));
+  if (filing) throw new RepoError(`${filing.owner}/${filing.name} is a filing-only repo of the Discord bot; remove it there first (Discord page, or discord filing remove).`);
   const known = await db.get(db.k.selectFrom("main.repos").select("owner").where("name", "=", name));
   // A bare name means the repo as already known, whoever owns it.
   if (known && input.includes("/") && known.owner.toLowerCase() !== owner.toLowerCase()) {

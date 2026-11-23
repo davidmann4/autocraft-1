@@ -6,8 +6,10 @@ import type { AliasableExpression, SqlBool } from "kysely";
 import type { Db } from "../db/index.ts";
 import { ref, type Eb } from "../db/kx.ts";
 
-/** A job may resume this many times; a stop past that fails it with RUNNER_STOPPED. */
+/** A job may resume this many times after an unclean stop (a crash or a kill without the stop signal), which a job that takes the runner down repeatedly causes; a stop past that fails it with RUNNER_STOPPED. */
 export const MAX_RESUMES = 2;
+/** A job may resume this many times in all, graceful restarts (deploys) included: a backstop against an endless loop. */
+export const MAX_TOTAL_RESUMES = 12;
 /** Jobs waiting in the queue to resume. */
 export const RESUMING_JOBS = "SELECT id FROM main.jobs WHERE state = 'queued' AND resumes > 0";
 /** `RESUMING_JOBS` as a subquery. */

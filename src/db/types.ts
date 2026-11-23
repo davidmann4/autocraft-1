@@ -590,12 +590,30 @@ export interface DiscordChannels {
   panel_message: string | null;
 }
 
+export interface DiscordEvents {
+  at: string;
+  kind: string;
+}
+
 export interface DiscordFiled {
   repo: string;
   number: number;
   login: string;
   reporter: string;
   at: string;
+}
+
+export interface DiscordFilingRepos {
+  name: string;
+  owner: string;
+  added_by: string;
+  added_at: string;
+}
+
+export interface DiscordHiddenRepos {
+  name: string;
+  hidden_by: string | null;
+  hidden_at: string | null;
 }
 
 export interface DiscordLinkCodes {
@@ -1138,6 +1156,7 @@ export interface Jobs {
   items: number | null;
   acted: number | null;
   resumes: Generated<number>;
+  crash_resumes: Generated<number>;
   lease_skips: number | null;
   lease_skip_keys: string | null;
 }
@@ -2334,7 +2353,10 @@ export interface DB {
   discord_alerts: DiscordAlerts;
   discord_categories: DiscordCategories;
   discord_channels: DiscordChannels;
+  discord_events: DiscordEvents;
   discord_filed: DiscordFiled;
+  discord_filing_repos: DiscordFilingRepos;
+  discord_hidden_repos: DiscordHiddenRepos;
   discord_link_codes: DiscordLinkCodes;
   discord_links: DiscordLinks;
   discord_mentions: DiscordMentions;
@@ -2518,7 +2540,10 @@ export interface DB {
   "main.discord_alerts": DiscordAlerts;
   "main.discord_categories": DiscordCategories;
   "main.discord_channels": DiscordChannels;
+  "main.discord_events": DiscordEvents;
   "main.discord_filed": DiscordFiled;
+  "main.discord_filing_repos": DiscordFilingRepos;
+  "main.discord_hidden_repos": DiscordHiddenRepos;
   "main.discord_link_codes": DiscordLinkCodes;
   "main.discord_links": DiscordLinks;
   "main.discord_mentions": DiscordMentions;
@@ -2706,7 +2731,10 @@ export const COLUMNS = {
   discord_alerts: ["user_hash", "sealed", "created_at"],
   discord_categories: ["category_id", "guild_id", "name", "position"],
   discord_channels: ["channel_id", "guild_id", "guild_name", "name", "watched", "parent_id", "default_repo", "position", "category_id", "panel_message"],
+  discord_events: ["at", "kind"],
   discord_filed: ["repo", "number", "login", "reporter", "at"],
+  discord_filing_repos: ["name", "owner", "added_by", "added_at"],
+  discord_hidden_repos: ["name", "hidden_by", "hidden_at"],
   discord_link_codes: ["code_hash", "login", "expires_at"],
   discord_links: ["user_hash", "login", "linked_at"],
   discord_mentions: ["msg_hash", "channel_hash", "repo", "number", "sealed", "signal"],
@@ -2751,7 +2779,7 @@ export const COLUMNS = {
   items: ["repo", "number", "kind", "state", "title", "body", "url", "author", "author_type", "author_association", "created_at", "updated_at", "closed_at", "merged_at", "merged_by", "state_reason", "is_draft", "labels", "assignees", "comments_count", "reactions_count", "additions", "deletions", "changed_files", "head_ref", "head_oid", "head_repo", "base_ref", "maintainer_can_modify", "mergeable", "review_decision", "ci_state", "closing_issues", "detail_level", "embed_hash", "class_hash", "class_scheme", "text_refs", "author_id"],
   job_items: ["id", "job_id", "repo", "number", "outcome", "at", "ref"],
   job_log_chunks: ["job_id", "seq", "start", "next_start", "chunk", "at"],
-  jobs: ["id", "step", "params", "requested_by", "requested_at", "state", "started_at", "ended_at", "progress", "summary", "error", "usage", "log_path", "pid", "cancel_requested_at", "cancel_requested_by", "repo", "items", "acted", "resumes", "lease_skips", "lease_skip_keys"],
+  jobs: ["id", "step", "params", "requested_by", "requested_at", "state", "started_at", "ended_at", "progress", "summary", "error", "usage", "log_path", "pid", "cancel_requested_at", "cancel_requested_by", "repo", "items", "acted", "resumes", "crash_resumes", "lease_skips", "lease_skip_keys"],
   lane_next: ["lane", "total", "items", "at"],
   leader_leases: ["role", "holder", "epoch", "expires_ms"],
   liveness_items: ["repo", "number", "kind", "verdict", "cause", "state", "wait", "phase", "since", "checked_at"],

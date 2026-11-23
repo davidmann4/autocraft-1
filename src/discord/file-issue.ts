@@ -10,7 +10,8 @@ import { GitHubProvider, type Provider } from "../dash/server/provider.ts";
 import { exec as defaultExec, type Exec } from "../fixup/git.ts";
 import { createBotIssue, createReporterIssue, IssueError, labelBotIssue, labelReporterIssue, type Note } from "../github/write.ts";
 import { githubIdentity } from "../github/identity.ts";
-import { guardRepo } from "../core/guard.ts";
+import { guardBotFiling } from "../core/guard.ts";
+import { botRepo } from "./filing-repos.ts";
 import { appChildEnv } from "../github/install-token.ts";
 import { openAppKeys } from "../github/app-keys.ts";
 import { JEV_PROMPTS } from "../prompts/index.ts";
@@ -196,8 +197,9 @@ export type BotRequest = FileRequest & {
 
 export type BotResult = { status: "filed"; number: number; url: string } | { status: "refused"; reason: string };
 
-/** The reporter's name as the issue shows it: one line, no mentions, links or Markdown, capped. */
+/** The reporter as the issue shows them: a Discord handle (`@name`) in a code span so GitHub does not ping a user of that name; anything else is one line without mentions, links or Markdown, capped. */
 export function creditName(name: string): string {
+  if (/^@[a-z0-9_.]{2,32}$/.test(name)) return `\`${name}\``;
   const t = name.replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\b[a-z][\w+.-]*:\/\/\S*|\bwww\.\S*/gi, " ").replace(/[@#*_~`|<>\[\]()\\]/g, "").replace(/\s+/g, " ").trim().slice(0, NAME_MAX);
   return t || "a Discord member";
 }
@@ -209,7 +211,7 @@ const botFiledSince = (db: Db, since: string) => db.k.selectFrom("audit").select
 
 /** Why the GitHub App cannot file for this person in this repo now, or null when it can: the app identity and the limits over 24 hours (per person, per repo, all of Discord). Reads only; the draft shows "Submit for me" only when this is null. */
 export async function botRefusal(db: Db, reporter: string, repo: string, now: number = Date.now(), /** Rows of this request already reserved in `discord_filed`. */ reserved = 0): Promise<string | null> {
-  if (!await isPublicRepo(db, repo)) return "That repo is not open for filing from Discord.";
+  if (!await botRepo(db, repo)) return "That repo is not open for filing from Discord.";
   if (await githubIdentity(db) !== "app") return "Filing from Discord is not set up.";
   const since = new Date(now - DAY_MS).toISOString();
   if (await count(db, db.k.selectFrom("discord_filed").select((eb) => eb.fn.countAll<number>().as("c")).where("reporter", "=", reporter).where("at", ">=", since)) >= PER_LOGIN + reserved) return `You have filed ${PER_LOGIN} issues from Discord in the last 24 hours.`;
@@ -238,8 +240,7 @@ export async function fileAsBot(deps: FileDeps, req: BotRequest, hooks: Pick<Fil
     const junk = req.junkChecked ? "ok" : await junkCheck(db, { title, body }, hooks.judge ?? modelJudge, log);
     if (junk === "junk") return { status: "refused", reason: JUNK_REFUSAL };
     if (junk === "unknown") return { status: "refused", reason: JUNK_UNKNOWN };
-    // A repo grant with no approval: filing for a reporter is not a pipeline action, so neither the repo's approvals nor its Pipeline switch apply. Its identity is the app's.
-    const g = await guardRepo(db, req.repo, null, { operator: "discord" });
+    const g = await guardBotFiling(db, req.repo);
     if ("refused" in g) return { status: "refused", reason: "Filing from Discord is not set up." };
     const run = hooks.exec ?? defaultExec;
     const w = { db, login: "discord", now: () => now, ...(hooks.mint && { mint: hooks.mint }) };
@@ -250,6 +251,10 @@ export async function fileAsBot(deps: FileDeps, req: BotRequest, hooks: Pick<Fil
     } catch (e) {
       if (e instanceof IssueError && !e.clear) { filed = true; return { status: "refused", reason: "GitHub could not be reached. Try again in a minute." }; }
       log(`discord: filing as the app failed: ${String((e as Error).message ?? e).slice(0, 200)}`);
+      // The installation no longer reaches the repo (the app was removed from it, or from its owner).
+      if (e instanceof IssueError && e.noAccess) return { status: "refused", reason: "AutoCraft can no longer file issues in this repo." };
+      // No token (GitHub 5xx, network, rate limit): nothing was sent, so the slot is freed.
+      if (e instanceof IssueError && e.unsent) return { status: "refused", reason: "GitHub could not be reached. Try again in a minute." };
       return { status: "refused", reason: "GitHub did not accept the issue." };
     }
     filed = true;

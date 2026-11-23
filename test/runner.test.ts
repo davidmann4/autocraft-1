@@ -19,7 +19,7 @@ const { DEFAULT_MAX_JOBS, Runner } = await import("../src/runner/runner.ts");
 const { STEPS } = await import("../src/runner/steps.ts");
 const { FAKE_TOKEN } = await import("./runner-steps.ts");
 const { inputHash } = await import("../src/runner/classify.ts");
-const { RUNNER_STOPPED } = await import("../src/runner/jobs.ts");
+const { RUNNER_STOPPED, endJob } = await import("../src/runner/jobs.ts");
 const { setInferenceMode } = await import("../src/remote/mode.ts");
 const { createToken } = await import("../src/dash/mcp/tokens.ts");
 const { claimCall, submitCall } = await import("../src/remote/calls.ts");
@@ -141,10 +141,10 @@ describe("runner", () => {
     const calls = await callOf();
     assert.equal(calls.length, 1, "the resumed run adopted the call instead of asking again");
     assert.equal((await db.get(db.k.selectFrom("agent_runs").select("state").where("id", "=", calls[0]!.run_id!)))!.state, "done");
-    assert.ok(j.log!.includes("resume 1 of 2"), j.log!);
+    assert.ok(j.log!.includes("queued to resume after the restart (resume 1)"), j.log!);
 
-    // A job left running by a runner that is gone resumes too, until it has resumed twice.
-    const left = Number((await db.get(db.k.insertInto("jobs").values({ step: "test-echo", params: "{}", requested_by: "boss", requested_at: new Date().toISOString(), state: "running", started_at: new Date().toISOString(), resumes: 1 }).returning("id")))!.id);
+    // A job left running by a runner that is gone resumes too, until it has crash-resumed twice.
+    const left = Number((await db.get(db.k.insertInto("jobs").values({ step: "test-echo", params: "{}", requested_by: "boss", requested_at: new Date().toISOString(), state: "running", started_at: new Date().toISOString(), resumes: 1, crash_resumes: 1 }).returning("id")))!.id);
     await second.recover();
     assert.equal((await getJob(db, left)).state, "queued");
     await db.run(db.k.updateTable("jobs").set({ state: "running" }).where("id", "=", left));
@@ -154,6 +154,22 @@ describe("runner", () => {
     const cli = Number((await db.get(db.k.insertInto("jobs").values({ step: "test-echo", params: "{}", requested_by: "cli", requested_at: new Date().toISOString(), state: "running", started_at: new Date().toISOString() }).returning("id")))!.id);
     await second.recover();
     assert.equal((await getJob(db, cli)).state, "failed");
+  });
+
+  test("graceful stops (deploys) resume a job well past the crash limit, which only unclean stops count against", async () => {
+    const id = Number((await db.get(db.k.insertInto("jobs").values({ step: "test-echo", params: "{}", requested_by: "boss", requested_at: new Date().toISOString(), state: "running", started_at: new Date().toISOString() }).returning("id")))!.id);
+    for (let i = 0; i < 3; i++) {
+      assert.equal((await endJob(db, id, 143, null, null, true))?.state, "queued");
+      await db.run(db.k.updateTable("jobs").set({ state: "running" }).where("id", "=", id));
+    }
+    const j = (await db.get(db.k.selectFrom("jobs").select(["resumes", "crash_resumes"]).where("id", "=", id)))!;
+    assert.equal(j.resumes, 3);
+    assert.equal(j.crash_resumes, 0);
+    await db.run(db.k.updateTable("jobs").set({ crash_resumes: 2 }).where("id", "=", id));
+    assert.equal((await endJob(db, id, 143, null, null, true))?.state, "queued", "a graceful stop ignores crash resumes");
+    await db.run(db.k.updateTable("jobs").set({ state: "running" }).where("id", "=", id));
+    await new Runner({ db, dbTarget: dbFile, logs: join(dir, "logs"), killAfterMs: 2000, log: () => {} }).recover();
+    assert.equal((await getJob(db, id)).error, RUNNER_STOPPED);
   });
 
   test("a runner stop while a step writes lets the write finish, and the write it refuses is no failed item: the job resumes", async () => {

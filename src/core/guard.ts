@@ -21,6 +21,7 @@ import type { ActionKind, PrFacts } from "./plan.ts";
 import { identityOfDecision, type Identity } from "../github/identity.ts";
 import { disputeOn } from "../answers/hold.ts";
 import { setting } from "../settings-read.ts";
+import { botRepo } from "../discord/filing-repos.ts";
 import type { Db } from "../db/index.ts";
 
 declare const guarded: unique symbol;
@@ -31,6 +32,8 @@ export type Guarded<K extends ActionKind = ActionKind> = { readonly [guarded]: t
 export type GuardedItem = { readonly [guarded]: true; readonly scope: "item"; readonly action: ItemWant; readonly repo: string; readonly number: number; readonly as: Identity };
 /** What the guard let through for a repo-level write (a label set, a fork, an issue, a batch branch): the approval and the global switch held. Only `guardRepo` makes one. */
 export type GuardedRepo = { readonly [guarded]: true; readonly scope: "repo"; readonly need: RepoNeed; readonly repo: string; readonly as: Identity };
+/** "Submit for me" on Discord: one new issue, and its label, in `owner/repo` as the GitHub App. Only guardBotFiling makes one and only createBotIssue and labelBotIssue take it, so a filing-only repo gets no other write. */
+export type GuardedFiling = { readonly [guarded]: true; readonly scope: "filing"; readonly owner: string; readonly repo: string; readonly as: "app" };
 /** What an item or repo write accepts. A PR grant is left out: no caller writes with one, and a merge or CI grant must not type-check there. */
 export type Grant = GuardedItem | GuardedRepo;
 export type Refused = { refused: string };
@@ -157,4 +160,13 @@ export async function guardRepo(db: Db, repo: string, need: RepoNeed, by: By, de
   const why = gateRepo(await repoApprovals(db, repo), need, by, repo);
   // `login`: the operator pressing the button right now (a conversation card), who acts as themselves with no answered decision yet.
   return why ? { refused: `${repo}: ${why}` } : ({ scope: "repo", need, repo, as: login ? `user:${login}` : await identityOfDecision(db, decisionId) } as unknown as GuardedRepo);
+}
+
+/**
+ * Lets the Discord bot's issue for a reporter through: a repo the bot offers (public and tracked, or filing-only), with its
+ * owner. Filing for a reporter is not a pipeline action, so neither the repo's approvals nor its Pipeline switch apply.
+ */
+export async function guardBotFiling(db: Db, repo: string): Promise<GuardedFiling | Refused> {
+  const r = await botRepo(db, repo);
+  return r ? ({ scope: "filing", owner: r.owner, repo: r.name, as: "app" } as unknown as GuardedFiling) : { refused: `${repo}: not open for filing from Discord` };
 }

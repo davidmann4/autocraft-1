@@ -6,7 +6,7 @@
 // The instance-wide setting `github_identity` decides whether that is used at all: under `box` (the default) the box
 // account makes every write, and `as` only appears in the audit row as a record of what it would be.
 import { audit } from "../dash/audit.ts";
-import type { Grant, Guarded } from "../core/guard.ts";
+import type { Grant, Guarded, GuardedFiling } from "../core/guard.ts";
 import { ownerOf } from "../owners.ts";
 import { knownSlugs, rememberSlug } from "./slugs.ts";
 import { AppError, call, GITHUB_API } from "./app.ts";
@@ -62,10 +62,10 @@ export async function identityOfDecision(db: Db, decisionId: string | undefined)
 }
 
 /** The identity a write of `kind` under grant `g` is made as. */
-export const identityFor = (g: Guarded | Grant, kind: WriteKind = "other"): Identity => (actsAsPerson(kind) ? g.as : "app");
+export const identityFor = (g: Guarded | Grant | GuardedFiling, kind: WriteKind = "other"): Identity => (actsAsPerson(kind) ? g.as : "app");
 
 /** What an audit row records: `legacy` while writes use the box account, else the identity the write is made as. */
-export async function auditIdentity(db: Db, g: Guarded | Grant, kind: WriteKind = "other"): Promise<"legacy" | Identity> {
+export async function auditIdentity(db: Db, g: Guarded | Grant | GuardedFiling, kind: WriteKind = "other"): Promise<"legacy" | Identity> {
   return await githubIdentity(db) === "box" ? "legacy" : identityFor(g, kind);
 }
 

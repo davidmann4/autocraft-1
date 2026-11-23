@@ -5,7 +5,7 @@
 // guard ran right before. Transports (querier, exec, git, merge command) stay
 // injected so tests fake them and assert the rows.
 import { recordPush } from "../push-outcomes.ts";
-import type { Grant, Guarded, GuardedItem, GuardedRepo } from "../core/guard.ts";
+import type { Grant, Guarded, GuardedFiling, GuardedItem, GuardedRepo } from "../core/guard.ts";
 import { auditIdentity, githubIdentity, identityFor, type WriteKind } from "./identity.ts";
 
 /** The PR steps that push to a contributor's branch or ask on the PR where it is closed to us (`lint`: the collect step of a stored patch). */
@@ -42,8 +42,11 @@ const direct: Retry = (f) => f();
 const repoName = (slug: string): string => splitSlug(slug).name;
 const refOf = (repo: string, number: number): string => `${repo}#${number}`;
 
+/** Every grant a write takes; a filing grant only createBotIssue and labelBotIssue take. */
+type AnyGrant = Guarded | Grant | GuardedFiling;
+
 /** A grant covers writes to its own repo (and, for a PR or item grant, its own number); a write elsewhere is a bug. */
-function covers(g: Guarded | Grant, repo: string, number?: number): void {
+function covers(g: AnyGrant, repo: string, number?: number): void {
   if (g.repo !== repo || (number !== undefined && "number" in g && g.number !== number)) throw new Error(`the guard covers ${g.repo}${"number" in g ? `#${g.number}` : ""}, not ${repo}${number === undefined ? "" : `#${number}`}`);
 }
 
@@ -58,7 +61,7 @@ function opensOwnPr(g: Grant | Guarded<"implement">, repo: string): void {
  * Who a write is made as, for the audit row's `identity`: `legacy` while the grant's repo is on the box account, else
  * the grant's identity (src/github/identity.ts). Every write takes it from its grant, so none goes unmapped.
  */
-const idOf = async (w: Writer, g: Guarded | Grant, kind: WriteKind = "other"): Promise<string> => await auditIdentity(w.db, g, kind);
+const idOf = async (w: Writer, g: AnyGrant, kind: WriteKind = "other"): Promise<string> => await auditIdentity(w.db, g, kind);
 
 /** The text a write puts on GitHub: the note line and the text, with anything that looks like a credential hidden. */
 const posted = (note: Note, text: string): string => withNote(note, scrub(text));
@@ -71,28 +74,32 @@ const posted = (note: Note, text: string): string => withNote(note, scrub(text))
 // app token, and the caller supplies the person's transport. Every other write of such a grant is the app's
 // (`actsAsPerson` in identity.ts), whatever transport the caller passes.
 
-const inAppLane = async (w: Writer, g: Guarded | Grant, kind: WriteKind = "other"): Promise<boolean> => await githubIdentity(w.db) === "app" && identityFor(g, kind) === "app";
+const inAppLane = async (w: Writer, g: AnyGrant, kind: WriteKind = "other"): Promise<boolean> => await githubIdentity(w.db) === "app" && identityFor(g, kind) === "app";
 
 /**
  * The child environment for a grant's repo, holding an installation token that reaches that repo only (and `scope`'s).
  * Never falls back to the box account: a failure is a clear error.
  */
-async function appEnv(w: Writer, g: Guarded | Grant, scope?: TokenScope): Promise<Record<string, string>> {
-  const owner = ownerOf(g.repo);
+async function appEnv(w: Writer, g: AnyGrant, scope?: TokenScope): Promise<Record<string, string>> {
+  // A filing grant names its owner: a filing-only repo has no `repos` row.
+  const owner = g.scope === "filing" ? g.owner : ownerOf(g.repo);
   try {
     return appChildEnv(await (w.mint ?? installationToken)(owner, g.repo, scope));
   } catch (e) {
     const fix = "install it on the repository or set the repository's identity back to legacy";
-    if (e instanceof AppNotInstalledError) throw new Error(`app identity: the GitHub App is not installed on ${owner}; ${fix}`);
-    if (e instanceof RepoNotInInstallationError) throw new Error(`app identity: ${owner}/${g.repo} is not in the GitHub App's installation; ${fix}`);
+    if (e instanceof AppNotInstalledError) throw new AppNoAccessError(`app identity: the GitHub App is not installed on ${owner}; ${fix}`);
+    if (e instanceof RepoNotInInstallationError) throw new AppNoAccessError(`app identity: ${owner}/${g.repo} is not in the GitHub App's installation; ${fix}`);
     throw new Error(`app identity: no installation token for ${owner}/${g.repo}: ${oneLine(String((e as Error).message ?? e))}`);
   }
 }
 
+/** The GitHub App's installation does not reach the repo (not installed on its owner, or the repo left out). */
+export class AppNoAccessError extends Error {}
+
 /** A failed command result for a mint failure: callers already handle a non-zero exit. No request went out, so it is marked not sent. */
 const failedResult = (e: unknown): ExecResult => ({ code: 1, stdout: "", stderr: String((e as Error).message ?? e), sent: false });
 
-async function laneExec(w: Writer, g: Guarded | Grant, exec: Exec, kind: WriteKind = "other"): Promise<Exec> {
+async function laneExec(w: Writer, g: AnyGrant, exec: Exec, kind: WriteKind = "other"): Promise<Exec> {
   if (!await inAppLane(w, g, kind)) return exec;
   return async (cmd, args, opts) => {
     let env: Record<string, string>;
@@ -358,7 +365,7 @@ async function madeBefore(w: Writer, action: string, target: string, keys: strin
  * Records the row first, runs the write, then marks the row done with `view`'s extra details or failed with the error.
  * With `once`, a write the job's earlier run made is not made again: its recorded result is returned.
  */
-async function recorded<T>(w: Writer, identity: string, action: string, target: string, details0: Details, f: () => Promise<T>, view?: (r: T) => Details, failure?: (r: T) => string | null, once?: Once<T>): Promise<T> {
+async function recorded<T>(w: Writer, identity: string, action: string, target: string, details0: Details, f: () => Promise<T>, view?: (r: T) => Details, failure?: (r: T) => string | null, once?: Once<T>, /** The pacing key's owner when the target's repo has no `repos` row. */ owner?: string): Promise<T> {
   let repeats: number | undefined;
   if (once) {
     const before = await madeBefore(w, action, target, [once.key, ...once.also ?? []]);
@@ -372,7 +379,7 @@ async function recorded<T>(w: Writer, identity: string, action: string, target: 
     }
   }
   const details = { ...details0, identity, ...jobOf(), ...(once && { writeKey: once.key }), ...(repeats !== undefined && { repeats }) };
-  const id = await begin(w, action, target, details);
+  const id = await begin(w, action, target, details, owner);
   let r: T;
   try {
     r = await f();
@@ -678,7 +685,12 @@ export class IssueError extends Error {
   clear: boolean;
   /** The write pacing held the create back (WritePacedError): nothing was sent and a later run may simply try again. */
   paced: boolean;
-  constructor(message: string, clear: boolean, paced = false) { super(message); this.clear = clear; this.paced = paced; }
+  /** Nothing was sent: no token could be minted (`noAccess`: the installation does not reach the repo) or the write was not the app's. */
+  unsent: boolean;
+  noAccess: boolean;
+  constructor(message: string, clear: boolean, paced = false, o: { unsent?: boolean; noAccess?: boolean } = {}) {
+    super(message); this.clear = clear; this.paced = paced; this.unsent = o.unsent ?? false; this.noAccess = o.noAccess ?? false;
+  }
 }
 
 // gh's own wording when GitHub rejects the request before creating anything.
@@ -739,39 +751,42 @@ export async function labelReporterIssue(w: Writer, exec: Exec, o: { repo: strin
 }
 
 /** Runs `gh` under the grant's app lane; a not-sent failure when the write would not be the GitHub App's (the instance writes as the box account). Never the box account. */
-async function asBot(w: Writer, g: GuardedRepo, exec: Exec, args: string[], input?: string): Promise<ExecResult> {
+async function asBot(w: Writer, g: GuardedFiling, exec: Exec, args: string[], input?: string): Promise<ExecResult> {
   if (!await inAppLane(w, g)) return { code: 1, stdout: "", stderr: "app identity: the instance writes as the box account, not the GitHub App", sent: false };
-  return (await laneExec(w, g, exec))("gh", args, input === undefined ? undefined : { input });
+  let env: Record<string, string>;
+  // Lost access is thrown, so the caller can tell it from a failure to reach GitHub.
+  try { env = await appEnv(w, g); } catch (e) { if (e instanceof AppNoAccessError) throw e; return failedResult(e); }
+  return exec("gh", args, { ...(input === undefined ? {} : { input }), env, replaceEnv: true });
 }
 
 /**
  * Opens an issue as the GitHub App for a Discord reporter who chose "Submit for me": audited as `discord-issue-bot`
  * with the grant's identity, with the URL and number but not the text. Throws an IssueError like createIssue.
  */
-export async function createBotIssue(w: Writer, g: GuardedRepo, exec: Exec, o: { repo: string; title: string; body: string }, note: Note): Promise<{ number: number; url: string }> {
+export async function createBotIssue(w: Writer, g: GuardedFiling, exec: Exec, o: { repo: string; title: string; body: string }, note: Note): Promise<{ number: number; url: string }> {
   covers(g, o.repo);
   const body = posted(note, o.body);
   const title = scrub(o.title);
   let r: ExecResult;
   try {
-    r = await recorded(w, await idOf(w, g), "discord-issue-bot", o.repo, {}, () => asBot(w, g, exec, ["issue", "create", "--repo", slugOf(o.repo), "--title", title, "--body-file", "-"], body),
+    r = await recorded(w, await idOf(w, g), "discord-issue-bot", o.repo, {}, () => asBot(w, g, exec, ["issue", "create", "--repo", `${g.owner}/${g.repo}`, "--title", title, "--body-file", "-"], body),
       (x) => { const m = x.stdout.match(/https:\/\/github\.com\/\S+\/issues\/(\d+)/); return m ? { url: m[0], number: Number(m[1]) } : {}; },
-      (x) => (x.code === 0 && /https:\/\/github\.com\/\S+\/issues\/\d+/.test(x.stdout) ? null : oneLine(x.stderr || x.stdout) || `exit code ${x.code}`));
+      (x) => (x.code === 0 && /https:\/\/github\.com\/\S+\/issues\/\d+/.test(x.stdout) ? null : oneLine(x.stderr || x.stdout) || `exit code ${x.code}`), undefined, g.owner);
   } catch (e) {
-    throw new IssueError(oneLine(String((e as Error).message ?? e)), true, e instanceof WritePacedError);
+    throw new IssueError(oneLine(String((e as Error).message ?? e)), true, e instanceof WritePacedError, { unsent: true, noAccess: e instanceof AppNoAccessError });
   }
   const url = r.stdout.match(/https:\/\/github\.com\/\S+\/issues\/(\d+)/);
-  if (r.code !== 0) { const m = oneLine(r.stderr || r.stdout) || `exit code ${r.code}`; throw new IssueError(m, r.sent === false || REFUSED.test(m)); }
+  if (r.code !== 0) { const m = oneLine(r.stderr || r.stdout) || `exit code ${r.code}`; throw new IssueError(m, r.sent === false || REFUSED.test(m), false, { unsent: r.sent === false }); }
   if (!url) throw new IssueError(oneLine(r.stderr || r.stdout) || "gh printed no issue URL", false);
   return { number: Number(url[1]), url: url[0] };
 }
 
 /** Adds a label to an issue the GitHub App filed for a Discord reporter; audited as `discord-issue-label` with the grant's identity. A refusal is recorded and returned as false, never thrown. */
-export async function labelBotIssue(w: Writer, g: GuardedRepo, exec: Exec, o: { repo: string; number: number; label: string }): Promise<boolean> {
+export async function labelBotIssue(w: Writer, g: GuardedFiling, exec: Exec, o: { repo: string; number: number; label: string }): Promise<boolean> {
   try {
     covers(g, o.repo);
     const r = await recorded(w, await idOf(w, g), "discord-issue-label", refOf(o.repo, o.number), { label: o.label },
-      () => asBot(w, g, exec, ["issue", "edit", String(o.number), "--repo", slugOf(o.repo), "--add-label", o.label]), undefined, (x) => (x.code === 0 ? null : oneLine(x.stderr || x.stdout) || `exit code ${x.code}`));
+      () => asBot(w, g, exec, ["issue", "edit", String(o.number), "--repo", `${g.owner}/${g.repo}`, "--add-label", o.label]), undefined, (x) => (x.code === 0 ? null : oneLine(x.stderr || x.stdout) || `exit code ${x.code}`), undefined, g.owner);
     return r.code === 0;
   } catch {
     return false;

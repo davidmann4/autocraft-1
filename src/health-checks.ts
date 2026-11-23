@@ -384,14 +384,9 @@ async function remoteNoTakerCheck({ db, nowMs, mode }: CheckCtx): Promise<Check[
 
 const READINESS_WORDS: Record<string, string> = { "quota-held": "holding for its reserve", paused: "paused", "cooled-off": "cooling off", "sandbox-failed": "failing its sandbox check", "version-refused": "too old to run calls", "harness-missing": "missing its model tool", failing: "failing" };
 
-/**
- * User-local mode with Discord configured: Discord calls run only in operators' Interactive slots (src/remote/interactive-slots.ts)
- * on a Task Runner that is ready and offers the small tier. Warns when none can take them now, or when a Discord call has waited
- * past THRESHOLDS.interactiveWaitMs (claims failing although a taker looks ready). The text names no login.
- */
-async function interactiveNoTakerCheck({ db, nowMs, mode }: CheckCtx): Promise<Check[]> {
-  const id = "interactive-no-taker", to = "/model-queue";
-  if (!envVar("DISCORD_KEY_FILE") || (mode ?? await inferenceMode(db)) !== "user-local") return [ok(id, to)];
+/** Whether a Task Runner can take Discord calls now (user-local mode with Discord configured; `applies` is false otherwise), and when not, why. Shared by interactiveNoTakerCheck and the Discord usage page. */
+export async function interactiveTakers(db: Db, nowMs: number, mode?: InferenceMode): Promise<{ applies: boolean; ready: boolean; why: string | null }> {
+  if (!envVar("DISCORD_KEY_FILE") || (mode ?? await inferenceMode(db)) !== "user-local") return { applies: false, ready: true, why: null };
   const rows = await db.all(db.k.selectFrom("main.mcp_tokens as t").innerJoin("main.access as a", "a.login", "t.login")
     .leftJoin("main.remote_helpers as h", "h.token_id", "t.id")
     .leftJoin("main.user_settings as us", (j) => j.onRef("us.login", "=", "t.login").on("us.key", "=", INTERACTIVE_SLOTS_KEY))
@@ -407,11 +402,22 @@ async function interactiveNoTakerCheck({ db, nowMs, mode }: CheckCtx): Promise<C
     : r.cooled ? READINESS_WORDS["cooled-off"]! : r.readiness !== "ready" ? (READINESS_WORDS[r.readiness ?? ""] ?? "not ready") + (r.readiness === "quota-held" && r.until ? ` until ${r.until.slice(11, 16)} UTC` : "")
     : !offersSmall(r.models) ? "offering no small-tier model" : "ready";
   const states = withSlots.map(state);
-  if (!states.includes("ready")) {
-    const why = !withSlots.length ? "no operator's Task Runner has Interactive slots"
-      : `${withSlots.length} Task Runner${withSlots.length === 1 ? " has" : "s have"} Interactive slots, ${states.length === 1 ? "and it is" : "but they are"} ${[...new Set(states)].join(" / ")}`;
-    return [{ id, state: "warn", to, since: null, text: `No Task Runner takes Discord calls: ${why}`, brief: "No Task Runner takes Discord calls" }];
-  }
+  if (states.includes("ready")) return { applies: true, ready: true, why: null };
+  const why = !withSlots.length ? "no operator's Task Runner has Interactive slots"
+    : `${withSlots.length} Task Runner${withSlots.length === 1 ? " has" : "s have"} Interactive slots, ${states.length === 1 ? "and it is" : "but they are"} ${[...new Set(states)].join(" / ")}`;
+  return { applies: true, ready: false, why };
+}
+
+/**
+ * User-local mode with Discord configured: Discord calls run only in operators' Interactive slots (src/remote/interactive-slots.ts)
+ * on a Task Runner that is ready and offers the small tier. Warns when none can take them now, or when a Discord call has waited
+ * past THRESHOLDS.interactiveWaitMs (claims failing although a taker looks ready). The text names no login.
+ */
+async function interactiveNoTakerCheck({ db, nowMs, mode }: CheckCtx): Promise<Check[]> {
+  const id = "interactive-no-taker", to = "/model-queue";
+  const t = await interactiveTakers(db, nowMs, mode);
+  if (!t.applies) return [ok(id, to)];
+  if (!t.ready) return [{ id, state: "warn", to, since: null, text: `No Task Runner takes Discord calls: ${t.why}`, brief: "No Task Runner takes Discord calls" }];
   const q = (await db.get(db.k.selectFrom("main.remote_calls").select((eb) => [eb.fn.countAll<number>().as("n"), eb.fn.min<number | null>("queued_since").as("oldest")])
     .where("state", "=", "queued").where("prompt_id", "like", "discord.%").where("queued_since", "<", nowMs - THRESHOLDS.interactiveWaitMs).where("seen_at", ">=", nowMs - CALLER_STALE_MS)))!;
   if (!q.n || q.oldest === null) return [ok(id, to)];
