@@ -36,3 +36,18 @@ test("warm starts need the key on the task's node and, on the volume, the same C
   assert.ok(!cold.initContainers?.some((c) => c.name === WARM_COPY_CONTAINER));
   assert.ok(!cold.volumes.some((v) => v.persistentVolumeClaim?.claimName.startsWith("craft-warm-")));
 });
+
+test("a rebuilt toolchain image starts from versions of the old one when rustc and the toolchain key match", () => {
+  const prepared: Prepared = { env: {}, mounts: [], packages: [], craftFontsRef: null, craftI18nRev: null, cacheVersion: "v1", cargoLock: "a".repeat(64) };
+  const envHash = warmEnvHash(prepared);
+  const rustc = "rustc 1.100.0 (abc 2026-11-01)\nhost: x86_64-unknown-linux-gnu\n";
+  const toolchain = { rustc, toolchain: "d".repeat(64) };
+  const status = { commit: "c".repeat(40), stored: 1, bytes: 5e9, image: "rust@sha256:old", ...toolchain, envHash, synced: 1, cargoLock: "a".repeat(64) };
+  const base: WarmInputs = { target: "pvc", key: "deckcraft-0123", node: "k3s-2", status, image: "rust@sha256:new", toolchain, envHash, checkout: ciCheckout("deckcraft"), cargoLock: prepared.cargoLock!, memoryLimitBytes: 16 * 1024 ** 3, memoryRoomBytes: null, nodeMaxBytes: null };
+
+  assert.ok(decideWarm(base).use, "same rustc and toolchain key, another digest");
+  assert.equal(decideWarm({ ...base, toolchain: { ...toolchain, rustc: rustc.replace("1.100.0", "1.101.0") } }).use, null, "another rustc");
+  assert.equal(decideWarm({ ...base, toolchain: { ...toolchain, toolchain: "e".repeat(64) } }).use, null, "another build tool or -dev package");
+  assert.equal(decideWarm({ ...base, toolchain: null }).use, null, "the new image's key is not known yet");
+  assert.equal(decideWarm({ ...base, status: { ...status, rustc: null, toolchain: null } }).use, null, "a version that records no key matches only its digest");
+});

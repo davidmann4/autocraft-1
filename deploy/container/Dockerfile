@@ -14,14 +14,26 @@
 ARG NODE_DEV_IMAGE=dhi.io/node:26-debian-dev@sha256:5101bfdf585a219118dbd5c3ed6554d778e95ff1b9d83aad6da1ebb87f26e3fc
 ARG NODE_RUNTIME_IMAGE=dhi.io/node:26@sha256:de8059011a5c409edeb514882b1f7093b8f0610bb3ca582c5470cec9106f6056
 
+# Layer order: every dependency install is keyed on lockfiles only, and the
+# source trees (src, web, worker, docs, scripts) are copied after them, so a
+# source-only commit reruns nothing but the web bundle and the final copies.
+
+################################################################################
+# Build toolchain shared by the web and dependency stages.
+FROM ${NODE_DEV_IMAGE} AS node-build
+RUN npm install -g pnpm@11.28.10
+
 ################################################################################
 # The dashboard bundle the server serves from web/dist.
-FROM ${NODE_DEV_IMAGE} AS web
-RUN npm install -g pnpm@11.28.10
+FROM node-build AS web
 WORKDIR /app/web
 COPY web/package.json web/pnpm-lock.yaml web/pnpm-workspace.yaml ./
 # Install scripts stay off, as in deploy/hook.sh; only esbuild needs its own to place its binary.
-RUN pnpm install --frozen-lockfile --ignore-scripts && pnpm rebuild esbuild
+# The pnpm store is a cache mount: it persists between builds on one builder
+# (a fresh CI runner starts it empty) and stays out of the image.
+RUN --mount=type=cache,id=pnpm-store,target=/pnpm-store \
+    pnpm install --frozen-lockfile --ignore-scripts --store-dir /pnpm-store \
+ && pnpm rebuild esbuild
 # src/ and docs/ are read by the web build too (shared API types, About page text).
 COPY src /app/src
 COPY docs /app/docs
@@ -59,7 +71,11 @@ RUN set -eux; \
       | grep -E '^[a-z0-9][a-z0-9.+-]*(:[a-z0-9]+)?$' | sort -u > /tmp/packages; \
     mkdir -p /rootfs /tmp/debs; \
     cd /tmp/debs; \
-    xargs -r -n1 sh -c 'apt-get download "$0" || true' < /tmp/packages; \
+    # One call fetches the whole list in a single pass. A name with no
+    # download candidate fails it, and then each package is fetched on its own,
+    # skipping those names.
+    apt-get download $(cat /tmp/packages) \
+      || xargs -r -n1 sh -c 'apt-get download "$0" || true' < /tmp/packages; \
     for deb in *.deb; do dpkg -x "$deb" /rootfs; done; \
     rm -rf /var/lib/apt/lists/* /tmp/debs /tmp/packages; \
     # `dpkg -x` runs no postinst, so make sure /bin/sh exists whatever the packages shipped.
@@ -113,23 +129,33 @@ RUN --mount=type=tmpfs,target=/tmp \
  && tar -xzf /tmp/gh.tgz -C /rootfs/usr/local --strip-components=1 --wildcards '*/bin/gh'
 
 ################################################################################
-# Application tree: production dependencies only, plus the built dashboard.
-FROM ${NODE_DEV_IMAGE} AS app
-ARG SOURCE_COMMIT=
+# Production dependencies, keyed on the lockfile alone.
+FROM node-build AS deps
 WORKDIR /app
-RUN npm install -g pnpm@11.28.10
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
-RUN pnpm install --frozen-lockfile --prod --ignore-scripts
-COPY src ./src
+RUN --mount=type=cache,id=pnpm-store,target=/pnpm-store \
+    pnpm install --frozen-lockfile --prod --ignore-scripts --store-dir /pnpm-store
+
+################################################################################
+# Application tree without node_modules: the sources plus the built dashboard.
+# The production stage copies it as its own layer, so a source change exports
+# and pushes this small layer and reuses the node_modules one.
+FROM ${NODE_DEV_IMAGE} AS app
+WORKDIR /app
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY --chmod=0755 deploy/backup.sh deploy/periodic.sh deploy/container/entrypoint.sh ./deploy/
+COPY --chmod=0755 deploy/container/ws ./deploy/ws
 COPY scripts ./scripts
-COPY deploy/backup.sh deploy/periodic.sh deploy/container/entrypoint.sh ./deploy/
-COPY deploy/container/ws ./deploy/ws
+# Served by the dashboard as the Task Runner helper and its legacy name (src/dash/server/index.ts).
+COPY worker ./worker
+COPY src ./src
 COPY web/src ./web/src
 COPY --from=web /app/web/dist ./web/dist
 # Shown on the dashboard's prompts page (src/dash/api/prompts.ts); there is no .git in the image.
-RUN set -eux; \
-    if [ -n "$SOURCE_COMMIT" ]; then printf '%s\n' "$SOURCE_COMMIT" > .source-commit; fi; \
-    chmod 0755 deploy/entrypoint.sh deploy/backup.sh deploy/ws
+# The argument is declared here, not at the top of the stage, because every RUN
+# after an ARG is keyed on its value, and it changes with every commit.
+ARG SOURCE_COMMIT=
+RUN if [ -n "$SOURCE_COMMIT" ]; then printf '%s\n' "$SOURCE_COMMIT" > .source-commit; fi
 
 ################################################################################
 # Production. Nothing is installed here: the shell-less runtime base receives the
@@ -137,6 +163,7 @@ RUN set -eux; \
 FROM ${NODE_RUNTIME_IMAGE}
 
 COPY --from=tools /rootfs/ /
+COPY --from=deps --chown=10001:10001 /app/node_modules /app/node_modules
 COPY --from=app --chown=10001:10001 /app /app
 
 # Every writable path is under /data (database, caches, job logs, HOME) or /config

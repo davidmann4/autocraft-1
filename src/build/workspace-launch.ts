@@ -343,7 +343,7 @@ async function planWarm(c: Ctx, w: WorkspaceRow, fresh: boolean, image: string):
     if (n && r.id !== w.id) load.set(n, (load.get(n) ?? 0) + 1);
   }
   const d = chooseWarm({
-    target, key, image, prepared, checkout, nodes, load, memoryLimitBytes: quantity(c.s.workspaceMemoryLimit),
+    target, key, image, toolchain: c.state.warm?.toolchainOf(image) ?? null, prepared, checkout, nodes, load, memoryLimitBytes: quantity(c.s.workspaceMemoryLimit),
   });
   return { target, storageBytes, use: d.use, why: d.why };
 }

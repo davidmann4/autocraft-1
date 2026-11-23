@@ -15,10 +15,14 @@ import { unboundLogins } from "./author-ids.ts";
 import { inferenceMode, type InferenceMode } from "./remote/mode.ts";
 import { CALLER_STALE_MS } from "./remote/room.ts";
 import { NO_TAKER_MS } from "./remote/takers.ts";
+import { INTERACTIVE_SLOTS_KEY, interactiveSlotsOf } from "./remote/interactive-slots.ts";
+import { acceptedModels, familyOf } from "./remote/mode.ts";
+import { envVar } from "./env.ts";
 import { STATUS_FRESH_MS } from "./remote/helpers.ts";
 import { manualExpr } from "./remote/manual-only.ts";
 import { confidentialReadyAt, privateStepExpr } from "./build/tasks.ts";
 import type { Db } from "./db/index.ts";
+import * as kx from "./db/kx.ts";
 import { setting } from "./settings-read.ts";
 import { BEAT_MS, leaderStatus } from "./db/leader.ts";
 import { ENDPOINT_KEY, type EndpointStatus } from "./build/worker-endpoint.ts";
@@ -46,6 +50,8 @@ export const THRESHOLDS = {
   /** In the user-local mode, a call queued this long with no claim by any helper in that time. */
   remoteQueuedMs: 10 * 60_000,
   /** In the user-local mode with a ready helper, the longest a queued call of each tier may wait. */
+  /** A Discord (interactive) call is withdrawn after a few seconds without a taker; one queued this long means claims are failing. */
+  interactiveWaitMs: 60_000,
   remoteTierWaitMs: { top: 30 * 60_000, mid: 20 * 60_000, small: 5 * 60_000 },
 } as const;
 
@@ -376,8 +382,46 @@ async function remoteNoTakerCheck({ db, nowMs, mode }: CheckCtx): Promise<Check[
     brief: "Some repos have no Task Runner that may take their model calls" }];
 }
 
+const READINESS_WORDS: Record<string, string> = { "quota-held": "holding for its reserve", paused: "paused", "cooled-off": "cooling off", "sandbox-failed": "failing its sandbox check", "version-refused": "too old to run calls", "harness-missing": "missing its model tool", failing: "failing" };
+
+/**
+ * User-local mode with Discord configured: Discord calls run only in operators' Interactive slots (src/remote/interactive-slots.ts)
+ * on a Task Runner that is ready and offers the small tier. Warns when none can take them now, or when a Discord call has waited
+ * past THRESHOLDS.interactiveWaitMs (claims failing although a taker looks ready). The text names no login.
+ */
+async function interactiveNoTakerCheck({ db, nowMs, mode }: CheckCtx): Promise<Check[]> {
+  const id = "interactive-no-taker", to = "/model-queue";
+  if (!envVar("DISCORD_KEY_FILE") || (mode ?? await inferenceMode(db)) !== "user-local") return [ok(id, to)];
+  const rows = await db.all(db.k.selectFrom("main.mcp_tokens as t").innerJoin("main.access as a", "a.login", "t.login")
+    .leftJoin("main.remote_helpers as h", "h.token_id", "t.id")
+    .leftJoin("main.user_settings as us", (j) => j.onRef("us.login", "=", "t.login").on("us.key", "=", INTERACTIVE_SLOTS_KEY))
+    .select(["t.id", "t.login", "a.role", "us.value as slots", "h.readiness", "h.until", "h.models", "h.reported_at",
+      (eb) => eb.exists(kx.schemaEb(eb).selectFrom("main.remote_cooloffs as co").select(eb.lit(1).as("one")).where("co.login", "=", eb.ref("t.login")).where("co.until", ">", nowMs)).as("cooled")])
+    .where("t.kind", "=", "runner").where("t.expires_at", ">", new Date(nowMs).toISOString()).where("a.role", "=", "operator"));
+  const accepted = await acceptedModels(db);
+  const withSlots = rows.filter((r) => interactiveSlotsOf(r.slots ?? undefined, r.role) > 0);
+  const offersSmall = (models: string | null): boolean => {
+    try { const m = JSON.parse(models ?? "{}") as Record<string, unknown>; return typeof m.small === "string" && familyOf(m.small, accepted.small) !== null; } catch { return false; }
+  };
+  const state = (r: (typeof rows)[number]): string => r.reported_at === null || Number(r.reported_at) < nowMs - STATUS_FRESH_MS ? "not connected"
+    : r.cooled ? READINESS_WORDS["cooled-off"]! : r.readiness !== "ready" ? (READINESS_WORDS[r.readiness ?? ""] ?? "not ready") + (r.readiness === "quota-held" && r.until ? ` until ${r.until.slice(11, 16)} UTC` : "")
+    : !offersSmall(r.models) ? "offering no small-tier model" : "ready";
+  const states = withSlots.map(state);
+  if (!states.includes("ready")) {
+    const why = !withSlots.length ? "no operator's Task Runner has Interactive slots"
+      : `${withSlots.length} Task Runner${withSlots.length === 1 ? " has" : "s have"} Interactive slots, ${states.length === 1 ? "and it is" : "but they are"} ${[...new Set(states)].join(" / ")}`;
+    return [{ id, state: "warn", to, since: null, text: `No Task Runner takes Discord calls: ${why}`, brief: "No Task Runner takes Discord calls" }];
+  }
+  const q = (await db.get(db.k.selectFrom("main.remote_calls").select((eb) => [eb.fn.countAll<number>().as("n"), eb.fn.min<number | null>("queued_since").as("oldest")])
+    .where("state", "=", "queued").where("prompt_id", "like", "discord.%").where("queued_since", "<", nowMs - THRESHOLDS.interactiveWaitMs).where("seen_at", ">=", nowMs - CALLER_STALE_MS)))!;
+  if (!q.n || q.oldest === null) return [ok(id, to)];
+  return [{ id, state: "warn", to, count: q.n, since: new Date(q.oldest).toISOString(),
+    text: `${q.n} Discord call${q.n === 1 ? " has" : "s have"} waited over ${Math.round(THRESHOLDS.interactiveWaitMs / 1000)} seconds although a Task Runner has a free Interactive slot`,
+    brief: "Discord calls wait although a Task Runner looks ready" }];
+}
+
 /** Every check, in the order the lists show them. */
-const SOURCES: ((ctx: CheckCtx) => Promise<Check[]>)[] = [runnerCheck, leaderChecks, workerChecks, queueCheck, confidentialCheck, syncCheck, syncRepoChecks, accountsCheck, rateCheck, deadlineChecks, livenessCheck, appIdentityChecks, authorIdsCheck, outsideSurgeCheck, remoteCallsCheck, remoteStarvedCheck, remoteManualCheck, remoteNoTakerCheck];
+const SOURCES: ((ctx: CheckCtx) => Promise<Check[]>)[] = [runnerCheck, leaderChecks, workerChecks, queueCheck, confidentialCheck, syncCheck, syncRepoChecks, accountsCheck, rateCheck, deadlineChecks, livenessCheck, appIdentityChecks, authorIdsCheck, outsideSurgeCheck, remoteCallsCheck, remoteStarvedCheck, remoteManualCheck, remoteNoTakerCheck, interactiveNoTakerCheck];
 
 export async function computeChecks(db: Db, nowMs: number = Date.now(), probe = false): Promise<Check[]> {
   const mode = await inferenceMode(db);

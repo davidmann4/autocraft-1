@@ -17,6 +17,8 @@ export const POOL_MAX: Record<DbRole, number> = { dashboard: 8, "dashboard-remot
 
 /** Key of the one writer lock every write takes (a write transaction, or a write statement outside one), so writes run one at a time as on SQLite. */
 const WRITER_LOCK = 0x61637772; // "acwr"
+/** First key of the named locks (WriteOptions.lock), taken as two 32-bit keys: a space apart from the single-key writer and migration locks. */
+const NAMED_LOCKS = 0x61636e6c; // "acnl"
 
 const DEFAULT_LOCK_TIMEOUT_MS = 30_000;
 /** A transaction whose client sends nothing for this long is ended by the server, so a dead process cannot keep the writer lock. */
@@ -42,6 +44,8 @@ export interface PgOptions {
   scope?: string;
   /** How long a transaction may sit idle before the server ends its session; 0 for no limit. Default 60 s. */
   idleInTransactionMs?: number;
+  /** Write statements outside a transaction run without the writer lock (ConnectOptions.rowWrites). */
+  rowWrites?: boolean;
 }
 
 /** A query that got no answer within its limit (`within`). */
@@ -137,6 +141,9 @@ export function writesRows(text: string): boolean {
   return head === "insert" || head === "update" || head === "delete" || head === "merge";
 }
 
+/** `s` as an SQL string literal (standard_conforming_strings, the default: only quotes are doubled). */
+const quoteLiteral = (s: string): string => `'${s.replaceAll("'", "''")}'`;
+
 /** Emits a query event for every round trip on `client` while someone observes. */
 function observeClient(client: Pg.PoolClient, ctx: EngineContext): void {
   const query = client.query.bind(client) as (...a: unknown[]) => unknown;
@@ -177,6 +184,7 @@ function schemaPlugin(k: typeof K, mainSchema: string | undefined): K.KyselyPlug
 
 /** An engine on the Postgres database at `url`. `k` and `pg` are the modules src/db/open.ts loaded. */
 export function postgresEngine(k: typeof K, pg: typeof Pg.default, url: string, opts: PgOptions, ctx: EngineContext): Engine {
+  const lockTimeout = (tx: Tx | undefined) => Math.max(1, Math.floor(tx?.lockTimeoutMs ?? opts.busyTimeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS));
   const pool = new pg.Pool({
     connectionString: pgConnectionString(opts.scope ? scopedUrl(url, opts.scope) : url),
     max: POOL_MAX[opts.role],
@@ -185,6 +193,8 @@ export function postgresEngine(k: typeof K, pg: typeof Pg.default, url: string, 
     application_name: `autocraft-${opts.role}`,
     // A startup parameter of every connection, so it also bounds statements outside transactions; no SET is sent.
     statement_timeout: opts.statementTimeoutMs ?? DEFAULT_STATEMENT_TIMEOUT_MS,
+    // A lone write of a rowWrites handle waits for row locks no longer than a transaction waits for its lock.
+    ...(opts.rowWrites && { lock_timeout: lockTimeout(undefined) }),
     types: typesFor(pg),
   });
   // An idle connection that fails (server restart, network) is dropped by the pool; without a listener it would crash the process.
@@ -205,21 +215,25 @@ export function postgresEngine(k: typeof K, pg: typeof Pg.default, url: string, 
     lockWrites(conn);
     await setSession((text) => conn.executeQuery(raw(text)), sessionSettings, "pool connections", (l) => console.warn(l));
   };
-  const lockTimeout = (tx: Tx | undefined) => Math.max(1, Math.floor(tx?.lockTimeoutMs ?? opts.busyTimeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS));
-  // A fenced process (src/db/fence.ts) checks its epoch after the writer lock: the check sees every write committed before it.
-  const beginWrite = (tx: Tx | undefined) => `BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL lock_timeout = ${lockTimeout(tx)}; SELECT pg_advisory_xact_lock(${WRITER_LOCK})${fenceSql()}`;
+  // A fenced process (src/db/fence.ts) checks its epoch after the writer lock: the check sees every write committed before
+  // it. So it takes the writer lock under a named lock too, first, as every holder of both takes them.
+  const beginWrite = (tx: Tx | undefined) => {
+    const fence = fenceSql();
+    const locks = [...(!tx?.lock || fence ? [`SELECT pg_advisory_xact_lock(${WRITER_LOCK})`] : []), ...(tx?.lock ? [`SELECT pg_advisory_xact_lock(${NAMED_LOCKS}, hashtext(${quoteLiteral(tx.lock)}))`] : [])];
+    return `BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL lock_timeout = ${lockTimeout(tx)}; ${locks.join("; ")}${fence}`;
+  };
   /** Connections between their BEGIN and its COMMIT or ROLLBACK. */
   const inTransaction = new WeakSet<K.DatabaseConnection>();
 
   /**
    * Every statement on `conn` passes here. Outside a transaction, a write runs as a transaction of its own under the writer
    * lock, so it waits for an open write transaction as on SQLite, where a count-then-write inside db.write would otherwise
-   * race with it. Reads outside a transaction take no lock.
+   * race with it. Reads outside a transaction take no lock, nor do the writes of a rowWrites handle in a process without a fence.
    */
   const lockWrites = (conn: K.DatabaseConnection): void => {
     const run = conn.executeQuery.bind(conn);
     conn.executeQuery = async <R>(q: K.CompiledQuery): Promise<K.QueryResult<R>> => {
-      if (inTransaction.has(conn) || !writesRows(q.sql)) return await run<R>(q);
+      if (inTransaction.has(conn) || !writesRows(q.sql) || (opts.rowWrites && !fenceSql())) return await run<R>(q);
       try {
         await run(raw(beginWrite(undefined)));
         const r = await run<R>(q);

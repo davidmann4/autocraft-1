@@ -1,6 +1,7 @@
 // Build tasks for a validated plan, and the warm build of the default branch.
 import { createTask, warmKeyOf, type NewTask } from "../build/tasks.ts";
 import { rustPlan } from "../worker/rust.ts";
+import { WORKSPACE_TEST_TARGETS } from "../worker/rust-targets.ts";
 import type { TaskStep } from "../worker/types.ts";
 import { featureOn } from "../build/features.ts";
 import type { VerifyPlan } from "./plan.ts";
@@ -53,8 +54,14 @@ export async function queueWarmBuild(db: Db, repo: string, mainSha: string, nowM
     .where("repo", "=", repo).where("warm_role", "=", "build").where("queued_at", ">", since))) return null;
   return await createTask(db, {
     step: "verify", repo, headSha: mainSha, baseSha: mainSha, requires: { ...REQUIRES, toolchains: [...REQUIRES.toolchains] }, priority: WARM_PRIORITY,
-    plan: rustPlan({ cargoArgs: ["--workspace"], test: false }), warm: { key: warmKeyOf(repo), role: "build" },
+    plan: warmBuildPlan(), warm: { key: warmKeyOf(repo), role: "build" },
   });
+}
+
+/** The worker's warm build: the units a whole-workspace plan builds and tests, as the cluster's warm producer builds them. */
+function warmBuildPlan(): TaskStep[] {
+  const [fetch, build] = rustPlan({ cargoArgs: ["--workspace"], test: false });
+  return [fetch!, build!, { name: "build tests", cmd: ["cargo", "test", "--offline", "--locked", "--no-run", ...WORKSPACE_TEST_TARGETS], network: "none", timeoutSec: 3600 }];
 }
 
 /** Queues a new task with the same step, commits, requirements, plan, patch and warm role as task `id`. */

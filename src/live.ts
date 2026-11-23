@@ -13,6 +13,7 @@ type Source = { table: string; ops?: ("INSERT" | "UPDATE" | "DELETE")[]; when?: 
  * these bumps nothing. Every other column of a table is compared (see liveSql).
  */
 export const BOOKKEEPING_COLUMNS: Record<string, string[]> = {
+  workspaces: ["updated_at", "last_call_at", "next_call", "create_tries", "pod_created_at"],
   repos: ["synced_at", "high_water", "reconciled_at"],
   items: ["embed_hash", "class_hash", "class_scheme", "text_refs"],
   classifications: ["at", "input_hash"],
@@ -87,6 +88,8 @@ export const TOPIC_TABLES: Record<string, Source[]> = {
   "pr-builds": [{ table: "pr_builds" }],
   // The nightly selection, runs, results and bench points; written by the nightly step's bookkeeping, not planner input.
   nightly: [{ table: "nightly_selection" }, { table: "nightly_runs" }, { table: "nightly_results" }, { table: "nightly_bench" }],
+  // The workspace page: the pods, their sessions and every call; not planner input.
+  workspaces: [{ table: "workspaces" }, { table: "workspace_sessions" }, { table: "workspace_calls" }],
   tasks: [{ table: "build_tasks" }, { table: "build_task_logs" }, { table: "build_artifacts" }],
   actions: [{ table: "actions" }],
   // Which maintainer posts an operator shared with Opus; not planner input.

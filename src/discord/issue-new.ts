@@ -13,7 +13,8 @@ import { BUTTON_URL_MAX, ISSUE_URL_MAX, cleanDraft, followUp, formDraft, issueUr
 import { fallbackQuestions, ISSUE_ANSWER_CHARS, ISSUE_BODY_CHARS, ISSUE_FORM_BODY_CHARS, ISSUE_TITLE_CHARS, parseDraft, parseQuestions, type FollowUpId, type IssueDraftInput, type IssueQuestionsInput } from "./issue-prompt.ts";
 import type { Call, Interactions } from "./interactions.ts";
 import type { DiscordKeys } from "./keys.ts";
-import { botRefusal, FILING_IN_DISCORD, fileAsBot, fileIssue, type BotRequest, type BotResult, type FileDeps, type FileRequest, type FileResult, type IssueKind } from "./file-issue.ts";
+import { botRefusal, FILING_IN_DISCORD, fileAsBot, fileIssue, JUNK_REFUSAL, junkCheck, modelJunkJudge, type BotRequest, type BotResult, type FileDeps, type FileRequest, type FileResult, type IssueKind } from "./file-issue.ts";
+import type { JunkAsk } from "./junk-ask.ts";
 import { deliver, fileRepoUrl, plain, renderMatches } from "./reply.ts";
 import { QUESTION_CHARS, type Match, type Search } from "./search.ts";
 import { trackedRepos } from "./store.ts";
@@ -72,6 +73,8 @@ type Session = {
   bot: boolean;
   /** The Discord name a bot-filed issue credits. */
   name: string;
+  /** The person changed the draft in the Edit form: the junk check runs again at submit. */
+  edited?: boolean;
   /** True while File it runs, so a second press cannot file twice. */
   filing: boolean;
   /** The new-issue limit's slot was taken. */
@@ -92,6 +95,8 @@ export type IssueNewDeps = {
   fileBot?: (deps: FileDeps, req: BotRequest) => Promise<BotResult>;
   /** Why the app cannot file for this person now (null: it can); botRefusal unless a test sets it. */
   botRefusal?: (db: Db, reporter: string, repo: string) => Promise<string | null>;
+  /** The junk check on the first message; the model check (Jev, Haiku where unsure) unless a test sets it. */
+  junk?: (db: Db, a: JunkAsk) => Promise<"junk" | "ok" | "unknown">;
 };
 
 const field = (custom_id: string, label: string, style: 1 | 2, max: number, opts: { required?: boolean; value?: string; placeholder?: string } = {}) => ({
@@ -208,6 +213,13 @@ export class IssueNew {
     if (!this.#d.search.allow(userKey, channelKey)) return void (await call.edit({ content: "Too many searches just now. Try again in a minute." }));
     s.repo = repo.name; s.repoUrl = `https://github.com/${repo.owner}/${repo.name}`;
     s.description = description; s.title = titleOf(description);
+    // The first message is checked before anything else is asked; no answer from a model lets the flow go on.
+    const ask: JunkAsk = { title: s.title, body: description, ...(s.chosen && { kind: s.chosen }) };
+    if (await (this.#d.junk ?? ((d, a) => junkCheck(d, a, modelJunkJudge(), this.#d.log)))(db, ask) === "junk") {
+      const { url } = issueUrl(s.repoUrl, s.title, description, ISSUE_URL_MAX);
+      this.#sessions.delete(sid);
+      return void (await call.edit({ content: `${JUNK_REFUSAL}\nYou can still open it on GitHub yourself.${url.length <= BUTTON_URL_MAX ? "" : `\n[Open on GitHub](<${url}>)`}`, components: url.length <= BUTTON_URL_MAX ? [{ type: 1, components: [{ type: 2, style: 5, label: "Open on GitHub", url }] }] : [] }));
+    }
     s.stage = "matched";
     // The questions are chosen in the background, so the matches reply does not wait for the model; "None of these" uses the result.
     s.capped = await this.#overCap();
@@ -353,7 +365,7 @@ export class IssueNew {
     const github = { type: 2, style: 5, label: "Open on GitHub instead", url };
     const githubText = asButton ? "" : `\n[Open on GitHub instead](<${url}>)`;
     try {
-      const r = await (this.#d.file ?? fileIssue)({ db: this.#d.db, log }, { reporter: keys.hash("author", s.user), repo: s.repo, title: s.draft.title, body: s.draft.body, kind: s.kind });
+      const r = await (this.#d.file ?? fileIssue)({ db: this.#d.db, log }, { reporter: keys.hash("author", s.user), repo: s.repo, title: s.draft.title, body: s.draft.body, kind: s.kind, junkChecked: !s.edited });
       if (r.status === "sign-in") {
         // The session stays, and gets time for the sign-in; File it works on the draft message afterwards.
         s.expires = this.#now() + SESSION_MS;
@@ -381,7 +393,7 @@ export class IssueNew {
     const asButton = url.length <= BUTTON_URL_MAX;
     try {
       const r = await (this.#d.fileBot ?? fileAsBot)({ db: this.#d.db, log }, {
-        reporter: keys.hash("author", s.user), reporterName: s.name || call.userName || "", repo: s.repo, title: s.draft.title, body: s.draft.body, kind: s.kind, drafted: s.drafted,
+        reporter: keys.hash("author", s.user), reporterName: s.name || call.userName || "", repo: s.repo, title: s.draft.title, body: s.draft.body, kind: s.kind, drafted: s.drafted, junkChecked: !s.edited,
       });
       if (r.status === "filed") {
         this.#sessions.delete(sid);
@@ -409,7 +421,7 @@ export class IssueNew {
     if (!s?.draft) return void (await call.edit({ content: "This draft has expired. Start again with /autocraft search." }));
     const f = call.fields();
     const d = cleanDraft({ title: f.title ?? "", body: f.body ?? "" }, await this.#repos());
-    if (d) s.draft = d;
+    if (d) { s.draft = d; s.edited = true; }
     await call.edit(await this.#rendered(s, sid));
   }
 }

@@ -46,9 +46,12 @@ test("sessions of ended jobs fail and end their workspace unless kept; resuming 
 test("a try on a repo no Task Runner takes is refused, and records no session", async () => {
   const w = await (await (await world()).repo()).issue(1, { title: "crash on open" });
   await setInferenceMode(w.db, "user-local", "test");
-  const req = { repo: "app", baseSha: "a".repeat(40), item: 1, prompt: "try it", envId: "k", keep: false, workspaceId: null, by: "cli" };
+  const req = { repo: "app", baseSha: "a".repeat(40), item: 1, prompt: "try it", envId: "k", keep: false, workspaceId: null, forLogin: "alice", by: "cli" };
   await assert.rejects(requestTrySession(w.db, req), /no Task Runner can take calls/);
   assert.equal((await w.db.all(w.db.k.selectFrom("workspace_sessions").select("id"))).length, 0);
   await setInferenceMode(w.db, "server", "test");
-  assert.ok(await requestTrySession(w.db, req) > 0, "outside the user-local mode the server's accounts take the call");
+  const id = await requestTrySession(w.db, req);
+  assert.ok(id > 0, "outside the user-local mode the server's accounts take the call");
+  assert.equal((await w.db.get(w.db.k.selectFrom("workspace_sessions").select("for_login").where("id", "=", id)))!.for_login, "alice", "the session records whose runners run its call");
+  await assert.rejects(requestTrySession(w.db, { ...req, forLogin: "not a login" }), /GitHub login/);
 });

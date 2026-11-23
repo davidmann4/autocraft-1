@@ -354,3 +354,33 @@ test("warm cargo locks: never published, empty files get their own inodes, and a
   assert.equal(existsSync(join(dest, ".cargo-lock")), false);
   assert.equal(existsSync(join(dest, "a")), true);
 });
+
+test("warm link reuse: a group-writable or foreign-group file is fetched again, a clean one with a new ctime is linked", async (t) => {
+  const tmp = mkdtempSync(join(tmpdir(), "warm-reuse-"));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+  const mtimeNs = 1_700_000_000_000_000_000n;
+  const bodies = ["clean", "gwrite", "foreign"].map((n) => Buffer.from(`content of ${n}`));
+  const shas = bodies.map((b) => createHash("sha256").update(b).digest("hex"));
+  const manifest: any = {
+    header: {},
+    entries: [
+      { path: "target/d", type: "dir", mode: 0o755, mtimeNs },
+      ...bodies.map((b, i) => ({ path: `target/d/f${i}`, type: "file", mode: 0o644, size: b.length, mtimeNs, sha256: shas[i] })),
+    ],
+  };
+  const fetch = async (sha: string) => (async function* () { yield zstdCompressSync(bodies[shas.indexOf(sha)]); })();
+  const prevRoot = join(tmp, "prev");
+  await applyManifest(manifest, { target: prevRoot }, fetch);
+  chmodSync(join(prevRoot, "d/f1"), 0o664);
+  // The agent's own unlink of another version sharing the inode bumps its ctime; that must not matter.
+  chmodSync(join(prevRoot, "d/f0"), 0o644);
+  const prev = { manifest, roots: { target: prevRoot } };
+  const next = join(tmp, "next");
+  const stats = await applyManifest(manifest, { target: next }, fetch, { previous: { ...prev, gid: process.getgid!() + 1 } });
+  assert.equal(stats.linked, 0, "a file of another group is never a link source");
+  const next2 = join(tmp, "next2");
+  const s2 = await applyManifest(manifest, { target: next2 }, fetch, { previous: prev });
+  assert.equal(s2.linked, 2, "g+w is refused, the other files are linked");
+  assert.equal(statSync(join(next2, "d/f0")).ino, statSync(join(prevRoot, "d/f0")).ino);
+  assert.notEqual(statSync(join(next2, "d/f1")).ino, statSync(join(prevRoot, "d/f1")).ino);
+});

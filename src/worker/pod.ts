@@ -24,6 +24,7 @@ import type { PodTask } from "../build/tasks.ts";
 import { BadBlobError, clearDir, DEFAULT_EXCLUDES, loadEd25519, removeCargoLocks, WARM_BASE_MARK, type Roots } from "../warm/manifest.ts";
 import { WarmStore } from "../warm/store-client.ts";
 import { markBuildStart, readBuildStart, trimTarget } from "../warm/trim.ts";
+import { readToolchain, toolchainRefusal, type BuiltWith } from "../warm/toolchain.ts";
 import { checkServiceUrl } from "./config.ts";
 import { WorkerApi } from "./client.ts";
 import { gateInputs } from "./environment.ts";
@@ -205,13 +206,16 @@ export async function mirrorWaitPhase(e: PodEnv, address: string | undefined, po
  *   SIGNING_KEY      private key PEM file (publish)
  *   TARGET, CARGO_HOME  the dirs to fill or publish; restore skips one that is unset. Publish them at the paths the
  *                    build used: the manifest records them, and cargo's fingerprints only match at the same paths.
- *   CHECKOUT, IMAGE, ENV_HASH  recorded in the manifest header; RUSTC_FILE holds `rustc -vV` output
+ *   CHECKOUT, IMAGE, ENV_HASH  recorded in the manifest header
+ *   TOOLCHAIN_DIR    where the pod's toolchain-id container wrote `rustc -vV` and the image's toolchain file
+ *                    (src/warm/toolchain.ts): publish records them, restore matches versions on them
  *   REPO, COMMIT     default to the task file's repo and head
  *   EXCLUDE          comma-separated exclusion patterns (default DEFAULT_EXCLUDES)
  *   RECHECK          comma-separated sha256s a restore reported as badBlobs (publish repairs them)
  *   BAD_BLOBS_FILE   restore writes its badBlobs there, one per line, and publish rechecks them too (a producer pod's
  *                    restore and publish share the file)
- *   IMAGE            on a restore: a version built with another toolchain image is a cold start
+ *   IMAGE            on a restore: a version built with another toolchain image is a cold start, unless its rustc and
+ *                    toolchain key match TOOLCHAIN_DIR's
  *   GC_KEEP (3), GC_MIN_AGE_HOURS (24, publish uses it too), GC_CAP_GB (150)
  * A configuration error fails every phase (exit 1); only store and content problems make warm-restore a cold start.
  */
@@ -290,14 +294,16 @@ async function restorePhase(e: PodEnv, env: NodeJS.ProcessEnv): Promise<number> 
     return 0;
   };
   if (!dirs.length) throw new Error("AUTOCRAFT_WARM_TARGET or AUTOCRAFT_WARM_CARGO_HOME is required");
-  // A dir left by an earlier build on the same volume. One built with this image and Cargo.lock is a valid start. Anything else is
+  // A dir left by an earlier build on the same volume. One built with this toolchain and Cargo.lock is a valid start. Anything else is
   // cleared, so two versions never mix in one dir. Only a dir that was empty is emptied again after a failure.
   const image = w.v("IMAGE");
+  const now: BuiltWith = { image: image ?? null, ...readToolchain(w.v("TOOLCHAIN_DIR")) };
   const lock = cargoLockOf(join(e.work, "src"));
   // The marker lives in the target dir (the volume; its parent may be read-only) and only ever describes a dir that holds a start
-  // built with this image and Cargo.lock: it is written after a successful restore or on reuse, never before.
+  // built with this toolchain and Cargo.lock: it is written after a successful restore or on reuse, never before.
   const markFile = roots.target ? join(roots.target, WARM_BASE_MARK) : null;
-  const mark = JSON.stringify({ image: image ?? null, cargoLock: lock });
+  const toolchain = now.rustc && now.toolchain ? { rustc: now.rustc, toolchain: now.toolchain } : { image: now.image };
+  const mark = JSON.stringify({ ...toolchain, cargoLock: lock });
   const writeMark = () => {
     if (!markFile) return;
     try {
@@ -338,10 +344,11 @@ async function restorePhase(e: PodEnv, env: NodeJS.ProcessEnv): Promise<number> 
     }
     const r = await store.restore(key, roots, verifyKeys);
     if (!r) return cold(`warm restore: the store has no version of ${key}`);
-    if (image && r.manifest.header.image !== image) {
+    const refused = image ? toolchainRefusal({ image: r.manifest.header.image, rustc: r.manifest.header.rustc, toolchain: r.manifest.header.toolchain ?? null }, now) : null;
+    if (refused) {
       // Cargo would rebuild everything beside the old artifacts, and the next publish would carry both.
       for (const d of dirs) clearDir(d);
-      return cold(`warm restore: ${key}@${r.latest.commit.slice(0, 12)} was built with ${r.manifest.header.image ?? "an unrecorded image"}, not ${image}`);
+      return cold(`warm restore: ${key}@${r.latest.commit.slice(0, 12)} ${refused}`);
     }
     await dropLocks();
     writeMark();
@@ -373,17 +380,18 @@ async function warmPublishPhase(e: PodEnv, env: NodeJS.ProcessEnv): Promise<numb
   if (!roots.target || !roots.cargo) throw new Error("AUTOCRAFT_WARM_TARGET and AUTOCRAFT_WARM_CARGO_HOME are required");
   let task: PodTask | undefined;
   if (!w.v("REPO") || !w.v("COMMIT")) task = JSON.parse(readFileSync(join(e.work, "task.json"), "utf8")) as PodTask;
-  const rustcFile = w.v("RUSTC_FILE");
-  const rustc = rustcFile && existsSync(rustcFile) ? readFileSync(rustcFile, "utf8").trim().slice(0, 4096) : null;
+  const { rustc, toolchain } = readToolchain(w.v("TOOLCHAIN_DIR"));
   if (!rustc) e.log("warm publish: no rustc -vV output; the manifest records none");
+  if (!toolchain) e.log("warm publish: the toolchain image declares no toolchain key; only pods of the same image start from this version");
   // Before the walk, which reads every file and so moves the atimes the trim reads.
   const start = readBuildStart(w.v("STAMP_FILE"));
-  const trim = start?.atime ? trimTarget(roots.target, start) : null;
-  if (!trim) e.log(`warm publish: ${start ? "reads do not update atimes on the target's file system" : "no build start recorded"}; nothing trimmed, and consumers count every source as changed`);
+  const found = start?.atime ? trimTarget(roots.target, start) : null;
+  const trim = found && found.profiles > 0 ? found : null;
+  if (!trim) e.log(`warm publish: ${!start ? "no build start recorded" : !start.atime ? "reads do not update atimes on the target's file system" : "no profile dir (.fingerprint or build/<package>/<hash>/fingerprint) found in the target"}; nothing trimmed, and consumers count every source as changed`);
   else if (trim.unattributed) e.log(`warm publish: ${trim.unattributed} kept units were read at an unknown time; consumers count every source as changed`);
   const s = await w.store(true).publish({
     key: w.key(), repo: w.v("REPO") ?? task!.repo, commit: w.v("COMMIT") ?? task!.headSha,
-    image: w.v("IMAGE") ?? null, rustc, envHash: w.v("ENV_HASH") ?? null, checkout: w.v("CHECKOUT") ?? null, cargoLock: cargoLockOf(join(e.work, "src")), trimmed: !!trim && trim.unattributed === 0,
+    image: w.v("IMAGE") ?? null, rustc, toolchain, envHash: w.v("ENV_HASH") ?? null, checkout: w.v("CHECKOUT") ?? null, cargoLock: cargoLockOf(join(e.work, "src")), trimmed: !!trim && trim.unattributed === 0,
     source: { target: roots.target, cargoHome: roots.cargo }, exclude: w.exclude(), omit: new Set(trim?.paths.map((p) => `target/${p}`)), signKey: w.signKey(), log: e.log,
     recheck: [...new Set([...w.list("RECHECK"), ...badBlobsOf(w.v("BAD_BLOBS_FILE"))])].filter((x) => /^[0-9a-f]{64}$/.test(x)), minBlobAgeMs: w.count("GC_MIN_AGE_HOURS", 24) * 3600_000,
   });

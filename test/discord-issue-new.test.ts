@@ -61,9 +61,11 @@ let questionsReply: string | null = JSON.stringify({ ask: ["steps", "env", "bogu
 const ask = (async (_db: unknown, id: string, input: unknown) => { calls.push({ id, input }); return id === "discord.issue-questions" ? questionsReply : draftReply; }) as IssueAsk;
 const search = new Search({ db, embedder, index: new VectorIndex(embedder), log: () => {} });
 installSearchCommands(ix, { db, keys, search });
-const filed: { reporter: string; repo: string; title: string; body: string; kind: string }[] = [];
+const junkCalls: { title: string; body: string; kind?: string }[] = [];
+let junkResult: "junk" | "ok" | "unknown" = "ok";
+const filed: { reporter: string; repo: string; title: string; body: string; kind: string; junkChecked?: boolean }[] = [];
 let fileResult: FileResult = { status: "refused", reason: "x" };
-installIssueNew(ix, { db, keys, search, log: (l) => assert.fail(l), ask, filing: true, file: async (_d, req) => { filed.push(req); return fileResult; } });
+installIssueNew(ix, { db, keys, search, log: (l) => assert.fail(l), ask, filing: true, junk: async (_d, a) => { junkCalls.push(a); return junkResult; }, file: async (_d, req) => { filed.push(req); return fileResult; } });
 
 let n = 0;
 const send = async (type: number, user: string, data: unknown, channel = "c1") => {
@@ -123,6 +125,36 @@ describe("search and filing flow", () => {
     // Another person cannot press someone's button.
     await press("u3", rows(b).find((x) => x.label === NONE)!.custom_id!);
     assert.match(rest.callbacks[0]!.data!.content!, /expired/);
+  });
+
+  test("a junk first message is refused with the GitHub link before any question; a clean one is not checked again at submit", async () => {
+    calls.length = 0; junkCalls.length = 0; filed.length = 0;
+    junkResult = "junk";
+    await searchCmd("u20");
+    await submitForm("u20", "photocraft", "test post please ignore");
+    assert.equal(calls.length, 0);
+    assert.deepEqual(junkCalls.map((j) => j.body), ["test post please ignore"]);
+    assert.match(rest.edits[0]!.content!, /does not look like a bug report/);
+    assert.equal(new URL(rows(rest.edits[0]!)[0]!.url!).searchParams.get("body"), "test post please ignore");
+    assert.equal(rows(rest.edits[0]!).some((x) => x.label === NONE), false);
+    junkResult = "ok"; junkCalls.length = 0;
+    await searchCmd("u21");
+    await submitForm("u21", "photocraft", "webp export quality slider does nothing");
+    assert.deepEqual(calls.map((c) => c.id), ["discord.issue-questions"]);
+    const modal = await pressToQuestions("u21", rows(rest.edits[0]!).find((x) => x.label === NONE)!.custom_id!);
+    await submit("u21", modal.data!.custom_id!, {});
+    fileResult = { status: "refused", reason: "x" };
+    const draftRows = rows(rest.edits[0]!);
+    const editId = draftRows.find((x) => x.label === "Edit")!.custom_id!;
+    await press("u21", draftRows.find((x) => x.label === "File it")!.custom_id!);
+    assert.equal(junkCalls.length, 1, "only the first message was checked");
+    assert.equal(filed[0]!.junkChecked, true);
+    // An edited draft is checked again at submit.
+    await press("u21", editId);
+    await submit("u21", modalId(), { title: "Edited title", body: "Edited body" });
+    await press("u21", rows(rest.edits[0]!).find((x) => x.label === "File it")!.custom_id!);
+    assert.equal(filed.at(-1)!.junkChecked, false);
+    filed.length = 0;
   });
 
   test("the search is limited to the chosen app", async () => {

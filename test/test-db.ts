@@ -31,7 +31,7 @@ export interface TestDatabase {
    * Another handle on the same database, over its own connection (SQLite) or pool (Postgres). `app` opens it the way the
    * app does, with the app's schema and triggers brought up to date.
    */
-  open(opts?: { busyTimeoutMs?: number; app?: boolean; /** Postgres only. */ idleInTransactionMs?: number }): Promise<Db>;
+  open(opts?: { busyTimeoutMs?: number; app?: boolean; /** Postgres only. */ idleInTransactionMs?: number; /** Postgres only. */ rowWrites?: boolean }): Promise<Db>;
   /** Closes every handle opened here and drops the database. */
   close(): Promise<void>;
 }
@@ -66,7 +66,7 @@ export async function testDatabase(schema = "", dialect: Db["dialect"] = TEST_PG
   await server.script(`CREATE DATABASE ${name}`);
   const url = new URL(admin);
   url.pathname = `/${name}`;
-  const open = async ({ app, ...opts }: { busyTimeoutMs?: number; app?: boolean; idleInTransactionMs?: number } = {}) =>
+  const open = async ({ app, ...opts }: { busyTimeoutMs?: number; app?: boolean; idleInTransactionMs?: number; rowWrites?: boolean } = {}) =>
     track(await connectDb(url.toString(), { role: "dashboard", migrate: !!app, ...opts }));
   if (schema) await (await open()).script(schema);
   return {

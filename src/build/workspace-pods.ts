@@ -3,7 +3,8 @@
 // arrives over exec stdin; the helper `ws` (deploy/container/ws) is copied from the AutoCraft image by an init container.
 // The labels are not the build tasks': the build launcher's orphan sweep deletes every autocraft-build pod it does not own.
 import { mirrorParts, POD_UID, type KubeSettings } from "./pods.ts";
-import { warmCopyParts, warmNodeVolume, warmVerifyVolume, WARM_COPY_CONTAINER, type WarmUse } from "./warm-mount.ts";
+import { toolchainIdParts, warmCopyParts, warmNodeVolume, warmVerifyVolume, WARM_COPY_CONTAINER, type WarmUse } from "./warm-mount.ts";
+import { TOOLCHAIN_ID_CONTAINER } from "../warm/toolchain.ts";
 import { WS_IMAGE_PATH, WS_POD_PATH } from "./workspace.ts";
 import { ciStepEnv, LAYOUT_SH, workspaceEnvHash, type WorkspacePrepared } from "./workspace-layout.ts";
 
@@ -80,6 +81,10 @@ export function workspacePodSpec(c: WorkspacePodCtx) {
     volumeMounts: [{ name: "work", mountPath: "/work" }],
   }] : [];
   const copy = ci?.copy ? [{
+    name: TOOLCHAIN_ID_CONTAINER, image: c.toolchainImage, imagePullPolicy: "IfNotPresent",
+    ...toolchainIdParts([{ name: "tmp", mountPath: "/tmp" }]),
+    resources: helper.resources, securityContext: SECURITY,
+  }, {
     name: WARM_COPY_CONTAINER, image: c.appImage, imagePullPolicy: "IfNotPresent",
     ...warmCopyParts(ci.copy, {
       checkout: ci.checkout, image: c.toolchainImage, envHash: workspaceEnvHash(ci.prepared), targetVolume: target!, tmpVolume: "tmp",

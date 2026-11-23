@@ -19,6 +19,9 @@ export const ALIVE_STALE_MS = 3 * ALIVE_EVERY_MS;
 export async function stampAlive(db: Db, nowMs: number = Date.now()): Promise<void> {
   // Called inside a transaction: the next tick stamps.
   if (db.inTransaction()) return;
+  // The usual stamp is one statement on the row alone; a stale stamp takes the writer lock to move the leases with it.
+  const fresh = await db.run(db.k.updateTable("main.remote_liveness").set({ alive_at: nowMs }).where("id", "=", 1).where("alive_at", ">=", nowMs - ALIVE_STALE_MS));
+  if (fresh.changes === 1) return;
   await db.write(async () => {
     const r = await db.get(db.k.selectFrom("main.remote_liveness").select("alive_at").where("id", "=", 1));
     if (!r) await db.run(db.k.insertInto("main.remote_liveness").values({ id: 1, alive_at: nowMs, since: nowMs }));

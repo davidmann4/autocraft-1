@@ -27,6 +27,7 @@ import { maintainersSettle } from "../../settlers.ts";
 import * as discord from "./discord.ts";
 import * as agents from "./agents.ts";
 import * as build from "./build.ts";
+import * as workspaces from "./workspaces.ts";
 import * as dec from "./decisions.ts";
 import * as conv from "./conversations.ts";
 import * as mcp from "./mcp.ts";
@@ -608,6 +609,11 @@ export function apiRoutes(opts: ApiOptions = {}): Route[] {
     { method: "POST", pattern: "/api/envs", operator: true, handler: ok(build.postEnv) },
     { method: "PUT", pattern: "/api/envs/:id", operator: true, handler: ok(build.putEnv) },
     { method: "POST", pattern: "/api/envs/:id/rotate-key", operator: true, handler: ok(build.postRotate) },
+    get("/api/workspaces", workspaces.list),
+    get("/api/workspaces/:id", workspaces.detail),
+    get("/api/workspaces/:id/calls", workspaces.calls),
+    get("/api/workspaces/:id/calls/:call", workspaces.output),
+    { method: "GET", pattern: "/api/workspaces/:id/calls/:call/image", handler: workspaces.image },
     get("/api/tasks", build.tasks),
     get("/api/tasks/:id", build.task),
     { method: "POST", pattern: "/api/tasks/:id/cancel", handler: ok(build.cancel) },

@@ -1,20 +1,21 @@
-// The junk check before an issue is filed from Discord: is the drafted title and body a real report or request, or spam,
-// abuse, empty or a test? Pure; no Node imports (the Prompts page imports it).
+// The junk check on the first message of an issue flow in Discord: is the description a real bug report or feature request, or
+// spam, abuse, empty or a test? Pure; no Node imports (the Prompts page imports it).
 import { flagBand, type FlagBand } from "../classify/parse.ts";
 import { wholeReplyJson } from "../core/reply-json.ts";
 
-/** Jev's yes-probability from which a draft counts as junk; below JEV_FLAG_NO (0.3) it is real, and Haiku decides in between. */
+/** Jev's yes-probability from which a message counts as junk; below JEV_FLAG_NO (0.3) it is real, and Haiku decides in between. */
 export const JUNK_JEV_YES = 0.8;
 export const JUNK_TEXT_CHARS = 3000;
 export const JUNK_TITLE_CHARS = 200;
 
-export type JunkAsk = { title: string; body: string };
+/** `kind` is what the person said they are reporting (bug or feature); the title is the description's first line. */
+export type JunkAsk = { title: string; body: string; kind?: "bug" | "feature" };
 
-export const JUNK_QUESTION = "Is this drafted GitHub issue junk: spam, advertising, abuse, gibberish, empty, or a test post, rather than a real bug report or feature request about the software?";
+export const JUNK_QUESTION = "Is this message junk: spam, advertising, abuse, gibberish, empty, or a test post, rather than a description of a real bug or feature request about the software? The kind, when given, is what the person said they are reporting.";
 
 export const SAMPLE_JUNK: JunkAsk[] = [{ title: "Export to WebP ignores the quality setting", body: "Exporting with quality 40 gives the same file size as quality 100.\n\nSteps: open any photo, choose File > Export > WebP, set the quality slider to 40." }];
 
-const clean = (a: JunkAsk): JunkAsk => ({ title: a.title.slice(0, JUNK_TITLE_CHARS), body: a.body.slice(0, JUNK_TEXT_CHARS) });
+const clean = (a: JunkAsk): JunkAsk => ({ ...(a.kind && { kind: a.kind }), title: a.title.slice(0, JUNK_TITLE_CHARS), body: a.body.slice(0, JUNK_TEXT_CHARS) });
 
 /** The data of one call, as one JSON string: Jev's request state and the Haiku prompt's data block. */
 export const junkState = (a: JunkAsk): string => JSON.stringify(clean(a), null, 1).replace(/</g, "\\u003c");

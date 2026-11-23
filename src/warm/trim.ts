@@ -13,6 +13,10 @@
 // `build/<package>-<hash>` (a build script's binary, or its run's OUT_DIR), `examples/<name>-<hash>`. Only entries whose
 // hash belongs to a stale fingerprint dir are left out, so an artifact this trim cannot attribute is kept. Incremental
 // dirs are named by rustc's crate id, not cargo's hash, and are matched by crate name.
+//
+// Cargo's build-dir layout (1.100) keeps each unit in one dir, `<profile>/build/<package>/<hash>/{fingerprint,out,run,...}`.
+// The unit is used when its `fingerprint/` dir was read or written by this build, and an unused one is left out whole.
+// A profile dir is one with `.fingerprint` or with such unit dirs; a target with neither is not trimmed or called trimmed.
 import { closeSync, lstatSync, openSync, readdirSync, readFileSync, readSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -73,6 +77,24 @@ export function staleEntries(l: ProfileListing): { paths: string[]; units: numbe
   return { paths, units: stale.size };
 }
 
+/** `<package>/<hash>` unit dirs of a profile's `build/` in the one-dir-per-unit layout, with whether this build used them. */
+export type UnitDir = { pkg: string; hash: string; touched: boolean };
+
+/** The unit dirs of the one-dir-per-unit layout that this build did not use, as paths relative to the profile dir; a package dir left empty goes too. */
+export function staleUnitDirs(units: UnitDir[]): { paths: string[]; units: number } {
+  const byPkg = new Map<string, UnitDir[]>();
+  for (const u of units) byPkg.set(u.pkg, [...(byPkg.get(u.pkg) ?? []), u]);
+  const paths: string[] = [];
+  let n = 0;
+  for (const [pkg, list] of byPkg) {
+    const stale = list.filter((u) => !u.touched);
+    n += stale.length;
+    if (stale.length === list.length) paths.push(`build/${pkg}`);
+    else for (const u of stale) paths.push(`build/${pkg}/${u.hash}`);
+  }
+  return { paths, units: n };
+}
+
 /**
  * Probes the target's file system, then writes `file`: the start stamp (the probe's ctime, set after every restored
  * file's times) and whether a read updated the probe's atime. Run after the restore and before the build.
@@ -124,12 +146,14 @@ function bytesOf(p: string): number {
 }
 
 /**
- * The stale entries of every profile dir under `target` (a dir with a `.fingerprint` child, at depth 1 or 2), as paths
+ * The stale entries of every profile dir under `target` (a dir with a `.fingerprint` child or with `build/<package>/<hash>/fingerprint`
+ * unit dirs, at depth 1 or 2), as paths
  * relative to `target`, with the units and bytes they hold. `unattributed` counts the units kept only because a file of
  * theirs was read at some time not known to be this build (atime after mtime but before the start): such a unit may hold
- * dep-info of an older commit, so the publish is not `trimmed` (src/warm/manifest.ts) when there is one.
+ * dep-info of an older commit, so the publish is not `trimmed` (src/warm/manifest.ts) when there is one. `profiles` counts the
+ * profile dirs found; with none, nothing was trimmed and the publish is not `trimmed` either.
  */
-export function trimTarget(target: string, start: BuildStart): { paths: string[]; units: number; bytes: number; unattributed: number } {
+export function trimTarget(target: string, start: BuildStart): { paths: string[]; units: number; bytes: number; unattributed: number; profiles: number } {
   // 2: read or written by this build; 1: read at an unknown time; 0: not read since warm-restore set its times.
   const use = (st: { mtimeNs: bigint; atimeNs: bigint }) => (st.mtimeNs >= start.stampNs || st.atimeNs >= start.stampNs ? 2 : st.atimeNs > st.mtimeNs ? 1 : 0);
   let unattributed = 0;
@@ -144,15 +168,24 @@ export function trimTarget(target: string, start: BuildStart): { paths: string[]
     if (level === 1) unattributed++;
     return level > 0;
   };
+  const unitDirs = (p: string): { pkg: string; hash: string; dir: string }[] =>
+    names(join(p, "build")).flatMap((pkg) => names(join(p, "build", pkg)).filter((h) => /^[0-9a-f]{16}$/.test(h) && isDir(join(p, "build", pkg, h, "fingerprint"))).map((hash) => ({ pkg, hash, dir: join(p, "build", pkg, hash) })));
+  const isProfile = (p: string) => isDir(join(p, ".fingerprint")) || unitDirs(p).length > 0;
   const profiles: string[] = [];
   for (const a of names(target)) {
     const p = join(target, a);
-    if (isDir(join(p, ".fingerprint"))) profiles.push(a);
-    else for (const b of names(p)) if (isDir(join(p, b, ".fingerprint"))) profiles.push(`${a}/${b}`);
+    if (isProfile(p)) profiles.push(a);
+    else for (const b of names(p)) if (isProfile(join(p, b))) profiles.push(`${a}/${b}`);
   }
-  const out = { paths: [] as string[], units: 0, bytes: 0, unattributed: 0 };
+  const out = { paths: [] as string[], units: 0, bytes: 0, unattributed: 0, profiles: profiles.length };
   for (const rel of profiles) {
     const p = join(target, rel);
+    const per = staleUnitDirs(unitDirs(p).map((u) => ({ pkg: u.pkg, hash: u.hash, touched: dirTouched(join(u.dir, "fingerprint"), true) })));
+    out.units += per.units;
+    for (const x of per.paths) {
+      out.paths.push(`${rel}/${x}`);
+      out.bytes += bytesOf(join(p, x));
+    }
     const listing: ProfileListing = {
       fingerprint: names(join(p, ".fingerprint")).map((name) => ({ name, touched: dirTouched(join(p, ".fingerprint", name), true) })),
       deps: names(join(p, "deps")), build: names(join(p, "build")), examples: names(join(p, "examples")),

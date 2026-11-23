@@ -21,7 +21,8 @@ import { changeWarmRepos, setWarmMinInterval, warmCoverage, WARM_INTERVAL_KEY, w
 import { FETCH_SCRIPT } from "../worker/rust.ts";
 import { WorkspaceSession } from "./workspace-tools.ts";
 import { LAYOUT_CI, warmOf } from "./workspace-layout.ts";
-import { requestTrySession, TRY_DEADLINE_SEC, TRY_PROMPT_MAX_BYTES, TRY_STEP } from "./workspace-session.ts";
+import { listHelpers } from "../remote/helpers.ts";
+import { capReply, requestTrySession, TRY_DEADLINE_SEC, TRY_PROMPT_MAX_BYTES, TRY_STEP } from "./workspace-session.ts";
 import { CLI_QUEUE_BY, enqueue, JobError } from "../runner/jobs.ts";
 import { capJson, createWorkspace, describeHeader, endWorkspace, execWs, getWorkspace, LIVE_STATES, WORKSPACE_COLUMNS, type WorkspaceRow, type WsHeader } from "./workspaces.ts";
 
@@ -51,7 +52,7 @@ const USAGE = `usage: autocraft-server envs list
        autocraft-server workspace show <id>
        autocraft-server workspace run <id> -- <command...>     (in the runner container: needs pods/exec)
        autocraft-server workspace tool <id> <tool> '<json args>'  (a session tool call, as a session makes it; same container)
-       autocraft-server workspace try <repo> <sha> --item N --prompt TEXT [--workspace ID] [--env ID] [--keep] [--deadline-sec N]
+       autocraft-server workspace try <repo> <sha> --item N --prompt TEXT [--workspace ID] [--env ID] --for LOGIN [--keep] [--deadline-sec N]
          (queues a test session job; its log has the result)
        autocraft-server workspace end <id>`;
 
@@ -454,6 +455,9 @@ async function workspace(args: string[]): Promise<void> {
       console.log(`layout 2 (CI paths)  warm target ${warm?.target ?? "-"}  volume ${warm ? `${(warm.storageBytes / 1024 ** 3).toFixed(0)} GiB` : "-"}  ${warm?.note ? safe(warm.note) : warm?.use ? `copying ${warm.use.key}@${warm.use.commit.slice(0, 12)} on ${warm.use.node}` : warm?.why ? `cold: ${safe(warm.why)}` : w.prepared ? "" : "reading the CI gate"}`);
     }
     if (w.error) console.log(`error: ${safe(w.error)}`);
+    const reply = await db.get(db.k.selectFrom("workspace_sessions as s").innerJoin("remote_calls as c", "c.id", "s.remote_call_id").select(["s.id", "c.reply"])
+      .where("s.workspace_id", "=", w.id).where("s.kind", "=", "try").where("c.reply", "is not", null).orderBy("s.id", "desc").limit(1));
+    if (reply?.reply?.trim()) console.log(`reply of try session ${reply.id}:\n${safe(capReply(reply.reply.trim()))}`);
     const calls = await db.all(db.k.selectFrom("workspace_calls").select(["id", "n", "tool", "state", "created_at", "finished_at", "result"]).where("workspace_id", "=", w.id).orderBy("id", "desc").limit(10));
     for (const c of calls.reverse()) {
       let summary = "";
@@ -496,14 +500,16 @@ async function workspace(args: string[]): Promise<void> {
     const [repo, sha] = pos;
     const item = Number(opt.get("item"));
     const prompt = opt.get("prompt");
-    if (!repo || !sha || pos.length !== 2 || !prompt || !Number.isInteger(item)) die(USAGE);
+    const forLogin = opt.get("for");
+    if (!repo || !sha || pos.length !== 2 || !prompt || !forLogin || !Number.isInteger(item)) die(USAGE);
+    if ((await listHelpers(db, forLogin)).length === 0) die(`${forLogin} has no registered Task Runner`);
     const workspaceId = opt.has("workspace") ? idOf(opt.get("workspace")) : null;
     const deadlineSec = opt.has("deadline-sec") ? Number(opt.get("deadline-sec")) : undefined;
     if (deadlineSec !== undefined && !(Number.isInteger(deadlineSec) && deadlineSec >= TRY_DEADLINE_SEC.min && deadlineSec <= TRY_DEADLINE_SEC.max)) die(`--deadline-sec must be ${TRY_DEADLINE_SEC.min} to ${TRY_DEADLINE_SEC.max}`);
     if (Buffer.byteLength(prompt, "utf8") > TRY_PROMPT_MAX_BYTES) die(`--prompt is at most ${TRY_PROMPT_MAX_BYTES} bytes`);
     // A given workspace brings its own environment.
     const envId = workspaceId === null ? await envOf(opt) : opt.get("env") ?? "";
-    const session = await run(async () => await requestTrySession(db, { repo, baseSha: sha, item, prompt, envId, keep: opt.has("keep"), ...(deadlineSec !== undefined && { deadlineSec }), workspaceId, by: "cli" }));
+    const session = await run(async () => await requestTrySession(db, { repo, baseSha: sha, item, prompt, envId, keep: opt.has("keep"), ...(deadlineSec !== undefined && { deadlineSec }), workspaceId, forLogin, by: "cli" }));
     try {
       // Queued, not run here: the runner runs the job, so a runner restart resumes it.
       const job = await enqueue(db, TRY_STEP, { repo, session }, CLI_QUEUE_BY);
