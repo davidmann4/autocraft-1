@@ -1,10 +1,11 @@
-// Builds an operator or maintainer starts from their own agent (MCP tools start_build, build_status, cancel_build, build_base): their
-// command lines run as a build task on the registered build environments, the same queue the pipeline's builds use.
-// The source is a default-branch commit AutoCraft has seen (so the CI gate it reads is upstream's) plus an optional patch
-// that turns it into the caller's working tree. The task counts as untrusted code: no confidential environment and no
-// warm-snapshot signer takes it, and it only reads the repo's warm build cache.
+// Builds an operator or maintainer starts from their own agent (MCP tools build_base, start_build, list_builds, build_status,
+// cancel_build): their command lines run as a build task on the registered build environments, the same queue the
+// pipeline's builds use. The source is a default-branch commit AutoCraft has seen (so the CI gate it reads is upstream's)
+// plus an optional patch that turns it into the caller's working tree. The task counts as untrusted code: no confidential
+// environment and no warm-snapshot signer takes it, and it only reads the repo's warm build cache.
 import type { BuildTask, TaskResult, TaskStep } from "../../web/src/api/types.ts";
 import { artifactText } from "../prepush/index.ts";
+import { patchProblem } from "../worker/patch.ts";
 import { FETCH_SCRIPT } from "../worker/rust.ts";
 import { BuildError } from "./envs.ts";
 import { mainCiRepos } from "../mainci/index.ts";
@@ -20,14 +21,17 @@ export const MAX_OPEN = 8;
 export const DEFAULT_STEP_MIN = 60;
 const MAX_STEP_MIN = 120;
 const LOG_LINES = { default: 120, max: 400 };
+export const MAX_LOG_LINES = LOG_LINES.max;
+export const MAX_LIST = 50;
 const SHA_RE = /^[0-9a-f]{40}$/;
-const OPEN_STATES = ["queued", "claimed", "running"];
+const OPEN_STATES = ["queued", "claimed", "running"] as const;
+const FETCH = "fetch deps";
 
 export type StartInput = { repo: string; base: string; patch?: string; steps: string[]; stepMinutes: number };
 
 /** The tool's arguments, or a BuildError(400) that says what is wrong. `repo` is already checked by the caller. */
 export function parseStart(repo: string, raw: Record<string, unknown>): StartInput {
-  for (const k of Object.keys(raw)) if (!["repo", "base", "patch", "steps", "step_minutes"].includes(k)) throw new BuildError(400, `unknown argument "${k}"`);
+  for (const k of Object.keys(raw)) if (!["repo", "base", "patch", "steps", "step_minutes", "format"].includes(k)) throw new BuildError(400, `unknown argument "${k}"`);
   if (typeof raw.base !== "string" || !SHA_RE.test(raw.base)) throw new BuildError(400, "base must be a full lowercase commit id (build_base gives the current one)");
   const steps = raw.steps;
   if (!Array.isArray(steps) || steps.length < 1 || steps.length > MAX_LINES) throw new BuildError(400, `steps must list 1 to ${MAX_LINES} command lines`);
@@ -38,6 +42,9 @@ export function parseStart(repo: string, raw: Record<string, unknown>): StartInp
   if (raw.patch !== undefined && raw.patch !== null && raw.patch !== "") {
     if (typeof raw.patch !== "string" || raw.patch.includes("\0")) throw new BuildError(400, "patch must be the text of a unified diff");
     if (Buffer.byteLength(raw.patch) > MAX_PATCH_BYTES) throw new BuildError(400, "patch is larger than 1 MiB; build a pushed default-branch commit closer to your tree");
+    // The worker refuses these when it applies the patch; refusing them here saves a trip through the queue.
+    const problem = patchProblem(raw.patch);
+    if (problem) throw new BuildError(400, `${problem} (binary files, symlinks and paths outside the tree cannot be sent)`);
     patch = raw.patch.endsWith("\n") ? raw.patch : `${raw.patch}\n`;
   }
   let stepMinutes = DEFAULT_STEP_MIN;
@@ -57,7 +64,7 @@ const exitName = (i: number): string => `step-${i + 1}.exit`;
  */
 export function buildPlan(steps: string[], stepMinutes: number): TaskStep[] {
   return [
-    { name: "fetch deps", cmd: ["sh", "-c", FETCH_SCRIPT], network: "fetch", timeoutSec: 900 },
+    { name: FETCH, cmd: ["sh", "-c", FETCH_SCRIPT], network: "fetch", timeoutSec: 900 },
     ...steps.map((line, i): TaskStep => ({
       name: `step ${i + 1}`,
       cmd: ["sh", "-c", `CARGO_NET_OFFLINE=true sh -c "$1"; echo $? > /out/${exitName(i)}; true`, `step-${i + 1}`, line],
@@ -79,16 +86,20 @@ async function knownBase(db: Db, repo: string, sha: string): Promise<boolean> {
   return !!await db.prepare("SELECT 1 FROM main_ci WHERE repo = ? AND head_sha = ? LIMIT 1").get(repo, sha);
 }
 
-/** Queues the build; returns its task id. */
-export async function startBuild(db: Db, i: StartInput): Promise<number> {
+/** Queues the build for `by`; returns its task id. The open-build count and the insert are one write, so the cap holds under parallel calls. */
+export async function startBuild(db: Db, i: StartInput, by: string): Promise<number> {
   const head = await currentBase(db, i.repo);
   if (!head) throw new BuildError(409, `AutoCraft has recorded no default-branch commit of ${i.repo} yet`);
   if (i.base !== head.sha && !await knownBase(db, i.repo, i.base)) throw new BuildError(400, `base must be a default-branch commit AutoCraft has seen; the current one is ${head.sha} (${head.branch}). Make the patch against it.`);
-  const open = (await db.prepare(`SELECT COUNT(*) AS n FROM build_tasks WHERE step = ? AND state IN (${OPEN_STATES.map(() => "?").join(", ")})`).get(MCP_BUILD_STEP, ...OPEN_STATES) as { n: number }).n;
-  if (open >= MAX_OPEN) throw new BuildError(429, `${MAX_OPEN} builds from agents are already queued or running; wait for one to end`);
-  return await createTask(db, {
-    step: MCP_BUILD_STEP, repo: i.repo, headSha: i.base, baseSha: i.base, requires: { os: "linux", toolchains: ["rust-stable"] },
-    plan: buildPlan(i.steps, i.stepMinutes), ...(i.patch !== undefined && { patch: i.patch }), warm: { key: warmKeyOf(i.repo), role: "use" },
+  return await db.write(async () => {
+    const open = (await db.prepare(`SELECT COUNT(*) AS n FROM build_tasks WHERE step = ? AND state IN (${OPEN_STATES.map(() => "?").join(", ")})`).get(MCP_BUILD_STEP, ...OPEN_STATES) as { n: number }).n;
+    if (open >= MAX_OPEN) throw new BuildError(429, `${MAX_OPEN} builds from agents are already queued or running; wait for one to end`);
+    const id = await createTask(db, {
+      step: MCP_BUILD_STEP, repo: i.repo, headSha: i.base, baseSha: i.base, requires: { os: "linux", toolchains: ["rust-stable"] },
+      plan: buildPlan(i.steps, i.stepMinutes), ...(i.patch !== undefined && { patch: i.patch }), warm: { key: warmKeyOf(i.repo), role: "use" },
+    });
+    await db.prepare("UPDATE build_tasks SET started_by = ? WHERE id = ?").run(by, id);
+    return id;
   });
 }
 
@@ -100,32 +111,115 @@ export async function ownBuild(db: Db, id: unknown): Promise<BuildTask> {
   return t;
 }
 
-export type LineResult = { line: number; command: string; exitCode: number | null; seconds: number | null; state: "ok" | "failed" | "timed out" | "running" | "not run" };
-export type BuildStatus = { task: BuildTask; done: boolean; ok: boolean | null; lines: LineResult[]; log: string; logTruncated: boolean };
+/** `ended`: the line ran, and its exit code comes with the task's end (a build pod reports exit codes then). */
+export type LineState = "ok" | "failed" | "timed out" | "running" | "ended" | "waiting" | "not run";
+export type LineResult = { line: number; command: string; state: LineState; exitCode: number | null; seconds: number | null };
+/** What a build is doing and did, as the tools return it (also as JSON). */
+export type BuildView = {
+  id: number; repo: string; base: string; patchBytes: number | null; startedBy: string | null;
+  state: BuildTask["state"]; environment: string | null;
+  /** While open: "queued", "source" (fetching and patching), "fetch deps", "line N" or "finishing"; the end state once over. */
+  phase: string;
+  /** 1 = the next queued task any environment takes; only while queued. */
+  queuePosition: number | null;
+  /** null while open; true when the fetch and every line passed. */
+  ok: boolean | null;
+  queuedAt: string; startedAt: string | null; endedAt: string | null;
+  /** Seconds since it started (to its end once over); null before it starts. */
+  elapsedSec: number | null;
+  linesDone: number; lines: LineResult[];
+  summary: string | null;
+};
 
-/** What the build did: each line's exit code (from its artifact), time and state, and the end of the log. */
-export async function buildStatus(db: Db, t: BuildTask, logLines: number = LOG_LINES.default): Promise<BuildStatus> {
-  const done = TERMINAL.includes(t.state);
-  const results = new Map<string, TaskResult>(t.results.map((r) => [r.step, r]));
-  const fetch = results.get("fetch deps");
-  const lines: LineResult[] = [];
-  for (const [i, step] of t.plan.slice(1).entries()) {
-    const r = results.get(step.name);
-    const command = step.cmd[4] ?? "";
-    const exitText = r ? (await artifactText(db, t.id, exitName(i)))?.trim() : undefined;
-    const exitCode = exitText !== undefined && /^\d{1,3}$/.test(exitText) ? Number(exitText) : null;
-    const seconds = r ? Math.round(r.durationMs / 1000) : null;
-    const state: LineResult["state"] = r?.timedOut ? "timed out" : r ? (exitCode === 0 ? "ok" : "failed") : !done ? "running" : "not run";
-    lines.push({ line: i + 1, command, exitCode, seconds, state });
-  }
-  const ok = !done ? null : t.state === "done" && !!fetch && fetch.exitCode === 0 && lines.every((l) => l.state === "ok");
-  const tail = await logTail(db, t.id);
-  const n = Math.min(Math.max(1, Math.trunc(logLines) || LOG_LINES.default), LOG_LINES.max);
-  const all = tail.text.replace(/\s+$/, "").split("\n");
-  return { task: t, done, ok, lines, log: all.slice(-n).join("\n"), logTruncated: tail.truncated || all.length > n };
+const exitOf = async (db: Db, id: number, i: number): Promise<number | null> => {
+  const text = (await artifactText(db, id, exitName(i)))?.trim();
+  return text !== undefined && /^\d{1,3}$/.test(text) ? Number(text) : null;
+};
+
+/** The plan step the task's newest log chunk belongs to (the step running now), or null. */
+async function loggingStep(db: Db, id: number): Promise<string | null> {
+  const r = await db.prepare("SELECT step FROM build_task_logs WHERE task_id = ? ORDER BY seq DESC LIMIT 1").get(id) as { step: string } | undefined;
+  return r?.step ?? null;
 }
 
-export const MAX_LOG_LINES = LOG_LINES.max;
+/**
+ * Each line's state. Results come with the task's end; a line's exit code comes earlier, as its artifact, from a worker
+ * that uploads artifacts after each step (a build pod uploads them at the end). Until then the line the newest log
+ * output belongs to is running, the lines before it ended and the lines after it wait.
+ */
+async function linesOf(db: Db, t: BuildTask, done: boolean, current: string | null): Promise<LineResult[]> {
+  const results = new Map<string, TaskResult>(t.results.map((r) => [r.step, r]));
+  const steps = t.plan.slice(1);
+  const at = steps.findIndex((s) => s.name === current);
+  const out: LineResult[] = [];
+  for (const [i, step] of steps.entries()) {
+    const r = results.get(step.name);
+    const exitCode = await exitOf(db, t.id, i);
+    const seconds = r ? Math.round(r.durationMs / 1000) : null;
+    let state: LineState;
+    if (r?.timedOut) state = "timed out";
+    else if (r || exitCode !== null) state = exitCode === 0 ? "ok" : "failed";
+    else if (done) state = "not run";
+    else state = at < 0 || i > at ? "waiting" : i === at ? "running" : "ended";
+    out.push({ line: i + 1, command: step.cmd[4] ?? "", state, exitCode, seconds });
+  }
+  return out;
+}
+
+async function queuePosition(db: Db, t: BuildTask): Promise<number | null> {
+  if (t.state !== "queued") return null;
+  const r = await db.prepare("SELECT COUNT(*) AS n FROM build_tasks WHERE state = 'queued' AND (priority > ? OR (priority = ? AND id < ?))").get(t.priority, t.priority, t.id) as { n: number };
+  return r.n + 1;
+}
+
+/** The view of one build. */
+export async function viewOf(db: Db, t: BuildTask, nowMs: number = Date.now()): Promise<BuildView> {
+  const done = TERMINAL.includes(t.state);
+  const current = done ? null : await loggingStep(db, t.id);
+  const lines = await linesOf(db, t, done, current);
+  const fetch = t.results.find((r) => r.step === FETCH);
+  const running = lines.find((l) => l.state === "running");
+  const phase = done ? t.state : t.state === "queued" ? "queued" : t.state === "claimed" ? "starting"
+    : running ? `line ${running.line}` : current === FETCH ? FETCH : lines.some((l) => l.state !== "waiting") ? "finishing" : "source";
+  const started = t.startedAt ?? t.claimedAt;
+  const end = t.endedAt ? Date.parse(t.endedAt) : nowMs;
+  const row = await db.prepare("SELECT started_by FROM build_tasks WHERE id = ?").get(t.id) as { started_by: string | null } | undefined;
+  return {
+    id: t.id, repo: t.repo, base: t.headSha, patchBytes: t.patchBytes, startedBy: row?.started_by ?? null,
+    state: t.state, environment: t.envLabel ?? t.envId, phase, queuePosition: await queuePosition(db, t),
+    ok: !done ? null : t.state === "done" && !!fetch && fetch.exitCode === 0 && lines.every((l) => l.state === "ok"),
+    queuedAt: t.queuedAt, startedAt: started, endedAt: t.endedAt,
+    elapsedSec: started ? Math.max(0, Math.round((end - Date.parse(started)) / 1000)) : null,
+    linesDone: lines.filter((l) => l.state !== "running" && l.state !== "waiting" && l.state !== "not run").length, lines,
+    summary: t.summary,
+  };
+}
+
+/** The end of a build's log, at most `n` lines. */
+export async function logEnd(db: Db, id: number, n: number = LOG_LINES.default): Promise<{ text: string; truncated: boolean }> {
+  const tail = await logTail(db, id);
+  const keep = Math.min(Math.max(1, Math.trunc(n) || LOG_LINES.default), LOG_LINES.max);
+  const all = tail.text.replace(/\s+$/, "").split("\n");
+  return { text: tail.text.trim() ? all.slice(-keep).join("\n") : "", truncated: tail.truncated || all.length > keep };
+}
+
+export type ListFilter = { repos: string[]; open: boolean; startedBy?: string; limit: number };
+
+/** Builds from these tools in `repos`, newest first: the open ones, or all. */
+export async function listBuilds(db: Db, f: ListFilter): Promise<BuildView[]> {
+  if (!f.repos.length) return [];
+  const where = [`step = ?`, `repo IN (${f.repos.map(() => "?").join(", ")})`];
+  const params: (string | number)[] = [MCP_BUILD_STEP, ...f.repos];
+  if (f.open) { where.push(`state IN (${OPEN_STATES.map(() => "?").join(", ")})`); params.push(...OPEN_STATES); }
+  if (f.startedBy) { where.push("started_by = ?"); params.push(f.startedBy); }
+  const ids = await db.prepare(`SELECT id FROM build_tasks WHERE ${where.join(" AND ")} ORDER BY id DESC LIMIT ?`).all(...params, Math.min(Math.max(1, f.limit), MAX_LIST)) as { id: number }[];
+  const out: BuildView[] = [];
+  for (const { id } of ids) {
+    const t = await getTask(db, id);
+    if (t) out.push(await viewOf(db, t));
+  }
+  return out;
+}
 
 /** Cancels an open build from these tools. */
 export async function cancelBuild(db: Db, t: BuildTask, by: string): Promise<BuildTask> {

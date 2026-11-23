@@ -267,6 +267,7 @@ export interface BuildTasks {
   sandbox_env: string | null;
   warm_image: string | null;
   warm_version: string | null;
+  started_by: string | null;
 }
 
 export interface ChangeSeq {
@@ -2676,7 +2677,7 @@ export const COLUMNS = {
   build_pod_runs: ["task_id", "env_id", "key_hash", "pvc", "stage", "pod", "pod_created_at", "prepared", "results", "failed", "ran", "logged", "create_tries", "failing_since", "retry_at", "started_at", "node", "reserved_cpu_m", "reserved_mem_bytes", "disruptions", "replaces", "log_positions"],
   build_sizes: ["repo", "memory_request_bytes", "memory_limit_bytes", "updated_at", "reason", "warm_target", "memory_source"],
   build_task_logs: ["task_id", "seq", "step", "chunk"],
-  build_tasks: ["id", "job_id", "step", "repo", "number", "head_sha", "base_sha", "requires", "priority", "plan", "state", "env_id", "attempts", "queued_at", "claimed_at", "started_at", "ended_at", "heartbeat_at", "cancel_requested_at", "results", "summary", "log_bytes", "artifact_bytes", "patch", "warm_key", "warm_role", "sandbox_env", "warm_image", "warm_version"],
+  build_tasks: ["id", "job_id", "step", "repo", "number", "head_sha", "base_sha", "requires", "priority", "plan", "state", "env_id", "attempts", "queued_at", "claimed_at", "started_at", "ended_at", "heartbeat_at", "cancel_requested_at", "results", "summary", "log_bytes", "artifact_bytes", "patch", "warm_key", "warm_role", "sandbox_env", "warm_image", "warm_version", "started_by"],
   change_seq: ["topic", "seq", "at"],
   ci_fixes: ["repo", "number", "head", "to_head", "kind", "state", "reason", "files", "attempt", "task_id", "runs", "created_at", "session", "patch", "lint_task", "lint_round", "lint_state"],
   ci_run_approvals: ["repo", "number", "head_oid", "cross_repo", "runs", "approved", "reread", "failed", "checked_at", "approved_at"],

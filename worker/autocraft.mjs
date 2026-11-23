@@ -4853,8 +4853,9 @@ export const CLI_COMMANDS = [
   { path: ["calls", "mine"], tool: "my_work", usage: "", summary: "today's calls on your machine, and your Task Runners", why: () => "needs one of your Task Runners reporting in, while the server is in the user-local inference mode" },
   { path: ["settings"], tool: "my_settings", usage: "", summary: "your reserve, repos, calls at once and interactive slots", why: () => "only maintainers and operators have settings" },
   { path: ["settings", "set"], tool: "set_my_settings", usage: "[--reserve <5h> <weekly>] [--max-calls N | --no-max-calls] [--repos <a,b>|all] [--interactive-slots N]", summary: "change them, as the Connect page does", why: () => "only maintainers and operators have settings" },
+  { path: ["build"], tool: "list_builds", usage: "[--repo R] [--all] [--mine] [--limit N]", summary: "queued and running builds (--all adds ended ones)", why: () => "only operators, and maintainers with write access to the repo, start builds" },
   { path: ["build", "base"], tool: "build_base", args: ["repo"], usage: "<repo>", summary: "the default-branch commit a build starts from", why: () => "only operators, and maintainers with write access to the repo, start builds" },
-  { path: ["build", "status"], tool: "build_status", args: ["id"], usage: "<id> [--log-lines N]", summary: "a build's state, each line's exit code and the end of its log", why: () => "only operators, and maintainers with write access to the repo, start builds" },
+  { path: ["build", "status"], tool: "build_status", args: ["id"], usage: "<id> [--log-lines N]", summary: "a build's phase, each line's state and exit code, and the end of its log", why: () => "only operators, and maintainers with write access to the repo, start builds" },
   { path: ["build", "cancel"], tool: "cancel_build", args: ["id"], usage: "<id>", summary: "stop a queued or running build", why: () => "only operators, and maintainers with write access to the repo, start builds" },
   { path: ["repos"], tool: "list_repos", usage: "", summary: "tracked repositories with their open decisions and fix-ups" },
   { path: ["fixups"], tool: "list_fixups", usage: "[--repo R] [--limit N]", summary: "PRs whose review fixes the pipeline could not apply" },
@@ -5117,6 +5118,7 @@ async function cmdServer(group, argv) {
   if (!sub && argv[0] !== undefined && !argv[0].startsWith("-") && CLI_COMMANDS.some((c) => c.path[0] === group && c.path.length > 1)) {
     throw new UsageError(`no command ${group} ${argv[0]}: \`autocraft ${group} --help\` lists them`);
   }
+  if (!cmd) throw new UsageError(`autocraft ${group} needs a command: \`autocraft ${group} --help\` lists them`);
   const { client } = await agentSession();
   const tools = await client.tools();
   const tool = tools.find((t) => t.name === cmd.tool);

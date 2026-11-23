@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { afterEach, test } from "node:test";
 import { storeArtifact, tempPath } from "../src/build/artifacts.ts";
 import { createEnv, hello } from "../src/build/envs.ts";
-import { claim, createTask, finishTask, getTask, startTask } from "../src/build/tasks.ts";
+import { appendLog, claim, createTask, finishTask, getTask, startTask } from "../src/build/tasks.ts";
 import { handleMcp, type McpEnv } from "../src/dash/mcp/index.ts";
 import { RateLimiter } from "../src/dash/server/util.ts";
 import type { Role } from "../src/dash/types.ts";
@@ -92,26 +92,68 @@ test("no confidential or warm-signing environment takes a build; a plain one doe
   assert.deepEqual((await claim(w.db, "plain", 2)).tasks.map((t) => t.id), [buildId(r.text)]);
 });
 
-test("the status reports a failed line from its own exit code, though the task's steps all succeeded", async () => {
+const exitArtifact = async (w: World, id: number, line: number, code: number): Promise<void> => {
+  const tmp = tempPath(id);
+  writeFileSync(tmp, `${code}\n`);
+  await storeArtifact(w.db, id, `step-${line}.exit`, tmp);
+};
+const json = async (env: McpEnv, name: string, args: Record<string, unknown>): Promise<any> => {
+  const r = await call(env, name, { ...args, format: "json" });
+  assert.equal(r.isError, false, r.text);
+  return JSON.parse(r.text);
+};
+
+test("a running build shows the line its log is on, finished lines' exit codes and the lines still waiting; at the end a failed line fails the build though every task step succeeded", async () => {
   const w = await fresh();
   const op = envOf(w, "operator");
   await createEnv(w.db, { id: "plain", label: "plain", kind: "local-sandbox", slots: 2 }, OPERATOR);
   await hello(w.db, "plain", { version: "1", capabilities: CAPS, slots: 2 });
-  const id = buildId((await call(op, "start_build", { repo: "app", base: MAIN, steps: ["cargo test -p a", "cargo clippy"] })).text);
+  const id = (await json(op, "start_build", { repo: "app", base: MAIN, steps: ["cargo test -p a", "cargo clippy", "cargo doc"] })).id;
+  assert.equal((await json(op, "build_status", { id })).queuePosition, 1);
   await claim(w.db, "plain", 2);
   await startTask(w.db, "plain", id);
-  assert.match((await call(op, "build_status", { id })).text, /still running/);
-  for (const [name, code] of [["step-1.exit", "0\n"], ["step-2.exit", "101\n"]] as const) {
-    const tmp = tempPath(id);
-    writeFileSync(tmp, code);
-    await storeArtifact(w.db, id, name, tmp);
-  }
+  await exitArtifact(w, id, 1, 0);
+  await appendLog(w.db, "plain", id, "step 2", "Checking a v0.1.0\n");
+  const live = await json(op, "build_status", { id });
+  assert.equal(live.ok, null);
+  assert.equal(live.phase, "line 2");
+  assert.deepEqual(live.lines.map((l: { state: string }) => l.state), ["ok", "running", "waiting"]);
+  assert.match(live.log, /Checking a/);
+  await exitArtifact(w, id, 2, 101);
+  await exitArtifact(w, id, 3, 0);
   const ok = { exitCode: 0, durationMs: 1000, timedOut: false };
-  await finishTask(w.db, "plain", id, { results: [{ step: "fetch deps", ...ok }, { step: "step 1", ...ok }, { step: "step 2", ...ok }], summary: "" });
-  const s = await call(op, "build_status", { id });
-  assert.match(s.text, /did not pass/);
-  assert.match(s.text, /1\. ok \(exit 0\)/);
-  assert.match(s.text, /2\. failed \(exit 101\)/);
+  await finishTask(w.db, "plain", id, { results: ["fetch deps", "step 1", "step 2", "step 3"].map((step) => ({ step, ...ok })), summary: "" });
+  const end = await json(op, "build_status", { id });
+  assert.equal(end.ok, false);
+  assert.deepEqual(end.lines.map((l: { exitCode: number }) => l.exitCode), [0, 101, 0]);
+  assert.match((await call(op, "build_status", { id })).text, /did not pass/);
+});
+
+test("list_builds shows open builds by default, ended ones with all, one user's with mine, and only repos the user may build", async () => {
+  const w = await fresh();
+  const op = envOf(w, "operator"), maint = envOf(w, "maintainer");
+  const a = (await json(op, "start_build", { repo: "app", base: MAIN, steps: ["cargo test"] })).id;
+  const b = (await json(maint, "start_build", { repo: "app", base: MAIN, steps: ["cargo test"] })).id;
+  await call(op, "cancel_build", { id: a });
+  const ids = async (env: McpEnv, args: Record<string, unknown> = {}) => (await json(env, "list_builds", args)).builds.map((x: { id: number }) => x.id);
+  assert.deepEqual(await ids(op), [b]);
+  assert.deepEqual(await ids(op, { all: true }), [b, a]);
+  assert.deepEqual(await ids(op, { all: true, mine: true }), [a]);
+  assert.equal((await json(op, "list_builds", {})).builds[0].startedBy, "someone");
+  assert.deepEqual(await ids(envOf(w, "maintainer", false)), []);
+});
+
+test("start_build refuses a patch the worker would refuse, and the open-build cap holds for calls made at once", async () => {
+  const w = await fresh();
+  const op = envOf(w, "operator");
+  const binary = "diff --git a/x.png b/x.png\nnew file mode 100644\nGIT binary patch\nliteral 1\n";
+  const r = await call(op, "start_build", { repo: "app", base: MAIN, patch: binary, steps: ["cargo test"] });
+  assert.equal(r.isError, true);
+  assert.match(r.text, /binary/);
+  const all = await Promise.all(Array.from({ length: 12 }, () => call(op, "start_build", { repo: "app", base: MAIN, steps: ["cargo test"] })));
+  const queued = all.filter((x) => !x.isError).length;
+  assert.ok(queued > 0 && queued <= 8, `${queued} queued`);
+  assert.equal((await w.db.prepare("SELECT COUNT(*) AS n FROM build_tasks").get() as { n: number }).n, queued);
 });
 
 test("the build tools reach no other build task", async () => {

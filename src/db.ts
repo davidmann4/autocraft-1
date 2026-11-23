@@ -322,6 +322,8 @@ export const ADDED_COLUMNS: [table: string, column: string, type: string][] = [
   ["build_sizes", "warm_target", "TEXT NOT NULL DEFAULT 'auto'"],
   // Whether a repository's memory row is an operator's size, an OOM floor, or unused (src/build/sizing.ts).
   ["build_sizes", "memory_source", "TEXT NOT NULL DEFAULT 'operator'"],
+  // Who started a build through the MCP build tools (src/build/mcp-builds.ts); null for the pipeline's own tasks.
+  ["build_tasks", "started_by", "TEXT"],
 ];
 
 // Indexes on added columns: they can only be created once the column exists.
