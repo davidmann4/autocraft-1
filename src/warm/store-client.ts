@@ -193,6 +193,8 @@ export type StoreConfig = {
 export type PublishInput = {
   key: string; repo: string; commit: string;
   image: string | null; rustc: string | null; envHash: string | null; checkout: string | null;
+  /** The toolchain image's toolchain key (src/warm/toolchain.ts). */
+  toolchain?: string | null;
   /** sha256 of the built checkout's Cargo.lock: consumers that need the same lock compare it. */
   cargoLock?: string | null;
   /** The target holds only units the build at `commit` read (ManifestHeader.trimmed). */
@@ -284,7 +286,7 @@ export class WarmStore {
   async publish(p: PublishInput): Promise<PublishStats> {
     const dav = this.rw();
     const entries = await walkTree(p.source, { exclude: p.exclude, omit: p.omit, concurrency: this.concurrency, log: p.log });
-    const header = makeHeader({ key: checkKey(p.key), repo: p.repo, commit: p.commit, stored: p.stored ?? Date.now(), image: p.image, rustc: p.rustc, envHash: p.envHash, checkout: p.checkout, cargoLock: p.cargoLock ?? null, trimmed: p.trimmed === true, targetDir: p.source.target, cargoHome: p.source.cargoHome }, entries);
+    const header = makeHeader({ key: checkKey(p.key), repo: p.repo, commit: p.commit, stored: p.stored ?? Date.now(), image: p.image, rustc: p.rustc, toolchain: p.toolchain ?? null, envHash: p.envHash, checkout: p.checkout, cargoLock: p.cargoLock ?? null, trimmed: p.trimmed === true, targetDir: p.source.target, cargoHome: p.source.cargoHome }, entries);
     const manifest = encodeManifest({ header, entries });
     const firstPath = new Map<string, string>();
     const abs = (path: string) => (path.startsWith("target/") ? `${p.source.target}/${path.slice(7)}` : `${p.source.cargoHome}/${path.slice(6)}`);

@@ -4,7 +4,7 @@ import { ConfigError, loadConfig } from "./server/config.ts";
 import { startServer } from "./server/index.ts";
 import { connectDb } from "../db/open.ts";
 
-/** How long a helper route waits for SQLite's write lock before it answers 503. */
+/** How long a helper route waits for the write lock (or, for a lone write on Postgres, a row lock) before it answers 503. */
 const REMOTE_BUSY_MS = 2_000;
 
 async function serve(): Promise<void> {
@@ -19,8 +19,9 @@ async function serve(): Promise<void> {
   const db = await connectDb(config.dbTarget, { role: "dashboard" });
   await scopeToTracked(db);
   await sweepRunningCards(db);
-  // The helper routes' own connection: they wait at most REMOTE_BUSY_MS for a write lock and then answer 503.
-  const remoteDb = await connectDb(config.dbTarget, { busyTimeoutMs: REMOTE_BUSY_MS, role: "dashboard-remote" });
+  // The helper routes' own connection: they wait at most REMOTE_BUSY_MS for a write lock and then answer 503. Their lone
+  // writes (heartbeats, status, the liveness stamp, token use) are row-local and take no writer lock.
+  const remoteDb = await connectDb(config.dbTarget, { busyTimeoutMs: REMOTE_BUSY_MS, role: "dashboard-remote", rowWrites: true });
   const { url, close } = await startServer({ config, db, remoteDb });
   console.log(`dashboard listening on ${url}${config.devAuth ? " (development sign-in)" : ""}`);
   const stop = () => void close().then(async () => {

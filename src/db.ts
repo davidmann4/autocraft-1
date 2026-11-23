@@ -326,6 +326,8 @@ export const ADDED_COLUMNS: [table: string, column: string, type: string][] = [
   ["build_tasks", "started_by", "TEXT"],
   // Who queued a workspace call through the MCP Connector's workspace tools (src/build/agent-workspaces.ts); the runner's agent server runs only these.
   ["workspace_calls", "agent_login", "TEXT"],
+  // The login whose own Task Runners run a try session's model call (src/build/workspace-session.ts).
+  ["workspace_sessions", "for_login", "TEXT COLLATE NOCASE"],
 ];
 
 // Indexes on added columns: they can only be created once the column exists.

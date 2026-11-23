@@ -243,7 +243,7 @@ function repoAllows(plans: PlanSet, repo: string, want: Want): boolean {
 }
 
 /** Topics whose changes call for a plan: content the stages read. Job logs, usage, agent runs, sandbox environments and tasks, audit entries the item-trace bookkeeping and the limits topic (its tables are already read through the jobs topic) do not. */
-export const INPUT_TOPICS = TOPICS.filter((t) => !["jobs", "usage", "agents", "envs", "tasks", "access", "github", "plans", "trace", "flow", "limits", "claims", "conversation-includes", "decision-choices", "held-followups", "decision-snooze", "security", "discord", "discord-links", "downloads", "build-features", "pr-builds", "nightly", "remote-helpers", "remote-queue", "rank-inputs"].includes(t));
+export const INPUT_TOPICS = TOPICS.filter((t) => !["jobs", "usage", "agents", "envs", "tasks", "workspaces", "access", "github", "plans", "trace", "flow", "limits", "claims", "conversation-includes", "decision-choices", "held-followups", "decision-snooze", "security", "discord", "discord-links", "downloads", "build-features", "pr-builds", "nightly", "remote-helpers", "remote-queue", "rank-inputs"].includes(t));
 
 /** User-local mode: the Task Runners that could take calls (takerSignature). Work a pool left for want of a taker waits on it. */
 const takersOf = async (db: Db): Promise<string> => {

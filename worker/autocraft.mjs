@@ -2941,6 +2941,12 @@ export async function claimRequest(server, token, base, signal) {
   }
 }
 
+/** The lane fields of a claim. The server rejects interactiveLane together with any other lane field, so an interactive claim carries only that one. @param {boolean} fastLane @param {boolean} ownLane @param {boolean} withOwnLane @param {boolean} interactiveLane */
+export function claimLaneFlags(fastLane, ownLane, withOwnLane, interactiveLane) {
+  if (interactiveLane) return { interactiveLane: true };
+  return { ...(fastLane && { fastLane: true }), ...(ownLane && { ownLane: true }), ...(withOwnLane && !ownLane && { withOwnLane: true }) };
+}
+
 /**
  * Claims one call when the helper is ready (checkReady); otherwise claims nothing and says why (`held`). On macOS the claim
  * names the path root of slot `slot` (a free one when not given), which the lease keeps, and offers only that slot's sessions.
@@ -2958,7 +2964,7 @@ async function claimOnce(cfg, slot, fastLane = false, requestId = newClaimId(), 
   const mac = process.platform === "darwin";
   const n = mac ? slot ?? pickSlot(slotBase()) : undefined;
   const root = n === undefined ? undefined : slotRoot(slotBase(), n);
-  const claim = { requestId, helperVersion: HELPER_VERSION, harness: adapter.id, harnessVersion: d.version, tiers, efforts: Object.fromEntries(Object.keys(tiers).map((t) => [t, adapter.maxEffort])), ...(cfg.repos && { repos: cfg.repos }), sessions: heldSessions(n), ...(root && { root }), ...(fastLane && { fastLane: true }), ...(ownLane && { ownLane: true }), ...(withOwnLane && !ownLane && { withOwnLane: true }), ...(interactiveLane && { interactiveLane: true }) };
+  const claim = { requestId, helperVersion: HELPER_VERSION, harness: adapter.id, harnessVersion: d.version, tiers, efforts: Object.fromEntries(Object.keys(tiers).map((t) => [t, adapter.maxEffort])), ...(cfg.repos && { repos: cfg.repos }), sessions: heldSessions(n), ...(root && { root }), ...claimLaneFlags(fastLane, ownLane, withOwnLane, interactiveLane) };
   /** @type {ClaimReply} */
   let reply;
   try {

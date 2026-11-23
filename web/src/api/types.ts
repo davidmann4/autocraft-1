@@ -3187,3 +3187,81 @@ export interface DownloadsReport {
   /** Newest 50. */
   releases: { repo: string; app: string; tag: string; publishedAt: string; latest: boolean; downloads: number; issues: number; per1k: number | null }[];
 }
+
+// ---- Workspaces ----------------------------------------------------------------------------------------------
+
+export type WorkspaceState = "requested" | "starting" | "seeding" | "ready" | "parked" | "ended" | "failed";
+export type WorkspaceCallState = "queued" | "running" | "done" | "failed";
+
+/** One workspace in the list (GET /api/workspaces). Without `canSee`, the error and cost are left out. */
+export type WorkspaceSummary = {
+  id: number;
+  repo: RepoName;
+  baseSha: string;
+  app: string | null;
+  state: WorkspaceState;
+  stateAt: string;
+  node: string | null;
+  /** How the target started: the warm version copied, or "started cold: <why>"; null when the workspace has no warm target. */
+  warm: string | null;
+  createdAt: string;
+  endedAt: string | null;
+  /** The issue or PR of the workspace's first session; null when no session names one. */
+  item: number | null;
+  sessions: number;
+  /** Cost of the sessions' model calls; null when none reported one or the reader may not see it. */
+  costUsd: number | null;
+  /** Operators and maintainers with write on the repo read errors, calls, prompts and replies. */
+  canSee: boolean;
+};
+export type WorkspacePage = { workspaces: WorkspaceSummary[]; next: string | null };
+
+export type WorkspaceSession = {
+  id: number;
+  kind: string | null;
+  item: number;
+  state: "queued" | "starting" | "running" | "done" | "failed";
+  /** Left out for readers who may not see the workspace's content. */
+  outcome: string | null;
+  forLogin: string | null;
+  requestedBy: string | null;
+  createdAt: string;
+  endedAt: string | null;
+  costUsd: number | null;
+  /** The model's final reply; operators and maintainers only. */
+  reply: string | null;
+  /** The text the session was asked to work on; operators and maintainers only. */
+  prompt: string | null;
+  jobId: number | null;
+};
+
+export type WorkspaceDetail = WorkspaceSummary & {
+  /** The fields below are null or empty for readers who may not see the workspace's content. */
+  error: string | null;
+  pod: string | null;
+  env: string | null;
+  layout: number | null;
+  sessionList: WorkspaceSession[];
+};
+
+/** A call's metadata; its output is read when the row opens (WorkspaceCallOutput), its image from the image endpoint. */
+export type WorkspaceCall = {
+  id: number;
+  /** The `ws run` number; null for other calls. */
+  n: number | null;
+  tool: string;
+  /** The command (shell), the path (read, write, edit, glob, grep), the app (app_start) or the binary. */
+  summary: string;
+  state: WorkspaceCallState;
+  isError: boolean;
+  createdAt: string;
+  startedAt: string | null;
+  finishedAt: string | null;
+  /** The call has settled with a result to read. */
+  hasOutput: boolean;
+  images: number;
+};
+/** Calls oldest first; `older` is the cursor of the earlier page (the id to pass as `before`). */
+export type WorkspaceCalls = { calls: WorkspaceCall[]; older: string | null };
+/** Untrusted text, shown as text: the first 4000 and the last 20000 characters of a longer output; `chars` is the full length. */
+export type WorkspaceCallOutput = { output: string | null; chars: number };

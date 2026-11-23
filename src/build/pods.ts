@@ -18,7 +18,8 @@ export type { KubeSettings };
 import { BuildError } from "./envs.ts";
 import { slugOf } from "../owners.ts";
 import { CACHE_VERSION, MAX_WARM_COMMAND } from "../worker/gate.ts";
-import { WARM_COPY_CONTAINER, WARM_MEMORY_FACTOR, WARM_MEMORY_MAX_BYTES, WARM_VERIFY_CONFIGMAP, warmCopyParts, warmNodeVolume, warmTmpfsBytes, warmVerifyVolume, type WarmUse } from "./warm-mount.ts";
+import { toolchainIdParts, WARM_COPY_CONTAINER, WARM_MEMORY_FACTOR, WARM_MEMORY_MAX_BYTES, WARM_VERIFY_CONFIGMAP, warmCopyParts, warmNodeVolume, warmTmpfsBytes, warmVerifyVolume, type WarmUse } from "./warm-mount.ts";
+import { TOOLCHAIN_ID_CONTAINER } from "../warm/toolchain.ts";
 
 
 export const DEFAULT_SETTINGS: KubeSettings = {
@@ -340,14 +341,12 @@ export const CACHE_STEP_WRAPPER = [
   "exit $s",
 ].join("\n");
 /**
- * A warm producer's build step: as CACHE_STEP_WRAPPER, with compile-cache writes. It records `rustc -vV` for the warm
- * manifest. The step runs with CARGO_NET_OFFLINE (the gate's warm-command does not say --offline); the rustc wrapper drops
+ * A warm producer's build step: as CACHE_STEP_WRAPPER, with compile-cache writes. The step runs with CARGO_NET_OFFLINE (the gate's warm-command does not say --offline); the rustc wrapper drops
  * it, because sccache keys on CARGO_* variables and the CI runners whose entries the build shares do not set it. The wrapper is a
  * bash script because dash drops environment variables whose names contain a hyphen, such as CARGO_BIN_EXE_<bin>.
  */
 export const WARM_STEP_WRAPPER = [
   COPY_SOURCE,
-  "rustc -vV > /meta/rustc.txt 2>/dev/null || true",
   'if [ -z "${SCCACHE_WEBDAV_ENDPOINT:-}" ]; then echo "the CI gate names no cache version: this step builds without the compile cache" >&2',
   "elif command -v sccache >/dev/null 2>&1; then",
   '  if b=$(command -v bash); then',
@@ -399,7 +398,8 @@ const SIGNING_KEY = "/keys/signing/private.pem";
 /** ConfigMap in the build namespace with the public half of the signing key (`public.pem`): restore and gc verify with it, so only the publish holds the private key. */
 export { WARM_VERIFY_CONFIGMAP };
 const VERIFY_KEY = "/keys/verify/public.pem";
-const RUSTC_FILE = "/meta/rustc.txt";
+/** The producer's toolchain-id output (src/warm/toolchain.ts), for the restore's match and the publish's manifest. */
+const TOOLCHAIN_DIR = "/meta/toolchain";
 const BAD_BLOBS_FILE = "/meta/bad-blobs";
 /** The build start warm-restore records for the publish's trim (src/warm/trim.ts). */
 const STAMP_FILE = "/meta/build-start.json";
@@ -606,6 +606,9 @@ export const MAX_RECHECK = 200;
  * steps that mount the build dirs read the CI runners' compile cache (`ciEnv`, `sccacheEnv`), and their pod carries the
  * `craft.build/cache=read` label that lets it reach the cache's read-only port.
  *
+ * Before warm-restore or warm-copy, `toolchain-id` (toolchain image) writes the image's rustc and toolchain file for them to
+ * match versions on (src/warm/toolchain.ts).
+ *
  * With `warm` (an offline group of a warm producer): `warm-restore` fills a memory-backed target dir at the checkout with the
  * key's newest warm version, the steps build at the CI paths and write the compile cache, and `warm-publish` (then, when
  * due, `warm-gc`) publishes the target and CARGO_HOME. The pod carries `craft.build/cache=write`. Only the steps, the
@@ -664,7 +667,8 @@ export function stepPod(c: PodCtx, image: string, appImage: string, plan: TaskSt
         target ? { ...targetVolume, mountPath: target } : { name: "work", mountPath: ci ? `${checkout}/target` : "/target", subPath: "target" },
         { name: "work", mountPath: "/cache", subPath: "cache" },
       ]),
-      ...(writing ? [{ name: "warm-meta", mountPath: "/meta" }] : []),
+      // Read-only: the publish signs what toolchain-id and the restore wrote there (toolchain key, build start, bad blobs).
+      ...(writing ? [{ name: "warm-meta", mountPath: "/meta", readOnly: true }] : []),
       { name: "work", mountPath: "/out", subPath: `out/${i}` },
       ...(offline ? prepared.mounts.map((m) => ({ name: "work", mountPath: m.target, subPath: m.sub, readOnly: true })) : []),
       ...(mp ? [mp.mount] : []),
@@ -696,13 +700,17 @@ export function stepPod(c: PodCtx, image: string, appImage: string, plan: TaskSt
   if (!writing) {
     const labels: Record<string, string> = group.steps.some((i) => cached(plan[i]!)) ? { "craft.build/cache": "read" } : {};
     const copy = starting
-      ? [container(WARM_COPY_CONTAINER, appImage, stepResources(c.s, c.memory, copyMemory ?? 0), warmCopyParts(use!, { checkout: checkout!, image, envHash: warmEnvHash(prepared), targetVolume, tmpVolume: "check-tmp" }))]
+      ? [
+        container(TOOLCHAIN_ID_CONTAINER, image, appResources(c.s), toolchainIdParts([{ name: "check-tmp", mountPath: "/tmp" }])),
+        container(WARM_COPY_CONTAINER, appImage, stepResources(c.s, c.memory, copyMemory ?? 0), warmCopyParts(use!, { checkout: checkout!, image, envHash: warmEnvHash(prepared), targetVolume, tmpVolume: "check-tmp" })),
+      ]
       : [];
     return pod(c, group.network, volumes, [disk, ...wait, ...check, ...copy, ...steps.slice(0, -1)], steps.slice(-1), labels, spec);
   }
   const w = warmPhases(c, appImage, warm!, slugOf(repo), target!, checkout!, image, warmEnvHash(prepared), targetVolume, extraMemory);
   const [init, last] = warm!.gc ? [[...steps, w.publish], [w.gc]] : [steps, [w.publish]];
-  return pod(c, group.network, volumes, [disk, ...wait, ...check, w.restore, ...init], last, { "craft.build/cache": "write" }, spec);
+  const id = container(TOOLCHAIN_ID_CONTAINER, image, appResources(c.s), toolchainIdParts([{ name: "warm-meta", mountPath: "/meta" }, { name: "warm-tmp", mountPath: "/tmp" }], TOOLCHAIN_DIR));
+  return pod(c, group.network, volumes, [disk, ...wait, ...check, id, w.restore, ...init], last, { "craft.build/cache": "write" }, spec);
 }
 
 /** The AutoCraft-image containers of a warm producer's pod (`slug` is the tracked `owner/name`, which the manifest header records) (`worker pod warm-restore|warm-publish|warm-gc`, src/worker/pod.ts). */
@@ -715,10 +723,10 @@ function warmPhases(c: PodCtx, appImage: string, warm: WarmPod, slug: string, ta
   const phase = (name: string, env: object[], mounts: object[], extraMemory: number | null = null) =>
     container(name, appImage, stepResources(c.s, c.memory, extraMemory ?? 0), { args: ["worker", "pod", name], env, volumeMounts: [...mounts, tmp] });
   return {
-    restore: phase(WARM_RESTORE_CONTAINER, v({ STORE_URL: c.s.sccacheUrl!, KEY: warm.key, TARGET: target, VERIFY_KEYS: VERIFY_KEY, IMAGE: image, BAD_BLOBS_FILE, STAMP_FILE }),
+    restore: phase(WARM_RESTORE_CONTAINER, v({ STORE_URL: c.s.sccacheUrl!, KEY: warm.key, TARGET: target, VERIFY_KEYS: VERIFY_KEY, IMAGE: image, TOOLCHAIN_DIR, BAD_BLOBS_FILE, STAMP_FILE }),
       [{ ...targetVolume, mountPath: target }, { name: "warm-meta", mountPath: "/meta" }, verify], extraMemory),
     publish: phase(WARM_PUBLISH_CONTAINER, [
-      ...v({ STORE_WRITE_URL: c.s.cacheWriteUrl!, KEY: warm.key, REPO: slug, SIGNING_KEY, TARGET: target, CARGO_HOME: "/cache/cargo", CHECKOUT: checkout, IMAGE: image, ENV_HASH: envHash, RUSTC_FILE, BAD_BLOBS_FILE, STAMP_FILE,
+      ...v({ STORE_WRITE_URL: c.s.cacheWriteUrl!, KEY: warm.key, REPO: slug, SIGNING_KEY, TARGET: target, CARGO_HOME: "/cache/cargo", CHECKOUT: checkout, IMAGE: image, ENV_HASH: envHash, TOOLCHAIN_DIR, BAD_BLOBS_FILE, STAMP_FILE,
         ...(warm.recheck?.length ? { RECHECK: warm.recheck.filter((x) => /^[0-9a-f]{64}$/.test(x)).slice(0, MAX_RECHECK).join(",") } : {}) }),
       ...writer,
     ], [

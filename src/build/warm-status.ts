@@ -3,6 +3,7 @@
 // rewrites it every 5 minutes while it runs.
 import type { WarmLine } from "../../web/src/api/types.ts";
 import type { ConfigMapApi, KConfigMap } from "./kube-api.ts";
+import type { ToolchainId } from "../warm/toolchain.ts";
 import { STATUS_DATA_KEY, STATUS_LABEL, STATUS_PREFIX, type KeyStatus, type NodeStatus } from "../warm/sync-agent.ts";
 
 export const STATUS_STALE_MS = 15 * 60_000;
@@ -71,6 +72,15 @@ export class WarmStatus {
   /** The statuses written within `withinMs`, one per node, each marked fresh or not. */
   recentNodes(withinMs: number): (NodeStatus & { fresh: boolean })[] {
     return this.statuses.filter((s) => this.now() - s.updated <= withinMs).map((s) => ({ ...s, fresh: this.now() - s.updated <= STATUS_STALE_MS }));
+  }
+
+  /**
+   * The rustc and toolchain key of toolchain image `image`, from any fresh status of a version built with it; null when none
+   * records them (src/warm/toolchain.ts). A digest names one image, so every such version records the same.
+   */
+  toolchainOf(image: string): ToolchainId | null {
+    for (const s of this.fresh()) for (const k of Object.values(s.keys)) if (k.image === image && k.rustc && k.toolchain) return { rustc: k.rustc, toolchain: k.toolchain };
+    return null;
   }
 
   /** Nodes whose fresh status holds `key` (at `commit`, when given), newest version first. */

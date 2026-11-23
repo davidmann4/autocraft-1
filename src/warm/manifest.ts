@@ -34,10 +34,10 @@ const SHA = /^[0-9a-f]{64}$/;
 const COMMIT = /^[0-9a-f]{7,64}$/;
 const NS = /^(0|[1-9][0-9]{0,20})$/;
 
-/** Warm data holds no secrets and every pod reads it as another uid: files keep their exec bits and gain read for all. */
-export const readableFileMode = (mode: number): number => mode | 0o444;
+/** Warm data holds no secrets and every pod reads it as another uid: files keep their exec bits and gain read for all and lose group/other write. */
+export const readableFileMode = (mode: number): number => (mode | 0o444) & ~0o022;
 /** Directories gain read and search for all. */
-export const readableDirMode = (mode: number): number => mode | 0o555;
+export const readableDirMode = (mode: number): number => (mode | 0o555) & ~0o022;
 
 export type FileEntry = { path: string; type: "file"; mode: number; size: number; mtimeNs: bigint; sha256: string };
 export type DirEntry = { path: string; type: "dir"; mode: number; mtimeNs: bigint };
@@ -54,6 +54,8 @@ export type ManifestHeader = {
   image: string | null;
   /** `rustc -vV` output. */
   rustc: string | null;
+  /** The image's toolchain key (src/warm/toolchain.ts); null or absent when the image declares none or the publisher did not record it. */
+  toolchain?: string | null;
   /** Hash of the build env (gate env, flags) the tree was built with. */
   envHash: string | null;
   /** Paths the build used: cargo fingerprints hold absolute paths, so a consumer must build at the same ones. */
@@ -257,7 +259,7 @@ function isDir(p: string): boolean {
 // ---------------------------------------------------------------------------------------------------------------
 // Encoding: zstd of JSON lines, the header first, then one entry per line in path order.
 
-type HeaderLine = { format: string; version: 1; key: string; repo: string; commit: string; stored: number; image: string | null; rustc: string | null; env_hash: string | null; checkout: string | null; target_dir: string; cargo_home: string; cargo_lock: string | null; trimmed: boolean; bytes: number; files: number };
+type HeaderLine = { format: string; version: 1; key: string; repo: string; commit: string; stored: number; image: string | null; rustc: string | null; toolchain: string | null; env_hash: string | null; checkout: string | null; target_dir: string; cargo_home: string; cargo_lock: string | null; trimmed: boolean; bytes: number; files: number };
 
 export function makeHeader(h: Omit<ManifestHeader, "bytes" | "files">, entries: Entry[]): ManifestHeader {
   let bytes = 0, files = 0;
@@ -269,7 +271,7 @@ export function encodeManifest(m: Manifest): Buffer {
   validateHeader(m.header);
   validateEntries(m.entries);
   const h = m.header;
-  const head: HeaderLine = { format: MANIFEST_FORMAT, version: 1, key: h.key, repo: h.repo, commit: h.commit, stored: h.stored, image: h.image, rustc: h.rustc, env_hash: h.envHash, checkout: h.checkout, target_dir: h.targetDir, cargo_home: h.cargoHome, cargo_lock: h.cargoLock ?? null, trimmed: h.trimmed === true, bytes: h.bytes, files: h.files };
+  const head: HeaderLine = { format: MANIFEST_FORMAT, version: 1, key: h.key, repo: h.repo, commit: h.commit, stored: h.stored, image: h.image, rustc: h.rustc, toolchain: h.toolchain ?? null, env_hash: h.envHash, checkout: h.checkout, target_dir: h.targetDir, cargo_home: h.cargoHome, cargo_lock: h.cargoLock ?? null, trimmed: h.trimmed === true, bytes: h.bytes, files: h.files };
   const lines = [JSON.stringify(head)];
   for (const e of m.entries) {
     const ns = e.mtimeNs.toString();
@@ -283,7 +285,7 @@ export function encodeManifest(m: Manifest): Buffer {
 function validateHeader(h: ManifestHeader): void {
   const optStr = (v: unknown) => v === null || (typeof v === "string" && v.length <= 65536);
   const ok = WARM_KEY.test(h.key) && typeof h.repo === "string" && /^[\w.-]+\/[\w.-]+$/.test(h.repo) && COMMIT.test(h.commit) && Number.isSafeInteger(h.stored) && h.stored > 0
-    && optStr(h.image) && optStr(h.rustc) && (h.cargoLock == null || /^[0-9a-f]{64}$/.test(h.cargoLock)) && optStr(h.envHash) && optStr(h.checkout) && typeof h.targetDir === "string" && typeof h.cargoHome === "string"
+    && optStr(h.image) && optStr(h.rustc) && (h.toolchain == null || /^[0-9a-f]{64}$/.test(h.toolchain)) && (h.cargoLock == null || /^[0-9a-f]{64}$/.test(h.cargoLock)) && optStr(h.envHash) && optStr(h.checkout) && typeof h.targetDir === "string" && typeof h.cargoHome === "string"
     && Number.isSafeInteger(h.bytes) && h.bytes >= 0 && Number.isSafeInteger(h.files) && h.files >= 0;
   if (!ok) throw new ManifestError("manifest header refused");
 }
@@ -308,7 +310,7 @@ export function decodeManifest(buf: Buffer): Manifest {
   const h = parse(lines[0] ?? "", 0);
   if (h.format !== MANIFEST_FORMAT || h.version !== 1) throw new ManifestError("not a v1 warm manifest");
   const header: ManifestHeader = {
-    key: h.key as string, repo: h.repo as string, commit: h.commit as string, stored: h.stored as number, image: (h.image ?? null) as string | null, rustc: (h.rustc ?? null) as string | null,
+    key: h.key as string, repo: h.repo as string, commit: h.commit as string, stored: h.stored as number, image: (h.image ?? null) as string | null, rustc: (h.rustc ?? null) as string | null, toolchain: (h.toolchain ?? null) as string | null,
     envHash: (h.env_hash ?? null) as string | null, checkout: (h.checkout ?? null) as string | null, targetDir: h.target_dir as string, cargoHome: h.cargo_home as string, cargoLock: (h.cargo_lock ?? null) as string | null, trimmed: h.trimmed === true, bytes: h.bytes as number, files: h.files as number,
   };
   validateHeader(header);
@@ -385,7 +387,19 @@ export function verifyLatest(l: Latest, keys: KeyObject[]): boolean {
 
 /** Returns a blob's compressed bytes. The caller caps how much it reads; apply checks size and hash after decompressing. */
 export type BlobSource = (sha256: string, size: number) => Promise<AsyncIterable<Uint8Array>>;
-export type Previous = { manifest: Manifest; roots: Partial<Roots> };
+/** `uid` and `gid` are the owner the agent wrote the previous tree as (default: this process's). */
+export type Previous = { manifest: Manifest; roots: Partial<Roots>; uid?: number; gid?: number };
+
+/**
+ * Whether a file of the previous tree is still as the agent left it: owned by the agent's uid and gid and not writable
+ * by group or others. A kubelet fsGroup relabel changes the group and adds g+rw; a write in place needs write access
+ * the agent's own read-only files deny to other users. ctime is no test: the agent's own unlinks and chmods of other
+ * versions sharing the inode change it.
+ */
+export function reusableFile(st: { mode: bigint; uid: bigint; gid: bigint }, uid: number, gid: number): boolean {
+  return (st.mode & 0o022n) === 0n && Number(st.uid) === uid && Number(st.gid) === gid;
+}
+
 export type ApplyStats = { files: number; dirs: number; symlinks: number; linked: number; copied: number; fetched: number; fetchedBytes: number; bytes: number };
 
 /**
@@ -433,6 +447,8 @@ export const MTIME_SLACK_NS = 1000n;
  * copied; the rest come from `fetch`. Modes are restored exactly, mtimes as setMtimes describes. Throws on the first
  * failure (BadBlobError for a bad blob) and leaves the partial tree for the caller to remove (clearDir).
  *
+ * A file is linked only if reusableFile holds, so a relabelled or group-writable file is fetched again.
+ *
  * `previous` must be a tree only the sync agent writes and consumers mount read-only: a linked file shares its inode,
  * so anything that can write the previous tree can change the new one. Pass no `previous` otherwise.
  */
@@ -476,6 +492,7 @@ export async function applyManifest(full: Manifest, roots: Partial<Roots>, fetch
       try {
         const st = lstatSync(c.abs, { bigint: true });
         if (!st.isFile() || Number(st.size) !== e.size || !near(st.mtimeNs, e.mtimeNs) || readableFileMode(Number(st.mode & 0o777n)) !== e.mode) continue;
+        if (!reusableFile(st, opts.previous!.uid ?? process.getuid!(), opts.previous!.gid ?? process.getgid!())) continue;
         // The shared inode may predate the normalization: make it readable for both versions.
         if ((Number(st.mode & 0o777n) & 0o444) !== 0o444) chmodSync(c.abs, e.mode);
         linkSync(c.abs, dest);

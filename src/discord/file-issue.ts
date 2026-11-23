@@ -34,6 +34,8 @@ export type FileRequest = {
   title: string;
   body: string;
   kind: IssueKind;
+  /** The junk check already ran on the person's first message; the draft is not checked again. */
+  junkChecked?: boolean;
 };
 
 export type FileResult =
@@ -57,6 +59,9 @@ export const BOT_LOGIN = "(app)";
 const NAME_MAX = 64;
 const DAY_MS = 86_400_000;
 const TITLE_MAX = 256;
+export const JUNK_REFUSAL = "That does not look like a bug report or a feature request.";
+export const JUNK_UNKNOWN = "The report could not be checked just now. Try again in a few minutes.";
+export const modelJunkJudge = (): NonNullable<FileHooks["judge"]> => modelJudge;
 const LABEL: Record<IssueKind, string> = { bug: "bug", feature: "enhancement" };
 
 /** What a test replaces: the token box and provider (else the secrets file's), `gh`, the junk judges, the clock and the public base URL. */
@@ -87,7 +92,7 @@ const modelJudge: NonNullable<FileHooks["judge"]> = {
 };
 
 /** Jev first, Haiku where Jev is unsure or unavailable. With no model answer the draft is not filed ("unknown"): the person still has the GitHub link. The texts of the calls are deleted when they end. */
-async function junkCheck(db: Db, a: JunkAsk, judge: NonNullable<FileHooks["judge"]>, log: (l: string) => void): Promise<"junk" | "ok" | "unknown"> {
+export async function junkCheck(db: Db, a: JunkAsk, judge: NonNullable<FileHooks["judge"]>, log: (l: string) => void): Promise<"junk" | "ok" | "unknown"> {
   try {
     if (await jevAvailable(db)) {
       const p = await judge.jev(db, a);
@@ -145,9 +150,9 @@ export async function fileIssue(deps: FileDeps, req: FileRequest, hooks: FileHoo
   const slot = Number((await db.get(db.k.insertInto("discord_filed").values({ repo: req.repo, number: 0, login: tok.login, reporter: req.reporter, at: new Date(now).toISOString() }).returning(kx.rowid("discord_filed").as("rowid"))))!.rowid);
   let filed = false;
   try {
-    const junk = await junkCheck(db, { title, body }, hooks.judge ?? modelJudge, log);
-    if (junk === "junk") return { status: "refused", reason: "That does not look like a bug report or a feature request." };
-    if (junk === "unknown") return { status: "refused", reason: "The report could not be checked just now. Try again in a few minutes." };
+    const junk = req.junkChecked ? "ok" : await junkCheck(db, { title, body }, hooks.judge ?? modelJudge, log);
+    if (junk === "junk") return { status: "refused", reason: JUNK_REFUSAL };
+    if (junk === "unknown") return { status: "refused", reason: JUNK_UNKNOWN };
 
     const run = hooks.exec ?? defaultExec;
     const env = appChildEnv(tok.access);
@@ -230,9 +235,9 @@ export async function fileAsBot(deps: FileDeps, req: BotRequest, hooks: Pick<Fil
   try {
     const late = await botRefusal(db, req.reporter, req.repo, now, 1);
     if (late) return { status: "refused", reason: late };
-    const junk = await junkCheck(db, { title, body }, hooks.judge ?? modelJudge, log);
-    if (junk === "junk") return { status: "refused", reason: "That does not look like a bug report or a feature request." };
-    if (junk === "unknown") return { status: "refused", reason: "The report could not be checked just now. Try again in a few minutes." };
+    const junk = req.junkChecked ? "ok" : await junkCheck(db, { title, body }, hooks.judge ?? modelJudge, log);
+    if (junk === "junk") return { status: "refused", reason: JUNK_REFUSAL };
+    if (junk === "unknown") return { status: "refused", reason: JUNK_UNKNOWN };
     // A repo grant with no approval: filing for a reporter is not a pipeline action, so neither the repo's approvals nor its Pipeline switch apply. Its identity is the app's.
     const g = await guardRepo(db, req.repo, null, { operator: "discord" });
     if ("refused" in g) return { status: "refused", reason: "Filing from Discord is not set up." };

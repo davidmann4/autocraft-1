@@ -13,6 +13,8 @@ export interface Tx {
   mode: "read" | "write";
   state: "opening" | "open" | "closed";
   lockTimeoutMs?: number;
+  /** The named lock the transaction takes in place of the writer lock (WriteOptions.lock). */
+  lock?: string;
   /** The connection the transaction runs on, recorded by the engine's driver at BEGIN. */
   conn?: DatabaseConnection;
   /** The transaction's Kysely (a Transaction<DB> typed as its base class, assigned through `unknown`: checking the subclass against the base over the full DB type is too large for the checker). */
@@ -248,21 +250,23 @@ export class Handle implements Db {
   }
 
   read<T>(fn: () => Promise<T>): Promise<T> {
-    return this.#transaction("read", fn, undefined);
+    return this.#transaction("read", fn, {});
   }
 
   write<T>(fn: () => Promise<T>, opts: WriteOptions = {}): Promise<T> {
-    return this.#forgetting(() => this.#transaction("write", fn, opts.lockTimeoutMs));
+    return this.#forgetting(() => this.#transaction("write", fn, opts));
   }
 
-  async #transaction<T>(mode: Tx["mode"], fn: () => Promise<T>, lockTimeoutMs: number | undefined): Promise<T> {
+  async #transaction<T>(mode: Tx["mode"], fn: () => Promise<T>, opts: WriteOptions): Promise<T> {
     const cur = this.#current();
     if (cur) {
       if (mode === "write" && cur.mode === "read") throw new Error("db.write inside db.read: a read snapshot cannot write");
+      // Taking a second lock inside a transaction could deadlock, and running under the outer lock alone would not exclude the inner one's other holders.
+      if (mode === "write" && cur.lock !== opts.lock) throw new Error(`db.write under ${opts.lock ? `the lock "${opts.lock}"` : "the writer lock"} inside a transaction under ${cur.lock ? `the lock "${cur.lock}"` : "the writer lock"}`);
       return fn();
     }
     const site = mode === "write" ? siteError() : undefined;
-    const tx: Tx = { mode, state: "opening", lockTimeoutMs };
+    const tx: Tx = { mode, state: "opening", lockTimeoutMs: opts.lockTimeoutMs, lock: opts.lock };
     let lockedAt: number | undefined;
     try {
       return await this.#als.run(tx, () =>
@@ -281,7 +285,7 @@ export class Handle implements Db {
       tx.state = "closed";
       if (site && lockedAt !== undefined) {
         const holdMs = performance.now() - lockedAt;
-        if (holdMs > SLOW_HOLD_MS) console.warn(`db: write lock held ${Math.round(holdMs)} ms by ${callSite(site)}`);
+        if (holdMs > SLOW_HOLD_MS) console.warn(`db: ${tx.lock ? `lock "${tx.lock}"` : "write lock"} held ${Math.round(holdMs)} ms by ${callSite(site)}`);
         if (this.#observers.size) this.#emit({ kind: "write-lock", holdMs, site: callSite(site) });
       }
     }

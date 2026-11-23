@@ -17,7 +17,7 @@ import { envVar } from "./env.ts";
 import { AppReadError, ownerOfVariables, readEnv, resolveOwner } from "./github/read.ts";
 import { DEFAULT_OWNER, ownerOf, slugOf } from "./owners.ts";
 import { classifyFailure, clearRepoFailure, recordRepoFailure } from "./sync-errors.ts";
-import { filterSeq } from "./async-seq.ts";
+import { exclusive } from "./async-seq.ts";
 import type { Expression, Insertable } from "kysely";
 import type { Db } from "./db/index.ts";
 import * as kx from "./db/kx.ts";
@@ -353,43 +353,57 @@ async function writePage(db: Db, repo: string, kind: Kind, detail: Detail, nodes
   const live = appSlug();
   if (live) { try { await rememberSlug(db, live); } catch { /* read-only connection */ } }
   const own = await mentionNames(db, live);
+  // Rows are built before the write lock, and the lock covers a fixed number of statements per page (multi-row, in
+  // batches), not statements per item: on Postgres each one is a network round trip. A number read twice keeps its last read.
+  const page = [...new Map(nodes.map((n) => [Number(n.number), n])).values()].map((n) => ({
+    n, row: toRow(repo, kind, n, detail), comments: detail === "full" ? commentRows(repo, kind, n, own) : [],
+  }));
+  if (!page.length) return;
+  const numbersOf = (xs: readonly { row: ItemRow }[]) => xs.map((x) => x.row.number);
   await db.write(async () => {
     // A read never replaces what a later-started read stored: the item, its comments and its read time stay the newer read's.
-    nodes = await filterSeq(nodes, async (n) => {
-      const last = (await db.get(db.k.selectFrom("main.item_reads").select("synced_at").where("repo", "=", repo).where("number", "=", n.number)))?.synced_at;
-      return last === undefined || !(Date.parse(last) > Date.parse(readAt));
-    });
-    for (const n of nodes) {
-      const row = toRow(repo, kind, n, detail);
-      // A row identical to the stored one (overlapping reads re-fetch many) writes nothing.
-      const old = await db.get(db.k.selectFrom("items").select(COLUMNS).where("repo", "=", repo).where("number", "=", n.number));
-      if (!force && old && COLUMNS.every((c) => old[c] === row[c])) continue;
-      await db.run(db.k.insertInto("main.items").values(row).onConflict((oc) => oc.columns(["repo", "number"]).doUpdateSet((eb) => ({
+    const reads = new Map<number, string>();
+    for (const b of kx.batches(page)) {
+      for (const r of await db.all(db.k.selectFrom("main.item_reads").select(["number", "synced_at"]).where("repo", "=", repo).where(kx.inList(db, "number", numbersOf(b), "bigint")))) reads.set(Number(r.number), r.synced_at);
+    }
+    const current = page.filter((x) => { const last = reads.get(x.row.number); return last === undefined || !(Date.parse(last) > Date.parse(readAt)); });
+    if (!current.length) return;
+    // A row identical to the stored one (overlapping reads re-fetch many) writes nothing.
+    const stored = new Map<number, Record<string, unknown>>();
+    for (const b of kx.batches(current)) {
+      for (const r of await db.all(db.k.selectFrom("items").select(COLUMNS).where("repo", "=", repo).where(kx.inList(db, "number", numbersOf(b), "bigint")))) stored.set(Number(r.number), r);
+    }
+    const changed = force ? current : current.filter((x) => { const old = stored.get(x.row.number); return !old || !COLUMNS.every((c) => old[c] === x.row[c]); });
+    for (const b of kx.batches(changed)) {
+      await db.run(db.k.insertInto("main.items").values(b.map((x) => x.row)).onConflict((oc) => oc.columns(["repo", "number"]).doUpdateSet((eb) => ({
         ...kx.excluded(itemUpsert)(eb),
         mergeable: keepKnownMergeableExpr(eb, "items"),
       }))));
       // After the upsert, which clears the stored refs when the text changed (schema trigger items_text_refs_stale).
-      if (kind === "pr") await db.run(db.k.updateTable("main.items").set({ text_refs: textRefs(row.title, row.body) }).where("repo", "=", repo).where("number", "=", n.number));
-      // The account seen under a login string owns its id-less history for the whitelist; a later account with the same login does not inherit it.
-      // A login with merged or closed PRs mirrored without an id is left to the backfill, which binds the author of that history, not the login's current holder.
-      if (typeof row.author === "string" && typeof row.author_id === "number") {
-        const login = row.author;
-        await db.run(db.k.insertInto("main.author_ids").columns(["login", "id"]).expression(
-          db.k.selectNoFrom((eb) => [eb.cast<string>(eb.val(login), "text").as("login"), eb.cast<number>(eb.val(row.author_id), "bigint").as("id")])
-            .where((eb) => eb.not(eb.exists(eb.selectFrom("main.items").select(eb.lit(1).as("one"))
-              .where("author", "=", login).where("kind", "=", "pr").where("state", "in", ["MERGED", "CLOSED"]).where("author_id", "is", null))))
-        ).onConflict((oc) => oc.doNothing()));
-      }
-      if (detail === "full") {
-        const rows = commentRows(repo, kind, n, own);
-        // A forced re-read of an unchanged item upserts in place: an identical comment bumps no topic. Comments past the newest 20 go.
-        if (!force) await db.run(db.k.deleteFrom("main.comments").where("repo", "=", repo).where("number", "=", n.number));
-        for (const row of rows) await db.run(db.k.insertInto("main.comments").values(row).onConflict((oc) => oc.column("id").doUpdateSet(kx.excluded(commentUpsert))));
-        if (force) await db.run(db.k.deleteFrom("main.comments").where("repo", "=", repo).where("number", "=", n.number).where(kx.inList(db, "id", rows.map((r) => r.id), "text", true)));
+      if (kind === "pr") {
+        const refs = kx.caseOf("number", b.map((x) => [x.row.number, textRefs(x.row.title, x.row.body)] as const));
+        await db.run(db.k.updateTable("main.items").set({ text_refs: refs }).where("repo", "=", repo).where(kx.inList(db, "number", numbersOf(b), "bigint")));
       }
     }
-    if (nodes.length) {
-      await db.run(db.k.insertInto("main.item_reads").values(nodes.map((n) => ({ repo, number: n.number, synced_at: readAt })))
+    // The account seen under a login string owns its id-less history for the whitelist; a later account with the same login does not inherit it.
+    // A login with merged or closed PRs mirrored without an id is left to the backfill, which binds the author of that history, not the login's current holder.
+    const ids = new Map<string, number>();
+    for (const { row } of changed) if (typeof row.author === "string" && typeof row.author_id === "number" && !ids.has(row.author)) ids.set(row.author, row.author_id);
+    if (ids.size) {
+      const unbound = new Set((await db.all(db.k.selectFrom("main.items").select("author").distinct().where(kx.inList(db, "author", [...ids.keys()]))
+        .where("kind", "=", "pr").where("state", "in", ["MERGED", "CLOSED"]).where("author_id", "is", null))).map((r) => r.author));
+      const bind = [...ids].filter(([login]) => !unbound.has(login)).map(([login, id]) => ({ login, id }));
+      for (const b of kx.batches(bind)) await db.run(db.k.insertInto("main.author_ids").values(b).onConflict((oc) => oc.doNothing()));
+    }
+    if (detail === "full" && changed.length) {
+      // A forced re-read of an unchanged item upserts in place: an identical comment bumps no topic. Comments past the newest 20 go.
+      if (!force) for (const b of kx.batches(changed)) await db.run(db.k.deleteFrom("main.comments").where("repo", "=", repo).where(kx.inList(db, "number", numbersOf(b), "bigint")));
+      const comments = [...new Map(changed.flatMap((x) => x.comments).map((c) => [c.id, c])).values()];
+      for (const b of kx.batches(comments)) await db.run(db.k.insertInto("main.comments").values(b).onConflict((oc) => oc.column("id").doUpdateSet(kx.excluded(commentUpsert))));
+      if (force) for (const x of changed) await db.run(db.k.deleteFrom("main.comments").where("repo", "=", repo).where("number", "=", x.row.number).where(kx.inList(db, "id", x.comments.map((r) => r.id), "text", true)));
+    }
+    for (const b of kx.batches(current)) {
+      await db.run(db.k.insertInto("main.item_reads").values(b.map((x) => ({ repo, number: x.row.number, synced_at: readAt })))
         .onConflict((oc) => oc.columns(["repo", "number"]).doUpdateSet(kx.excluded(["synced_at"]))
           .where((eb) => eb(eb.fn<number>("julianday", [eb.ref("excluded.synced_at")]), ">=", eb.fn<number>("julianday", [eb.ref("main.item_reads.synced_at")])))));
     }
@@ -980,6 +994,9 @@ export async function runSync(db: Db, client: Querier, opts: SyncOpts, now: Date
   return { mode, items };
 }
 
+/** How often a mirror run checks whether the default-branch poll is due (src/mainci POLL_EVERY_MS). */
+const MAIN_CI_CHECK_MS = 30_000;
+
 /** The GitHub rate the sync leaves for everything else: it waits for the reset below this many points; the diff re-reads use the same floor. */
 export const SYNC_RESERVE = 1000;
 
@@ -1010,8 +1027,21 @@ async function sync(args: string[]): Promise<void> {
     // Each run leaves a row for the Pipeline page; rows older than two days go.
     const row = (await db.get(db.k.insertInto("sync_runs").values({ started_at: iso(new Date()) }).returning(kx.rowid("sync_runs").as("rowid"))))!.rowid;
     await db.run(db.k.deleteFrom("sync_runs").where("started_at", "<", iso(new Date(Date.now() - 2 * 86400_000))));
+    // The default-branch poll, and the warm builds it queues, keep their own cadence while a long pass runs. Its own client:
+    // a client's rate figures follow one request at a time.
+    const mainCi = exclusive(async () => {
+      try {
+        await (await import("./mainci/index.ts")).pollMainCiIfDue(db, new Client(reserve));
+      } catch (e) {
+        // A failed read of the default branches must not fail the mirror run; the next check asks again.
+        console.log(`main-ci: ${String((e as Error)?.message ?? e).slice(0, 200)}`);
+      }
+    });
+    const pollsMainCi = !opts.full && !opts.only.length;
+    const mainCiTimer = pollsMainCi ? setInterval(() => void mainCi.skip(), MAIN_CI_CHECK_MS) : undefined;
+    mainCiTimer?.unref();
     try {
-      const { mode, items } = await runSync(db, querier, opts);
+      const { mode, items } = await runSync(db, querier, opts).finally(() => clearInterval(mainCiTimer));
       await db.run(db.k.updateTable("sync_runs").set({ ended_at: iso(new Date()), mode, items }).where(kx.rowid("sync_runs"), "=", row));
       console.log(`sync: mode=${mode} items=${items} points=${client.spent} left=${client.remaining}`);
       // Sandboxed calls read the item snapshot instead of GitHub. The refresh is incremental and writes nothing when nothing differs; a visibility change alone removes a repository's rows.
@@ -1025,14 +1055,7 @@ async function sync(args: string[]): Promise<void> {
           console.log(`activity: ${String((e as Error)?.message ?? e).slice(0, 200)}`);
         }
       }
-      // A failed read of the default branches must not fail the mirror run; the next run asks again.
-      if (!opts.full && !opts.only.length) {
-        try {
-          await (await import("./mainci/index.ts")).pollMainCiIfDue(db, querier);
-        } catch (e) {
-          console.log(`main-ci: ${String((e as Error)?.message ?? e).slice(0, 200)}`);
-        }
-      }
+      if (pollsMainCi) await mainCi.run();
       // Release download and star counts for the Downloads report; one failing repo is logged and skipped.
       if (!opts.full && !opts.only.length) {
         try {

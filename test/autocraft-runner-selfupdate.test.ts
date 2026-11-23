@@ -24,3 +24,8 @@ test("the runner updates itself only to a newer version, and never from a git ch
     assert.equal(helper.inGitCheckout(join(root, "plain", "a.mjs")), false);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+test("an interactive claim carries no other lane field, even with the own lane on", () => {
+  assert.deepEqual(helper.claimLaneFlags(true, false, true, true), { interactiveLane: true });
+  assert.deepEqual(helper.claimLaneFlags(false, false, true, false), { withOwnLane: true });
+});

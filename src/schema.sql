@@ -1181,6 +1181,7 @@ CREATE TABLE IF NOT EXISTS workspace_sessions (
   remote_call_id INTEGER,
   job_id INTEGER,
   requested_by TEXT NOT NULL,
+  for_login TEXT COLLATE NOCASE,      -- a try session: the login whose own Task Runners run its model call
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   ended_at TEXT

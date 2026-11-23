@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { TaskStep } from "./types.ts";
+import { WORKSPACE_BUILD_TARGETS, WORKSPACE_TEST_TARGETS } from "./rust-targets.ts";
 import type { TaskStep as PlanStep } from "../../web/src/api/types.ts";
 
 export type RustPlanOptions = {
@@ -54,25 +55,28 @@ export function hasCargoLock(checkoutDir: string): boolean {
  */
 export function rustPlan(o: RustPlanOptions = {}): TaskStep[] {
   const extra = o.cargoArgs ?? [];
+  const workspace = extra.length === 1 && extra[0] === "--workspace";
   const steps: TaskStep[] = [
     { name: "fetch deps", cmd: ["sh", "-c", FETCH_SCRIPT], network: "fetch", timeoutSec: o.fetchTimeoutSec ?? 900 },
-    { name: "build", cmd: ["cargo", "build", "--offline", "--locked", "--all-targets", ...extra], network: "none", timeoutSec: o.buildTimeoutSec ?? 3600 },
+    { name: "build", cmd: ["cargo", "build", "--offline", "--locked", ...(workspace ? WORKSPACE_BUILD_TARGETS : ["--all-targets", ...extra])], network: "none", timeoutSec: o.buildTimeoutSec ?? 3600 },
   ];
   if (o.test ?? true) {
-    steps.push({ name: "test", cmd: ["cargo", "test", "--offline", "--locked", ...extra], network: "none", timeoutSec: o.testTimeoutSec ?? 3600, artifacts: o.testArtifacts });
+    steps.push({ name: "test", cmd: ["cargo", "test", "--offline", "--locked", ...(workspace ? WORKSPACE_TEST_TARGETS : extra)], network: "none", timeoutSec: o.testTimeoutSec ?? 3600, artifacts: o.testArtifacts });
   }
   return steps;
 }
 
 /**
  * The warm producer's build of a default-branch head: the CI gate's `warm-command` when it has one (AUTOCRAFT_WARM_COMMAND,
- * set by the build pod from the gate at that head; run with bash, as the gate does), else what the gate's test leg compiles.
+ * set by the build pod from the gate at that head; run with bash, as the gate does), else AutoCraft's whole-workspace build
+ * (WORKSPACE_BUILD_TARGETS, WORKSPACE_TEST_TARGETS).
  * Offline: the pod sets CARGO_NET_OFFLINE, since a warm-command does not say --offline.
  */
 export const WARM_BUILD_SCRIPT = [
   'if [ -n "${AUTOCRAFT_WARM_COMMAND:-}" ]; then echo "warm build: the CI gate\'s warm-command"; exec bash --noprofile --norc -eo pipefail -c "$AUTOCRAFT_WARM_COMMAND"; fi',
-  "cargo test --workspace --no-run --locked || exit $?",
-  "exec cargo build --workspace --all-targets --locked",
+  "echo \"warm build: AutoCraft's workspace build (the gate has no warm-command)\"",
+  `cargo test --locked --no-run ${WORKSPACE_TEST_TARGETS.join(" ")} || exit $?`,
+  `exec cargo build --locked ${WORKSPACE_BUILD_TARGETS.join(" ")}`,
 ].join("\n");
 
 /** The plan of a warm producer task: fetch the dependencies (through the crate mirror when the environment has one), then build. */

@@ -20,6 +20,7 @@ import { createHash } from "node:crypto";
 import { OLD_MTIME_SEC } from "../worker/warm-copy.ts";
 import { gateEnvOf, warmEnvHash } from "./pods.ts";
 import { decideWarm, type WarmTarget, type WarmUse } from "./warm-mount.ts";
+import type { ToolchainId } from "../warm/toolchain.ts";
 import type { WarmNode } from "./warm-status.ts";
 
 export const LAYOUT_CI = 2;
@@ -75,6 +76,8 @@ export function ciStepEnv(p: WorkspacePrepared): Record<string, string> {
 
 export type WarmChoice = {
   target: WarmTarget; key: string; image: string; prepared: WorkspacePrepared; checkout: string;
+  /** The image's rustc and toolchain key (WarmStatus.toolchainOf). */
+  toolchain?: ToolchainId | null;
   /** Nodes whose status holds the key (WarmStatus.warmNodesFor), newest version first. */
   nodes: WarmNode[];
   /** Live workspaces per node, so the copies spread out. */
@@ -103,7 +106,7 @@ export function chooseWarm(c: WarmChoice): { use: WarmUse; why: null } | { use: 
   let why: string | null = null;
   for (const n of nodes) {
     const d = decideWarm({
-      target: c.target, key: c.key, node: n.node, status: n, image: c.image, envHash, checkout: c.checkout, cargoLock: c.prepared.cargoLock,
+      target: c.target, key: c.key, node: n.node, status: n, image: c.image, toolchain: c.toolchain, envHash, checkout: c.checkout, cargoLock: c.prepared.cargoLock,
       memoryLimitBytes: c.memoryLimitBytes, memoryRoomBytes: null, nodeMaxBytes: null,
     });
     if (d.use) return d;
@@ -139,6 +142,8 @@ export const WARM_CHANGED_DIRS = "/work/.ws/warm-changed.dirs";
 export const WARM_MTIMES_SH = `set -e
 files() { find . -path ./.git -prune -o -path ./target -prune -o \\( -type f -o -type l \\) -print0; }
 if [ "$1" = list ]; then
+  # Trimmed version: the gate's checkouts (read-only mounts in the gate's steps) match its env, so they are old like the unchanged files.
+  if [ -d /work/ext ]; then find /work/ext \\( -type f -o -type l \\) -print0 | xargs -0 -r touch -h -d @${OLD_MTIME_SEC} --; fi
   files | xargs -0 -r touch -h -d @${OLD_MTIME_SEC} --
   if [ -s ${WARM_CHANGED_FILES} ]; then xargs -0 -r touch -c -h -- <${WARM_CHANGED_FILES}; fi
   if [ -s ${WARM_CHANGED_DIRS} ]; then xargs -0 -r touch -c -- <${WARM_CHANGED_DIRS}; fi

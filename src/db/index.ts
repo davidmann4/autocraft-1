@@ -64,6 +64,13 @@ export interface Statement {
 export interface WriteOptions {
   /** How long to wait for the write lock before failing with a lock timeout. Defaults to the handle's busy timeout. */
   lockTimeoutMs?: number;
+  /**
+   * Postgres: a named lock the transaction takes in place of the one writer lock, so it runs alongside other writes and
+   * waits only for transactions under the same name. For a transaction whose read-then-write concerns only rows that
+   * writes under this name change, its other writes being compare-and-set. A fenced process takes the writer lock too. A
+   * write inside an open transaction must name the same lock. SQLite runs every write alone and ignores it.
+   */
+  lock?: string;
 }
 
 /** One event for `db.observe`. */

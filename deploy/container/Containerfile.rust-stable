@@ -15,6 +15,16 @@
 # rust-toolchain.toml asks for: its `channel` must be the release here, and its `components` and `targets` must be
 # installed here. The wasm32 target is the one the pipeline repositories' toolchain files add.
 #
+# The last step writes the toolchain file /usr/local/share/autocraft/toolchain.txt: what can change compiled output, namely
+# the Rust release, its components and targets, the sccache release, and the versions of the C toolchain (gcc, g++, cpp,
+# binutils, pkg-config), of the tools build scripts run or load (clang, libclang, llvm, cmake, make, ninja, nasm, yasm,
+# protoc, perl, python3) and of every `-dev` package (headers and .pc files build scripts probe, libc6-dev among them).
+# Warm versions are matched on its sha256 and `rustc -vV` (src/warm/toolchain.ts), so a rebuild that changes none of these
+# keeps every warm cache. So does adding a package that no build script runs, loads or links against, such as Xvfb, Mesa's
+# drivers, ImageMagick, ripgrep or a runtime library without its -dev package; such a package can still change what a test
+# or a screenshot sees, not what is compiled. The image holds no
+# AutoCraft code: pods run AutoCraft's phases from the AutoCraft image and its step scripts come with the pod spec.
+#
 #   podman build -f deploy/container/Containerfile.rust-stable -t rust-stable deploy/container
 FROM docker.io/library/rust:1.100.0-bookworm
 
@@ -23,7 +33,7 @@ RUN set -eux; \
     apt-get install -y --no-install-recommends \
       pkg-config libx11-dev libxcb1-dev libxkbcommon-dev libwayland-dev libxrandr-dev libxi-dev libxcursor-dev \
       libgl1-mesa-dev libegl1 libvulkan1 mesa-vulkan-drivers libgtk-3-dev libfontconfig1-dev libfreetype-dev \
-      libasound2-dev libdbus-1-dev poppler-utils qpdf \
+      libasound2-dev libdbus-1-dev poppler-utils qpdf libxkbcommon-x11-0 libxcb-xkb1 \
       xvfb x11-utils xauth libgl1-mesa-dri imagemagick ripgrep \
       fonts-dejavu-core fonts-noto-core fonts-noto-cjk fonts-noto-color-emoji; \
     rm -rf /var/lib/apt/lists/*; \
@@ -43,7 +53,12 @@ RUN set -eux; \
     tar -xzf /tmp/sccache.tar.gz -C /tmp; \
     install -m 0755 "/tmp/$name/sccache" /usr/local/bin/sccache; \
     rm -rf /tmp/sccache.tar.gz "/tmp/$name"; \
-    sccache --version
+    sccache --version; \
+    mkdir -p /usr/local/share/autocraft; \
+    { rustc -vV; rustup component list --installed; rustup target list --installed; sccache --version; \
+      dpkg-query -W -f '${binary:Package} ${Version}\n' \
+        | LC_ALL=C grep -E '^((gcc|g\+\+|cpp|binutils|pkg-config|pkgconf|cmake|protobuf-compiler)(-[^: ]+)?|(clang|libclang|llvm)[^: ]*|make|ninja-build|nasm|yasm|perl|perl-base|python3|python3\.[0-9]+|[^: ]+-dev)(:[a-z0-9]+)? ' | LC_ALL=C sort; } > /usr/local/share/autocraft/toolchain.txt; \
+    chmod 0644 /usr/local/share/autocraft/toolchain.txt
 
 # The uid build pods run as (the AutoCraft image's); steps write only to their mounts (the checkout, target dir, /cache, /out, /tmp).
 USER 10001:10001

@@ -10,10 +10,11 @@
 // workspace crate rebuilds.
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, lstatSync, lutimesSync, mkdirSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { existsSync, lstatSync, lutimesSync, linkSync, mkdirSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join, relative } from "node:path";
 import { slugOf } from "../owners.ts";
 import { CHANGED_FILE, COPY_MARK_FILE } from "../build/warm-mount.ts";
+import { readToolchain, toolchainRefusal } from "../warm/toolchain.ts";
 import { clearDir, decodeManifest, removeCargoLocks, loadEd25519, parseLatest, verifyLatest } from "../warm/manifest.ts";
 
 /** 2001-01-01, as CI's restore-mtimes step uses: older than any warm build. */
@@ -162,6 +163,19 @@ export function setMtimes(work: string, commit: string, trimmed: boolean): strin
 }
 
 /**
+ * Sets every file of the gate's extra checkouts (`<work>/ext/*`, mounted read-only in the steps, so set here while the
+ * volume is writable) to OLD_MTIME. Cargo's fingerprints of path dependencies there (e.g. a font manifest) compare against
+ * the warm build's dep-info; fresh mtimes make it rebuild every crate that reads them. Returns the file count.
+ */
+export function setExtMtimes(work: string): number {
+  const ext = join(work, "ext");
+  if (!isDir(ext)) return 0;
+  const files = walk(ext);
+  for (const p of files) lutimesSync(join(ext, p), OLD_MTIME_SEC, OLD_MTIME_SEC);
+  return files.length;
+}
+
+/**
  * Moves every entry of `from` into `to` with renames (same file system), then removes `from`. What `to` already holds is
  * kept: an earlier step fetched it for this checkout (a newer index cache, a newly pinned crate). Each file lands whole, so
  * a CARGO_HOME never holds a half-copied file.
@@ -189,11 +203,94 @@ export function copyFailure(stderr: string): string {
   return `cp: ${lines.slice(-2).join(" ")}`;
 }
 
-function cp(from: string, to: string): Promise<void> {
+/** Copies run at once, directory levels below the root that are split into separate copies, and entries per `cp` call. */
+export const COPY_PARALLEL = 8;
+const COPY_SPLIT_DEPTH = 4;
+const COPY_BATCH = 64;
+
+function cpRun(args: string[]): Promise<void> {
   return new Promise((resolve, reject) => {
-    execFile("cp", ["-a", "--", `${from}/.`, `${to}/`], { timeout: 30 * 60_000, maxBuffer: 1024 * 1024 }, (err, _o, stderr) =>
+    execFile("cp", args, { timeout: 30 * 60_000, maxBuffer: 1024 * 1024 }, (err, _o, stderr) =>
       err ? reject(new Error(copyFailure(stderr || err.message))) : resolve());
   });
+}
+
+/** `<inode>\t<path>` NUL-terminated, for the regular files under `dir` that have more than one link. */
+function listLinked(dir: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile("find", [dir, "-type", "f", "-links", "+1", "-printf", "%i\\t%p\\0"], { maxBuffer: 1 << 28 }, (err, out) => (err ? reject(new Error(`find: ${err.message}`)) : resolve(out)));
+  });
+}
+
+function attrs(from: string, to: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    execFile("chmod", [`--reference=${from}`, "--", to], (e1) => {
+      if (e1) return reject(e1);
+      execFile("touch", ["-r", from, "--", to], (e2) => (e2 ? reject(e2) : resolve()));
+    });
+  });
+}
+
+/**
+ * Like `cp -a from/. to/` (modes, mtimes, symlinks), with COPY_PARALLEL `cp` processes at once: the top COPY_SPLIT_DEPTH
+ * directory levels are created here and their entries copied in batches, and deeper trees are copied whole. Directory
+ * modes and mtimes are set after their contents. The first failure rejects once the running copies end.
+ */
+export async function copyTree(from: string, to: string): Promise<void> {
+  // Files with several links (cargo uplifts binaries as hard links): the first path of each inode is copied, the others
+  // are linked to its copy afterwards, so the copy shares inodes like the source does. A dir that holds a later path is
+  // split too, so that path can be left out of the batches.
+  const firstOf = new Map<string, string>();
+  const later = new Map<string, string>();
+  for (const rec of (await listLinked(from)).split("\0")) {
+    const t = rec.indexOf("\t");
+    if (t < 0) continue;
+    const ino = rec.slice(0, t), path = rec.slice(t + 1);
+    const first = firstOf.get(ino);
+    if (first === undefined) firstOf.set(ino, path);
+    else later.set(path, first);
+  }
+  const withLater = new Set<string>();
+  for (const path of later.keys()) for (let d = dirname(path); d.length >= from.length && !withLater.has(d); d = dirname(d)) withLater.add(d);
+  const dirs: { from: string; to: string }[] = [];
+  const jobs: string[][] = [];
+  const split = (a: string, b: string, depth: number) => {
+    dirs.push({ from: a, to: b });
+    let batch: string[] = [];
+    const flush = () => {
+      if (batch.length) jobs.push(["-a", "-t", b, "--", ...batch]);
+      batch = [];
+    };
+    for (const e of readdirSync(a, { withFileTypes: true })) {
+      if (later.has(join(a, e.name))) continue;
+      if (e.isDirectory() && (depth + 1 < COPY_SPLIT_DEPTH || withLater.has(join(a, e.name)))) {
+        mkdirSync(join(b, e.name));
+        split(join(a, e.name), join(b, e.name), depth + 1);
+        continue;
+      }
+      batch.push(join(a, e.name));
+      if (batch.length >= COPY_BATCH) flush();
+    }
+    flush();
+  };
+  mkdirSync(to, { recursive: true });
+  split(from, to, 0);
+  let next = 0;
+  let failure: Error | null = null;
+  const worker = async () => {
+    while (!failure && next < jobs.length) {
+      try {
+        await cpRun(jobs[next++]);
+      } catch (e) {
+        failure ??= e as Error;
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(COPY_PARALLEL, jobs.length) }, worker));
+  if (failure) throw failure;
+  for (const [path, first] of later) linkSync(join(to, relative(from, first)), join(to, relative(from, path)));
+  // Deepest first: setting a directory's mtime after its children keeps it.
+  for (const d of dirs.reverse()) await attrs(d.from, d.to);
 }
 
 const isEmpty = (d: string) => !existsSync(d) || readdirSync(d).length === 0;
@@ -205,7 +302,8 @@ export type CopyMark = { state: "copying" | "done" | "cold"; commit: string; tri
 
 /**
  * AUTOCRAFT_WARM_* of warm-copy: KEY, COMMIT (the version the runner chose), SOURCE (the key's dir on the node), VERIFY_KEYS,
- * TARGET, CARGO_HOME, CHECKOUT, IMAGE, ENV_HASH, MODE (tmpfs | pvc), SAME_LOCK (1: the version's Cargo.lock must be the
+ * TARGET, CARGO_HOME, CHECKOUT, IMAGE, TOOLCHAIN_DIR (what the pod's toolchain-id container wrote: a version of another image
+ * is taken when its rustc and toolchain key match, src/warm/toolchain.ts), ENV_HASH, MODE (tmpfs | pvc), SAME_LOCK (1: the version's Cargo.lock must be the
  * checkout's), CARGO_LOCK (that Cargo.lock's sha256, for a pod whose checkout arrives after the copy) and MTIMES (`later`:
  * the checkout arrives after the copy, and the runner sets its mtimes then). A version that does not verify or match is a
  * cold start (exit 0); a missing setting fails the pod.
@@ -275,7 +373,8 @@ export async function warmCopyPhase(work: string, env: NodeJS.ProcessEnv, log: L
   }
   if (header.commit !== commit || header.key !== key) return cold(`the manifest of ${at} names another version`);
   if (header.checkout !== need("CHECKOUT") || header.targetDir !== target || header.cargoHome !== cargoHome) return cold(`${at} was built at other paths`);
-  if (header.image !== need("IMAGE")) return cold(`${at} was built with ${header.image ?? "an unrecorded image"}`);
+  const refused = toolchainRefusal({ image: header.image, rustc: header.rustc, toolchain: header.toolchain ?? null }, { image: need("IMAGE"), ...readToolchain(env.AUTOCRAFT_WARM_TOOLCHAIN_DIR) });
+  if (refused) return cold(`${at} ${refused}`);
   if (header.envHash !== need("ENV_HASH")) return cold(`${at} was built with another CI env`);
   if (env.AUTOCRAFT_WARM_SAME_LOCK === "1") {
     const lock = env.AUTOCRAFT_WARM_CARGO_LOCK || cargoLockOf(join(work, "src"));
@@ -284,11 +383,11 @@ export async function warmCopyPhase(work: string, env: NodeJS.ProcessEnv, log: L
   const t0 = performance.now();
   try {
     if (volume) write({ state: "copying", commit });
-    await cp(join(cur, "target"), target);
+    await copyTree(join(cur, "target"), target);
     // cp -a keeps hard links, and cargo deadlocks on flocks of lock files that share an inode.
     await removeCargoLocks(target);
     mkdirSync(cargoTmp, { recursive: true });
-    await cp(join(cur, "cargo"), cargoTmp);
+    await copyTree(join(cur, "cargo"), cargoTmp);
   } catch (e) {
     return cold(`copying ${at} failed (${(e as Error).message})`);
   }
@@ -301,7 +400,9 @@ export async function warmCopyPhase(work: string, env: NodeJS.ProcessEnv, log: L
   const secs = (performance.now() - t0) / 1000;
   const trimmed = header.trimmed === true;
   const mtimes = env.AUTOCRAFT_WARM_MTIMES === "later" ? "the checkout's mtimes are set once it arrives" : setMtimes(work, commit, trimmed);
+  // A version that is not `trimmed` may hold units built against other checkouts (the producer's restore does not check the env hash), so only a trimmed one gets old ext mtimes; its env hash covers the craft-fonts and craft-i18n commits, so the checkouts here are the ones it was built with.
+  const ext = env.AUTOCRAFT_WARM_MTIMES === "later" || !trimmed ? 0 : setExtMtimes(work);
   write({ state: "done", commit, trimmed, bytes: header.bytes, secs: Math.round(secs * 10) / 10 });
-  log(`warm copy ${(header.bytes / 1e9).toFixed(1)} GB in ${secs.toFixed(1)} s: ${at} into ${volume ? "the volume" : "memory"}; ${mtimes}`);
+  log(`warm copy ${(header.bytes / 1e9).toFixed(1)} GB in ${secs.toFixed(1)} s: ${at} into ${volume ? "the volume" : "memory"}; ${mtimes}${ext ? `; ${ext} files of the gate's checkouts set to 2001-01-01` : ""}`);
   return 0;
 }

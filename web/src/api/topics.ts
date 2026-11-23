@@ -7,7 +7,7 @@
  */
 export type Topic =
   | "repos" | "sync" | "items" | "ranks" | "stages" | "flow" | "checks" | "classify" | "dupes" | "decisions" | "reviews" | "queue" | "jobs" | "usage" | "accounts" | "agents"
-  | "envs" | "tasks" | "actions" | "fixes" | "verify" | "postmerge" | "access" | "settings" | "trace" | "github" | "fasttrack" | "outside" | "plans" | "conversations" | "held-followups" | "conversation-includes" | "decision-choices" | "decision-snooze" | "steps" | "mainci" | "limits" | "claims" | "preapprovals" | "security" | "discord" | "discord-links" | "downloads" | "build-features" | "pr-builds" | "nightly" | "remote-helpers" | "remote-queue";
+  | "envs" | "tasks" | "workspaces" | "actions" | "fixes" | "verify" | "postmerge" | "access" | "settings" | "trace" | "github" | "fasttrack" | "outside" | "plans" | "conversations" | "held-followups" | "conversation-includes" | "decision-choices" | "decision-snooze" | "steps" | "mainci" | "limits" | "claims" | "preapprovals" | "security" | "discord" | "discord-links" | "downloads" | "build-features" | "pr-builds" | "nightly" | "remote-helpers" | "remote-queue";
 
 /** What moves an item's queue position (src/rank/position.ts), for every query that carries the badge. */
 const withSlot = (...topics: Topic[]): Topic[] => [...new Set<Topic>([...topics, "steps", "repos"])];
@@ -98,6 +98,10 @@ const RULES: [prefix: string, topics: Topic[]][] = [
   ["build-features", ["build-features", "repos"]],
   ["screenshot-setup", ["build-features"]],
   ["areas:", ["classify", "jobs"]],
+  // The workspace pages read only their own tables; a settled call's output never changes.
+  ["workspaces", ["workspaces"]],
+  ["workspace:", ["workspaces"]],
+  ["workspace-output:", []],
   // The caches report: the runner's node reads (envs), warm tasks, default-branch heads and the warm producer's settings.
   ["envs-caches", ["envs", "tasks", "mainci", "settings"]],
   ["envs", ["envs", "tasks"]],

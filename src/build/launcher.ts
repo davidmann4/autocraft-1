@@ -21,6 +21,7 @@ import { classifyPodEnd, disruptionPolicy, MAX_DISRUPTIONS, pendingKind } from "
 import { guardedApi, inClusterApi, KubeError, type CapacityApi, type KResourceQuota, type ConfigMapApi, type ContainerStatus, type KPod, type KubeApi } from "./kube-api.ts";
 import { gib, raiseAfterOom, repoMemory, repoSizing, repoWarmTarget } from "./sizing.ts";
 import { decideWarm, WARM_COPY_CONTAINER, type WarmUse } from "./warm-mount.ts";
+import { TOOLCHAIN_ID_CONTAINER } from "../warm/toolchain.ts";
 import { STATUS_NAMESPACE, WarmStatus } from "./warm-status.ts";
 import { takeLog, type LogPos } from "./pod-log.ts";
 import { WarmPlacer } from "./warm-place.ts";
@@ -739,7 +740,7 @@ async function endStage(c: EnvCtx, run: Run, t: TaskRow, pod: KPod): Promise<voi
     const results = json<TaskResult[]>(run.results, []);
     let failed: string | null = null;
     let ran = run.ran;
-    for (const [name, fallback] of [[DISK_CONTAINER, "the task's volume is over its size"], [MIRROR_WAIT_CONTAINER, "the crate mirror is not reachable"], [PACKAGES_CONTAINER, "the toolchain image lacks packages the CI gate installs"], [WARM_RESTORE_CONTAINER, "the warm restore failed"], [WARM_COPY_CONTAINER, "the warm copy failed"]] as const) {
+    for (const [name, fallback] of [[DISK_CONTAINER, "the task's volume is over its size"], [MIRROR_WAIT_CONTAINER, "the crate mirror is not reachable"], [PACKAGES_CONTAINER, "the toolchain image lacks packages the CI gate installs"], [TOOLCHAIN_ID_CONTAINER, "the toolchain image could not report its rustc"], [WARM_RESTORE_CONTAINER, "the warm restore failed"], [WARM_COPY_CONTAINER, "the warm copy failed"]] as const) {
       const term = statusOf(pod, name)?.state?.terminated;
       if (!term || failed) continue;
       // The restore's and the copy's output say which version the build starts from, or why it starts cold.
@@ -873,7 +874,7 @@ async function createStage(c: EnvCtx, run: Run, t: TaskRow, stage: number): Prom
       const step = stepMemory(c.s, memory);
       const view = target === "tmpfs" && c.cluster ? await capacityView(c) : null;
       const d = decideWarm({
-        target, key: warmKeyOf(t.repo), node: run.node, status: nodeWarm(c, t.repo, run.node), image: kept.image, envHash: warmEnvHash(kept),
+        target, key: warmKeyOf(t.repo), node: run.node, status: nodeWarm(c, t.repo, run.node), image: kept.image, toolchain: c.state.warm?.toolchainOf(kept.image) ?? null, envHash: warmEnvHash(kept),
         checkout: ciCheckout(t.repo), cargoLock: kept.cargoLock ?? null, memoryLimitBytes: quantity(step.limit),
         memoryRoomBytes: run.reserved_mem_bytes === null ? null : Math.max(0, run.reserved_mem_bytes - quantity(step.request)),
         nodeMaxBytes: view && !("error" in view) ? view.nodeMaxMem : null,

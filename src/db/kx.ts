@@ -286,6 +286,11 @@ export function excluded<C extends string>(cols: readonly C[]): (eb: ExpressionB
   return (eb) => Object.fromEntries(cols.map((c) => [c, eb.ref(`excluded.${c}`) as Expression<any>]) as [C, Expression<any>][]) as Record<C, Expression<any>>;
 }
 
+/** `CASE e WHEN k THEN v ... END` over `pairs`: one statement sets a different value per row (NULL for a key not listed). */
+export function caseOf<V extends Param>(e: Ex, pairs: readonly (readonly [Param, V])[]): RawBuilder<V> {
+  return sql<V>`CASE ${x(e)} ${sql.join(pairs.map(([k, v]) => sql`WHEN ${k} THEN ${v}`), sql` `)} END`;
+}
+
 /** Rows per multi-row statement: a row of ten bound values keeps a statement far under both engines' parameter limits. */
 export const BATCH_ROWS = 500;
 

@@ -65,6 +65,7 @@ test("warm sync: versions with hard links, grace, refused versions, the node cap
       const abs = join(p.startsWith("target/") ? tree(key).target : tree(key).cargoHome, p.slice(p.indexOf("/") + 1));
       mkdirSync(join(abs, ".."), { recursive: true });
       writeFileSync(abs, body);
+      chmodSync(abs, 0o644);
     }
   };
   let stored = Date.now();
@@ -107,6 +108,17 @@ test("warm sync: versions with hard links, grace, refused versions, the node cap
   assert.notEqual(inode("deckcraft", g2, "target/debug/app"), inode("deckcraft", g1, "target/debug/app"));
   assert.equal(dav.gets.filter((p) => p.includes("/blobs/")).length, 1);
   assert.equal(kube.status("k3s-1").keys.deckcraft!.commit, "c".repeat(40));
+
+  // A restart with an old mode mark and a group-writable file clears the bit and keeps `current`.
+  const big = join(dir, "deckcraft", g2, "target/debug/libbig.rlib");
+  chmodSync(big, 0o664);
+  rmSync(join(dir, "deckcraft", g2, ".modes-ok2"));
+  await new SyncAgent({
+    dir, node: "k3s-1", namespace: "craft-cache", kube, store, log: () => {}, verifyKeys: () => [publicKey], assign: () => assign,
+    writeBytesPerSec: 0, graceMs: 3600_000, now: () => clock, diskUse: () => ({ sizeBytes: 1e9, usedBytes: 1e8, availBytes: 9e8 }),
+  }).cycle();
+  assert.equal(cur("deckcraft"), g2);
+  assert.equal(statSync(big).mode & 0o022, 0);
 
   // The replaced version stays through the grace period, then goes.
   clock += 30 * 60_000;
@@ -331,6 +343,8 @@ test("warm sync: the startup fix-up adds read bits to files and directories of a
   writeFileSync(join(dir, "target/g"), "y");
   chmodSync(join(dir, "target/g"), 0o640);
   chmodSync(join(dir, "target/sub"), 0o700);
+  chmodSync(dir, 0o755);
+  chmodSync(join(dir, "target"), 0o755);
   t.after(() => { chmodSync(join(dir, "target/sub"), 0o755); rmSync(dir, { recursive: true, force: true }); });
   assert.equal(addReadBits(dir), 3);
   assert.equal(statSync(join(dir, "target/g")).mode & 0o777, 0o644);

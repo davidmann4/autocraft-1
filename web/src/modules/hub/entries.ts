@@ -1,4 +1,4 @@
-import { DownloadSimpleIcon, BookOpenIcon, BroadcastIcon, FlowArrowIcon, BrainIcon, CpuIcon, ChartLineUpIcon, ClockCounterClockwiseIcon, CoinsIcon, DiscordLogoIcon, FileTextIcon, GaugeIcon, GithubLogoIcon, HeartbeatIcon, KeyIcon, MoonIcon, PlugsConnectedIcon, QueueIcon, RobotIcon, ScalesIcon, TreeStructureIcon, UsersIcon, FolderSimpleIcon, StackIcon, type Icon } from "@phosphor-icons/react";
+import { DownloadSimpleIcon, BookOpenIcon, BroadcastIcon, FlowArrowIcon, BrainIcon, CpuIcon, ChartLineUpIcon, ClockCounterClockwiseIcon, CoinsIcon, DiscordLogoIcon, FileTextIcon, GaugeIcon, GithubLogoIcon, HeartbeatIcon, KeyIcon, MoonIcon, PlugsConnectedIcon, QueueIcon, RobotIcon, ScalesIcon, TreeStructureIcon, UsersIcon, FolderSimpleIcon, StackIcon, CubeIcon, type Icon } from "@phosphor-icons/react";
 import { modules } from "../../registry";
 import { can } from "../../registry/permissions";
 import type { User } from "../../api/types";
@@ -25,6 +25,7 @@ export const SETTINGS: Entry[] = [
   { label: "Repos", to: "/repos", path: "repos", icon: FolderSimpleIcon },
   { label: "Contributors", to: "/contributors", path: "contributors", icon: UsersIcon },
   { label: "Build environments", to: "/envs", path: "envs", icon: StackIcon },
+  { label: "Workspaces", to: "/workspaces", path: "workspaces", icon: CubeIcon },
   { label: "Inference", to: "/inference", path: "inference", icon: CpuIcon },
   { label: "Accounts", to: "/accounts", path: "accounts", icon: BrainIcon, serverOnly: true },
   { label: "Access", to: "/access", path: "access", icon: KeyIcon },

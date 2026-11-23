@@ -57,6 +57,30 @@ test("writes take the one writer lock: a second writer waits for the commit, and
   }
 });
 
+test("a write under a named lock, and a lone write of a rowWrites handle, run while another write holds the writer lock", { skip: needsPg }, async () => {
+  const t = await testDatabase(SCHEMA);
+  try {
+    const [a, b] = [await t.open(), await t.open({ busyTimeoutMs: 200, rowWrites: true })];
+    await a.prepare("INSERT INTO t (v) VALUES ('first')").run();
+    let writer: unknown, sameName: unknown;
+    await a.write(async () => {
+      await a.prepare("INSERT INTO t (v) VALUES ('a')").run();
+      await b.prepare("UPDATE t SET v = 'lone' WHERE v = 'first'").run();
+      await b.write(() => b.prepare("INSERT INTO t (v) VALUES ('named')").run(), { lock: "k" });
+      writer = await b.write(async () => undefined).catch((e: unknown) => e);
+    });
+    assert.ok(isLockTimeout(writer), `a write under the writer lock still waits for it: ${String(writer)}`);
+    assert.equal(await count(a), 3);
+    // Writes under the same name run one at a time.
+    await b.write(async () => {
+      sameName = await a.write(async () => undefined, { lock: "k", lockTimeoutMs: 100 }).catch((e: unknown) => e);
+    }, { lock: "k" });
+    assert.ok(isLockTimeout(sameName), String(sameName));
+  } finally {
+    await t.close();
+  }
+});
+
 test("a nested write joins the outer one on its connection and rolls back with it", { skip: needsPg }, async () => {
   const t = await testDatabase(SCHEMA);
   try {
