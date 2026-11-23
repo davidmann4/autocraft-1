@@ -505,7 +505,7 @@ export function decidePr(f: PrFacts, pass: PassFacts = NO_PASS): Plan {
   if (f.operator?.fix) { /* the operator's fix-up above */ }
   else if (fx) {
     if (fx.bucket === "ask" || (!fx.done && (fx.bucket === "cannot-push" || fx.bucket === "fix"))) actions.push(act("fixup", f.head, { bucket: fx.bucket, source: "review" }));
-  } else if (((e && e.state === "needs-fix-up" && e.premerge === "fix") || preapprovedPremergeFix(f)) && f.premerge?.fixesSafe && f.mergeable !== "CONFLICTING" && !f.mergeHeld && !f.draft && !f.lint.some((l) => l.source === "premerge")) {
+  } else if (((e && e.state === "needs-fix-up" && e.premerge === "fix") || (preapprovedPremergeFix(f) && !held)) && f.premerge?.fixesSafe && f.mergeable !== "CONFLICTING" && !f.mergeHeld && !f.draft && !f.lint.some((l) => l.source === "premerge")) {
     actions.push(act("fixup", f.head, { bucket: "fix", source: "premerge" }));
   }
 

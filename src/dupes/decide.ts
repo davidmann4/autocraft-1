@@ -222,6 +222,7 @@ async function textOf(db: Db, p: GroupPlan) {
 /** Asks (or refreshes) the group decisions of one repo (every repo when omitted). Returns the ids asked or refreshed. Each plan is written in one transaction, so no other process sees its members unheld in between. */
 export async function askGroupDecisions(db: Db, repo: string | undefined, at: string): Promise<string[]> {
   const asked: string[] = [];
+  const fast = await fastTracked(db, repo);
   for (const p of await groupPlans(db, repo)) {
     const id = await db.write(async (): Promise<string | null> => {
       if (!p.closing) {
@@ -241,7 +242,7 @@ export async function askGroupDecisions(db: Db, repo: string | undefined, at: st
       const alts = (await canonInfo(db, p.repo, p.items.filter((i) => i.kind === primary.kind && i.number !== p.number && i.role !== "stay").map((i) => i.number))).sort(compareCanonical).slice(0, 3);
       const q = {
         id, kind: "duplicate", repo: p.repo, number: p.number, question: t.question, context: t.context, facts: t.facts,
-        options: [{ ...GROUP_OPTIONS.accept, label: t.keepLabel }, ...alts.map((a) => ({ key: keepKey(a.number), label: `Keep #${a.number} instead`, hint: `Posts the comments shown under it: keeps #${a.number}, closes the others, #${p.number} too.` })), GROUP_OPTIONS.distinct],
+        options: [{ ...GROUP_OPTIONS.accept, label: t.keepLabel }, ...alts.map((a) => ({ key: keepKey(a.number), label: `Keep #${a.number} instead`, hint: `Posts the comments shown under it: keeps #${a.number}, closes the others, ${fast.has(`${p.repo}#${p.number}`) ? `leaves #${p.number} open` : `#${p.number} too`}.` })), GROUP_OPTIONS.distinct],
         recommended: t.why ? "accept" : null, recommended_reason: t.why,
         asked_by: ACTOR, asked_at: at, summary: t.summary, summary_by: t.by, summary_at: at,
       };
@@ -261,7 +262,7 @@ export async function askGroupDecisions(db: Db, repo: string | undefined, at: st
       }));
       await storeOptionTexts(db, id, ["accept", ...alts.map((a) => keepKey(a.number))], async (n) => {
         const r = await db.get(db.k.selectFrom("items").select("state").where("repo", "=", p.repo).where("number", "=", n));
-        return r?.state === "OPEN" && await inPilot(db, p.repo, n);
+        return r?.state === "OPEN" && !fast.has(`${p.repo}#${n}`) && await inPilot(db, p.repo, n);
       });
       return id;
     });
@@ -334,15 +335,16 @@ export async function resetGroupAnswer(db: Db, id: string): Promise<void> {
   await db.run(db.k.updateTable("dupe_groups").set({ applied_answer: null }).where("decision_id", "=", id));
 }
 
-/** Writes the roles an answer of "keep #N instead" implies: N is kept; the kept item it replaces closes when it is open and in the pilot, else stays. */
+/** Writes the roles an answer of "keep #N instead" implies: N is kept; the kept item it replaces closes when it is open, in the pilot and not fast-tracked with bypass checks, else stays. */
 async function rekeep(db: Db, id: string, n: number, repo: string): Promise<void> {
   await restoreRoles(db, id);
   const row = await db.get(db.k.selectFrom("dupe_group_items").select("kind").where("decision_id", "=", id).where("number", "=", n));
   if (!row) return;
   const old = await db.all(db.k.selectFrom("dupe_group_items as gi").innerJoin("items as i", (j) => j.onRef("i.repo", "=", "gi.repo").onRef("i.number", "=", "gi.number"))
     .select(["gi.number", "i.state"]).where("gi.decision_id", "=", id).where("gi.kind", "=", row.kind).where("gi.role", "=", "keep").where("gi.number", "<>", n));
+  const fast = await fastTracked(db, repo);
   for (const o of old) {
-    const closes = o.state === "OPEN" && await inPilot(db, repo, o.number);
+    const closes = o.state === "OPEN" && !fast.has(`${repo}#${o.number}`) && await inPilot(db, repo, o.number);
     await db.run(db.k.updateTable("dupe_group_items").set({ role: closes ? "close" : "stay", target: closes ? n : null }).where("decision_id", "=", id).where("number", "=", o.number));
   }
   await db.run(db.k.updateTable("dupe_group_items").set({ target: n }).where("decision_id", "=", id).where("kind", "=", row.kind).where("role", "=", "close").where("number", "<>", n));

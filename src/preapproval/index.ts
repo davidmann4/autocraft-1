@@ -465,10 +465,21 @@ async function advance(db: Db, p: Row, held: ReadonlySet<string>, factOf: () => 
     const synced = (await db.get(db.k.selectFrom("repos").select("synced_at").where("name", "=", p.repo)))?.synced_at ?? null;
     const lag = p.state === "review" && cur === p.from_head && (synced === null || synced <= p.updated_at)
       && !await db.get(db.k.selectFrom("opus_reviews").select((eb) => eb.lit(1).as("one")).where("repo", "=", p.repo).where("number", "=", p.number).where("head_oid", "=", head));
-    if (!lag && p.state !== "queued") {
+    // Once queued, only a row with bypass checks goes on across the pipeline's own push: the Merge answer at the old head is taken back with the move.
+    if (!lag && (p.state !== "queued" || p.bypass)) {
       // The pipeline's own CI fix or conflict merge on the pushed head carries the pre-approval on: the new head needs the whole chain again.
       const own = await ownPush(db, p, cur);
-      if (own) return void await move(db, p, "review", { head: cur, line: `The ${own} pushed ${short(cur)}; it needs a fresh review, a clean pre-merge review and green CI before the PR goes to the merge queue.` });
+      const line = `The ${own} pushed ${short(cur)}; it needs a fresh review, a clean pre-merge review and green CI before the PR goes to the merge queue.`;
+      if (own && p.state !== "queued") return void await move(db, p, "review", { head: cur, line });
+      if (own) {
+        const moved = await db.write(async () => {
+          if (!await moveRaw(db, p, "review", { head: cur })) return false;
+          await revertAnswer(db, p, ACTOR);
+          return true;
+        });
+        if (moved) await say(db, p.repo, p.number, line);
+        return;
+      }
     }
     if (!lag) return cancel(cur === p.from_head ? `the head went back to ${short(cur)}` : `another push moved the head to ${short(cur)}`);
   }
@@ -540,8 +551,10 @@ async function advance(db: Db, p: Row, held: ReadonlySet<string>, factOf: () => 
     if (defects) {
       // Defects with fixes are the pipeline's fix-up to make, as a take-fix review's are; its push is reviewed again (ownPush). Only defects it cannot fix stop the row.
       const f = await factOf();
-      if (f && decidePr(f).actions.some((a) => a.kind === "fixup" && a.params?.source === "premerge")) return await noteOnce(db, p, head, "premerge-fixup", `The pre-merge review of ${headName(p)} found ${defects} defect${defects === 1 ? "" : "s"} with fixes; ${approvedAhead(p)}, so the fix-up makes them.`);
-      if (f?.lint.some((l) => l.source === "premerge" && !l.ended)) return;
+      const acts = f ? decidePr(f).actions : [];
+      if (acts.some((a) => a.kind === "fixup" && a.params?.source === "premerge")) return await noteOnce(db, p, head, "premerge-fixup", `The pre-merge review of ${headName(p)} found ${defects} defect${defects === 1 ? "" : "s"} with fixes; ${approvedAhead(p)}, so the fix-up makes them.`);
+      // Its patch is linted, then collected and pushed.
+      if (f?.lint.some((l) => l.source === "premerge" && !l.ended) || acts.some((a) => a.kind === "lint" && a.params?.source === "premerge")) return;
       // Its push may not be in the mirror yet: the new head then carries the row on (ownPush).
       if (await db.get(db.k.selectFrom("fixups").select((eb) => eb.lit(1).as("one")).where("repo", "=", p.repo).where("number", "=", p.number).where("from_head", "=", head)
         .where("source", "=", "premerge").where("state", "in", ["pushing", "pushed"]))) return;

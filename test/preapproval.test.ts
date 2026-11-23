@@ -16,6 +16,7 @@ import type { Req } from "../src/dash/types.ts";
 import type { CachedEntry } from "../src/core/plan-read.ts";
 import { refreshPlanCache } from "../src/core/plan-cache.ts";
 import { queuedField } from "../src/review/queued.ts";
+import { createTask } from "../src/build/tasks.ts";
 
 let current: World | null = null;
 const fresh = async (): Promise<World> => (current = await (await world()).repo());
@@ -290,6 +291,45 @@ describe("pre-approved merge", () => {
     await w.db.run(w.db.k.updateTable("premerge_reviews").set({ unsure: 1 }).where("number", "=", 21));
     await settle(w);
     assert.equal((await preapprovalOf(w.db, "app", 21))?.state, "queued");
+  });
+
+  test("with bypass checks, the row waits while the pre-merge fix-up's patch is linted and then collected, until its push", async () => {
+    const w = await (await (await fresh()).pr(23)).review(23, { verdict: "take-fix" });
+    await bypassed(w, 23);
+    await w.premerge(23, "defect");
+    await settle(w);
+    assert.ok((await kindsOf(w, 23)).includes("fixup:premerge"), (await kindsOf(w, 23)).join());
+    const task = await createTask(w.db, { step: "lint", repo: "app", headSha: "a".repeat(40), plan: [{ name: "t", cmd: ["true"], network: "none", timeoutSec: 60 }] });
+    await w.db.run(w.db.k.insertInto("fixups").values({ repo: "app", number: 23, from_head: "sha23b", state: "linting", attempt: 1, created_at: T0, source: "premerge", lint_task: task }));
+    await settle(w);
+    assert.equal((await preapprovalOf(w.db, "app", 23))?.state, "ci");
+    // The lint task ended: the collection is planned, and the row waits for it rather than asking.
+    await w.db.run(w.db.k.updateTable("build_tasks").set({ state: "done" }).where("id", "=", task));
+    assert.ok((await kindsOf(w, 23)).includes("lint:premerge"), (await kindsOf(w, 23)).join());
+    await settle(w);
+    assert.equal((await preapprovalOf(w.db, "app", 23))?.state, "ci");
+    await w.db.run(w.db.k.updateTable("fixups").set({ state: "pushed", to_head: "sha23c" }).where("number", "=", 23));
+    await w.synced(23, "sha23c");
+    await settle(w);
+    const p = (await preapprovalOf(w.db, "app", 23))!;
+    assert.deepEqual([p.state, p.head], ["review", "sha23c"]);
+  });
+
+  test("once queued, the pipeline's own CI fix carries a row with bypass checks back to review and takes its Merge answer back; without it the row is cancelled", async () => {
+    const w = await (await (await (await (await fresh()).pr(24)).review(24, { verdict: "take-fix" })).pr(25)).review(25, { verdict: "take-fix" });
+    for (const n of [24, 25]) {
+      await (n === 24 ? bypassed(w, n) : inCi(w, n));
+      await w.premerge(n, "clean");
+      await settle(w);
+      assert.equal((await preapprovalOf(w.db, "app", n))?.state, "queued");
+      await w.db.run(w.db.k.insertInto("ci_fixes").values({ repo: "app", number: n, head: `sha${n}b`, to_head: `sha${n}c`, kind: "format", state: "pushed", attempt: 1, created_at: T0 }));
+      await w.synced(n, `sha${n}c`);
+      await settle(w);
+    }
+    const p = (await preapprovalOf(w.db, "app", 24))!;
+    assert.deepEqual([p.state, p.head], ["review", "sha24c"]);
+    assert.deepEqual(await answerOf(w, 24, "sha24b"), [{ answer: null }]);
+    assert.equal((await preapprovalOf(w.db, "app", 25))?.state, "cancelled");
   });
 
   test("cancelling a queued PR that is in a batch removes it from the batch and takes the answer back", async () => {
