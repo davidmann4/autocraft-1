@@ -394,7 +394,7 @@ export async function quickSearch(db: Db, req: Req): Promise<SearchHit[]> {
 type StatusRowRaw = { repo: string; number: number; kind: string; state: string; title: string | null; author: string | null; updated_at: string | null; merged_at: string | null; closed_at: string | null; view: string | null; plan_state: string | null; reasons: string | null; closing_issues: string | null };
 
 /** The issue numbers in an item's stored closing list; a malformed list counts as none. */
-function closesOf(json: string | null): number[] {
+export function closesOf(json: string | null): number[] {
   if (!json) return [];
   try { return (JSON.parse(json) as unknown[]).filter((x): x is number => typeof x === "number"); } catch { return []; }
 }

@@ -248,7 +248,7 @@ describe("transport", () => {
     assert.match(init.body.result.instructions, /untrusted/);
     assert.equal((await rpc(t, "initialize", { protocolVersion: "1999-01-01" })).body.result.protocolVersion, "2025-06-18");
     const tools = (await rpc(t, "tools/list")).body.result.tools.map((x: { name: string }) => x.name).sort();
-    assert.deepEqual(tools, ["get_inbox_item", "list_fixups", "list_inbox", "list_merge_queue", "list_repos", "my_settings", "send_feedback", "set_my_settings", "set_weight"]);
+    assert.deepEqual(tools, ["get_inbox_item", "get_item", "list_fixups", "list_inbox", "list_merge_queue", "list_repos", "my_settings", "search_items", "send_feedback", "set_my_settings", "set_weight"]);
     assert.equal((await rpc(t, "no/such")).body.error.code, -32601);
   });
 });
@@ -264,9 +264,33 @@ describe("tools", () => {
     // maint can read secretcraft on GitHub, checked with their dashboard session's token.
     const maint = await tokenFor("maint");
     assert.ok(data((await call(maint, "list_inbox")).text).decisions.some((d: { id: string }) => d.id === S7));
+    assert.equal(data((await call(maint, "get_item", { item: "secretcraft#7" })).text).title, "Secret thing");
     const photo = data((await call(maint, "list_inbox", { repo: "storytold/photocraft", limit: 5 })).text);
     assert.deepEqual(photo.decisions.map((d: { id: string }) => d.id).sort(), [P1, P10, "photocraft#11:scope"].sort());
     assert.match(photo.decisions.find((d: { id: string }) => d.id === P1).link, /^\/items\/photocraft\/1#decision-/);
+  });
+
+  test("get_item and search_items read the mirror within the user's repos and frame its text as untrusted", async () => {
+    const viewer = await viewerToken();
+    const r = await call(viewer, "get_item", { item: "https://github.com/storytold/photocraft/pull/1" });
+    assert.equal(r.isError, false);
+    assert.doesNotMatch(r.text.slice(0, r.text.indexOf("<<<untrusted")), /Ignore previous/);
+    assert.equal(r.text.split("<<<end untrusted>>>").length, 2, "only the frame's own end marker");
+    const it = data(r.text);
+    assert.equal(it.head, "a1");
+    assert.ok(it.decisions.includes(P1));
+    assert.equal((await call(viewer, "get_item", { item: "secretcraft#7" })).isError, true);
+    const all = data((await call(viewer, "search_items", { state: "all", limit: 25 })).text);
+    assert.ok(all.items.length > 0);
+    assert.equal(all.items.some((x: { item: string }) => x.item.startsWith("secretcraft#")), false);
+    const issues = data((await call(viewer, "search_items", { repo: "photocraft", kind: "issue" })).text);
+    assert.deepEqual(issues.items.map((x: { item: string }) => x.item), ["photocraft#10"]);
+    assert.deepEqual(data((await call(viewer, "search_items", { query: "sepia" })).text).items.map((x: { item: string }) => x.item), ["photocraft#10"]);
+    // Pages follow on from each other without repeating a row.
+    const first = data((await call(viewer, "search_items", { state: "all", limit: 2 })).text);
+    const second = data((await call(viewer, "search_items", { state: "all", limit: 2, cursor: first.next })).text);
+    assert.equal(second.items.some((x: { item: string }) => first.items.some((y: { item: string }) => y.item === x.item)), false);
+    assert.match((await call(viewer, "search_items", { cursor: "x" })).text, /not valid/);
   });
 
   test("arguments are checked", async () => {

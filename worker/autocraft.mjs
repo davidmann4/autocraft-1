@@ -4904,6 +4904,8 @@ export const CLI_COMMANDS = [
   { path: ["settings", "set"], tool: "set_my_settings", usage: "[--reserve <5h> <weekly>] [--max-calls N | --no-max-calls] [--repos <a,b>|all] [--interactive-slots N]", summary: "change them, as the Connect page does", why: () => "only maintainers and operators have settings" },
   { path: ["repos"], tool: "list_repos", usage: "", summary: "tracked repositories with their open decisions and fix-ups" },
   { path: ["fixups"], tool: "list_fixups", usage: "[--repo R] [--limit N]", summary: "PRs whose review fixes the pipeline could not apply" },
+  { path: ["items"], tool: "search_items", usage: "[--query Q] [--repo R] [--kind K] [--state S] [--author A] [--since D] [--limit N] [--cursor C]", summary: "issues and PRs from AutoCraft's copy of GitHub" },
+  { path: ["items", "show"], tool: "get_item", args: ["item"], usage: "<item>", summary: "one issue or PR from AutoCraft's copy of GitHub" },
 ];
 
 /**
