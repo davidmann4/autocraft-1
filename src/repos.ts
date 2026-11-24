@@ -4,6 +4,7 @@ import { audit } from "./dash/audit.ts";
 import { execFile } from "node:child_process";
 import { DEFAULT_OWNER, OWNER, reloadOwners, splitSlug } from "./owners.ts";
 import { appCoverage, githubIdentity, setGithubIdentityChecked } from "./github/identity.ts";
+import { listRepoOwner, ownerAllowed } from "./github/allowed-owners.ts";
 import { readAppSecrets } from "./github/install-token.ts";
 import { PilotError, setRepoPipeline } from "./pilot.ts";
 import { AppReadError, readEnv } from "./github/read.ts";
@@ -42,6 +43,7 @@ export async function trackRepo(db: Db, by: string, input: string): Promise<bool
     // Items updated while the repo was untracked were never read; the next sync reads the repo in full.
     await db.run(db.k.updateTable("main.repos").set({ high_water: null, synced_at: null, reconciled_at: null }).where("name", "=", name));
     await audit(db, by, "repo-track", name);
+    await listRepoOwner(db, by, (await db.get(db.k.selectFrom("main.repos").select("owner").where("name", "=", name)))?.owner ?? owner, "track");
   }
   return r.changes > 0;
 }
@@ -66,10 +68,12 @@ export async function trackRepoChecked(db: Db, by: string, input: string, exists
     if (await exists(DEFAULT_OWNER, name)) throw new RepoError(`${DEFAULT_OWNER}/${name} exists; repo names are unique across owners.`);
     if (!(await exists(owner, name))) throw new RepoError(`${owner}/${name} was not found or is not readable.`);
   }
+  const known2 = NAME.test(name) ? await db.get(db.k.selectFrom("main.repos").select("owner").where("name", "=", name)) : undefined;
+  const repoOwner = input.includes("/") ? owner : known2?.owner ?? owner;
+  if (OWNER.test(repoOwner) && !await ownerAllowed(db, repoOwner)) throw new RepoError(`${repoOwner} is not an allowed owner of the GitHub App.`);
   // Under the GitHub App identity a repo the installation does not cover could not be written to.
   if (await githubIdentity(db) === "app" && NAME.test(name) && OWNER.test(owner)) {
-    const known2 = await db.get(db.k.selectFrom("main.repos").select("owner").where("name", "=", name));
-    const c = await appCoverage(input.includes("/") ? owner : known2?.owner ?? owner, name, mint);
+    const c = await appCoverage(repoOwner, name, mint);
     if (c.kind === "uncovered") throw new RepoError(`The GitHub App does not cover ${name}: ${c.why}`);
     if (c.kind === "unconfirmed") throw new RepoError(`GitHub could not confirm the GitHub App's installation for ${name}. Try again.`);
   }

@@ -274,6 +274,9 @@ export function createHttpApi(): Api {
       revokeLink: (id) => post("/api/admin/github-app/links/revoke", { id }),
       remove: () => post("/api/admin/github-app/remove", {}),
       setIdentity: (identity) => post("/api/admin/github-app/identity", { identity }),
+      allowOwner: (login) => post("/api/admin/github-app/owners", { login }),
+      removeOwner: (login) => post("/api/admin/github-app/owners/remove", { login }),
+      ackForeignInstalls: () => post("/api/admin/github-app/foreign-ack", {}),
     },
     discord: {
       setup: () => get("/api/admin/discord"),

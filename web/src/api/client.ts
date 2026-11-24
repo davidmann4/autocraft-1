@@ -361,6 +361,12 @@ export interface Api {
     remove(): Promise<{ settingsUrl: string }>;
     /** Sets the instance-wide GitHub identity. `app` is refused (with the uncovered repos in the message) unless the app is registered and covers every tracked repo. Every session ends; `signIn` is where to go next. */
     setIdentity(identity: "box" | "app"): Promise<{ identity: "box" | "app"; signIn: string }>;
+    /** Puts an account on the allowed owners list; the first one also lists the accounts that must stay allowed. */
+    allowOwner(login: string): Promise<{ ok: true }>;
+    /** Takes an account off the list; refused, with the reason, for an account that owns a tracked or filing-only repo or the app. */
+    removeOwner(login: string): Promise<{ ok: true }>;
+    /** Clears the warning about installations removed from accounts that are not allowed owners. */
+    ackForeignInstalls(): Promise<{ ok: true }>;
   };
   /** Optional Discord mention counting. Operators change it; everyone signed in may read it. */
   discord: {

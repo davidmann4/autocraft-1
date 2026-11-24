@@ -4,6 +4,7 @@
 import { execFile } from "node:child_process";
 import { audit } from "../dash/audit.ts";
 import { OWNER } from "../owners.ts";
+import { listRepoOwner, ownerAllowed } from "../github/allowed-owners.ts";
 import { appCoverage } from "../github/identity.ts";
 import { AppReadError, readEnv } from "../github/read.ts";
 import { publicRepoNames } from "../public/status.ts";
@@ -73,7 +74,8 @@ function parseSlug(input: string): { owner: string; name: string } {
 
 /**
  * Adds a filing-only repo after GitHub confirms that it is public, takes issues and is in the GitHub App's installation.
- * Refuses a name that is tracked, known under another owner, or already on the list. Audited as `discord-filing-add`.
+ * Refuses a name that is tracked, known under another owner, or already on the list, and an owner that is not an allowed
+ * owner of the GitHub App (src/github/allowed-owners.ts) while that list has accounts. Audited as `discord-filing-add`.
  */
 export async function addFilingRepo(db: Db, by: string, input: string, deps: { read?: ReadRepo; mint?: (owner: string, repo: string) => Promise<string> } = {}): Promise<FilingRepo> {
   const asked = parseSlug(input);
@@ -85,6 +87,7 @@ export async function addFilingRepo(db: Db, by: string, input: string, deps: { r
   if (facts.private) throw new FilingRepoError(`${owner}/${name} is not public.`);
   if (!facts.hasIssues) throw new FilingRepoError(`${owner}/${name} has issues turned off.`);
   if (facts.archived) throw new FilingRepoError(`${owner}/${name} is archived.`);
+  if (!await ownerAllowed(db, owner)) throw new FilingRepoError(`${owner} is not an allowed owner of the GitHub App.`);
   const tracked = await db.get(db.k.selectFrom("main.tracked_repos").select("name").where((eb) => eb(eb.fn("lower", ["name"]), "=", name.toLowerCase())));
   if (tracked) throw new FilingRepoError(`${tracked.name} is a tracked repo; the bot offers it while it is public.`);
   const known = await db.get(db.k.selectFrom("main.repos").select(["name", "owner"]).where((eb) => eb(eb.fn("lower", ["name"]), "=", name.toLowerCase())));
@@ -97,6 +100,7 @@ export async function addFilingRepo(db: Db, by: string, input: string, deps: { r
   const row = { owner, name, added_by: by, added_at: new Date().toISOString() };
   await db.run(db.k.insertInto("discord_filing_repos").values(row));
   await audit(db, by, "discord-filing-add", name, { owner });
+  await listRepoOwner(db, by, owner, "filing");
   return { owner, name, addedBy: by, addedAt: row.added_at };
 }
 

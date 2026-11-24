@@ -189,7 +189,7 @@ describe("github app registration", () => {
     assert.equal(status.app.slug, "autocraft-test");
     assert.equal(status.app.installUrl, "https://github.com/apps/autocraft-test/installations/new");
     assert.equal(status.app.transferUrl, "https://github.com/organizations/glasswing/settings/apps/autocraft-test/advanced");
-    assert.deepEqual(status.installations, [{ owner: "glasswing", selection: "selected", repos: ["glasswing/photocraft"] }]);
+    assert.deepEqual(status.installations, [{ id: 7, owner: "glasswing", type: null, selection: "selected", repos: ["glasswing/photocraft"], createdAt: null, allowed: false, protected: true }]);
     const audit = JSON.stringify(await db.all(db.k.selectFrom("audit").select(kx.cols("audit"))));
     for (const secret of [PEM.slice(40, 80), CLIENT_SECRET, WEBHOOK_SECRET, "ghs_installation"]) {
       assert.ok(!text.includes(secret) && !page.includes(secret) && !audit.includes(secret));

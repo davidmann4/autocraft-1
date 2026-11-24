@@ -107,13 +107,14 @@ export const countOf = async (db: Db, repo: string, number: number): Promise<num
   (await db.get(db.k.selectFrom("discord_mentions").select((eb) => eb.fn.countAll<number>().as("n")).where("repo", "=", repo).where("number", "=", number)))!.n;
 
 /** What the bot reports about a guild and its channels, for the admin page. The watched flag is kept across updates. */
-export async function upsertChannel(db: Db, c: { channelId: string; guildId: string; guildName: string | null; name: string | null; parentId?: string | null; position?: number | null; categoryId?: string | null }): Promise<void> {
+export async function upsertChannel(db: Db, c: { channelId: string; guildId: string; guildName: string | null; name: string | null; parentId?: string | null; position?: number | null; categoryId?: string | null; viewable?: boolean }): Promise<void> {
   await db.run(db.k.insertInto("discord_channels")
-    .values({ channel_id: c.channelId, guild_id: c.guildId, guild_name: c.guildName, name: c.name, parent_id: c.parentId ?? null, position: c.position ?? null, category_id: c.categoryId ?? null })
+    .values({ channel_id: c.channelId, guild_id: c.guildId, guild_name: c.guildName, name: c.name, parent_id: c.parentId ?? null, position: c.position ?? null, category_id: c.categoryId ?? null, viewable: c.viewable === false ? 0 : 1 })
     .onConflict((oc) => oc.column("channel_id").doUpdateSet((eb) => ({
       guild_id: eb.ref("excluded.guild_id"), guild_name: eb.fn.coalesce("excluded.guild_name", "discord_channels.guild_name"),
       name: eb.fn.coalesce("excluded.name", "discord_channels.name"), parent_id: eb.ref("excluded.parent_id"),
       position: eb.ref("excluded.position"), category_id: eb.ref("excluded.category_id"),
+      ...(c.viewable === undefined ? {} : { viewable: eb.ref("excluded.viewable") }),
     }))));
 }
 

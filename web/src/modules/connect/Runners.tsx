@@ -36,6 +36,7 @@ const readinessBadge = (h: RunnerInfo): { text: string; tone: Tone } => {
     "version-refused": { text: "Runner too old", tone: "bad" },
     "harness-missing": { text: "Harness missing", tone: "bad" },
     failing: { text: until("Calls failing"), tone: "bad" },
+    "login-refresh": { text: until("Waiting for login refresh"), tone: "warn" },
   };
   return map[h.readiness];
 };

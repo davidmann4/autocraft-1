@@ -76,19 +76,24 @@ export async function usageOf(db: Db, now: number = Date.now()): Promise<Discord
   };
 }
 
+/** Names like "___hidden___" that Discord shows for channels the bot cannot see. */
+const PLACEHOLDER_NAME = /^_+hidden_+$/i;
+
 async function setupOf(db: Db): Promise<DiscordSetup> {
   const st = await db.get(db.k.selectFrom("discord_status").select(["state", "detail", "at"]).where("id", "=", 1).$narrowType<{ state: DiscordSetup["state"] }>());
   const channels = await db.all(db.k.selectFrom("discord_channels as c")
     .leftJoin("discord_categories as k", (j) => j.onRef("k.category_id", "=", "c.category_id").onRef("k.guild_id", "=", "c.guild_id"))
     .select(["c.channel_id as channelId", "c.guild_id as guildId", "c.guild_name as guildName", "c.name", "c.watched", "c.default_repo as defaultRepo", "k.name as category"])
     .where("c.parent_id", "is", null)
+    // Channels the bot cannot view stay listed only while watched, so they can be switched off. The name pattern catches placeholder names.
+    .where((eb) => eb.or([eb("c.viewable", "=", 1), eb("c.watched", "=", 1)]))
     .orderBy("c.guild_name", (o) => o.asc().nullsFirst()).orderBy("c.guild_id")
     .orderBy((eb) => eb("k.category_id", "is not", null)).orderBy((eb) => eb("k.position", "is", null))
     .orderBy("k.position", (o) => o.asc().nullsFirst()).orderBy("k.category_id", (o) => o.asc().nullsFirst())
     .orderBy((eb) => eb("c.position", "is", null)).orderBy("c.position", (o) => o.asc().nullsFirst()).orderBy("c.channel_id"));
   return {
     state: st?.state ?? "off", detail: st?.detail ?? null, at: st?.at ?? null,
-    channels: channels.map((c) => ({ ...c, watched: !!c.watched })),
+    channels: channels.filter((c) => c.watched || !PLACEHOLDER_NAME.test(c.name ?? "")).map((c) => ({ ...c, watched: !!c.watched })),
     repos: await publicRepoNames(db),
     filingRepos: await filingRepos(db),
     offer: await offerState(db),

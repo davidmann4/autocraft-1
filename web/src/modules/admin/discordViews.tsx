@@ -16,6 +16,7 @@ import { TimeAgo } from "../../ui/atoms/TimeAgo";
 import { Avatar } from "../../ui/atoms/Avatar";
 import { ConfirmButton } from "../../ui/molecules/ConfirmButton";
 import { Block } from "../../ui/molecules/Block";
+import { DisclosureButton, useRememberedOpen } from "../../ui/molecules/DisclosureButton";
 import { Facts } from "../../ui/molecules/Facts";
 import { Page } from "../../ui/organisms/Page";
 import { useWrite } from "../../lib/hooks";
@@ -28,7 +29,11 @@ export function DiscordView(_: ViewProps) {
   const { data, error, refetch } = useQuery("discord-setup", (api) => api.discord.setup());
   const api = useApi();
   const write = useWrite();
-  const guilds = data ? [...new Set(data.channels.map((c) => c.guildId))] : [];
+  const [showAll, setShowAll] = useRememberedOpen("discord-channels");
+  const inUse = data ? data.channels.filter((c) => c.watched || c.defaultRepo !== null) : [];
+  const allShown = showAll || inUse.length === 0;
+  const shown = data ? (allShown ? data.channels : inUse) : [];
+  const guilds = [...new Set(shown.map((c) => c.guildId))];
   return (
     <Page title="Discord">
       <ErrorLine error={error?.message ?? write.error} className="mt-3" />
@@ -46,6 +51,7 @@ export function DiscordView(_: ViewProps) {
           </Block>
           <Block className="mt-4" title="Channels" aside={`${data.channels.filter((c) => c.watched).length} watched`} flush>
             {data.channels.length === 0 && <div className="px-4 py-3 text-sm text-ink/55">The bot has reported no channels.</div>}
+            <div id="discord-channel-list">
             {guilds.map((g) => (
               <div key={g} className="border-b border-line last:border-0">
                 <div className="flex flex-wrap items-baseline gap-x-2 bg-ink/[0.03] px-4 py-2 text-sm font-medium">
@@ -53,7 +59,7 @@ export function DiscordView(_: ViewProps) {
                   <span className="num text-2xs font-normal text-ink/45">{g}</span>
                 </div>
                 <ul>
-                  {data.channels.filter((c) => c.guildId === g).map((c, i, all) => (
+                  {shown.filter((c) => c.guildId === g).map((c, i, all) => (
                     <Fragment key={c.channelId}>
                     {c.category !== null && c.category !== (all[i - 1]?.category ?? null) && (
                       <li className="border-t border-line bg-ink/[0.02] px-4 pb-1 pt-2 text-2xs font-medium uppercase tracking-wide text-ink/45 first:border-0">{c.category}</li>
@@ -81,6 +87,12 @@ export function DiscordView(_: ViewProps) {
                 </ul>
               </div>
             ))}
+            </div>
+            {inUse.length > 0 && inUse.length < data.channels.length ? (
+              <DisclosureButton open={showAll} onToggle={setShowAll} controls="discord-channel-list" className="border-t border-line">
+                {showAll ? "Show fewer" : `Show all channels (${data.channels.length})`}
+              </DisclosureButton>
+            ) : null}
           </Block>
           <DiscordOfferBlock offer={data.offer} filingCount={data.filingRepos.length} onSet={(r, on) => api.discord.setOffer(r, on).then(() => refetch())} />
           <DiscordFilingBlock repos={data.filingRepos} onAdd={(r) => api.discord.addFilingRepo(r).then(() => refetch())} onRemove={(r) => api.discord.removeFilingRepo(r).then(() => refetch())} />

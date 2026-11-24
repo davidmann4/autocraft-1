@@ -139,6 +139,11 @@ export function createMockApi(): Api {
       { channelId: "9000000000000007", guildId: "9000000000000001", guildName: "Glasswing Community", name: "release-notes", watched: false, defaultRepo: null, category: "Development" },
       { channelId: "9000000000000003", guildId: "9000000000000001", guildName: "Glasswing Community", name: "support", watched: true, defaultRepo: null, category: "Community" },
       { channelId: "9000000000000008", guildId: "9000000000000001", guildName: "Glasswing Community", name: "help-desk", watched: false, defaultRepo: null, category: "Community" },
+      { channelId: "9100000000000011", guildId: "9100000000000001", guildName: "Open Tools Collective", name: "general", watched: false, defaultRepo: null, category: null },
+      { channelId: "9100000000000012", guildId: "9100000000000001", guildName: "Open Tools Collective", name: "showcase", watched: false, defaultRepo: null, category: "Community" },
+      { channelId: "9100000000000013", guildId: "9100000000000001", guildName: "Open Tools Collective", name: "bug-reports", watched: true, defaultRepo: "pdfcraft", category: "Support" },
+      { channelId: "9100000000000014", guildId: "9100000000000001", guildName: "Open Tools Collective", name: "off-topic", watched: false, defaultRepo: null, category: "Community" },
+      { channelId: "9100000000000015", guildId: "9100000000000001", guildName: "Open Tools Collective", name: "voice-lounge", watched: false, defaultRepo: null, category: "Community" },
     ],
   };
   const find = (id: string) => {

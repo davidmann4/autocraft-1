@@ -1032,8 +1032,10 @@ export interface GithubAppStatus {
   /** The signed-in operator has let the app act as them; null when no app is registered. */
   authorized: boolean | null;
   app: { id: string; slug: string; name: string | null; installUrl: string; transferUrl: string } | null;
-  /** Each account the app is installed on, with the repos it covers. */
-  installations: { owner: string; selection: "all" | "selected"; repos: string[] }[];
+  /** Each account the app is installed on, with the repos it covers; `allowed`: the account is on the allowed owners list; `protected`: it owns a tracked or filing-only repo or the app, so its installation is never removed. */
+  installations: { id: number; owner: string; type: "User" | "Organization" | null; selection: "all" | "selected"; repos: string[]; createdAt: string | null; allowed: boolean; protected: boolean }[];
+  /** Accounts the app may be installed on; empty: any account, nothing is removed. `kept`: why the account cannot be taken off the list. */
+  allowedOwners: { login: string; addedBy: string; addedAt: string; kept: string | null }[];
   /** Org setup links that can still be used. */
   links: GithubSetupLink[];
   /** Set when GitHub could not be read. */
@@ -2511,7 +2513,7 @@ export interface NextPage {
 // ---- Now page (GET /api/now) ---------------------------------------------------
 
 /** A thing that needs attention; `to` is the page where it is fixed. `info` problems do not break "all healthy". */
-export type NowProblem = { id: string; area: "pipeline" | "runner" | "workers" | "breaker" | "limit" | "account" | "jev" | "main-ci" | "jobs" | "sync" | "deadline" | "liveness"; tone: "bad" | "warn"; text: string; to: string; since: string | null; /** Set on a job stopped for running past its step's limit: the step an operator acknowledges to clear the warning. */ ackStep?: string };
+export type NowProblem = { id: string; area: "pipeline" | "runner" | "workers" | "breaker" | "limit" | "account" | "jev" | "main-ci" | "jobs" | "sync" | "deadline" | "liveness"; tone: "bad" | "warn"; text: string; to: string; since: string | null; /** Set on a job stopped for running past its step's limit: the step an operator acknowledges to clear the warning. */ ackStep?: string; /** Another warning an operator clears by acknowledging it. */ ack?: "app-foreign-install" };
 export type NowHealth = {
   pipeline: { enabled: boolean; by: string | null; at: string | null };
   problems: NowProblem[];

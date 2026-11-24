@@ -52,8 +52,8 @@ export function HealthMenu() {
                     <span className="min-w-0 flex-1 break-words text-ink [overflow-wrap:anywhere]">{p.text}</span>
                     {p.since && <TimeAgo iso={p.since} className="num ml-1 shrink-0 text-xs text-ink/50" />}
                   </Link>
-                  {operator && p.ackStep && (
-                    <Button loading={write.busy === p.id} onClick={() => void write.run(p.id, () => api.pipeline.ackDeadline(p.ackStep!))} className="m-1 shrink-0 max-md:h-11">
+                  {operator && (p.ackStep || p.ack) && (
+                    <Button loading={write.busy === p.id} onClick={() => void write.run(p.id, () => (p.ackStep ? api.pipeline.ackDeadline(p.ackStep) : api.githubApp.ackForeignInstalls()))} className="m-1 shrink-0 max-md:h-11">
                       Acknowledge
                     </Button>
                   )}
