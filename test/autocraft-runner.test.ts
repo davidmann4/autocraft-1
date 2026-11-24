@@ -81,11 +81,24 @@ test("instruction files and .claude directories are removed from a checkout at a
   }
 });
 
-test("a Claude login's token is used only while it outlives the call's timeout by 10 minutes", () => {
+test("a Claude login 20 minutes from its end takes short calls and leaves long ones for after its refresh", () => {
   const now = 1_000_000_000_000;
   const creds = (expiresAt: number) => ({ claudeAiOauth: { accessToken: "sk-ant-oat-x", refreshToken: "r", expiresAt } });
-  assert.deepEqual(helper.claudeLoginToken(creds(now + (900 + 601) * 1000), 900, now), { token: "sk-ant-oat-x" });
-  assert.deepEqual(helper.claudeLoginToken(creds(now + (900 + 600) * 1000), 900, now), { problem: helper.CLAUDE_LOGIN_EXPIRES });
+  const near = creds(now + 20 * 60_000);
+  const room = helper.claudeLoginRoom(near, now)!;
+  assert.ok(helper.loginTakesCalls(room), "the runner stays ready");
+  // The claim names the room; a call it lets through gets the token when it starts, so nothing claimed is given back.
+  for (const t of [120, 300, 600]) {
+    assert.ok(t <= room.room, `a ${t} s call is claimed`);
+    assert.deepEqual(helper.claudeLoginToken(near, t, now + 60_000), { token: "sk-ant-oat-x" }, `a ${t} s call starts after a minute's preparation`);
+  }
+  assert.ok(room.room < 900 && room.room < 1200);
+  assert.deepEqual(helper.claudeLoginToken(near, 1200, now), { problem: helper.CLAUDE_LOGIN_EXPIRES }, "a 20-minute call waits for the refresh");
+  assert.ok(room.refreshAt < now + 20 * 60_000, "calls end before the login's end, when claude refreshes it");
+  // Close to the refresh point no call fits; a fresh login has room for the longest calls.
+  assert.ok(!helper.loginTakesCalls(helper.claudeLoginRoom(creds(now + 6 * 60_000), now)));
+  assert.ok(helper.claudeLoginRoom(creds(now + 8 * 3600_000), now)!.room > 3 * 3600);
+  assert.equal(helper.claudeLoginRoom({ claudeAiOauth: { accessToken: "k", expiresAt: Number.MAX_SAFE_INTEGER } }, now), null, "a login without an end sets no limit");
   assert.ok("problem" in helper.claudeLoginToken(null, 900, now));
 });
 

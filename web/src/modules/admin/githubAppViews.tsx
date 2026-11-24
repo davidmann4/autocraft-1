@@ -33,7 +33,8 @@ export function GithubAppView(_: ViewProps) {
           <IdentityBlock s={data} onChange={refetch} />
           <AppBlock s={data} onChange={refetch} />
           <SetupLinks links={data.links} onChange={refetch} />
-          {data.app && <Installations s={data} />}
+          {data.app && <AllowedOwners s={data} onChange={refetch} />}
+          {data.app && <Installations s={data} onChange={refetch} />}
         </>
       )}
     </Page>
@@ -152,17 +153,102 @@ function RegisterForm({ s }: { s: GithubAppStatus }) {
   );
 }
 
-function Installations({ s }: { s: GithubAppStatus }) {
+/** Run one write at a time with its busy key and error, then reread the page. */
+function useWrite(onChange: () => void) {
+  const [busy, setBusy] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const run = async (key: string, f: () => Promise<unknown>) => {
+    setBusy(key);
+    setError(null);
+    try {
+      await f();
+      onChange();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(null);
+    }
+  };
+  return { busy, error, run };
+}
+
+/** The accounts the app may be installed on; an installation on any other account is removed. An empty list enforces nothing. */
+function AllowedOwners({ s, onChange }: { s: GithubAppStatus; onChange: () => void }) {
+  const api = useApi();
+  const w = useWrite(onChange);
+  const [login, setLogin] = useState("");
+  const on = s.allowedOwners.length > 0;
+  return (
+    <Block className="mt-4" title="Allowed owners" aside={<Badge tone={on ? "ok" : "neutral"}>{on ? "On" : "Off (no owners listed)"}</Badge>}>
+      <form
+        className="flex flex-wrap items-center gap-2"
+        onSubmit={(e) => {
+          e.preventDefault();
+          void w.run("allow", async () => {
+            await api.githubApp.allowOwner(login.trim());
+            setLogin("");
+          });
+        }}
+      >
+        <Input value={login} onChange={(e) => setLogin(e.target.value)} placeholder="GitHub account" aria-label="GitHub account" maxLength={39} className="w-full sm:w-52" />
+        <Button type="submit" variant="primary" loading={w.busy === "allow"} disabled={!login.trim()} className="max-md:h-11 max-md:w-full">
+          Allow
+        </Button>
+      </form>
+      <ErrorLine error={w.error} className="mt-2" />
+      {on && (
+        <ul className="mt-3">
+          {s.allowedOwners.map((o) => (
+            <li key={o.login} className="flex flex-wrap items-center gap-x-3 gap-y-1 border-t border-line py-2 first:border-0">
+              <span className="min-w-0 break-all text-sm font-medium">{o.login}</span>
+              <span className="text-xs text-ink/55">
+                {o.addedBy} · {day(o.addedAt)}
+              </span>
+              {o.kept ? (
+                <Badge tone="ok" className="ml-auto">
+                  Protected
+                </Badge>
+              ) : (
+                <ConfirmButton
+                  className="ml-auto"
+                  label="Remove"
+                  confirmLabel={`Remove ${o.login}`}
+                  loading={w.busy === `remove:${o.login}`}
+                  onConfirm={() => void w.run(`remove:${o.login}`, () => api.githubApp.removeOwner(o.login))}
+                />
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+    </Block>
+  );
+}
+
+function Installations({ s, onChange }: { s: GithubAppStatus; onChange: () => void }) {
+  const api = useApi();
+  const w = useWrite(onChange);
   return (
     <Block className="mt-4" title="Installations">
-      <ErrorLine error={s.error} className="px-4 pt-3" />
+      <ErrorLine error={s.error ?? w.error} className="px-4 pt-3" />
       {s.installations.length === 0 && !s.error && <div className="px-4 py-3 text-sm text-ink/55">Not installed anywhere yet.</div>}
       <ul>
         {s.installations.map((i) => (
-          <li key={i.owner} className="border-b border-line px-4 py-3 last:border-0">
-            <div className="flex items-center gap-2 text-sm font-medium">
-              {i.owner}
+          <li key={i.id} className="border-b border-line px-4 py-3 last:border-0">
+            <div className="flex flex-wrap items-center gap-2 text-sm">
+              <span className="min-w-0 break-all font-medium">{i.owner}</span>
+              {i.type && <Badge>{i.type}</Badge>}
               <Badge>{i.selection === "all" ? "All repos" : `${i.repos.length} repos`}</Badge>
+              {i.createdAt && <span className="text-xs text-ink/55">installed {day(i.createdAt)}</span>}
+              {i.allowed || i.protected ? (
+                <Badge tone="ok" className="ml-auto">
+                  {i.allowed ? "Allowed" : "Protected"}
+                </Badge>
+              ) : (
+                <Button size="sm" variant="secondary" className="ml-auto max-md:h-11" loading={w.busy === i.owner} onClick={() => void w.run(i.owner, () => api.githubApp.allowOwner(i.owner))}>
+                  Allow
+                </Button>
+              )}
             </div>
             <ul className="mt-1.5 flex flex-wrap gap-x-4 gap-y-1 text-sm text-ink/70">
               {i.repos.map((r) => (

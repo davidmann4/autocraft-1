@@ -10,6 +10,7 @@ import { audit } from "../dash/audit.ts";
 import { envVar } from "../env.ts";
 import { localEmbedder } from "../embed/model.ts";
 import { VectorIndex } from "../embed/vectors.ts";
+import { guildPerms, type Overwrite, type Role } from "./perms.ts";
 import { Gateway } from "./gateway.ts";
 import { Interactions } from "./interactions.ts";
 import { Pings } from "./pings.ts";
@@ -31,27 +32,40 @@ import { forgetAuthor, forgetMessages, handleDispatch, setStatus, upsertCategory
 import type { Db } from "../db/index.ts";
 import { openDb } from "../db/open.ts";
 
-type Channel = { id: string; name?: string; type?: number; parent_id?: string | null; position?: number };
+type Channel = { id: string; name?: string; type?: number; parent_id?: string | null; position?: number; permission_overwrites?: Overwrite[] };
 const CATEGORY = 4;
 // Text, announcement and forum channels can be watched; their threads and forum posts count under them.
 const LISTED = new Set([0, 5, 15]);
 
 /** Keeps the channel list the admin page shows; no message is involved. Rows of deleted channels are removed by handleDispatch, which runs first. */
 export async function handleMeta(db: Db, type: string, d: unknown): Promise<void> {
-  const x = d as { id?: string; name?: string; guild_id?: string; type?: number; parent_id?: string | null; position?: number; unavailable?: boolean; channels?: Channel[]; threads?: Channel[] };
+  const x = d as { id?: string; name?: string; guild_id?: string; type?: number; parent_id?: string | null; position?: number; unavailable?: boolean; channels?: Channel[]; threads?: Channel[]; roles?: Role[]; role?: Role; role_id?: string; user?: { id?: string }; members?: { user?: { id?: string }; roles?: string[] }[]; permission_overwrites?: Overwrite[] };
   const thread = async (guildId: string, t: Channel): Promise<void> => {
     if (t.parent_id) await upsertChannel(db, { channelId: t.id, guildId, guildName: null, name: t.name ?? null, parentId: t.parent_id });
   };
-  if (type === "GUILD_CREATE" && x.id) {
+  const reviewGuild = async (guildId: string): Promise<void> => {
+    for (const id of guildPerms.channelIds(guildId)) await db.run(db.k.updateTable("discord_channels").set({ viewable: guildPerms.viewable(guildId, id) ? 1 : 0 }).where("channel_id", "=", id));
+  };
+  if (type === "READY") {
+    guildPerms.botId = x.user?.id ?? null;
+  } else if (type === "GUILD_ROLE_CREATE" || type === "GUILD_ROLE_UPDATE") {
+    if (x.guild_id && x.role) { guildPerms.setRole(x.guild_id, x.role); await reviewGuild(x.guild_id); }
+  } else if (type === "GUILD_ROLE_DELETE") {
+    if (x.guild_id && x.role_id) { guildPerms.deleteRole(x.guild_id, x.role_id); await reviewGuild(x.guild_id); }
+  } else if (type === "GUILD_MEMBER_UPDATE") {
+    if (x.guild_id && x.user?.id && x.user.id === guildPerms.botId) { guildPerms.setBotRoles(x.guild_id, (x as { roles?: string[] }).roles ?? []); await reviewGuild(x.guild_id); }
+  } else if (type === "GUILD_CREATE" && x.id) {
+    guildPerms.setGuild(x.id, x.roles ?? [], x.members, x.channels ?? []);
     for (const c of x.channels ?? []) {
       if (c.type === CATEGORY) await upsertCategory(db, { categoryId: c.id, guildId: x.id, name: c.name ?? null, position: c.position ?? null });
-      else if (c.type === undefined || LISTED.has(c.type)) await upsertChannel(db, { channelId: c.id, guildId: x.id, guildName: x.name ?? null, name: c.name ?? null, position: c.position, categoryId: c.parent_id });
+      else if (c.type === undefined || LISTED.has(c.type)) await upsertChannel(db, { channelId: c.id, guildId: x.id, guildName: x.name ?? null, name: c.name ?? null, position: c.position, categoryId: c.parent_id, viewable: guildPerms.viewable(x.id!, c.id) });
     }
     for (const t of x.threads ?? []) await thread(x.id, t);
   } else if ((type === "CHANNEL_CREATE" || type === "CHANNEL_UPDATE") && x.id && x.guild_id && x.type === CATEGORY) {
     await upsertCategory(db, { categoryId: x.id, guildId: x.guild_id, name: x.name ?? null, position: x.position ?? null });
   } else if ((type === "CHANNEL_CREATE" || type === "CHANNEL_UPDATE") && x.id && x.guild_id && (x.type === undefined || LISTED.has(x.type))) {
-    await upsertChannel(db, { channelId: x.id, guildId: x.guild_id, guildName: null, name: x.name ?? null, position: x.position, categoryId: x.parent_id });
+    guildPerms.setChannel(x.guild_id, x.id, x.permission_overwrites);
+    await upsertChannel(db, { channelId: x.id, guildId: x.guild_id, guildName: null, name: x.name ?? null, position: x.position, categoryId: x.parent_id, viewable: guildPerms.viewable(x.guild_id, x.id) });
   } else if ((type === "THREAD_CREATE" || type === "THREAD_UPDATE") && x.id && x.guild_id) {
     await thread(x.guild_id, x as Channel);
   } else if (type === "THREAD_LIST_SYNC" && x.guild_id) {

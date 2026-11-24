@@ -1,7 +1,9 @@
 // GitHub App webhooks. A delivery is verified, reduced to the repo and item number it names, and queued; the
 // runner re-reads those items from GitHub. A new comment addressed to the app with a command (src/github/commands.ts) also
-// queues that command, with the commenter and the comment's id. Nothing else in the payload is stored, and none of it reaches a prompt.
+// queues that command, with the commenter and the comment's id. An installation delivery is checked against the allowed
+// owners (src/github/allowed-owners.ts). Nothing else in the payload is stored, and none of it reaches a prompt.
 import { createHmac } from "node:crypto";
+import { installationEvent } from "./allowed-owners.ts";
 import { queueCommand } from "./commands.ts";
 import { ONE_QUERY, Transient, writeItemNode, type Querier } from "../mirror.ts";
 import { ownerOf } from "../owners.ts";
@@ -95,6 +97,11 @@ export async function handleDelivery(db: Db, secret: string | null, headers: { s
     payload = JSON.parse(raw.toString("utf8"));
   } catch {
     return { status: 400 };
+  }
+  // An installation on an account that is not an allowed owner is removed right after the answer; the sweep is the backup.
+  if (event === "installation" || event === "installation_repositories") {
+    void installationEvent(db, event, payload).catch((e: unknown) => console.log(`webhook ${event}: ${String((e as Error)?.message ?? e).slice(0, 200)}`));
+    return { status: 202, queued: 0 };
   }
   return { status: 202, queued: await queueDelivery(db, event, payload, new Date(), appSlug) };
 }

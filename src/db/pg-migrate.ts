@@ -20,11 +20,21 @@ export function pgSchemaStamp(sql: string = pgSchemaSql()): string {
   return m[1]!;
 }
 
-/** Runs `fn` in one transaction that holds the migration lock; rolls back if it throws. */
-export async function withMigrationLock<T>(client: PgQueryable, fn: () => Promise<T>): Promise<T> {
+/** SQLSTATE codes worth retrying: deadlock_detected and lock_not_available (lock_timeout expired). */
+const RETRYABLE_CODES = new Set(["40P01", "55P03"]);
+const MIGRATION_RETRY_DELAYS_MS = [2000, 4000, 8000, 16000];
+
+export interface MigrationLockOpts {
+  /** Replaced in tests so retries do not wait. */
+  sleep?: (ms: number) => Promise<void>;
+}
+
+async function lockedAttempt<T>(client: PgQueryable, fn: () => Promise<T>): Promise<T> {
   await client.query("BEGIN");
   try {
     await client.query(`SELECT pg_advisory_xact_lock(${MIGRATION_LOCK_KEY})`);
+    // DDL queues behind running queries of older processes during a rolling deploy; give up and retry rather than deadlock or hang.
+    await client.query("SET LOCAL lock_timeout = '15s'");
     const out = await fn();
     await client.query("COMMIT");
     return out;
@@ -35,12 +45,32 @@ export async function withMigrationLock<T>(client: PgQueryable, fn: () => Promis
 }
 
 /**
+ * Runs `fn` in one transaction that holds the migration lock; rolls back if it throws. A deadlock or lock timeout against
+ * another process's queries restarts the whole transaction (up to 5 attempts, 2 s to 16 s apart); `fn` must therefore
+ * recheck its own preconditions.
+ */
+export async function withMigrationLock<T>(client: PgQueryable, fn: () => Promise<T>, opts: MigrationLockOpts = {}): Promise<T> {
+  const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await lockedAttempt(client, fn);
+    } catch (e) {
+      const code = (e as { code?: unknown } | null)?.code;
+      const delay = MIGRATION_RETRY_DELAYS_MS[attempt - 1];
+      if (typeof code !== "string" || !RETRYABLE_CODES.has(code) || delay === undefined) throw e;
+      console.warn(`schema migration attempt ${attempt} failed (${code}); retrying in ${delay / 1000}s`);
+      await sleep(delay);
+    }
+  }
+}
+
+/**
  * Applies the schema under the migration lock. `then` runs in the same transaction after it (triggers generated at
  * runtime, value migrations, writing the stored stamp), so a concurrent opener sees all of it or none. `unless` runs first
  * under the lock: true skips everything (another opener migrated while this one waited). `before` runs just before the
  * schema.
  */
-export async function applyPgSchema(client: PgQueryable, then?: () => Promise<void>, opts: { unless?: () => Promise<boolean>; before?: () => Promise<void> } = {}): Promise<void> {
+export async function applyPgSchema(client: PgQueryable, then?: () => Promise<void>, opts: { unless?: () => Promise<boolean>; before?: () => Promise<void> } & MigrationLockOpts = {}): Promise<void> {
   await withMigrationLock(client, async () => {
     if (await opts.unless?.()) return;
     await opts.before?.();
@@ -48,5 +78,5 @@ export async function applyPgSchema(client: PgQueryable, then?: () => Promise<vo
     await client.query("SET LOCAL client_min_messages = warning");
     await client.query(pgSchemaSql());
     await then?.();
-  });
+  }, opts);
 }

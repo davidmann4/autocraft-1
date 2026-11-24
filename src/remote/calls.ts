@@ -392,6 +392,8 @@ export async function authorsOf(db: Db, refs: readonly ItemRef[]): Promise<strin
 
 /** A queued call as claims read it: the items parsed, the repos it names and its authors. */
 type Cand = Waiter & Pick<Row, "prompt_id" | "tier" | "parent_id" | "sticky_login" | "seen_at"> & {
+  /** The call's time limit (its bundle's timeout). */
+  timeoutMs: number;
   refs: ItemRef[]; repos: string[]; authors: ReadonlySet<string>; releasedBy: string | null; releasedAt: number | null;
   /** The lowercase login whose own Task Runners alone take the call (NewCall.forLogin), or null for the shared pool. */
   forLogin: string | null;
@@ -506,10 +508,11 @@ export function parseClaim(raw: unknown): Claim {
   if (c.interactiveLane !== undefined && typeof c.interactiveLane !== "boolean") throw new HttpError(400, "interactiveLane must be a boolean");
   if (c.interactiveLane === true && (c.fastLane === true || c.ownLane === true || c.withOwnLane === true)) throw new HttpError(400, "interactiveLane excludes the other lanes");
   if (c.withOwnLane !== undefined && typeof c.withOwnLane !== "boolean") throw new HttpError(400, "withOwnLane must be a boolean");
+  if (c.maxTimeoutSeconds !== undefined && (!Number.isInteger(c.maxTimeoutSeconds) || (c.maxTimeoutSeconds as number) < 1)) throw new HttpError(400, "maxTimeoutSeconds must be whole seconds, at least 1");
   // Protocol 3 helpers know no wait; a field they might send is not read.
   const wait = protocol >= 4 ? c.wait : undefined;
   if (wait !== undefined && (!Number.isInteger(wait) || (wait as number) < 0 || (wait as number) > 30)) throw new HttpError(400, "wait must be whole seconds from 0 to 30");
-  return { requestId: c.requestId, ...(c.fastLane === true && { fastLane: true }), ...(c.ownLane === true && { ownLane: true }), ...(c.withOwnLane === true && { withOwnLane: true }), ...(c.interactiveLane === true && { interactiveLane: true }), ...(wait !== undefined && { wait: wait as number }), protocol, helperVersion: c.helperVersion, harness: c.harness as HarnessId, harnessVersion: c.harnessVersion, tiers, ...(efforts && { efforts }), ...(c.repos !== undefined && { repos: c.repos as string[] }), ...(c.sessions !== undefined && { sessions: c.sessions as number[] }), ...(c.root !== undefined && { root: c.root as string }) };
+  return { requestId: c.requestId, ...(c.fastLane === true && { fastLane: true }), ...(c.ownLane === true && { ownLane: true }), ...(c.withOwnLane === true && { withOwnLane: true }), ...(c.interactiveLane === true && { interactiveLane: true }), ...(wait !== undefined && { wait: wait as number }), protocol, helperVersion: c.helperVersion, harness: c.harness as HarnessId, harnessVersion: c.harnessVersion, tiers, ...(efforts && { efforts }), ...(c.repos !== undefined && { repos: c.repos as string[] }), ...(c.sessions !== undefined && { sessions: c.sessions as number[] }), ...(c.root !== undefined && { root: c.root as string }), ...(c.maxTimeoutSeconds !== undefined && { maxTimeoutSeconds: c.maxTimeoutSeconds as number }) };
 }
 
 /** Whether dotted version `v` is older than `min` (numeric parts compared in order; a part that is not a number counts as 0). */
@@ -629,8 +632,8 @@ async function leaseCall(db: Db, id: number, caller: Caller, claim: Claim, model
 export const QUEUE_CACHE_MS = 2_000;
 type QueueCache = { at: number; sig: string; followUps: Cand[]; ordered: Cand[] };
 const queueCaches = new WeakMap<Db, QueueCache>();
-/** The parsed items, repos, authors and bound login of each queued call by id: they never change, so a rebuild reads them only for new calls. */
-type Parsed = Pick<Cand, "refs" | "repos" | "authors" | "forLogin" | "boundSlot" | "refusedToken">;
+/** The parsed items, repos, authors, bound login and time limit of each queued call by id: they never change, so a rebuild reads them only for new calls. */
+type Parsed = Pick<Cand, "refs" | "repos" | "authors" | "forLogin" | "boundSlot" | "refusedToken" | "timeoutMs">;
 const parsedCalls = new WeakMap<Db, Map<number, Parsed>>();
 /** Drops the cached queue order: a call was queued or leased by this process. Other processes' changes show in the signature (count and newest id of the queued calls) or within QUEUE_CACHE_MS. */
 export const dropQueueCache = (db: Db): void => void queueCaches.delete(db);
@@ -674,13 +677,13 @@ async function queuedCalls(db: Db, nowMs: number, sigRow?: { n: number; m: numbe
     .select(["id", "class as cls", "level", "step", "repo", "since", "seen_at", "prompt_id", "tier", "parent_id", "sticky_login", "released_by", "released_at", "picked_by", "picked_at", "pick_until",
       (eb) => eb("id", ">", newest).as("inline"), (eb) => eb.case().when("id", ">", newest).then(eb.ref("items")).end().as("items"),
       (eb) => eb.case().when("id", ">", newest).then(eb.ref("authors")).end().as("authors"), (eb) => eb.case().when("id", ">", newest).then(eb.ref("for_login")).end().as("for_login"),
-      (eb) => eb.case().when("id", ">", newest).then(eb.ref("bound_slot")).end().as("bound_slot")])
+      (eb) => eb.case().when("id", ">", newest).then(eb.ref("bound_slot")).end().as("bound_slot"), (eb) => eb.case().when("id", ">", newest).then(eb.ref("timeout_ms")).end().as("timeout_ms")])
     .where("state", "=", literal("queued")).$narrowType<{ tier: Tier }>());
   // The items and authors of older calls not parsed yet (a requeued lease), in one read.
   const fresh = queued.filter((r) => !known.has(Number(r.id)) && !r.inline).map((r) => Number(r.id));
   // A new call has no refused_token yet: only a requeued one, read here, can have one.
-  const texts = new Map<number, { items: string | null; authors: string | null; for_login: string | null; bound_slot: number | null; refused_token?: number | null }>(queued.filter((r) => r.inline).map((r) => [Number(r.id), r]));
-  if (fresh.length) for (const x of await db.all(db.k.selectFrom("main.remote_calls").select(["id", "items", "authors", "for_login", "bound_slot", "refused_token"]).where(inList(db, "id", fresh, "bigint")))) texts.set(Number(x.id), x);
+  const texts = new Map<number, { items: string | null; authors: string | null; for_login: string | null; bound_slot: number | null; timeout_ms: number | null; refused_token?: number | null }>(queued.filter((r) => r.inline).map((r) => [Number(r.id), r]));
+  if (fresh.length) for (const x of await db.all(db.k.selectFrom("main.remote_calls").select(["id", "items", "authors", "for_login", "bound_slot", "timeout_ms", "refused_token"]).where(inList(db, "id", fresh, "bigint")))) texts.set(Number(x.id), x);
   const rows = await mapSeq(queued, async (r): Promise<Cand> => {
     const id = Number(r.id);
     let p = known.get(id);
@@ -690,7 +693,7 @@ async function queuedCalls(db: Db, nowMs: number, sigRow?: { n: number; m: numbe
       // Calls queued before authors were stored on the row are read now.
       const authors = x.authors !== null ? JSON.parse(x.authors) as string[] : judges(r.prompt_id) ? await authorsOf(db, refs) : [];
       p = { refs, repos: [...new Set([...refs.map((i) => i.repo), ...(r.repo ? [r.repo] : [])])], authors: new Set(authors), forLogin: x.for_login?.toLowerCase() ?? null, boundSlot: Number(x.bound_slot) === 1,
-        refusedToken: x.refused_token == null ? null : Number(x.refused_token) };
+        refusedToken: x.refused_token == null ? null : Number(x.refused_token), timeoutMs: Number(x.timeout_ms) };
     }
     seen.set(id, p);
     return {
@@ -999,9 +1002,13 @@ async function prepareClaim(db: Db, caller: Caller, claim: Claim, canWrite: (rep
   let tiers = new Set<Tier>(), repos: ReadonlySet<string> | null = null;
   // The user's reserve as the latest full try read it, and when.
   let last: { at: number; reserve: Reserve } | null = null;
+  // Calls the latest try could have taken but for their time limit (Claim.maxTimeoutSeconds): the claim then counts as no
+  // idle helper's, so other runners do not pass over those calls for it, and its empty reply says why.
+  let tooLong = 0;
   const attempt: ClaimTry = async (now, { quick, live }) => {
     // A quick try with nothing to take changes nothing; the full tries, at least every RETRY_MS, check the credential as well.
     if (quick && !(await claimOrder(db, caller, tiers, repos, claim.sessions ?? [], now, fast, undefined, bound, mode)).length) return null;
+    tooLong = 0;
     const x = (now === nowMs && pending ? await pending : null) ?? await tryReads(db, caller, claim.repos, now);
     pending = null;
     last = { at: now, reserve: x.reserve };
@@ -1025,6 +1032,8 @@ async function prepareClaim(db: Db, caller: Caller, claim: Claim, canWrite: (rep
       // calls at once: it takes them at the limit too, with no limit of its own. An older helper runs them in a slot, as any call.
       if (full && r.parent_id === null && !own) continue;
       if (!(await eligible(caller, r, can, others))) continue;
+      // The limit counts from the claim's arrival: the time it was held is gone from the helper's login too.
+      if (claim.maxTimeoutSeconds !== undefined && r.timeoutMs > claim.maxTimeoutSeconds * 1000 - (now - nowMs)) { tooLong++; continue; }
       // The client left, or shutdown answered the claim: nothing is leased to nobody.
       // A credential the try read as busy needs no busy mark.
       const lease = await leaseCall(db, Number(r.id), caller, claim, claim.tiers[r.tier]!, Date.now(), lane || max === null || own ? null : r.parent_id !== null ? max + 1 : max, live, !fast && !own && !lane && x.idle, slots);
@@ -1045,8 +1054,9 @@ async function prepareClaim(db: Db, caller: Caller, claim: Claim, canWrite: (rep
     attempt,
     // An idle helper, with what it takes (the user's picks narrowed by the helper's list): an author's claim gives way to it
     // (idleOthers). The fast lane and the own lane say nothing about the helper's other slots.
-    idle: async (now) => { if (!fast && !own) await db.run(db.k.updateTable("main.mcp_tokens").set({ idle_claim_at: now, idle_tiers: JSON.stringify([...tiers]), idle_repos: repos ? JSON.stringify([...repos]) : null }).where("id", "=", caller.tokenId)); },
-    empty: async (now, held) => ({ lease: null, retryAfter: held ? scaledS(1) : CLAIM_RETRY_S, reserve: last?.at === now ? last.reserve : await userReserve(db, caller.login) }),
+    idle: async (now) => { if (!fast && !own && !tooLong) await db.run(db.k.updateTable("main.mcp_tokens").set({ idle_claim_at: now, idle_tiers: JSON.stringify([...tiers]), idle_repos: repos ? JSON.stringify([...repos]) : null }).where("id", "=", caller.tokenId)); },
+    empty: async (now, held) => ({ lease: null, retryAfter: held ? scaledS(1) : CLAIM_RETRY_S, reserve: last?.at === now ? last.reserve : await userReserve(db, caller.login),
+      ...(tooLong && { reason: `${tooLong} queued call${tooLong === 1 ? " needs" : "s need"} more time than the ${Math.max(0, Math.floor((claim.maxTimeoutSeconds! * 1000 - (now - nowMs)) / 60_000))} min this Task Runner's harness login has before its refresh` }) }),
   };
 }
 

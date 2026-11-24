@@ -1064,6 +1064,14 @@ async function sync(args: string[]): Promise<void> {
           console.log(`releases: ${String((e as Error)?.message ?? e).slice(0, 200)}`);
         }
       }
+      // GitHub App installations on accounts that are not allowed owners.
+      if (!opts.full && !opts.only.length) {
+        try {
+          await (await import("./github/allowed-owners.ts")).sweepInstallationsIfDue(db);
+        } catch (e) {
+          console.log(`github app: sweep: ${String((e as Error)?.message ?? e).slice(0, 200)}`);
+        }
+      }
       // Findings whose fix is landing: a merged pull request, or a fix that reached the default branch through an advisory.
       if (!opts.full && !opts.only.length) {
         try {

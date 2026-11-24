@@ -92,6 +92,11 @@ export type Claim = {
   /** A claim from a slot or the fast lane of a helper that also runs an own lane: the calls bound to its user are left to that lane. */
   withOwnLane?: boolean;
   /**
+   * Only calls whose timeout is at most this many seconds: the helper's harness login is refreshed before a longer call could
+   * finish. Absent: any timeout. A server without the field offers any call, and the helper gives back one that does not fit.
+   */
+  maxTimeoutSeconds?: number;
+  /**
    * Protocol 4 only: how long the server may hold the claim open when nothing is queued for it, in whole seconds (0 to 30).
    * A call queued meanwhile is leased at once; when none comes, the empty reply has `retryAfter: 1`. Absent or 0: answered at once.
    */
@@ -125,11 +130,13 @@ export type ClaimReply = ({ lease: null; /** Seconds to wait before the next cla
  * could not be read, or the provider refused a run for its limit. `paused`: its user paused it until a reset. `cooled-off`: the
  * server gives the login, across all its helpers and tokens, no calls for a while after repeated lost leases or failed
  * replies (ClaimReply `reason`, `until`; src/remote/cooloff.ts). `failing`: the helper's last 5 calls failed or were given
- * back in a row; it claims again at `until` if its checks pass (`reason` names the last error). The
- * rest need the user: the sandbox check failed, the server refused the helper's version, or the harness or its login is missing.
+ * back in a row; it claims again at `until` if its checks pass (`reason` names the last error). `login-refresh`: no call fits
+ * before the helper has its harness refresh the login, at `until`; it claims again once the login is refreshed. A server
+ * without it answers 400, and the helper reports `harness-missing` with the same reason instead. The rest need the user:
+ * the sandbox check failed, the server refused the helper's version, or the harness or its login is missing.
  */
-export type Readiness = "ready" | "quota-held" | "paused" | "cooled-off" | "sandbox-failed" | "version-refused" | "harness-missing" | "failing";
-export const READINESS: readonly Readiness[] = ["ready", "quota-held", "paused", "cooled-off", "sandbox-failed", "version-refused", "harness-missing", "failing"];
+export type Readiness = "ready" | "quota-held" | "paused" | "cooled-off" | "sandbox-failed" | "version-refused" | "harness-missing" | "failing" | "login-refresh";
+export const READINESS: readonly Readiness[] = ["ready", "quota-held", "paused", "cooled-off", "sandbox-failed", "version-refused", "harness-missing", "failing", "login-refresh"];
 /** The longest time between two status reports of a running helper. */
 export const STATUS_EVERY_S = 300;
 

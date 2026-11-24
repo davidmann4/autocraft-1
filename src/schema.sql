@@ -425,6 +425,16 @@ CREATE TABLE IF NOT EXISTS github_app_states (
   created_at TEXT NOT NULL
 );
 
+-- GitHub accounts the GitHub App may be installed on (src/github/allowed-owners.ts). No row: any account may install it
+-- and nothing is removed; with rows, an installation on another account is uninstalled. Installations match by account id;
+-- a row whose id GitHub could not tell yet matches by login until a later read fills it.
+CREATE TABLE IF NOT EXISTS app_allowed_owners (
+  login TEXT PRIMARY KEY COLLATE NOCASE,  -- as GitHub spells it; refreshed from the installation when the id matches
+  account_id INTEGER UNIQUE,
+  added_by TEXT NOT NULL,
+  added_at TEXT NOT NULL
+);
+
 -- One-time links an operator hands to an org owner to set the GitHub App up in their org. Only the hash of the link's secret is kept.
 CREATE TABLE IF NOT EXISTS github_setup_links (
   id TEXT PRIMARY KEY,
@@ -2402,7 +2412,8 @@ CREATE TABLE IF NOT EXISTS discord_channels (
   default_repo TEXT,                  -- tracked repo whose new-issue page the bot's "File a new issue" button opens
   position INTEGER,                   -- Discord's sort key within its category; NULL until the bot next connects
   category_id TEXT,                   -- the channel's category (discord_categories), not the thread parent
-  panel_message TEXT                  -- the bot's issue panel message in this channel (src/discord/panel.ts), edited in place on re-post
+  panel_message TEXT,                 -- the bot's issue panel message in this channel (src/discord/panel.ts), edited in place on re-post
+  viewable INTEGER NOT NULL DEFAULT 1 -- 0 when the bot lacks View Channel there (src/discord/perms.ts); the admin page omits such channels unless watched
 );
 -- Channel categories (type 4), for ordering the admin list like Discord's sidebar.
 CREATE TABLE IF NOT EXISTS discord_categories (

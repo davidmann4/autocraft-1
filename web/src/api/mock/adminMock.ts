@@ -150,7 +150,7 @@ let appRemoved = false;
 export const AUDIT_ACTIONS = [
   "answer", "undo", "dispute", "dispute-resolve", "answer-sweep", "adopt", "opinion", "opinion-retract", "comment", "override", "rule", "access-add", "access-remove", "access-role",
   "session-revoke", "mcp-token-create", "mcp-token-revoke", "usage-reserve", "my-repos", "max-calls", "sign-in", "sign-in-refused", "repo-track", "repo-untrack",
-  "session-revoke", "sign-in", "sign-in-refused", "github-app-register", "github-app-register-failed", "github-app-remove", "github-identity", "github-app-link-create", "github-app-link-revoke", "github-app-link-use", "github-app-manager", "repo-track", "repo-untrack",
+  "session-revoke", "sign-in", "sign-in-refused", "github-app-register", "github-app-register-failed", "github-app-remove", "github-identity", "github-app-link-create", "github-app-link-revoke", "github-app-link-use", "github-app-manager", "app-owner-allow", "app-owner-remove", "app-install-removed", "repo-track", "repo-untrack",
 ];
 
 function buildAudit(): AuditEntry[] {
@@ -187,6 +187,19 @@ export function createAdminMock(me: User, changed: () => void): AdminApi {
     { id: "l1", org: "storytold", createdBy: me.login, createdAt: new Date(NOW - 2 * H).toISOString(), expiresAt: new Date(NOW + 7 * D - 2 * H).toISOString() },
     { id: "l2", org: "glasswing", createdBy: me.login, createdAt: new Date(NOW - 3 * D).toISOString(), expiresAt: new Date(NOW + 4 * D).toISOString() },
   ];
+  /** The allowed owners: glasswing, storytold and harborlight (not installed yet); the app's installation on lumenworks is not allowed. */
+  const appOwners: { login: string; addedBy: string; addedAt: string }[] = [
+    { login: "glasswing", addedBy: me.login, addedAt: new Date(NOW - 5 * D).toISOString() },
+    { login: "storytold", addedBy: me.login, addedAt: new Date(NOW - 5 * D).toISOString() },
+    { login: "harborlight", addedBy: me.login, addedAt: new Date(NOW - 1 * D).toISOString() },
+  ];
+  /** The app's owner and owners of tracked repos, which stay allowed. */
+  const keptWhy = (login: string): string | null => {
+    if (login.toLowerCase() === "glasswing") return "glasswing owns the GitHub App";
+    const r = repos.find((x) => x.tracked && x.owner.toLowerCase() === login.toLowerCase());
+    return r ? `${r.owner} owns the tracked repo ${r.name}` : null;
+  };
+  const isAllowed = (login: string) => appOwners.some((o) => o.login.toLowerCase() === login.toLowerCase());
   /** The mock app: registered unless removed (?unregistered shows the registration form), installed on storytold for two repos. */
   const appStatus = (): GithubAppStatus => {
     const registered = !appRemoved && (typeof location === "undefined" || !location.search.includes("unregistered"));
@@ -195,9 +208,11 @@ export function createAdminMock(me: User, changed: () => void): AdminApi {
       app: registered ? { id: "1234567", slug: "autocraft-demo", name: "AutoCraft", installUrl: "https://github.com/apps/autocraft-demo/installations/new", transferUrl: "https://github.com/settings/apps/autocraft-demo/advanced" } : null,
       links: [...setupLinks],
       installations: registered ? [
-        { owner: "glasswing", selection: "selected", repos: ["glasswing/photocraft", "glasswing/designcraft", "glasswing/filmcraft"] },
-        { owner: "storytold", selection: "selected", repos: ["storytold/filmcraft", "storytold/designcraft"] },
-      ] : [],
+        { id: 101, owner: "glasswing", type: "Organization" as const, selection: "selected" as const, repos: ["glasswing/photocraft", "glasswing/designcraft", "glasswing/filmcraft"], createdAt: new Date(NOW - 40 * D).toISOString() },
+        { id: 102, owner: "storytold", type: "Organization" as const, selection: "selected" as const, repos: ["storytold/filmcraft", "storytold/designcraft"], createdAt: new Date(NOW - 30 * D).toISOString() },
+        { id: 103, owner: "lumenworks", type: "Organization" as const, selection: "all" as const, repos: ["lumenworks/inkwell", "lumenworks/lantern"], createdAt: new Date(NOW - 2 * H).toISOString() },
+      ].map((i) => ({ ...i, allowed: isAllowed(i.owner), protected: keptWhy(i.owner) !== null })) : [],
+      allowedOwners: appOwners.map((o) => ({ ...o, kept: keptWhy(o.login) })),
       error: null,
     };
   };
@@ -469,6 +484,30 @@ export function createAdminMock(me: User, changed: () => void): AdminApi {
         appRemoved = true;
         log("github-app-remove", "autocraft-demo", { slug: "autocraft-demo", owner: "glasswing" });
         return wait({ settingsUrl: "https://github.com/organizations/glasswing/settings/apps/autocraft-demo" });
+      },
+      async allowOwner(login) {
+        requireOperator("change the allowed owners");
+        if (!/^[A-Za-z0-9][A-Za-z0-9-]{0,38}$/.test(login)) throw new Error("That is not a GitHub account name.");
+        if (isAllowed(login)) throw new Error(`${login} is already an allowed owner.`);
+        appOwners.push({ login, addedBy: me.login, addedAt: nowIso() });
+        appOwners.sort((a, b) => a.login.localeCompare(b.login));
+        log("app-owner-allow", login);
+        return wait({ ok: true as const });
+      },
+      async removeOwner(login) {
+        requireOperator("change the allowed owners");
+        const i = appOwners.findIndex((o) => o.login.toLowerCase() === login.toLowerCase());
+        if (i < 0) throw new Error(`${login} is not an allowed owner.`);
+        const why = keptWhy(login);
+        if (why) throw new Error(`${why}, so it stays an allowed owner.`);
+        appOwners.splice(i, 1);
+        log("app-owner-remove", login);
+        return wait({ ok: true as const });
+      },
+      async ackForeignInstalls() {
+        requireOperator("acknowledge warnings");
+        log("app-foreign-install-ack", "github-app");
+        return wait({ ok: true as const });
       },
       async revokeLink(id) {
         requireOperator("revoke setup links");

@@ -90,7 +90,7 @@ export async function checkProblems(db: Db, hidden: HiddenRepos, internals: bool
     id === "runner" ? "runner" : id.startsWith("deadline:") ? "deadline" : id === "liveness" ? "liveness" : id.startsWith("worker:") || id === "build-queue" ? "workers" : id === "accounts" ? "account" : "sync";
   return (await computeChecks(db, nowMs))
     .filter((c) => c.state !== "ok" && !(c.repo !== undefined && isHiddenRepo(hidden, c.repo)))
-    .map((c) => ({ id: c.id, area: area(c.id), tone: c.state === "fail" ? "bad" : "warn", text: internals ? c.text : c.brief, to: c.to, since: c.since, ...(c.ackStep ? { ackStep: c.ackStep } : {}) }));
+    .map((c) => ({ id: c.id, area: area(c.id), tone: c.state === "fail" ? "bad" : "warn", text: internals ? c.text : c.brief, to: c.to, since: c.since, ...(c.ackStep ? { ackStep: c.ackStep } : {}), ...(c.ack ? { ack: c.ack } : {}) }));
 }
 
 export async function healthOf(db: Db, hidden: HiddenRepos, internals: boolean, nowMs: number): Promise<NowHealth> {

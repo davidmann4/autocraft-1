@@ -109,7 +109,7 @@ export async function convertManifest(code: string, deps: AppDeps = {}): Promise
   return { id, slug, privateKey, clientId, clientSecret, webhookSecret: str(j.webhook_secret), owner, name: str(j.name) };
 }
 
-export type Installation = { id: number; owner: string; selection: "all" | "selected" };
+export type Installation = { id: number; owner: string; /** The account's GitHub id. */ accountId: number | null; selection: "all" | "selected"; type: "User" | "Organization" | null; createdAt: string | null };
 
 /** The app's name as GitHub shows it. */
 export async function appName(app: AppSecrets, deps: AppDeps = {}): Promise<string | null> {
@@ -117,11 +117,38 @@ export async function appName(app: AppSecrets, deps: AppDeps = {}): Promise<stri
 }
 
 export async function installations(app: AppSecrets, deps: AppDeps = {}): Promise<Installation[]> {
-  const list = (await call(deps.apiBase ?? GITHUB_API, "/app/installations?per_page=100", appJwt(app))) as Array<Record<string, unknown>>;
-  return list.flatMap((i) => {
-    const owner = str((i.account as { login?: unknown } | null)?.login);
-    return typeof i.id === "number" && owner ? [{ id: i.id, owner, selection: i.repository_selection === "all" ? "all" as const : "selected" as const }] : [];
-  });
+  const jwt = appJwt(app);
+  const out: Installation[] = [];
+  for (let page = 1; page <= 50; page++) {
+    const list = (await call(deps.apiBase ?? GITHUB_API, `/app/installations?per_page=100&page=${page}`, jwt)) as Array<Record<string, unknown>>;
+    for (const i of list) {
+      const account = i.account as { login?: unknown; type?: unknown; id?: unknown } | null;
+      const owner = str(account?.login);
+      const type = account?.type === "User" || account?.type === "Organization" ? account.type : null;
+      if (typeof i.id === "number" && owner) out.push({ id: i.id, owner, accountId: typeof account?.id === "number" ? account.id : null, selection: i.repository_selection === "all" ? "all" : "selected", type, createdAt: str(i.created_at) });
+    }
+    if (list.length < 100) break;
+  }
+  return out;
+}
+
+/**
+ * A GitHub account's id and login as GitHub spells it, or null when there is no such account. An installed account comes
+ * from the installation list; another is read from `/users/{login}` with a token of the app's first installation.
+ */
+export async function accountByLogin(app: AppSecrets, login: string, deps: AppDeps = {}, list?: Installation[]): Promise<{ id: number; login: string } | null> {
+  const all = list ?? await installations(app, deps);
+  const hit = all.find((i) => i.owner.toLowerCase() === login.toLowerCase() && i.accountId !== null);
+  if (hit) return { id: hit.accountId!, login: hit.owner };
+  const base = deps.apiBase ?? GITHUB_API;
+  const token = all[0] ? str(((await call(base, `/app/installations/${all[0].id}/access_tokens`, appJwt(app), "POST")) as { token?: unknown }).token) : null;
+  try {
+    const u = (await call(base, `/users/${encodeURIComponent(login)}`, token)) as { id?: unknown; login?: unknown };
+    return typeof u.id === "number" ? { id: u.id, login: str(u.login) ?? login } : null;
+  } catch (e) {
+    if (e instanceof AppError && e.status === 404) return null;
+    throw e;
+  }
 }
 
 /** The login of the account an installation belongs to, or null when the app has no such installation. */
@@ -141,21 +168,22 @@ export async function installationFor(app: AppSecrets, owner: string, deps: AppD
 }
 
 /**
- * Names of the repos an installation covers. It mints a short-lived
+ * Names of the repos an installation covers, at most 5,000. It mints a short-lived
  * installation token for this one read and drops it; the cached minter used
- * for writes is a later step.
+ * for writes is a later step. `complete`: throw instead of answering a list cut at that cap.
  */
-export async function installationRepos(app: AppSecrets, installationId: number, deps: AppDeps = {}): Promise<string[]> {
+export async function installationRepos(app: AppSecrets, installationId: number, deps: AppDeps = {}, complete = false): Promise<string[]> {
   const base = deps.apiBase ?? GITHUB_API;
   const t = (await call(base, `/app/installations/${installationId}/access_tokens`, appJwt(app), "POST")) as { token?: unknown };
   const token = str(t.token);
   if (!token) throw new AppError("GitHub gave no installation token");
   const out: string[] = [];
-  for (let page = 1; page <= 10; page++) {
+  for (let page = 1; page <= 50; page++) {
     const r = (await call(base, `/installation/repositories?per_page=100&page=${page}`, token)) as { repositories?: Array<{ full_name?: unknown }> };
     const names = (r.repositories ?? []).flatMap((x) => (typeof x.full_name === "string" ? [x.full_name] : []));
     out.push(...names);
-    if (names.length < 100) break;
+    if (names.length < 100) return out;
   }
+  if (complete) throw new AppError(`installation ${installationId} covers more than ${out.length} repos; the list was not read in full`);
   return out;
 }
