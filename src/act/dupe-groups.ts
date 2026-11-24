@@ -89,7 +89,8 @@ export async function actOnGroups(db: Db, run: GroupRun): Promise<GroupResult> {
   const ref = (n: number) => `${run.repo}#${n}`;
 
   // An item queued with bypass checks after the answer is never closed by it: it is released below (the planner keeps it open the same way, src/dupes/decide.ts).
-  const bypass = await bypassQueued(db, run.repo);
+  // Read again at each closer, so a queue request made while the run waits on GitHub is seen.
+  const bypassed = async (n: number): Promise<boolean> => (await bypassQueued(db, run.repo)).has(ref(n));
 
   decisions: for (const dec of await groupDecisionsToAct(db, run.repo)) {
     const items: Item[] = await db.all(db.k.selectFrom("dupe_group_items").select(["number", "kind", "role", "detail", "head"]).where("decision_id", "=", dec.id).orderBy("number"));
@@ -98,7 +99,7 @@ export async function actOnGroups(db: Db, run: GroupRun): Promise<GroupResult> {
     const details = await findSeq(items, async (i) => i.role === "keep" && i.kind === "issue" && texts.has(`${i.number}:details`) && await inPilot(db, run.repo, i.number));
     if (run.dryRun) {
       if (details && !await posted(dec.id, details.number, "details")) run.log(`  would post the details comment on ${ref(details.number)} (${dec.id})`);
-      for (const c of closers) if (!await posted(dec.id, c.number, "close")) run.log(bypass.has(ref(c.number)) ? `  would release ${ref(c.number)}, queued with bypass checks (${dec.id})` : `  would comment and close ${ref(c.number)} (${dec.id})`);
+      for (const c of closers) if (!await posted(dec.id, c.number, "close")) run.log(await bypassed(c.number) ? `  would release ${ref(c.number)}, queued with bypass checks (${dec.id})` : `  would comment and close ${ref(c.number)} (${dec.id})`);
       continue;
     }
     // A PR is closed or kept only at a head a stored comparison read: with none that recorded heads, the set is compared first
@@ -173,7 +174,7 @@ export async function actOnGroups(db: Db, run: GroupRun): Promise<GroupResult> {
         if (run.left() <= 0) return res;
         cur = { item: c, step: "close" };
         if (await changed(c)) continue decisions;
-        if (bypass.has(ref(c.number))) { await skip(c.number, "close", "it was queued with bypass checks", true); continue; }
+        if (await bypassed(c.number)) { await skip(c.number, "close", "it was queued with bypass checks", true); continue; }
         const live = await run.io.live(c.number);
         if (!live) { await skip(c.number, "close", "GitHub returned no such item"); continue; }
         if (live.state !== "OPEN") { await skip(c.number, "close", `already ${live.state.toLowerCase()} on GitHub`); continue; }
@@ -194,6 +195,7 @@ export async function actOnGroups(db: Db, run: GroupRun): Promise<GroupResult> {
         let url = (await db.get(db.k.selectFrom("dupe_group_posts").select("url").where("decision_id", "=", dec.id).where("number", "=", c.number).where("step", "=", "comment")))?.url ?? null;
         if (url === null) {
           if (await changed(c)) continue decisions;
+          if (await bypassed(c.number)) { await skip(c.number, "close", "it was queued with bypass checks", true); continue; }
           url = await run.io.comment(live, text, { number: c.number, decision: dec.id });
           await record(dec.id, c.number, "comment", url);
         }

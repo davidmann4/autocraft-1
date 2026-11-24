@@ -67,7 +67,8 @@ test("an item queued with bypass checks is never the one to close in a duplicate
   assert.deepEqual(await roles(), ["1:close", "2:keep"]);
 });
 
-test("a member queued with bypass checks after its group was answered is released by the act step, not closed", async () => {
+// Queued with bypass checks before the act step runs, or while it waits on GitHub for that member.
+for (const during of [false, true]) test(`a member queued with bypass checks after its group was answered is released by the act step, not closed${during ? " (queued during the run)" : ""}`, async () => {
   const w = await (await (await (await world()).repo()).issue(1, { title: "crash on open" })).issue(2, { title: "crashes when opening" });
   const db = w.db;
   await fillEmbedHashes(db);
@@ -81,10 +82,13 @@ test("a member queued with bypass checks after its group was answered is release
   await w.answerDecision(id, "accept");
   await applyDuplicateAnswers(db, T1);
   assert.deepEqual((await groupClosersPending(db)).map((c) => c.number), [1], "the answer closes #1");
-  await addFastTrack(db, "op", "app#1");
-  await setFastTrackBypass(db, "op", "app#1");
+  const queue = async () => { await addFastTrack(db, "op", "app#1"); await setFastTrackBypass(db, "op", "app#1"); };
+  if (!during) await queue();
   const closed: number[] = [];
-  const live = async (n: number): Promise<GroupLive> => ({ id: `I${n}`, type: "Issue", state: "OPEN", head: null });
+  const live = async (n: number): Promise<GroupLive> => {
+    if (during && n === 1) await queue();
+    return { id: `I${n}`, type: "Issue", state: "OPEN", head: null };
+  };
   const res = await actOnGroups(db, {
     repo: "app", at: () => T1, log: () => {}, left: () => 10, handled: () => {}, dryRun: false,
     io: { live, comment: async () => "https://x/c", close: async (l) => { closed.push(Number(l.id.slice(1))); } },

@@ -323,6 +323,13 @@ test("a Hold answer means no merge and no pre-merge fix-up", () => {
   }
 });
 
+test("a Hold or Close answer stops the pre-merge fix-up of a pre-approval queued with bypass checks", () => {
+  const bypass = { operator: { fix: null, hold: false, premerge: true, preapproved: true, bypass: true }, premerge: premerge({ defects: 1, fixesSafe: true }) };
+  const fixes = (o: Over) => decidePr(prFacts({ ...bypass, ...o })).actions.some((a) => a.kind === "fixup");
+  assert.equal(fixes({}), true, "unanswered: the pipeline makes the fixes");
+  for (const answer of ["hold", "close"]) assert.equal(fixes({ decision: answered(answer) }), false, answer);
+});
+
 test("changes requested blocks every action that moves the PR toward a merge", () => {
   for (const over of [{}, { ...SIZE_L, decision: answered("merge") }, { ...SIZE_L }, { premerge: null }, { verification: null }, { runs: runs() }]) {
     const p = decidePr(prFacts({ ...over, changesRequested: { why: "w", live: false } }));
