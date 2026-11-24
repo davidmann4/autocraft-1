@@ -1,7 +1,8 @@
 // Operators' and maintainers' own builds through the MCP server: only they get the tools (a maintainer where they write), a build starts only from a default-branch
 // commit AutoCraft recorded, no confidential or signing environment takes one, and the status reads each line's own exit code.
 import assert from "node:assert/strict";
-import { writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, test } from "node:test";
 import { storeArtifact, tempPath } from "../src/build/artifacts.ts";
@@ -127,6 +128,27 @@ test("a running build shows the line its log is on, finished lines' exit codes a
   assert.equal(end.ok, false);
   assert.deepEqual(end.lines.map((l: { exitCode: number }) => l.exitCode), [0, 101, 0]);
   assert.match((await call(op, "build_status", { id })).text, /did not pass/);
+});
+
+test("on a build pod, which reports exit codes only at the end, a line that prints nothing is running once its container starts, and the line before it ended", async () => {
+  const w = await fresh();
+  const op = envOf(w, "operator");
+  await createEnv(w.db, { id: "plain", label: "plain", kind: "local-sandbox", slots: 2 }, OPERATOR);
+  await hello(w.db, "plain", { version: "1", capabilities: CAPS, slots: 2 });
+  const id = (await json(op, "start_build", { repo: "app", base: MAIN, steps: ["echo built", "true", "true"] })).id;
+  await claim(w.db, "plain", 2);
+  await startTask(w.db, "plain", id);
+  // The pod logs a running line's container live, and only what it printed; run the first two lines' real commands.
+  const out = join(SCRATCH, `build-${id}-out`);
+  mkdirSync(out, { recursive: true });
+  for (const step of (await getTask(w.db, id))!.plan.slice(1, 3)) {
+    const [sh, flag, script, ...args] = step.cmd;
+    const printed = execFileSync(sh!, [flag!, script!.replaceAll("/out/", `${out}/`), ...args], { encoding: "utf8" });
+    if (printed) await appendLog(w.db, "plain", id, step.name, printed);
+  }
+  const live = await json(op, "build_status", { id });
+  assert.equal(live.phase, "line 2");
+  assert.deepEqual(live.lines.map((l: { state: string }) => l.state), ["ended", "running", "waiting"]);
 });
 
 test("list_builds shows open builds by default, ended ones with all, one user's with mine, and only repos the user may build", async () => {
