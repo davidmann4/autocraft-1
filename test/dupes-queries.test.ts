@@ -3,13 +3,14 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { canonInfoAll } from "../src/dupes/canonical.ts";
 import { compareAgain } from "../src/dupes/compare.ts";
-import { askGroupDecisions, groupPlans } from "../src/dupes/decide.ts";
+import { applyDuplicateAnswers, askGroupDecisions, groupPlans } from "../src/dupes/decide.ts";
+import { actOnGroups, groupClosersPending, type GroupLive } from "../src/act/dupe-groups.ts";
 import { duplicateGroups, kindSetsOf, saveComparison, type StoredComparison } from "../src/dupes/plan.ts";
-import { addFastTrack, setFastTrackBypass } from "../src/fasttrack.ts";
+import { addFastTrack, removeFastTrack, setFastTrackBypass } from "../src/fasttrack.ts";
 import { uncheckedPairCounts, uncheckedPairs } from "../src/dupes/check.ts";
 import { duplicateCount, duplicateHeld, backlogHeld } from "../src/dupes/held.ts";
 import { fillEmbedHashes } from "../src/itemhash.ts";
-import { T0, world } from "./world-db.ts";
+import { T0, T1, world } from "./world-db.ts";
 
 test("canonical info, unchecked pairs, duplicate holds and comparison re-marking read the stored rows", async () => {
   const w = await (await (await (await world()).repo()).issue(1, { title: "crash on open" })).issue(2, { title: "crashes when opening" });
@@ -58,4 +59,39 @@ test("an item queued with bypass checks is never the one to close in a duplicate
   await setFastTrackBypass(db, "op", "app#1");
   assert.deepEqual(await roles(), ["1:stay", "2:keep"]);
   assert.deepEqual(await askGroupDecisions(db, "app", T0), []);
+  // Off the list, a pre-approved merge in progress with bypass checks still keeps it open; once that ends, the usual rule.
+  await removeFastTrack(db, "op", "app#1");
+  await db.run(db.k.insertInto("preapprovals").values({ repo: "app", number: 1, by: "op", at: T0, instructions: "", state: "review", from_head: "h1", head: "h1", updated_at: T0, bypass: 1 }));
+  assert.deepEqual(await roles(), ["1:stay", "2:keep"]);
+  await db.run(db.k.updateTable("preapprovals").set({ state: "cancelled" }).where("repo", "=", "app").where("number", "=", 1));
+  assert.deepEqual(await roles(), ["1:close", "2:keep"]);
+});
+
+test("a member queued with bypass checks after its group was answered is released by the act step, not closed", async () => {
+  const w = await (await (await (await world()).repo()).issue(1, { title: "crash on open" })).issue(2, { title: "crashes when opening" });
+  const db = w.db;
+  await fillEmbedHashes(db);
+  const hash = async (n: number) => (await db.get(db.k.selectFrom("items").select("embed_hash").where("repo", "=", "app").where("number", "=", n)))!.embed_hash!;
+  await db.run(db.k.insertInto("duplicate_pairs").values({ repo: "app", a: 1, b: 2, a_hash: await hash(1), b_hash: await hash(2), similarity: 0.9, verdict: "duplicate", created_at: T0 }));
+  const [g] = await duplicateGroups(db, "app");
+  const [set] = await kindSetsOf(db, g!);
+  await saveComparison(db, { repo: "app", key: set!.key, kind: "issue", members: [1, 2], hash: set!.hash, kept: 2, source: "model", model: "sonnet", reason: "2 is fuller", result: null, error: null, attempts: 1, at: T0 } as StoredComparison);
+  const [id] = await askGroupDecisions(db, "app", T0);
+  assert.ok(id);
+  await w.answerDecision(id, "accept");
+  await applyDuplicateAnswers(db, T1);
+  assert.deepEqual((await groupClosersPending(db)).map((c) => c.number), [1], "the answer closes #1");
+  await addFastTrack(db, "op", "app#1");
+  await setFastTrackBypass(db, "op", "app#1");
+  const closed: number[] = [];
+  const live = async (n: number): Promise<GroupLive> => ({ id: `I${n}`, type: "Issue", state: "OPEN", head: null });
+  const res = await actOnGroups(db, {
+    repo: "app", at: () => T1, log: () => {}, left: () => 10, handled: () => {}, dryRun: false,
+    io: { live, comment: async () => "https://x/c", close: async (l) => { closed.push(Number(l.id.slice(1))); } },
+  });
+  assert.deepEqual(closed, []);
+  assert.deepEqual(res.skipped.map((s) => s.ref), ["app#1"]);
+  assert.deepEqual(await groupClosersPending(db), []);
+  const role = await db.get(db.k.selectFrom("dupe_group_items").select("role").where("decision_id", "=", id).where("number", "=", 1));
+  assert.equal(role?.role, "stay", "released: not held by the decision");
 });

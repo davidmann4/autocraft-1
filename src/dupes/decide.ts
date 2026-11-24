@@ -10,7 +10,7 @@ import { jobItem } from "../runner/job-items.ts";
 import { audit } from "../dash/audit.ts";
 import { actionable, ask, factsOf, getDecision, validateAsk } from "../decisions.ts";
 import { compareCanonical, canonInfo } from "./canonical.ts";
-import { DUP_FACT, GROUP_OPTIONS, groupId, keepKey, keptOf } from "./held.ts";
+import { bypassQueued, DUP_FACT, GROUP_OPTIONS, groupId, keepKey, keptOf } from "./held.ts";
 import { duplicateGroups, kindSetsLoader, currentComparison, storedComparisons, type Group, type KindSet, type StoredComparison } from "./plan.ts";
 import { oneSentence } from "../review/summary.ts";
 import { storeOptionTexts } from "./texts.ts";
@@ -77,18 +77,12 @@ async function answeredKeepsLoader(db: Db, repo?: string): Promise<(repo: string
   };
 }
 
-/** The items fast-tracked with bypass checks (src/fasttrack.ts) as `repo#number`, of one repo or every repo. */
-async function fastTracked(db: Db, repo?: string): Promise<Set<string>> {
-  const rows = await db.all(db.k.selectFrom("fast_track").select(["repo", "number"]).where("bypass", "=", 1).$if(!!repo, (q) => q.where("repo", "=", repo!)));
-  return new Set(rows.map((r) => `${r.repo}#${r.number}`));
-}
-
 /** Plans for the groups whose comparisons are all current. `closing` is false for a group with nothing to close. */
 export async function groupPlans(db: Db, repo?: string): Promise<GroupPlan[]> {
   const out: GroupPlan[] = [];
   const groups = await duplicateGroups(db, repo), setsOf = await kindSetsLoader(db, groups), stored = await storedComparisons(db, repo), answeredKeeps = await answeredKeepsLoader(db, repo);
   // An item queued with bypass checks is wanted as it is: it is never closed as a duplicate, so it and the item kept stay open and are both worked.
-  const fast = await fastTracked(db, repo);
+  const fast = await bypassQueued(db, repo);
   for (const g of groups) {
     const sets = await filterSeq(setsOf(g), async (s) => await someSeq(s.members, async (m) => m.state === "OPEN" && await setsOf.inPilot(s.repo, m.number)));
     if (!sets.length) continue;
@@ -222,7 +216,7 @@ async function textOf(db: Db, p: GroupPlan) {
 /** Asks (or refreshes) the group decisions of one repo (every repo when omitted). Returns the ids asked or refreshed. Each plan is written in one transaction, so no other process sees its members unheld in between. */
 export async function askGroupDecisions(db: Db, repo: string | undefined, at: string): Promise<string[]> {
   const asked: string[] = [];
-  const fast = await fastTracked(db, repo);
+  const fast = await bypassQueued(db, repo);
   for (const p of await groupPlans(db, repo)) {
     const id = await db.write(async (): Promise<string | null> => {
       if (!p.closing) {
@@ -342,7 +336,7 @@ async function rekeep(db: Db, id: string, n: number, repo: string): Promise<void
   if (!row) return;
   const old = await db.all(db.k.selectFrom("dupe_group_items as gi").innerJoin("items as i", (j) => j.onRef("i.repo", "=", "gi.repo").onRef("i.number", "=", "gi.number"))
     .select(["gi.number", "i.state"]).where("gi.decision_id", "=", id).where("gi.kind", "=", row.kind).where("gi.role", "=", "keep").where("gi.number", "<>", n));
-  const fast = await fastTracked(db, repo);
+  const fast = await bypassQueued(db, repo);
   for (const o of old) {
     const closes = o.state === "OPEN" && !fast.has(`${repo}#${o.number}`) && await inPilot(db, repo, o.number);
     await db.run(db.k.updateTable("dupe_group_items").set({ role: closes ? "close" : "stay", target: closes ? n : null }).where("decision_id", "=", id).where("number", "=", o.number));

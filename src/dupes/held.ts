@@ -89,6 +89,14 @@ export async function backlogHeld(db: Db, repo: string, number: number): Promise
     .where((eb) => backlogHeldExpr(db, eb, "i")));
 }
 
+/** The items queued with bypass checks as `repo#number`, of one repo or every repo: fast-tracked with it (src/fasttrack.ts), or with a pre-approved merge in progress that has it (removing the item from the list leaves that row). Duplicate checks never close one. */
+export async function bypassQueued(db: Db, repo?: string): Promise<Set<string>> {
+  const fast = await db.all(db.k.selectFrom("fast_track").select(["repo", "number"]).where("bypass", "=", 1).$if(!!repo, (q) => q.where("repo", "=", repo!)));
+  const pre = await db.all(db.k.selectFrom("preapprovals").select(["repo", "number"]).where("bypass", "=", 1).where("state", "in", ["fixup", "review", "ci", "queued"])
+    .$if(!!repo, (q) => q.where("repo", "=", repo!)));
+  return new Set([...fast, ...pre].map((r) => `${r.repo}#${r.number}`));
+}
+
 export async function duplicateHeld(db: Db, repo: string, number: number): Promise<boolean> {
   return !!await db.get(db.k.selectFrom("decisions").select((eb) => eb.lit(1).as("one")).where("kind", "=", "duplicate").where((eb) => eb.not(kx.like(db, "id", eb.val("%:dupegroup:%"))))
       .where("repo", "=", repo).where("number", "=", number).where((eb) => eb.or([eb("answer", "is", null), eb("answer", "=", "close")])).limit(1))

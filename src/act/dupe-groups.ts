@@ -6,7 +6,7 @@
 import { settledByExpr } from "../settlers.ts";
 import { audit } from "../dash/audit.ts";
 import { embedHash } from "../itemhash.ts";
-import { backlogHeld } from "../dupes/held.ts";
+import { backlogHeld, bypassQueued } from "../dupes/held.ts";
 import { inPilot } from "../pilot.ts";
 import { textsFor } from "../dupes/texts.ts";
 import { compareAgain } from "../dupes/compare.ts";
@@ -88,6 +88,9 @@ export async function actOnGroups(db: Db, run: GroupRun): Promise<GroupResult> {
     await db.run(db.k.insertInto("dupe_group_posts").values({ decision_id: id, number: n, step, url, at: run.at() }).onConflict((oc) => oc.doNothing()));
   const ref = (n: number) => `${run.repo}#${n}`;
 
+  // An item queued with bypass checks after the answer is never closed by it: it is released below (the planner keeps it open the same way, src/dupes/decide.ts).
+  const bypass = await bypassQueued(db, run.repo);
+
   decisions: for (const dec of await groupDecisionsToAct(db, run.repo)) {
     const items: Item[] = await db.all(db.k.selectFrom("dupe_group_items").select(["number", "kind", "role", "detail", "head"]).where("decision_id", "=", dec.id).orderBy("number"));
     const texts = new Map((await textsFor(db, dec.id, dec.answer)).map((t) => [`${t.number}:${t.step}`, t.text]));
@@ -95,7 +98,7 @@ export async function actOnGroups(db: Db, run: GroupRun): Promise<GroupResult> {
     const details = await findSeq(items, async (i) => i.role === "keep" && i.kind === "issue" && texts.has(`${i.number}:details`) && await inPilot(db, run.repo, i.number));
     if (run.dryRun) {
       if (details && !await posted(dec.id, details.number, "details")) run.log(`  would post the details comment on ${ref(details.number)} (${dec.id})`);
-      for (const c of closers) if (!await posted(dec.id, c.number, "close")) run.log(`  would comment and close ${ref(c.number)} (${dec.id})`);
+      for (const c of closers) if (!await posted(dec.id, c.number, "close")) run.log(bypass.has(ref(c.number)) ? `  would release ${ref(c.number)}, queued with bypass checks (${dec.id})` : `  would comment and close ${ref(c.number)} (${dec.id})`);
       continue;
     }
     // A PR is closed or kept only at a head a stored comparison read: with none that recorded heads, the set is compared first
@@ -170,6 +173,7 @@ export async function actOnGroups(db: Db, run: GroupRun): Promise<GroupResult> {
         if (run.left() <= 0) return res;
         cur = { item: c, step: "close" };
         if (await changed(c)) continue decisions;
+        if (bypass.has(ref(c.number))) { await skip(c.number, "close", "it was queued with bypass checks", true); continue; }
         const live = await run.io.live(c.number);
         if (!live) { await skip(c.number, "close", "GitHub returned no such item"); continue; }
         if (live.state !== "OPEN") { await skip(c.number, "close", `already ${live.state.toLowerCase()} on GitHub`); continue; }
