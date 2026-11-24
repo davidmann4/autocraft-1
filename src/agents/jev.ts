@@ -4,6 +4,8 @@
 // - Not installed (the `jev` command cannot start): checked on every pass, cheap, until the command exists.
 // - The account fails (out of credit, missing or rejected key): tried again on the first pass an hour after the last failure.
 //
+// - Answers cannot be read (JEV_UNREADABLE_LIMIT in a row, counted from the recorded Jev runs): same hourly retry; one readable answer ends it.
+//
 // The state is one settings row, settings.jev_unavailable, shown on the Accounts page.
 import { accessSync, constants } from "node:fs";
 import { delimiter, join } from "node:path";
@@ -17,7 +19,11 @@ export const JEV_UNAVAILABLE_KEY = "jev_unavailable";
 /** How long after the last account failure the next pass tries Jev again. */
 export const JEV_RETRY_MS = 60 * 60_000;
 
-export type JevOutage = { kind: "off" | "missing" | "account"; reason: string; since: string; at: string };
+/** Consecutive Jev runs recorded as an unreadable answer that count as an outage. */
+export const JEV_UNREADABLE_LIMIT = 20;
+export const JEV_UNREADABLE_SUMMARY = "unreadable answer";
+
+export type JevOutage = { kind: "off" | "missing" | "account" | "format"; reason: string; since: string; at: string };
 
 // Through settings-read, so a planner pass reads them from its snapshot.
 const get = setting;
@@ -70,7 +76,7 @@ export async function jevUsable(db: Db, nowMs: number = Date.now()): Promise<boo
   const o = await jevOutage(db);
   if (!o) return true;
   if (o.kind === "missing") return jevInstalled();
-  if (o.kind === "account") return nowMs - Date.parse(o.at) >= JEV_RETRY_MS;
+  if (o.kind === "account" || o.kind === "format") return nowMs - Date.parse(o.at) >= JEV_RETRY_MS;
   return true;
 }
 
@@ -81,13 +87,13 @@ export async function jevAvailable(db: Db, nowMs: number = Date.now()): Promise<
     return false;
   }
   const usable = await jevUsable(db, nowMs), o = await jevOutage(db);
-  // A switch turned back on or a command installed since the outage was recorded ends it; an account outage ends with a call that works.
-  if (usable && o && o.kind !== "account") await clear(db);
+  // A switch turned back on or a command installed since the outage was recorded ends it; an account or format outage ends with a call that works.
+  if (usable && o && o.kind !== "account" && o.kind !== "format") await clear(db);
   return usable;
 }
 
 /** Records a failure; `since` stays at the first failure of an outage. */
-export async function markJevUnavailable(db: Db, kind: "missing" | "account", reason: string, nowMs: number = Date.now()): Promise<void> {
+export async function markJevUnavailable(db: Db, kind: "missing" | "account" | "format", reason: string, nowMs: number = Date.now()): Promise<void> {
   const prev = await jevOutage(db);
   const at = new Date(nowMs).toISOString();
   await put(db, JEV_UNAVAILABLE_KEY, JSON.stringify({ kind, reason, since: prev?.kind === kind ? prev.since : at, at } satisfies JevOutage));
@@ -97,6 +103,18 @@ export async function markJevUnavailable(db: Db, kind: "missing" | "account", re
 export async function markJevWorking(db: Db, startedMs: number): Promise<void> {
   const o = await jevOutage(db);
   if (o && o.kind !== "off" && Date.parse(o.at) < startedMs) await clear(db);
+}
+
+/**
+ * Marks Jev unavailable when the latest JEV_UNREADABLE_LIMIT finished Jev runs (any process) were all unreadable answers.
+ * Call after the run is recorded. Returns whether it marked.
+ */
+export async function markJevUnreadable(db: Db, nowMs: number = Date.now()): Promise<boolean> {
+  const rows = await db.all(db.k.selectFrom("agent_runs").select("summary").where("provider", "=", "jev").where("state", "!=", "running")
+    .orderBy("id", "desc").limit(JEV_UNREADABLE_LIMIT));
+  if (rows.length < JEV_UNREADABLE_LIMIT || rows.some((r) => r.summary !== JEV_UNREADABLE_SUMMARY)) return false;
+  await markJevUnavailable(db, "format", `Jev answers could not be read (${JEV_UNREADABLE_LIMIT} in a row)`, nowMs);
+  return true;
 }
 
 /**

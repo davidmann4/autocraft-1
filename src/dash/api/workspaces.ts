@@ -160,7 +160,9 @@ export async function calls(db: Db, req: Req): Promise<WorkspaceCalls> {
   const limit = limitOf(req, CALL_PAGE, 200);
   let q = db.k.selectFrom("workspace_calls")
     .select((eb) => ["id", "n", "tool", "args", "state", "created_at", "started_at", "finished_at", eb.case().when("result", "is not", null).then(1).else(0).end().as("has_result"),
-      kx.jsonBool(db, "result", "$.isError").as("is_error"), kx.jsonNum(db, "result", "$.acct.images").as("images")] as const)
+      kx.jsonBool(db, "result", "$.isError").as("is_error"), kx.jsonNum(db, "result", "$.acct.images").as("images"),
+      kx.jsonType(db, "result", "$.images[0].data").as("image_data"), kx.jsonNum(db, "result", "$.images[0].bytes").as("image_bytes"),
+      kx.jsonText(db, "result", "$.images[0].sha256").as("image_sha"), kx.jsonText(db, "result", "$.images[0].note").as("image_note")] as const)
     .where("workspace_id", "=", w.id).where("tool", "not in", OWN_CALLS);
   if (after !== null) q = q.where((eb) => eb.or([eb("id", ">", after), ...(running.length ? [eb("id", "in", running)] : [])])).orderBy("id", "asc").limit(200);
   else {
@@ -174,6 +176,7 @@ export async function calls(db: Db, req: Req): Promise<WorkspaceCalls> {
     calls: page.map((r): WorkspaceCall => ({
       id: r.id, n: r.n, tool: r.tool, summary: summaryOf(r.tool, argsOf(r.args)), state: r.state as WorkspaceCall["state"], isError: r.state === "failed" || Number(r.is_error) === 1,
       createdAt: r.created_at, startedAt: r.started_at, finishedAt: r.finished_at, hasOutput: Number(r.has_result) === 1, images: Number(r.images ?? 0),
+      notKept: r.image_data !== "text" && r.image_sha ? { bytes: Number(r.image_bytes ?? 0), sha256: r.image_sha, note: r.image_note } : null,
     })),
   };
 }
@@ -202,9 +205,10 @@ export async function image(db: Db, req: Req): Promise<Res> {
     const row = await db.get(db.k.selectFrom("workspace_calls")
       .select((eb) => {
         const res = eb.case().when(kx.jsonValid(db, "result")).then(eb.ref("result")).end();
-        return [kx.jsonText(db, res, "$.images[0].data").as("data"), kx.jsonText(db, res, "$.images[0].mimeType").as("mime")] as const;
+        return [kx.jsonText(db, res, "$.images[0].data").as("data"), kx.jsonText(db, res, "$.images[0].mimeType").as("mime"), kx.jsonText(db, res, "$.images[0].sha256").as("sha")] as const;
       })
       .where("workspace_id", "=", w.id).where("id", "=", idOf(req.params.call, "call")));
+    if (!row?.data && row?.sha) throw new HttpError(404, "this screenshot was not kept");
     if (!row?.data || !row.mime || !IMAGE_TYPES.has(row.mime)) throw new HttpError(404, "no such screenshot");
     return { body: Buffer.from(row.data, "base64"), headers: { "content-type": row.mime, "content-disposition": "inline", "content-security-policy": "sandbox", "x-content-type-options": "nosniff", "cache-control": "private, no-cache" } };
   } catch (e) {

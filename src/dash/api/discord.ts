@@ -1,6 +1,6 @@
 // Discord mentions: the admin page's data and writes, and what the item page shows. The channel list and the
 // connection state are written by the runner's gateway client (src/discord/); this file only reads them.
-import type { DiscordAccount, DiscordLinkCode, DiscordInfo, DiscordSetup, DiscordUsage } from "../../../web/src/api/types.ts";
+import type { DiscordAccount, DiscordFilingAdded, DiscordLinkCode, DiscordInfo, DiscordSetup, DiscordUsage } from "../../../web/src/api/types.ts";
 import { envVar } from "../../env.ts";
 import { excluded } from "../../db/kx.ts";
 import { audit } from "../audit.ts";
@@ -9,8 +9,8 @@ import { HttpError } from "../server/util.ts";
 import { DISCORD_PRIVACY_PATH } from "../server/discord-privacy.ts";
 import { readKeyFile, type DiscordKeys } from "../../discord/keys.ts";
 import { countOf, linksOf } from "../../discord/store.ts";
-import { addFilingRepo, botRepos, filingRepos, FilingRepoError, offerState, removeFilingRepo, setOffered } from "../../discord/filing-repos.ts";
-import { reactOn } from "../../discord/react.ts";
+import { addFilingRepo, botRepos, filingReposWithMode, FilingRepoError, offerState, removeFilingRepo, setOffered } from "../../discord/filing-repos.ts";
+import { reactEmoji, reactOn, setReactEmoji, validReactEmoji } from "../../discord/react.ts";
 import { signalCountOf, signalLinks } from "../../discord/signals.ts";
 import { createLinkCode, linkedSince, listLinks, unlinkLogin, unlinkRow } from "../../discord/links.ts";
 import type { Req } from "../types.ts";
@@ -95,9 +95,9 @@ async function setupOf(db: Db): Promise<DiscordSetup> {
     state: st?.state ?? "off", detail: st?.detail ?? null, at: st?.at ?? null,
     channels: channels.filter((c) => c.watched || !PLACEHOLDER_NAME.test(c.name ?? "")).map((c) => ({ ...c, watched: !!c.watched })),
     repos: await publicRepoNames(db),
-    filingRepos: await filingRepos(db),
+    filingRepos: await filingReposWithMode(db),
     offer: await offerState(db),
-    contact: await contactOf(db), reactOn: await reactOn(db), privacyPath: PRIVACY_PATH, links: await listLinks(db),
+    contact: await contactOf(db), reactOn: await reactOn(db), reactEmoji: await reactEmoji(db), privacyPath: PRIVACY_PATH, links: await listLinks(db),
     usage: await usageOf(db),
   };
 }
@@ -137,18 +137,18 @@ export async function putContact(db: Db, req: Req): Promise<DiscordSetup> {
   return await setupOf(db);
 }
 
-/** Adds a filing-only repo (`repo`: owner/name) once GitHub confirms it; the refusal's reason is the error. */
-export async function addFiling(db: Db, req: Req): Promise<DiscordSetup> {
+/** Adds a filing-only repo (`repo`: owner/name) once GitHub confirms it is public with issues on; the refusal's reason is the error. `added` says whether it is link-only, and why. */
+export async function addFiling(db: Db, req: Req): Promise<DiscordFilingAdded> {
   operator(req);
   const repo = body(req).repo;
   if (typeof repo !== "string" || repo.length > 200) throw new HttpError(400, "repo (owner/name) is required");
   try {
-    await addFilingRepo(db, req.user.login, repo);
+    const r = await addFilingRepo(db, req.user.login, repo);
+    return { ...await setupOf(db), added: { owner: r.owner, name: r.name, mode: r.mode, why: r.why ?? null } };
   } catch (e) {
     if (e instanceof FilingRepoError) throw new HttpError(400, e.message);
     throw e;
   }
-  return await setupOf(db);
 }
 
 export async function removeFiling(db: Db, req: Req): Promise<DiscordSetup> {
@@ -168,12 +168,21 @@ export async function setOffer(db: Db, req: Req): Promise<DiscordSetup> {
   return await setupOf(db);
 }
 
+/** Sets the Reactions switch (`on`) and/or the reaction emoji (`emoji`: a custom emoji name or one Unicode emoji). */
 export async function putReact(db: Db, req: Req): Promise<DiscordSetup> {
   operator(req);
-  const on = body(req).on;
-  if (typeof on !== "boolean") throw new HttpError(400, "on must be true or false");
-  await db.run(db.k.insertInto("settings").values({ key: "discord_react", value: on ? "on" : "off" }).onConflict((oc) => oc.column("key").doUpdateSet(excluded(["value"]))));
-  await audit(db, req.user.login, on ? "discord-react-on" : "discord-react-off", null);
+  const { on, emoji } = body(req);
+  if (on === undefined && emoji === undefined) throw new HttpError(400, "on or emoji is required");
+  if (on !== undefined && typeof on !== "boolean") throw new HttpError(400, "on must be true or false");
+  if (emoji !== undefined && (typeof emoji !== "string" || !validReactEmoji(emoji.trim()))) throw new HttpError(400, "emoji must be a custom emoji name (2-32 letters, digits or underscores) or one Unicode emoji");
+  if (typeof on === "boolean") {
+    await db.run(db.k.insertInto("settings").values({ key: "discord_react", value: on ? "on" : "off" }).onConflict((oc) => oc.column("key").doUpdateSet(excluded(["value"]))));
+    await audit(db, req.user.login, on ? "discord-react-on" : "discord-react-off", null);
+  }
+  if (typeof emoji === "string") {
+    await setReactEmoji(db, emoji.trim());
+    await audit(db, req.user.login, "discord-react-emoji", emoji.trim());
+  }
   return await setupOf(db);
 }
 

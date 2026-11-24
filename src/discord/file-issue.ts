@@ -193,6 +193,8 @@ export type BotRequest = FileRequest & {
   reporterName: string;
   /** Whether a model wrote the draft: it decides the note line. */
   drafted: boolean;
+  /** Runs only once the limits and the junk check have passed, so a refused filing uploads nothing; its Markdown (the screenshots) goes before the footer. */
+  attach?: () => Promise<string>;
 };
 
 export type BotResult = { status: "filed"; number: number; url: string } | { status: "refused"; reason: string };
@@ -245,9 +247,10 @@ export async function fileAsBot(deps: FileDeps, req: BotRequest, hooks: Pick<Fil
     const run = hooks.exec ?? defaultExec;
     const w = { db, login: "discord", now: () => now, ...(hooks.mint && { mint: hooks.mint }) };
     const note: Note = req.drafted ? { by: "model", kind: "issue", model: "haiku" } : { by: "fixed" };
+    const extra = req.attach ? (await req.attach()).trim() : "";
     let made: { number: number; url: string };
     try {
-      made = await createBotIssue(w, g, run, { repo: req.repo, title, body: `${body}\n\n${botFooter(req.reporterName)}` }, note);
+      made = await createBotIssue(w, g, run, { repo: req.repo, title, body: `${body}${extra ? `\n\n${extra}` : ""}\n\n${botFooter(req.reporterName)}` }, note);
     } catch (e) {
       if (e instanceof IssueError && !e.clear) { filed = true; return { status: "refused", reason: "GitHub could not be reached. Try again in a minute." }; }
       log(`discord: filing as the app failed: ${String((e as Error).message ?? e).slice(0, 200)}`);

@@ -5,9 +5,12 @@
 // "Used" is read from the unit's fingerprint dir, `<profile>/.fingerprint/<package>-<hash>`: cargo reads the fingerprint
 // of every unit in the build's graph to decide whether it is fresh, and rewrites it when it compiles the unit. That holds
 // for any command, so it covers a CI gate's own warm-command, which `--message-format=json` could not. A read shows in
-// the file's atime: warm-restore sets each file's atime to its mtime, and Linux (relatime or strictatime) updates an atime
-// that is not newer than the mtime on the next read. warm-restore then records the build's start and whether a read on
-// the target's file system updates atimes at all (`markBuildStart`); without both nothing is trimmed.
+// the file's atime, but under relatime (the usual mount option) only when the atime is not newer than the mtime or the
+// ctime: a file read once after its times were last set (the restore's own copy of a same-content file, a target reused
+// from the volume after a publish read every file) hides every later read for a day. So `markBuildStart`, run after the
+// restore and before the build, first changes every fingerprint file's ctime (a chmod to its own mode, which leaves the
+// mtime alone), then records the build's start and whether a read on the target's file system updates atimes at all;
+// without both nothing is trimmed. After that, any read during the build moves the atime to the start or later.
 //
 // A unit's artifacts carry the fingerprint dir's hash: `deps/lib<crate>-<hash>.rlib`, `deps/<crate>-<hash>`,
 // `build/<package>-<hash>` (a build script's binary, or its run's OUT_DIR), `examples/<name>-<hash>`. Only entries whose
@@ -17,7 +20,7 @@
 // Cargo's build-dir layout (1.100) keeps each unit in one dir, `<profile>/build/<package>/<hash>/{fingerprint,out,run,...}`.
 // The unit is used when its `fingerprint/` dir was read or written by this build, and an unused one is left out whole.
 // A profile dir is one with `.fingerprint` or with such unit dirs; a target with neither is not trimmed or called trimmed.
-import { closeSync, lstatSync, openSync, readdirSync, readFileSync, readSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, lstatSync, openSync, readdirSync, readFileSync, readSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 /** What warm-restore records for the trim: when the build started (ns, file-system clock) and whether reads update atimes there. */
@@ -96,14 +99,30 @@ export function staleUnitDirs(units: UnitDir[]): { paths: string[]; units: numbe
 }
 
 /**
- * Probes the target's file system, then writes `file`: the start stamp (the probe's ctime, set after every restored
- * file's times) and whether a read updated the probe's atime. Run after the restore and before the build.
+ * Prepares the target's fingerprint files (prepareFingerprints), then probes the target's file system and writes `file`:
+ * the start stamp (the probe's ctime, set after every prepared file's) and whether a read updated the probe's atime
+ * when it was newer than the mtime and older than the ctime, the case the prepared files are in. Run after the restore and
+ * before the build.
+ *
+ * File times come from a clock that ticks every few milliseconds, so a read just before the stamp can share its value
+ * and look like a read by the build. The stamp is therefore taken again until it is later than every prepared file's
+ * atime; without that, a stale unit read by the restore could be kept in a publish called trimmed.
  */
 export function markBuildStart(target: string, file: string): BuildStart {
+  const { latestAtimeNs } = prepareFingerprints(target);
   const probe = join(target, `.autocraft-atime-probe-${process.pid}`);
   writeFileSync(probe, "x");
   try {
-    utimesSync(probe, 1_000_000_000, 1_000_000_000);
+    const setProbe = () => {
+      utimesSync(probe, Math.floor(Date.now() / 1000) - 60, 1_000_000_000);
+      return lstatSync(probe, { bigint: true });
+    };
+    let st0 = setProbe();
+    for (let tries = 0; st0.ctimeNs <= latestAtimeNs; tries++) {
+      if (tries >= 1000) throw new Error("the file-system clock did not pass the fingerprint files' atimes");
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1);
+      st0 = setProbe();
+    }
     const fd = openSync(probe, "r");
     try {
       readSync(fd, Buffer.alloc(1), 0, 1, 0);
@@ -111,7 +130,7 @@ export function markBuildStart(target: string, file: string): BuildStart {
       closeSync(fd);
     }
     const st = lstatSync(probe, { bigint: true });
-    const start = { stampNs: st.ctimeNs, atime: st.atimeNs > st.mtimeNs };
+    const start = { stampNs: st0.ctimeNs, atime: st.atimeNs >= st0.ctimeNs };
     writeFileSync(file, JSON.stringify({ stampNs: String(start.stampNs), atime: start.atime }));
     return start;
   } finally {
@@ -137,6 +156,48 @@ const isDir = (p: string) => {
 };
 const names = (p: string) => (isDir(p) ? readdirSync(p) : []);
 
+/** The one-dir-per-unit layout's `build/<package>/<hash>/` dirs of profile dir `p` that hold a `fingerprint/`. */
+const unitDirs = (p: string): { pkg: string; hash: string; dir: string }[] =>
+  names(join(p, "build")).flatMap((pkg) => names(join(p, "build", pkg)).filter((h) => /^[0-9a-f]{16}$/.test(h) && isDir(join(p, "build", pkg, h, "fingerprint"))).map((hash) => ({ pkg, hash, dir: join(p, "build", pkg, hash) })));
+const isProfile = (p: string) => isDir(join(p, ".fingerprint")) || unitDirs(p).length > 0;
+
+/** Profile dirs under `target` (a dir with a `.fingerprint` child or with unit dirs, at depth 1 or 2), relative to `target`. */
+function profileDirs(target: string): string[] {
+  const out: string[] = [];
+  for (const a of names(target)) {
+    const p = join(target, a);
+    if (isProfile(p)) out.push(a);
+    else for (const b of names(p)) if (isProfile(join(p, b))) out.push(`${a}/${b}`);
+  }
+  return out;
+}
+
+/** Every fingerprint dir of every profile under `target`, in both layouts. */
+const fingerprintDirs = (target: string): string[] =>
+  profileDirs(target).flatMap((rel) => {
+    const p = join(target, rel);
+    return [...names(join(p, ".fingerprint")).map((n) => join(p, ".fingerprint", n)), ...unitDirs(p).map((u) => join(u.dir, "fingerprint"))];
+  });
+
+/**
+ * Sets each fingerprint file's ctime to now, so its atime is not newer than its ctime and relatime records the next
+ * read. Returns how many files it prepared and the latest atime among them (0 with none).
+ */
+export function prepareFingerprints(target: string): { files: number; latestAtimeNs: bigint } {
+  let files = 0, latestAtimeNs = 0n;
+  for (const d of fingerprintDirs(target)) {
+    if (!isDir(d)) continue;
+    for (const f of readdirSync(d)) {
+      const st = lstatSync(join(d, f), { bigint: true });
+      if (!st.isFile()) continue;
+      chmodSync(join(d, f), Number(st.mode & 0o7777n));
+      files++;
+      if (st.atimeNs > latestAtimeNs) latestAtimeNs = st.atimeNs;
+    }
+  }
+  return { files, latestAtimeNs };
+}
+
 /** Bytes of the files under `p` (no links followed). */
 function bytesOf(p: string): number {
   const st = lstatSync(p, { throwIfNoEntry: false });
@@ -149,13 +210,17 @@ function bytesOf(p: string): number {
  * The stale entries of every profile dir under `target` (a dir with a `.fingerprint` child or with `build/<package>/<hash>/fingerprint`
  * unit dirs, at depth 1 or 2), as paths
  * relative to `target`, with the units and bytes they hold. `unattributed` counts the units kept only because a file of
- * theirs was read at some time not known to be this build (atime after mtime but before the start): such a unit may hold
+ * theirs was read before the start and after its mtime and ctime were last set, so relatime may have hidden a read by
+ * this build (markBuildStart's preparation leaves no such file): such a unit may hold
  * dep-info of an older commit, so the publish is not `trimmed` (src/warm/manifest.ts) when there is one. `profiles` counts the
  * profile dirs found; with none, nothing was trimmed and the publish is not `trimmed` either.
  */
 export function trimTarget(target: string, start: BuildStart): { paths: string[]; units: number; bytes: number; unattributed: number; profiles: number } {
-  // 2: read or written by this build; 1: read at an unknown time; 0: not read since warm-restore set its times.
-  const use = (st: { mtimeNs: bigint; atimeNs: bigint }) => (st.mtimeNs >= start.stampNs || st.atimeNs >= start.stampNs ? 2 : st.atimeNs > st.mtimeNs ? 1 : 0);
+  // 2: read or written by this build. 1: its atime is newer than its mtime and ctime, so relatime may have skipped a read
+  // by this build. 0: its atime is not newer than its mtime or ctime, which did not change during the build (both are
+  // before the start), so relatime would have recorded any read by it.
+  const use = (st: { mtimeNs: bigint; atimeNs: bigint; ctimeNs: bigint }) =>
+    st.mtimeNs >= start.stampNs || st.atimeNs >= start.stampNs ? 2 : st.atimeNs > st.mtimeNs && st.atimeNs > st.ctimeNs ? 1 : 0;
   let unattributed = 0;
   const dirTouched = (d: string, deep: boolean) => {
     const st = lstatSync(d, { bigint: true });
@@ -168,15 +233,7 @@ export function trimTarget(target: string, start: BuildStart): { paths: string[]
     if (level === 1) unattributed++;
     return level > 0;
   };
-  const unitDirs = (p: string): { pkg: string; hash: string; dir: string }[] =>
-    names(join(p, "build")).flatMap((pkg) => names(join(p, "build", pkg)).filter((h) => /^[0-9a-f]{16}$/.test(h) && isDir(join(p, "build", pkg, h, "fingerprint"))).map((hash) => ({ pkg, hash, dir: join(p, "build", pkg, hash) })));
-  const isProfile = (p: string) => isDir(join(p, ".fingerprint")) || unitDirs(p).length > 0;
-  const profiles: string[] = [];
-  for (const a of names(target)) {
-    const p = join(target, a);
-    if (isProfile(p)) profiles.push(a);
-    else for (const b of names(p)) if (isProfile(join(p, b))) profiles.push(`${a}/${b}`);
-  }
+  const profiles = profileDirs(target);
   const out = { paths: [] as string[], units: 0, bytes: 0, unattributed: 0, profiles: profiles.length };
   for (const rel of profiles) {
     const p = join(target, rel);

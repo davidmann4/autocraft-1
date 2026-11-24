@@ -24,7 +24,7 @@ import { downloadsReport } from "./downloadsMock";
 import { classifierReport, costReport, disagreementList } from "./insightFixtures";
 import { pickDecision, shortRepo } from "../../lib/links";
 import { itemList, mockDiscordCount, mockDiscordLinks, settledFor } from "./itemsFixtures";
-import type { DiscordSetup } from "../types";
+import type { DiscordFilingAdded, DiscordSetup } from "../types";
 import { postmergeFor, premergeFor, prWorkFor } from "./verifyFixtures";
 import { nextPageFixture } from "./nextMock";
 import { queueBatchList, queueList } from "./queueFixtures";
@@ -106,10 +106,10 @@ export function createMockApi(): Api {
       used: 6, max: 25,
     },
     filingRepos: [
-      { owner: "example-studio", name: "sketchpad", addedBy: "mara-lindqvist", addedAt: new Date(Date.now() - 6 * 86_400_000).toISOString() },
-      { owner: "open-tools-collective", name: "vector-shapes-and-paths-library", addedBy: "mara-lindqvist", addedAt: new Date(Date.now() - 40 * 60_000).toISOString() },
+      { owner: "example-studio", name: "sketchpad", addedBy: "mara-lindqvist", addedAt: new Date(Date.now() - 6 * 86_400_000).toISOString(), mode: "submit", why: null },
+      { owner: "open-tools-collective", name: "vector-shapes-and-paths-library", addedBy: "mara-lindqvist", addedAt: new Date(Date.now() - 40 * 60_000).toISOString(), mode: "link", why: "The GitHub App is not installed on open-tools-collective." },
     ],
-    contact: "discord-privacy@example.org", reactOn: true, privacyPath: "/privacy",
+    contact: "discord-privacy@example.org", reactOn: true, reactEmoji: "bot", privacyPath: "/privacy",
     usage: {
       counts: { started: { day: 14, week: 63 }, junk: { day: 2, week: 9 }, filed: { day: 6, week: 31 }, link: { day: 3, week: 12 }, limits: { day: 1, week: 4 } },
       prompts: [
@@ -131,20 +131,18 @@ export function createMockApi(): Api {
       { id: "l1", login: "mira-anders", linkedAt: new Date(Date.now() - 3 * 86_400_000).toISOString() },
       { id: "l2", login: "tomas-vale", linkedAt: new Date(Date.now() - 40 * 3_600_000).toISOString() },
     ],
-    channels: [
-      { channelId: "9000000000000004", guildId: "9000000000000001", guildName: "Glasswing Community", name: "general", watched: false, defaultRepo: null, category: null },
-      { channelId: "9000000000000005", guildId: "9000000000000001", guildName: "Glasswing Community", name: "announcements", watched: false, defaultRepo: null, category: null },
-      { channelId: "9000000000000006", guildId: "9000000000000001", guildName: "Glasswing Community", name: "rules", watched: false, defaultRepo: null, category: null },
-      { channelId: "9000000000000002", guildId: "9000000000000001", guildName: "Glasswing Community", name: "dev-chat", watched: true, defaultRepo: "photocraft", category: "Development" },
-      { channelId: "9000000000000007", guildId: "9000000000000001", guildName: "Glasswing Community", name: "release-notes", watched: false, defaultRepo: null, category: "Development" },
-      { channelId: "9000000000000003", guildId: "9000000000000001", guildName: "Glasswing Community", name: "support", watched: true, defaultRepo: null, category: "Community" },
-      { channelId: "9000000000000008", guildId: "9000000000000001", guildName: "Glasswing Community", name: "help-desk", watched: false, defaultRepo: null, category: "Community" },
-      { channelId: "9100000000000011", guildId: "9100000000000001", guildName: "Open Tools Collective", name: "general", watched: false, defaultRepo: null, category: null },
-      { channelId: "9100000000000012", guildId: "9100000000000001", guildName: "Open Tools Collective", name: "showcase", watched: false, defaultRepo: null, category: "Community" },
-      { channelId: "9100000000000013", guildId: "9100000000000001", guildName: "Open Tools Collective", name: "bug-reports", watched: true, defaultRepo: "pdfcraft", category: "Support" },
-      { channelId: "9100000000000014", guildId: "9100000000000001", guildName: "Open Tools Collective", name: "off-topic", watched: false, defaultRepo: null, category: "Community" },
-      { channelId: "9100000000000015", guildId: "9100000000000001", guildName: "Open Tools Collective", name: "voice-lounge", watched: false, defaultRepo: null, category: "Community" },
-    ],
+    channels: Array.from({ length: 70 }, (_, i) => {
+      const first = i < 35;
+      return {
+        channelId: `${first ? "90" : "91"}0000000000${String(100 + i)}`,
+        guildId: first ? "9000000000000001" : "9100000000000001",
+        guildName: first ? "Glasswing Community" : "Open Tools Collective",
+        name: `channel-${i + 1}`,
+        watched: new URLSearchParams(location.search).get("inuse") === "1" && i === 3,
+        defaultRepo: null,
+        category: i % 10 < 5 ? "Community" : "Development",
+      };
+    }),
   };
   const find = (id: string) => {
     const d = decisions.find((x) => x.id === id);
@@ -365,10 +363,11 @@ export function createMockApi(): Api {
         if (mockRole() !== "operator") throw new Error("only operators change the Discord settings");
         const [owner, name] = repo.trim().split("/");
         if (!owner || !name) throw new Error("Give the repo as owner/name.");
-        if (owner === "no-app-here") throw new Error(`The GitHub App is not installed on ${owner}.`);
-        discord.filingRepos = [...discord.filingRepos, { owner, name, addedBy: "you", addedAt: nowIso() }];
+        if (owner === "private-org") throw new Error(`${owner}/${name} is not public.`);
+        const added = owner === "example-studio" ? { owner, name, mode: "submit" as const, why: null } : { owner, name, mode: "link" as const, why: `The GitHub App is not installed on ${owner}.` };
+        discord.filingRepos = [...discord.filingRepos, { owner, name, addedBy: "you", addedAt: nowIso(), mode: added.mode, why: added.why }];
         changed();
-        return wait(structuredClone(discord));
+        return wait<DiscordFilingAdded>({ ...structuredClone(discord), added });
       },
       setOffer(repo, on) {
         if (mockRole() !== "operator") throw new Error("only operators change the Discord settings");
@@ -399,6 +398,13 @@ export function createMockApi(): Api {
       setReact(on) {
         if (mockRole() !== "operator") throw new Error("only operators change the Discord settings");
         discord.reactOn = on;
+        changed();
+        return wait(structuredClone(discord));
+      },
+      setReactEmoji(emoji) {
+        if (mockRole() !== "operator") throw new Error("only operators change the Discord settings");
+        if (!/^[A-Za-z0-9_]{2,32}$/.test(emoji.trim()) && !/^\p{Extended_Pictographic}/u.test(emoji.trim())) throw new Error("emoji must be a custom emoji name (2-32 letters, digits or underscores) or one Unicode emoji");
+        discord.reactEmoji = emoji.trim();
         changed();
         return wait(structuredClone(discord));
       },

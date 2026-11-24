@@ -9,6 +9,9 @@ import type { CommandDef, DiscordRest, EditBody } from "./rest.ts";
 /** A submitted modal's components: action rows hold `components`; a Label (type 18) holds one `component`. A select gives `values`, a text input `value`. */
 export type ModalComponent = { type?: number; custom_id?: string; value?: string; values?: string[]; component?: ModalComponent; components?: ModalComponent[] };
 
+/** A file of a submitted File Upload (type 19), from the interaction's `data.resolved.attachments`. */
+export type DiscordAttachment = { id: string; filename: string; url: string; content_type?: string; size: number };
+
 export type DiscordUser = { id: string; username?: string; global_name?: string | null };
 
 export type Interaction = {
@@ -19,7 +22,7 @@ export type Interaction = {
     values?: string[];
     components?: ModalComponent[];
     options?: { name: string; type: number; value?: unknown; focused?: boolean; options?: { name: string; type: number; value?: unknown; focused?: boolean }[] }[];
-    resolved?: { messages?: Record<string, { content?: string }> };
+    resolved?: { messages?: Record<string, { content?: string }>; attachments?: Record<string, DiscordAttachment> };
   };
 };
 
@@ -39,6 +42,8 @@ export type Call = {
   edit(body: EditBody): Promise<void>;
   /** The values of a submitted modal, by custom_id: the text of an input, or the first chosen value of a select. */
   fields(): Record<string, string>;
+  /** The files of each File Upload of a submitted modal, by custom_id, resolved from the attachment ids it gives. */
+  files(): Record<string, DiscordAttachment[]>;
   /** The chosen values of a select menu that was used in a message. */
   values(): string[];
   /** For handlers added with `immediate`: acknowledges a select or button without changing the message. */
@@ -64,6 +69,7 @@ type Entry = { handler: Handler; ephemeral: boolean; immediate: boolean };
 type EntryOpts = { ephemeral?: boolean; immediate?: boolean };
 
 export type Choice = { name: string; value: string };
+const FILE_UPLOAD = 19;
 const COMMAND = 2, COMPONENT = 3, AUTOCOMPLETE = 4, MODAL_SUBMIT = 5, MESSAGE_COMMAND = 3;
 
 export class Interactions {
@@ -149,7 +155,7 @@ export class Interactions {
     if (!find) return;
     try {
       const opts = sub?.options ?? i.data?.options ?? [];
-      const call = { interaction: i, userId: i.member?.user?.id ?? i.user?.id ?? null, userName: null, option: () => undefined, targetText: () => undefined, edit: async () => {}, fields: () => ({}), values: () => [], ack: async () => {}, showModal: async () => {}, reply: async () => {}, defer: async () => {},
+      const call = { interaction: i, userId: i.member?.user?.id ?? i.user?.id ?? null, userName: null, option: () => undefined, targetText: () => undefined, edit: async () => {}, fields: () => ({}), files: () => ({}), values: () => [], ack: async () => {}, showModal: async () => {}, reply: async () => {}, defer: async () => {},
         focused: () => { const o = opts.find((x) => x.focused); return o ? { name: o.name, value: typeof o.value === "string" ? o.value : "" } : undefined; } } as Call;
       await this.#rest.interactionCallback(i.id, i.token, 8, { choices: (await find(call)).slice(0, 25) });
     } catch (e) {
@@ -186,6 +192,8 @@ export class Interactions {
         targetText: () => (i.data?.type === MESSAGE_COMMAND && i.data.target_id ? i.data.resolved?.messages?.[i.data.target_id]?.content : undefined),
         edit: (body) => this.#rest.editInteractionResponse(appId, i.token, body),
         fields: () => Object.fromEntries((i.data?.components ?? []).flatMap((r) => (r.component ? [r.component] : (r.components ?? []))).filter((c) => c.custom_id).map((c) => [c.custom_id!, c.value ?? c.values?.[0] ?? ""])),
+        files: () => Object.fromEntries((i.data?.components ?? []).flatMap((r) => (r.component ? [r.component] : (r.components ?? []))).filter((c) => c.type === FILE_UPLOAD && c.custom_id)
+          .map((c) => [c.custom_id!, (c.values ?? []).flatMap((id) => { const a = i.data?.resolved?.attachments?.[id]; return a ? [a] : []; })])),
         values: () => i.data?.values ?? [],
         ack: async () => { answered = true; await this.#rest.interactionCallback(i.id, i.token, 6); },
         showModal: async (m) => { answered = true; await this.#rest.interactionCallback(i.id, i.token, 9, m); },

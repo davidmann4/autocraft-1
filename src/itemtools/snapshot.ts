@@ -4,8 +4,9 @@
 // read it through the item tools (src/itemtools/server). Nothing written on the
 // dashboard (notes, opinions, comments), no settings, audit, accounts, access
 // lists, tokens or host paths goes in. Only public repositories are copied.
-import { existsSync, mkdirSync, renameSync, rmSync, statSync, unlinkSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync, unlinkSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import { dataDir } from "../db.ts";
 import type { Db } from "../db/index.ts";
@@ -107,7 +108,7 @@ export function writeSnapshot(src: string = snapshotSource(), dest: string = sna
   let target = dest;
   if (!existsSync(dest) || !hasVersion(dest)) {
     rebuilt = true;
-    target = `${dest}.${process.pid}.tmp`;
+    target = tmpFile(dest);
     rmSync(target, { force: true });
     const fresh = new DatabaseSync(target);
     fresh.exec("PRAGMA journal_mode=DELETE");
@@ -205,7 +206,7 @@ export async function writeSnapshotFromDb(db: Db, dest: string = snapshotFile(),
   mkdirSync(dirname(dest), { recursive: true });
   recoverJournal(dest);
   let stamp = "";
-  const target = `${dest}.${process.pid}.tmp`;
+  const target = tmpFile(dest);
   rmSync(target, { force: true });
   const out = new DatabaseSync(target, { timeout: 30_000 });
   try {
@@ -285,15 +286,80 @@ export async function writeSnapshotFromDb(db: Db, dest: string = snapshotFile(),
  * Db handle (`db` if given and Postgres, else a connection opened and closed here).
  */
 export async function buildSnapshot(db?: Db, dest: string = snapshotFile()): Promise<SnapshotStats> {
-  if (db?.dialect === "postgres") return writeSnapshotFromDb(db, dest);
-  const target = dbTarget();
-  if (!isPgUrl(target)) return writeSnapshot(target, dest);
-  const own = await connectDb(target, { role: "cli", migrate: false });
+  return withSnapshotLock(dest, async () => {
+    if (db?.dialect === "postgres") return writeSnapshotFromDb(db, dest);
+    const target = dbTarget();
+    if (!isPgUrl(target)) return writeSnapshot(target, dest);
+    const own = await connectDb(target, { role: "cli", migrate: false });
+    try {
+      return await writeSnapshotFromDb(own, dest);
+    } finally {
+      await own.close();
+    }
+  });
+}
+
+/** The partial file a rebuild writes before renaming it over `dest`; one name is enough because builds hold the lock. */
+const tmpFile = (dest: string): string => `${dest}.tmp`;
+
+const LOCK_WAIT_MS = 15 * 60_000;
+let inProcess: Promise<unknown> = Promise.resolve();
+// The lock's connection while held: a build awaiting something no handle keeps alive would otherwise let the
+// connection be collected, and closing it releases the lock.
+let held: DatabaseSync | undefined;
+
+/**
+ * Runs `fn` as the only snapshot build for `dest`: after the builds already running in this process, and while holding
+ * an exclusive SQLite lock on `<dest>.lock`. Builders are separate processes (the runner leader's build child, embed
+ * jobs, the `item-tools snapshot` command), possibly in separate containers that share the directory, so a pid in a lock file cannot tell whether its
+ * holder is alive; the lock is a POSIX file lock, which the kernel releases when the holding process dies. A waiter
+ * polls without blocking the event loop. Holding the lock means no other build is writing, so every partial file in the
+ * directory is left over from an interrupted one and is deleted.
+ */
+export async function withSnapshotLock<T>(dest: string, fn: () => Promise<T>, waitMs: number = LOCK_WAIT_MS): Promise<T> {
+  const run = inProcess.then(() => holdingLock(dest, fn, waitMs));
+  inProcess = run.catch(() => undefined);
+  return run;
+}
+
+async function holdingLock<T>(dest: string, fn: () => Promise<T>, waitMs: number): Promise<T> {
+  mkdirSync(dirname(dest), { recursive: true });
+  const lock = new DatabaseSync(`${dest}.lock`, { timeout: 0 });
   try {
-    return await writeSnapshotFromDb(own, dest);
+    const deadline = Date.now() + waitMs;
+    for (;;) {
+      try {
+        lock.exec("BEGIN EXCLUSIVE");
+        break;
+      } catch (e) {
+        if (!isBusy(e)) throw e;
+        if (Date.now() >= deadline) throw new Error(`another item snapshot build has held ${dest}.lock for over ${Math.round(waitMs / 60_000)} min`);
+        await sleep(1000);
+      }
+    }
+    held = lock;
+    removePartials(dest);
+    try {
+      return await fn();
+    } finally {
+      removePartials(dest);
+      lock.exec("ROLLBACK");
+      held = undefined;
+    }
   } finally {
-    await own.close();
+    lock.close();
   }
+}
+
+const isBusy = (e: unknown): boolean => ((e as { errcode?: number })?.errcode ?? 0) % 256 === 5;
+
+/** Deletes the partial files of interrupted rebuilds: `<file>.tmp`, the `<file>.<pid>.tmp` of older versions, and their journals. */
+function removePartials(dest: string): void {
+  const name = basename(dest);
+  const partial = new RegExp(`^${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\.(?:\\d+\\.)?tmp(?:-journal)?$`);
+  let entries: string[];
+  try { entries = readdirSync(dirname(dest)); } catch { return; }
+  for (const f of entries) if (partial.test(f)) rmSync(join(dirname(dest), f), { force: true });
 }
 
 /**
@@ -345,7 +411,7 @@ function hasVersion(file: string): boolean {
   }
 }
 
-/** Rebuilds the snapshot after a sync that changed something; a failure is logged, never thrown into the sync. */
+/** Updates the snapshot after a run that changed what it copies; a failure is logged, never thrown into the run. */
 export async function refreshSnapshot(log: (line: string) => void = console.log, db?: Db): Promise<void> {
   try {
     const r = await buildSnapshot(db);

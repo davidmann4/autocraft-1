@@ -284,6 +284,7 @@ export function createHttpApi(): Api {
       setChannelRepo: (channelId, repo) => put("/api/admin/discord/channel-repo", { channelId, repo }),
       setContact: (contact) => put("/api/admin/discord/contact", { contact }),
       setReact: (on) => put("/api/admin/discord/react", { on }),
+      setReactEmoji: (emoji) => put("/api/admin/discord/react", { emoji }),
       removeLink: (id) => post("/api/admin/discord/unlink", { id }),
       addFilingRepo: (repo) => post("/api/admin/discord/filing-repos/add", { repo }),
       removeFilingRepo: (repo) => post("/api/admin/discord/filing-repos/remove", { repo }),

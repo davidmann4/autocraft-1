@@ -185,6 +185,8 @@ export const ADDED_COLUMNS: [table: string, column: string, type: string][] = [
   ["build_tasks", "warm_image", "TEXT"],
   // The AutoCraft version (runner image) a warm task was queued under: a failed task blocks a retry only under the same version.
   ["build_tasks", "warm_version", "TEXT"],
+  // The producer revision (WARM_PRODUCER_REV, src/build/warm-queue.ts) a warm task was queued under; NULL on older rows.
+  ["build_tasks", "warm_rev", "INTEGER"],
   ["decisions", "recommended_reason", "TEXT"],
   ["decisions", "recommend_failures", "INTEGER"],
   ["decisions", "recommend_failed_at", "TEXT"],

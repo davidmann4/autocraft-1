@@ -44,7 +44,7 @@ type TaskRow = {
   requires: string; priority: number; plan: string; state: TaskState; env_id: string | null; attempts: number;
   queued_at: string; claimed_at: string | null; started_at: string | null; ended_at: string | null; heartbeat_at: string | null;
   cancel_requested_at: string | null; results: string; summary: string | null; log_bytes: number; artifact_bytes: number;
-  patch?: string | null; warm_key?: string | null; warm_role?: string | null; sandbox_env?: string | null; warm_image?: string | null; warm_version?: string | null;
+  patch?: string | null; warm_key?: string | null; warm_role?: string | null; sandbox_env?: string | null; warm_image?: string | null; warm_version?: string | null; warm_rev?: number | null;
   env_label?: string | null; default_branch?: string | null;
 };
 
@@ -66,6 +66,7 @@ export type NewTask = {
   /** A warm producer task: the toolchain image it was queued with. */
   warmImage?: string;
   warmVersion?: string;
+  warmRev?: number;
 };
 
 export type Warm = { key: string; role: "use" | "build" };
@@ -151,7 +152,7 @@ export async function createTask(db: Db, t: NewTask): Promise<number> {
   const r = await db.get(db.k.insertInto("build_tasks").values({
     job_id: t.jobId ?? currentJobId(), step: t.step, repo: t.repo, number: t.number ?? null, head_sha: t.headSha, base_sha: t.baseSha ?? null,
     requires: JSON.stringify(requires), priority, plan: JSON.stringify(plan), state: "queued", queued_at: nowIso(),
-    patch, warm_key: warm?.key ?? null, warm_role: warm?.role ?? null, warm_image: t.warmImage ?? null, warm_version: t.warmVersion ?? null,
+    patch, warm_key: warm?.key ?? null, warm_role: warm?.role ?? null, warm_image: t.warmImage ?? null, warm_version: t.warmVersion ?? null, warm_rev: t.warmRev ?? null,
   }).returning("id"));
   return r!.id;
 }
@@ -235,7 +236,7 @@ export async function claim(db: Db, envId: string, free: number, nowMs: number =
           // A warm build waits for its repo's interval and takes the newest default-branch head, with the plan this environment runs.
           let head = t.head_sha, base = t.base_sha;
           if (t.step === WARM_STEP) {
-            const w = await warmClaim(db, t.repo, kube!, nowMs);
+            const w = await warmClaim(db, t.repo, kube!, nowMs, t.id);
             if (!w) continue;
             [head, base, plan] = [w.head, w.head, w.plan];
           }

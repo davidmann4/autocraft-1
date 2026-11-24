@@ -1,4 +1,4 @@
-// The Discord search and filing flow: /autocraft search opens a form (app select and description), the reply lists
+// The Discord search and filing flow: /autocraft report opens a form (app select and description), the reply lists
 // matches with "None of these", which goes through the follow-up questions to a checked draft with a type select and
 // File it / Edit / Open on GitHub; File it shows each result of fileIssue(). The daily cap builds the draft from the
 // form alone, and the rate limit refuses.
@@ -11,8 +11,12 @@ import { toBlob } from "../src/embed/store.ts";
 import { VectorIndex } from "../src/embed/vectors.ts";
 import { Interactions } from "../src/discord/interactions.ts";
 import { sanitize } from "../src/discord/issue-draft.ts";
-import type { FileResult } from "../src/discord/file-issue.ts";
+import type { BotRequest, FileResult } from "../src/discord/file-issue.ts";
+import { signV4 } from "../src/discord/attachments.ts";
+import { installPanel } from "../src/discord/panel.ts";
 import { installIssueNew, type IssueAsk } from "../src/discord/issue-new.ts";
+import { addFilingRepo, COVERAGE_TTL_MS, coverageReader, removeFilingRepo, type ReadRepo } from "../src/discord/filing-repos.ts";
+import { AppNotInstalledError } from "../src/github/install-token.ts";
 import { DiscordKeys } from "../src/discord/keys.ts";
 import type { CallbackData, CommandDef, DiscordRest, EditBody, MessageBody } from "../src/discord/rest.ts";
 import { Search } from "../src/discord/search.ts";
@@ -65,12 +69,13 @@ const junkCalls: { title: string; body: string; kind?: string }[] = [];
 let junkResult: "junk" | "ok" | "unknown" = "ok";
 const filed: { reporter: string; repo: string; title: string; body: string; kind: string; junkChecked?: boolean }[] = [];
 let fileResult: FileResult = { status: "refused", reason: "x" };
-installIssueNew(ix, { db, keys, search, log: (l) => assert.fail(l), ask, filing: true, junk: async (_d, a) => { junkCalls.push(a); return junkResult; }, file: async (_d, req) => { filed.push(req); return fileResult; } });
+const flow = installIssueNew(ix, { db, keys, search, log: (l) => assert.fail(l), ask, filing: true, store: null, junk: async (_d, a) => { junkCalls.push(a); return junkResult; }, file: async (_d, req) => { filed.push(req); return fileResult; } });
+installPanel(ix, db, flow);
 
 let n = 0;
-const send = async (type: number, user: string, data: unknown, channel = "c1") => {
+const send = async (type: number, user: string, data: unknown, channel = "c1", on = ix) => {
   rest.callbacks.length = 0; rest.edits.length = 0;
-  ix.dispatch("INTERACTION_CREATE", { id: `i${++n}`, token: "t", type, application_id: "app1", channel_id: channel, member: { user: { id: user } }, data });
+  on.dispatch("INTERACTION_CREATE", { id: `i${++n}`, token: "t", type, application_id: "app1", channel_id: channel, member: { user: { id: user } }, data });
   for (let k = 0; k < 50 && !(rest.callbacks.length && (rest.callbacks.at(-1)!.type !== 5 || rest.edits.length)); k++) await new Promise((r) => setTimeout(r, 5));
 };
 const modalId = (): string => rest.callbacks.find((c) => c.type === 9)!.data!.custom_id!;
@@ -84,7 +89,7 @@ const submitForm = (user: string, app: string, description: string) =>
   ] });
 const press = (user: string, custom_id: string) => send(3, user, { custom_id });
 const choose = (user: string, custom_id: string, values: string[]) => send(3, user, { custom_id, values });
-const searchCmd = (user: string, channel = "c1") => send(2, user, { name: "autocraft", type: 1, options: [{ name: "search", type: 1 }] }, channel);
+const searchCmd = (user: string, channel = "c1") => send(2, user, { name: "autocraft", type: 1, options: [{ name: "report", type: 1 }] }, channel);
 type Comp = { type: number; label?: string; custom_id?: string; url?: string; content?: string; components?: Comp[]; accessory?: Comp; options?: { value: string; default?: boolean }[] };
 // Buttons and selects in order; a result section contributes its accessory button.
 const rows = (b: EditBody) => (b.components as Comp[]).flatMap((r) => (r.type === 9 ? [r.accessory!] : r.type === 10 ? [] : r.components!));
@@ -109,7 +114,7 @@ before(async () => {
 });
 
 describe("search and filing flow", () => {
-  test("/autocraft search answers with the form: app select preselected, description box; the reply lists matches and the None button", async () => {
+  test("/autocraft report answers with the form: app select preselected, description box; the reply lists matches and the None button", async () => {
     await searchCmd("u1");
     assert.equal(rest.callbacks[0]!.type, 9);
     const comps = rest.callbacks[0]!.data!.components as { type: number; label: string; component: { type: number; custom_id: string; options?: { label: string; value: string; default?: boolean }[]; style?: number } }[];
@@ -125,6 +130,21 @@ describe("search and filing flow", () => {
     // Another person cannot press someone's button.
     await press("u3", rows(b).find((x) => x.label === NONE)!.custom_id!);
     assert.match(rest.callbacks[0]!.data!.content!, /expired/);
+  });
+
+  test("the panel's find button and /autocraft search open a search-only form whose submit replies with matches, not the issue form", async () => {
+    calls.length = 0;
+    for (const open of [() => press("u30", "panel:find"), () => send(2, "u30", { name: "autocraft", type: 1, options: [{ name: "search", type: 1 }] })]) {
+      await open();
+      const modal = rest.callbacks[0]!;
+      assert.equal(modal.type, 9);
+      const comps = modal.data!.components as { component: { type: number; custom_id: string } }[];
+      assert.deepEqual(comps.map((c) => [c.component.type, c.component.custom_id]), [[4, "q"]]);
+      await send(5, "u30", { custom_id: modalId(), components: [{ type: 18, component: { type: 4, custom_id: "q", value: "webp export quality slider does nothing" } }] });
+      assert.match(v2text(rest.edits[0]!), /photocraft#1 Export to WebP/);
+      assert.ok(rows(rest.edits[0]!).some((x) => x.label === "File a new issue"));
+    }
+    assert.deepEqual(calls, []);
   });
 
   test("a junk first message is refused with the GitHub link before any question; a clean one is not checked again at submit", async () => {
@@ -278,6 +298,98 @@ describe("search and filing flow", () => {
     assert.match(e.content!, /\[Open on GitHub instead\]\(<https:\/\/github\.com\//);
     assert.ok(!rows(e).some((x) => x.url && x.url.length > 512));
   });
+
+  test("without screenshot storage the bug form has no upload field", async () => {
+    await press("u41", "panel:bug");
+    const comps = rest.callbacks[0]!.data!.components as { component: { type: number } }[];
+    assert.ok(comps.length && !comps.some((c) => c.component.type === 19));
+  });
+
+  test("with storage, Submit for me embeds the copied PNG and names the attachment that is not an image", async () => {
+    const ix2 = new Interactions(rest, (l) => assert.fail(l));
+    const puts: { url: string; headers: Record<string, string> }[] = [];
+    const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);
+    const fakeFetch = (async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (init?.method === "PUT") { puts.push({ url, headers: init.headers as Record<string, string> }); return new Response(null, { status: 200 }); }
+      return new Response(url.endsWith("shot.png") ? PNG : new TextEncoder().encode("plain text, not an image"), { status: 200 });
+    }) as typeof fetch;
+    const bodies: string[] = [];
+    installIssueNew(ix2, { db, keys, search, log: (l) => assert.fail(l), ask, junk: async () => "ok", botRefusal: async () => null,
+      store: { endpoint: "https://store.example.test", bucket: "shots", accessKeyId: "id", secretAccessKey: "secret", publicUrl: "https://files.example.test" }, fetch: fakeFetch,
+      fileBot: async (_d, req: BotRequest) => { bodies.push(`${req.body}\n\n${await req.attach?.() ?? ""}`); return { status: "filed", number: 9, url: "https://github.com/storytold/photocraft/issues/9" }; } });
+    draftReply = JSON.stringify({ title: "Export crashes", kind: "bug", body: "It crashes on export." });
+    await send(2, "u40", { name: "autocraft", type: 1, options: [{ name: "report", type: 1 }] }, "c1", ix2);
+    const upload = (rest.callbacks[0]!.data!.components as { component: { type: number; custom_id: string } }[]).find((c) => c.component.type === 19)!;
+    const att = (id: string, filename: string, content_type: string) => ({ id, filename, content_type, size: 20, url: `https://cdn.discordapp.com/ephemeral-attachments/1/${id}/${filename}` });
+    await send(5, "u40", { custom_id: modalId(), components: [
+      { type: 18, component: { type: 3, custom_id: "app", values: ["photocraft"] } },
+      { type: 18, component: { type: 4, custom_id: "description", value: "export crashes the app" } },
+      { type: 18, component: { type: 19, custom_id: upload.component.custom_id, values: ["a1", "a2"] } },
+    ], resolved: { attachments: { a1: att("a1", "shot.png", "image/png"), a2: att("a2", "notes].png", "image/png") } } }, "c1", ix2);
+    const next = rows(rest.edits[0]!).find((x) => x.label === NONE || x.label === "Continue")!.custom_id!;
+    await send(3, "u40", { custom_id: next }, "c1", ix2);
+    await send(5, "u40", { custom_id: modalId(), components: [{ type: 1, components: [{ type: 4, custom_id: "steps", value: "Export" }] }] }, "c1", ix2);
+    assert.match(rest.edits[0]!.content!, /attach them there/);
+    assert.equal(puts.length, 0, "nothing is uploaded before Submit for me");
+    await send(3, "u40", { custom_id: rows(rest.edits[0]!).find((x) => x.label === "Submit for me")!.custom_id! }, "c1", ix2);
+    assert.equal(puts.length, 1);
+    assert.match(puts[0]!.url, /^https:\/\/store\.example\.test\/shots\/discord\/\d{4}\/\d{2}\/[0-9a-f]{32}\.png$/);
+    const key = puts[0]!.url.split("/shots/")[1];
+    assert.ok(bodies[0]!.includes(`![shot.png](https://files.example.test/${key})`));
+    assert.doesNotMatch(bodies[0]!, /notes/);
+    assert.match(rest.edits[0]!.content!, /^Filed as photocraft#9\nnotes\.png was left out: it is not a PNG, JPEG, GIF or WebP image\.$/);
+  });
+
+  test("a filing-only repo the app does not cover is added link-only; its draft offers Submit for me once the app covers it", async () => {
+    let installed = false, clock = 0;
+    const minted: string[] = [];
+    const mint = async (owner: string, repo: string) => { minted.push(repo); if (!installed) throw new AppNotInstalledError(owner); return "ghs_install"; };
+    const read: ReadRepo = async (owner, name) => ({ owner, name, private: false, hasIssues: true, archived: false });
+    assert.equal((await addFilingRepo(db, "op", "example-studio/sketchpad", { read, mint })).mode, "link");
+    const ix3 = new Interactions(rest, (l) => assert.fail(l));
+    // fileBot runs the junk model and copies the screenshots (req.attach): a press it never reaches does neither.
+    const pressed: BotRequest[] = [];
+    installIssueNew(ix3, { db, keys, search, log: (l) => assert.fail(l), ask, store: null, junk: async () => "ok", botRefusal: async () => null, covers: coverageReader(mint, () => clock),
+      fileBot: async (_d, req) => { pressed.push(req); return { status: "filed", number: 3, url: "https://github.com/example-studio/sketchpad/issues/3" }; } });
+    const draft = async (user: string): Promise<EditBody> => {
+      await send(2, user, { name: "autocraft", type: 1, options: [{ name: "report", type: 1 }] }, "c1", ix3);
+      await send(5, user, { custom_id: modalId(), components: [
+        { type: 18, component: { type: 3, custom_id: "app", values: ["sketchpad"] } },
+        { type: 18, component: { type: 4, custom_id: "description", value: "brush strokes lag on large canvases" } },
+      ] }, "c1", ix3);
+      await send(3, user, { custom_id: rows(rest.edits[0]!).find((x) => x.label === "Continue")!.custom_id! }, "c1", ix3);
+      await send(5, user, { custom_id: modalId(), components: [{ type: 1, components: [{ type: 4, custom_id: "steps", value: "Draw" }] }] }, "c1", ix3);
+      return rest.edits[0]!;
+    };
+    draftReply = JSON.stringify({ title: "Brush lags", kind: "bug", body: "Strokes lag on large canvases." });
+    const linkOnly = await draft("u50");
+    assert.ok(!rows(linkOnly).some((x) => x.label === "Submit for me"));
+    assert.ok(rows(linkOnly).some((x) => x.url?.startsWith("https://github.com/example-studio/sketchpad/issues/new")));
+    assert.match(linkOnly.content!, /cannot file issues in this repo yet/);
+    // A hand-built Submit for me press on the link-only draft files and attaches nothing.
+    await send(3, "u50", { custom_id: rows(linkOnly).find((x) => x.label === "Edit")!.custom_id!.replace(":edit:", ":bot:") }, "c1", ix3);
+    assert.equal(pressed.length, 0);
+    assert.match(rest.edits[0]!.content!, /cannot file issues in this repo yet/);
+    installed = true;
+    const reads = minted.length;
+    assert.ok(!rows(await draft("u51")).some((x) => x.label === "Submit for me"), "within the cache time the earlier reading holds");
+    assert.equal(minted.length, reads, "and GitHub is not asked again");
+    clock += COVERAGE_TTL_MS;
+    const covered = await draft("u52");
+    assert.ok(rows(covered).some((x) => x.label === "Submit for me"));
+    assert.doesNotMatch(covered.content!, /cannot file/);
+    await send(3, "u52", { custom_id: rows(covered).find((x) => x.label === "Submit for me")!.custom_id! }, "c1", ix3);
+    assert.equal(pressed.length, 1, "once covered, the press files");
+    await removeFilingRepo(db, "op", "sketchpad");
+  });
+});
+
+test("Signature Version 4 matches AWS's published S3 GET example", () => {
+  const empty = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+  const auth = signV4({ method: "GET", host: "examplebucket.s3.amazonaws.com", path: "/test.txt", headers: { Range: "bytes=0-9", "x-amz-content-sha256": empty, "x-amz-date": "20130524T000000Z" }, payloadHash: empty },
+    { accessKeyId: "AKIAIOSFODNN7EXAMPLE", secretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", region: "us-east-1", service: "s3" }, "20130524T000000Z");
+  assert.match(auth, /Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41$/);
 });
 
 test("the sanitizer removes foreign link targets and hidden comments", () => {

@@ -1,6 +1,11 @@
-// `/autocraft search`, the panel's buttons and the "File a new issue" button: a form (app and description), a look for an
+// `/autocraft report`, the panel's bug and feature buttons and the "File a new issue" button: a form (app and description), a look for an
 // existing issue, up to three follow-up questions, and a draft the GitHub App files for the person ("Submit for me",
 // file-issue.ts) or the person opens on GitHub themselves.
+//
+// When screenshot storage is configured (attachments.ts), the bug and undecided forms take up to three images. Only
+// their Discord links are kept with the session; "Submit for me" copies them to our bucket after the limits and the
+// junk check pass and embeds them in the issue body, and its reply names each file left out and why. The prefilled
+// GitHub link cannot carry files, so the person is told to attach them there. Images never reach a model prompt.
 //
 // What a person typed lives in memory for the session only (15 minutes) and is never stored or logged. The model calls
 // (step `discord-issue`) record their cost under a daily cap of their own; their prompt and reply texts are deleted when
@@ -17,9 +22,10 @@ import { botRefusal, FILING_IN_DISCORD, fileAsBot, fileIssue, JUNK_REFUSAL, junk
 import type { JunkAsk } from "./junk-ask.ts";
 import { deliver, fileRepoUrl, plain, renderMatches } from "./reply.ts";
 import { QUESTION_CHARS, type Match, type Search } from "./search.ts";
-import { botRepo, botRepos, FILING_MAX } from "./filing-repos.ts";
+import { appCovers, botRepo, botRepos, FILING_MAX, type CoverageReading } from "./filing-repos.ts";
 import type { Db } from "../db/index.ts";
 import { DISCORD_TAKE_WAIT_MS } from "./limits.ts";
+import { attachStoreFromEnv, copyAttachments, MAX_SCREENSHOTS, type AttachStore, type Attachment, type Copied, type Outcome } from "./attachments.ts";
 
 export const ISSUE_CAP_KEY = "discord_issue_daily_usd";
 export const DEFAULT_ISSUE_CAP_USD = 2;
@@ -30,7 +36,7 @@ const USER_LIMIT = 3, CHANNEL_LIMIT = 10;
 const MAX_APPS = 25;
 const MESSAGE_CHARS = 1900;
 const MAX_CALLS = 2;
-const USED = "That button was already used. Start again with /autocraft search.";
+const USED = "That button was already used. Start again with /autocraft report.";
 
 /** The model step; tests replace it. Null when the call failed or got no answer. */
 export type IssueAsk = {
@@ -71,6 +77,8 @@ type Session = {
   drafted: boolean;
   /** The draft offers "Submit for me": the app may file for this person in this repo now. */
   bot: boolean;
+  /** A filing-only repo the GitHub App does not cover: the draft offers only the GitHub link and says why. */
+  linkOnly?: boolean;
   /** The Discord name a bot-filed issue credits. */
   name: string;
   /** The "limits" event was counted for this session. */
@@ -85,6 +93,10 @@ type Session = {
   stage: "form" | "matched" | "asking" | "drafted";
   /** Model calls made; at most MAX_CALLS (the questions and one draft). */
   calls: number;
+  /** Screenshots attached to the form: Discord's links only, nothing downloaded. */
+  attachments: Attachment[];
+  /** The screenshots stored, or refused for type or size, by an earlier Submit for me that GitHub then refused: a second press uploads them not again and retries only the rest. */
+  copies?: Map<string, Outcome>;
 };
 
 export type IssueNewDeps = {
@@ -97,8 +109,14 @@ export type IssueNewDeps = {
   fileBot?: (deps: FileDeps, req: BotRequest) => Promise<BotResult>;
   /** Why the app cannot file for this person now (null: it can); botRefusal unless a test sets it. */
   botRefusal?: (db: Db, reporter: string, repo: string) => Promise<string | null>;
+  /** Whether the GitHub App covers a filing-only repo; appCovers (a few minutes' cache) unless a test sets it. */
+  covers?: (owner: string, name: string) => Promise<CoverageReading>;
   /** The junk check on the first message; the model check (Jev, Haiku where unsure) unless a test sets it. */
   junk?: (db: Db, a: JunkAsk) => Promise<"junk" | "ok" | "unknown">;
+  /** The screenshot bucket; read from the environment unless a test sets it (null: screenshots off). */
+  store?: AttachStore | null;
+  /** Downloads from Discord and uploads to the bucket; replaced in tests. */
+  fetch?: typeof fetch;
 };
 
 const field = (custom_id: string, label: string, style: 1 | 2, max: number, opts: { required?: boolean; value?: string; placeholder?: string } = {}) => ({
@@ -111,14 +129,18 @@ const KINDS: { value: IssueKind; label: string }[] = [{ value: "bug", label: "Bu
 const titleOf = (description: string): string => { const t = description.replace(/\s+/g, " ").trim(); return t.length > 80 ? `${t.slice(0, 79)}…` : t; };
 const TOO_MANY = "\nToo many new issues just now. Try again later.";
 const button = (label: string, custom_id: string, style: 1 | 2 = 2) => ({ type: 2, style, label: label.slice(0, 80), custom_id });
+const LINK_ONLY = "AutoCraft cannot file issues in this repo yet; open it on GitHub.";
+const SHOTS_ON_GITHUB = "\nThe GitHub page does not get your screenshots; attach them there.";
 
 export class IssueNew {
   #d: IssueNewDeps;
   #sessions = new Map<string, Session>();
   #hits = new Map<string, number[]>();
+  #store: AttachStore | null;
 
   constructor(deps: IssueNewDeps) {
     this.#d = deps;
+    this.#store = deps.store === undefined ? attachStoreFromEnv() : deps.store;
   }
 
   get #filing(): boolean {
@@ -186,7 +208,7 @@ export class IssueNew {
     return mine.slice(0, MAX_APPS).sort((x, y) => x.label.localeCompare(y.label)).map((r) => ({ name: r.name, label: r.label }));
   }
 
-  /** `/autocraft search`, the panel and the "File a new issue" button: the form with the app select (`repo` preselected) and the description box. `kind`: what the person said they are reporting. */
+  /** `/autocraft report`, the panel and the "File a new issue" button: the form with the app select (`repo` preselected) and the description box. `kind`: what the person said they are reporting. */
   async open(call: Call, repo: string | null, question = "", kind?: IssueKind): Promise<void> {
     const apps = await this.#apps(repo);
     if (!apps.length) return void (await call.reply({ content: "No public repo to search yet." }));
@@ -195,7 +217,7 @@ export class IssueNew {
     this.#sessions.set(sid, {
       user: call.userId, repo: "", repoUrl: "", expires: this.#now() + SESSION_MS,
       title: "", description: "", matches: [], questions: [], capped: false, answers: [], stage: "form", calls: 0, kind: kind ?? "bug", chosen: kind, filing: false, counted: false,
-      drafted: false, bot: false, name: call.userName ?? "",
+      drafted: false, bot: false, name: call.userName ?? "", attachments: [],
     });
     await call.showModal({
       custom_id: `inew:form:${sid}`, title: kind === "bug" ? "Report a bug" : kind === "feature" ? "Request a feature" : "Find or report an issue",
@@ -203,6 +225,9 @@ export class IssueNew {
         labelled("App", { type: 3, custom_id: "app", required: true, options: apps.map((a) => ({ label: a.label.slice(0, 100), value: a.name, ...(a.name === repo ? { default: true } : {}) })) }),
         labelled(kind === "bug" ? "Describe the problem" : kind === "feature" ? "Describe the idea" : "Describe the problem or the idea", { type: 4, custom_id: "description", style: 2, required: true, max_length: ISSUE_FORM_BODY_CHARS, placeholder: "What happened, or what would you like?",
           ...(question.trim() ? { value: question.replace(/\s+/g, " ").trim().slice(0, ISSUE_FORM_BODY_CHARS) } : {}) }),
+        // Offered only where Submit for me can store the files: a control that cannot work is never shown.
+        ...(this.#store && kind !== "feature" ? [{ type: 18, label: "Screenshots", description: `Optional, up to ${MAX_SCREENSHOTS} images`,
+          component: { type: 19, custom_id: "screenshots", min_values: 0, max_values: MAX_SCREENSHOTS, required: false, file_types: [".png", ".jpg", ".jpeg", ".gif", ".webp"] } }] : []),
       ],
     });
   }
@@ -211,16 +236,17 @@ export class IssueNew {
   async form(call: Call, sid: string): Promise<void> {
     const { db, keys } = this.#d;
     const s = this.#session(call, sid);
-    if (!s) return void (await call.edit({ content: "This form has expired. Start again with /autocraft search." }));
+    if (!s) return void (await call.edit({ content: "This form has expired. Start again with /autocraft report." }));
     if (s.stage !== "form") return void (await call.edit({ content: USED }));
     const f = call.fields();
     const repo = f.app ? await botRepo(db, f.app) : null;
     const description = (f.description ?? "").trim().slice(0, ISSUE_FORM_BODY_CHARS);
-    if (!repo || !description) return void (await call.edit({ content: "Pick an app and describe the problem. Start again with /autocraft search." }));
+    if (!repo || !description) return void (await call.edit({ content: "Pick an app and describe the problem. Start again with /autocraft report." }));
     const userKey = keys.hash("author", s.user), channelKey = keys.hash("channel", call.interaction.channel_id ?? "?");
     if (!this.#d.search.allow(userKey, channelKey)) return void (await call.edit({ content: "Too many searches just now. Try again in a minute." }));
     s.repo = repo.name; s.repoUrl = `https://github.com/${repo.owner}/${repo.name}`;
     s.description = description; s.title = titleOf(description);
+    s.attachments = this.#store ? (call.files().screenshots ?? []).slice(0, MAX_SCREENSHOTS).map((a) => ({ url: a.url, filename: a.filename, contentType: a.content_type ?? "", size: Number(a.size) || 0 })) : [];
     await recordEvent(db, "started", this.#d.log, this.#now());
     // The first message is checked before anything else is asked; no answer from a model lets the flow go on.
     const ask: JunkAsk = { title: s.title, body: description, ...(s.chosen && { kind: s.chosen }) };
@@ -228,7 +254,7 @@ export class IssueNew {
       await recordEvent(db, "junk", this.#d.log, this.#now());
       const { url } = issueUrl(s.repoUrl, s.title, description, ISSUE_URL_MAX);
       this.#sessions.delete(sid);
-      return void (await call.edit({ content: `${JUNK_REFUSAL}\nYou can still open it on GitHub yourself.${url.length <= BUTTON_URL_MAX ? "" : `\n[Open on GitHub](<${url}>)`}`, components: url.length <= BUTTON_URL_MAX ? [{ type: 1, components: [{ type: 2, style: 5, label: "Open on GitHub", url }] }] : [] }));
+      return void (await call.edit({ content: `${JUNK_REFUSAL}\nYou can still open it on GitHub yourself.${this.#shots(s)}${url.length <= BUTTON_URL_MAX ? "" : `\n[Open on GitHub](<${url}>)`}`, components: url.length <= BUTTON_URL_MAX ? [{ type: 1, components: [{ type: 2, style: 5, label: "Open on GitHub", url }] }] : [] }));
     }
     s.stage = "matched";
     // The questions are chosen in the background, so the matches reply does not wait for the model; "None of these" uses the result.
@@ -252,7 +278,7 @@ export class IssueNew {
   /** "None of these" or "Continue": the follow-up questions are chosen now (a model call, or the kind's fixed ones when it fails), then asked in a second form behind a Continue button; with none, the draft follows at once. */
   async none(call: Call, sid: string): Promise<void> {
     const s = this.#session(call, sid);
-    if (!s) return void (await call.reply({ content: "This form has expired. Start again with /autocraft search." }));
+    if (!s) return void (await call.reply({ content: "This form has expired. Start again with /autocraft report." }));
     if (s.stage === "asking" && s.questions.length) {
       await call.showModal({
         custom_id: `inew:ans:${sid}`, title: "A few more details",
@@ -288,7 +314,7 @@ export class IssueNew {
 
   async answers(call: Call, sid: string): Promise<void> {
     const s = this.#session(call, sid);
-    if (!s) return void (await call.edit({ content: "This form has expired. Start again with /autocraft search." }));
+    if (!s) return void (await call.edit({ content: "This form has expired. Start again with /autocraft report." }));
     if (s.stage !== "asking") return void (await call.edit({ content: USED }));
     s.stage = "drafted";
     const f = call.fields();
@@ -315,7 +341,10 @@ export class IssueNew {
     const { db, keys, log } = this.#d;
     try {
       const why = await (this.#d.botRefusal ?? ((d, r, repo) => botRefusal(d, r, repo, this.#now())))(db, keys.hash("author", s.user), s.repo);
-      s.bot = why === null;
+      // A filing-only repo is offered whether or not the app covers it; coverage is read here, so an installation made later shows at the next draft.
+      const repo = why === null ? await botRepo(db, s.repo) : null;
+      s.linkOnly = !!repo?.filingOnly && !(await (this.#d.covers ?? appCovers)(repo.owner, repo.name)).covered;
+      s.bot = why === null && !s.linkOnly;
       // Once per session: later renders (after an edit) are the same draft.
       if (why !== null && !s.limitCounted) { s.limitCounted = true; await recordEvent(db, "limits", log, this.#now()); }
     } catch (e) {
@@ -339,8 +368,8 @@ export class IssueNew {
     const fence = (t: string): string => `\`\`\`\n${t.replace(/`{3,}/g, "``")}\n\`\`\``;
     const head = `Your draft for ${s.repo}:\n**${plain(d.title)}**\n`;
     const asButton = url.length <= BUTTON_URL_MAX;
-    const credit = s.bot ? "\nSubmit for me files it from the AutoCraft bot and names you as the reporter." : "";
-    const foot = `${credit}${asButton ? "" : `\n[Open on GitHub instead](<${url}>)`}${trimmed ? "\nThe GitHub link holds only the start of the text; Edit shows all of it." : ""}`;
+    const credit = s.bot ? "\nSubmit for me files it from the AutoCraft bot and names you as the reporter." : s.linkOnly ? `\n${LINK_ONLY}` : "";
+    const foot = `${credit}${this.#shots(s)}${asButton ? "" : `\n[Open on GitHub instead](<${url}>)`}${trimmed ? "\nThe GitHub link holds only the start of the text; Edit shows all of it." : ""}`;
     const room = MESSAGE_CHARS - head.length - foot.length - 10;
     const preview = room > 80 ? fence(d.body.length > room ? `${d.body.slice(0, room - 1)}…` : d.body) : "";
     return {
@@ -361,7 +390,7 @@ export class IssueNew {
   async kind(call: Call, sid: string): Promise<void> {
     const s = this.#session(call, sid);
     const v = call.values()[0];
-    if (!s?.draft) return void (await call.reply({ content: "This draft has expired. Start again with /autocraft search." }));
+    if (!s?.draft) return void (await call.reply({ content: "This draft has expired. Start again with /autocraft report." }));
     if (v === "bug" || v === "feature") s.kind = v;
     await call.ack();
   }
@@ -370,7 +399,7 @@ export class IssueNew {
   async file(call: Call, sid: string): Promise<void> {
     const { keys, log } = this.#d;
     const s = this.#session(call, sid);
-    if (!s?.draft) return void (await call.reply({ content: "This draft has expired. Start again with /autocraft search." }));
+    if (!s?.draft) return void (await call.reply({ content: "This draft has expired. Start again with /autocraft report." }));
     if (s.filing) return void (await call.reply({ content: "Filing is already in progress." }));
     s.filing = true;
     await call.defer();
@@ -387,9 +416,9 @@ export class IssueNew {
         await call.edit({ content: "Sign in with GitHub to file this issue under your account, then press File it again.", components: [{ type: 1, components: [{ type: 2, style: 5, label: "Sign in with GitHub", url: r.url }] }] });
       } else if (r.status === "filed") {
         this.#sessions.delete(sid);
-        await call.edit({ content: `Filed as ${s.repo}#${r.number}`, components: [{ type: 1, components: [{ type: 2, style: 5, label: `${s.repo}#${r.number}`.slice(0, 80), url: r.url }] }] });
+        await call.edit({ content: `Filed as ${s.repo}#${r.number}${s.attachments.length ? "\nYour screenshots are not in it; attach them on GitHub's page." : ""}`, components: [{ type: 1, components: [{ type: 2, style: 5, label: `${s.repo}#${r.number}`.slice(0, 80), url: r.url }] }] });
       } else {
-        await call.edit({ content: `${plain(r.reason)}\nYou can still open it on GitHub yourself.${githubText}`, components: asButton ? [{ type: 1, components: [github] }] : [] });
+        await call.edit({ content: `${plain(r.reason)}\nYou can still open it on GitHub yourself.${this.#shots(s)}${githubText}`, components: asButton ? [{ type: 1, components: [github] }] : [] });
       }
     } finally {
       s.filing = false;
@@ -400,33 +429,50 @@ export class IssueNew {
   async bot(call: Call, sid: string): Promise<void> {
     const { keys, log } = this.#d;
     const s = this.#session(call, sid);
-    if (!s?.draft) return void (await call.reply({ content: "This draft has expired. Start again with /autocraft search." }));
+    if (!s?.draft) return void (await call.reply({ content: "This draft has expired. Start again with /autocraft report." }));
     if (s.filing) return void (await call.reply({ content: "Filing is already in progress." }));
     s.filing = true;
     await call.defer();
     const { url } = issueUrl(s.repoUrl, s.draft.title, s.draft.body, ISSUE_URL_MAX);
     const asButton = url.length <= BUTTON_URL_MAX;
+    const linkReply = (reason: string) => call.edit({ content: `${reason}${this.#shots(s)}${asButton ? "" : `\n[Open on GitHub](<${url}>)`}`, components: asButton ? [{ type: 1, components: [{ type: 2, style: 5, label: "Open on GitHub", url }] }] : [] });
+    const store = this.#store;
+    // The screenshot result of this press, for its reply.
+    let copied: Copied | undefined;
+    const attach = store && s.attachments.length
+      ? async (): Promise<string> => (copied = await copyAttachments(store, s.attachments, { log, now: this.#now, ...(this.#d.fetch && { fetch: this.#d.fetch }) }, s.copies ??= new Map())).markdown
+      : undefined;
     try {
+      // A press the draft did not offer (a stale or hand-built one), or on a filing-only repo the app does not cover, never reaches the junk model or the screenshot copies.
+      const repo = s.bot ? await botRepo(this.#d.db, s.repo) : null;
+      if (!s.bot || (repo?.filingOnly && !(await (this.#d.covers ?? appCovers)(repo.owner, repo.name)).covered)) return void (await linkReply(LINK_ONLY));
       const r = await (this.#d.fileBot ?? fileAsBot)({ db: this.#d.db, log }, {
         reporter: keys.hash("author", s.user), reporterName: s.name || call.userName || "", repo: s.repo, title: s.draft.title, body: s.draft.body, kind: s.kind, drafted: s.drafted, junkChecked: !s.edited,
+        ...(attach && { attach }),
       });
       if (r.status === "filed") {
         await recordEvent(this.#d.db, "filed", log, this.#now());
         this.#sessions.delete(sid);
-        await call.edit({ content: `Filed as ${s.repo}#${r.number}`, components: [{ type: 1, components: [{ type: 2, style: 5, label: `${s.repo}#${r.number}`.slice(0, 80), url: r.url }] }] });
+        const left = (copied?.skipped ?? []).map((k) => `\n${plain(k.filename)} was left out: ${k.why}.`).join("");
+        await call.edit({ content: `Filed as ${s.repo}#${r.number}${left}`, components: [{ type: 1, components: [{ type: 2, style: 5, label: `${s.repo}#${r.number}`.slice(0, 80), url: r.url }] }] });
       } else {
         await recordEvent(this.#d.db, r.reason === JUNK_REFUSAL ? "junk" : "link", log, this.#now());
-        await call.edit({ content: `${plain(r.reason)}\nYou can still open it on GitHub yourself.${asButton ? "" : `\n[Open on GitHub](<${url}>)`}`, components: asButton ? [{ type: 1, components: [{ type: 2, style: 5, label: "Open on GitHub", url }] }] : [] });
+        await call.edit({ content: `${plain(r.reason)}\nYou can still open it on GitHub yourself.${this.#shots(s)}${asButton ? "" : `\n[Open on GitHub](<${url}>)`}`, components: asButton ? [{ type: 1, components: [{ type: 2, style: 5, label: "Open on GitHub", url }] }] : [] });
       }
     } finally {
       s.filing = false;
     }
   }
 
+  /** The note that the prefilled GitHub link leaves the person's screenshots behind. */
+  #shots(s: Session): string {
+    return s.attachments.length ? SHOTS_ON_GITHUB : "";
+  }
+
   /** "Edit": the draft's title and body in a form. */
   async edit(call: Call, sid: string): Promise<void> {
     const s = this.#session(call, sid);
-    if (!s?.draft) return void (await call.reply({ content: "This draft has expired. Start again with /autocraft search." }));
+    if (!s?.draft) return void (await call.reply({ content: "This draft has expired. Start again with /autocraft report." }));
     await call.showModal({
       custom_id: `inew:fix:${sid}`, title: "Edit the draft",
       components: [field("title", "Title", 1, ISSUE_TITLE_CHARS, { value: s.draft.title }), field("body", "Body", 2, 4000, { value: s.draft.body })],
@@ -435,7 +481,7 @@ export class IssueNew {
 
   async fix(call: Call, sid: string): Promise<void> {
     const s = this.#session(call, sid);
-    if (!s?.draft) return void (await call.edit({ content: "This draft has expired. Start again with /autocraft search." }));
+    if (!s?.draft) return void (await call.edit({ content: "This draft has expired. Start again with /autocraft report." }));
     const f = call.fields();
     const d = cleanDraft({ title: f.title ?? "", body: f.body ?? "" }, await this.#repos());
     if (d) { s.draft = d; s.edited = true; }
@@ -447,7 +493,7 @@ export function installIssueNew(ix: Interactions, deps: IssueNewDeps): IssueNew 
   const { db } = deps;
   const flow = new IssueNew(deps);
   // No fields: Discord shows the command's form at once, and the form is the first response.
-  ix.command("autocraft search", { name: "autocraft", type: 1, description: "AutoCraft", dm_permission: false, options: [{ type: 1, name: "search", description: "Find existing issues or report a new one" }] }, async (call) => {
+  ix.command("autocraft report", { name: "autocraft", type: 1, description: "AutoCraft", dm_permission: false, options: [{ type: 1, name: "report", description: "Report a bug or request a feature" }] }, async (call) => {
     await flow.open(call, (await fileRepoUrl(db, call.interaction.channel_id, []))?.split("/").pop() ?? null);
   }, { immediate: true });
   // The "File a new issue" button of search results: `inewi:open:<repo>[:<seed>]`; the other actions belong to a session.
@@ -459,14 +505,14 @@ export function installIssueNew(ix: Interactions, deps: IssueNewDeps): IssueNew 
     else if (action === "kind") await flow.kind(call, a ?? "");
     else if (action === "bot") await flow.bot(call, a ?? "");
     else if (action === "file" && (deps.filing ?? FILING_IN_DISCORD)) await flow.file(call, a ?? "");
-    else await call.reply({ content: "This form has expired. Start again with /autocraft search." });
+    else await call.reply({ content: "This form has expired. Start again with /autocraft report." });
   }, { immediate: true });
   ix.component("inew", async (call) => {
     const [, action, sid] = (call.interaction.data?.custom_id ?? "").split(":");
     if (action === "form") await flow.form(call, sid ?? "");
     else if (action === "ans") await flow.answers(call, sid ?? "");
     else if (action === "fix") await flow.fix(call, sid ?? "");
-    else await call.edit({ content: "This form has expired. Start again with /autocraft search." });
+    else await call.edit({ content: "This form has expired. Start again with /autocraft report." });
   });
   return flow;
 }

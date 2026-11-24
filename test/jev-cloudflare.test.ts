@@ -11,6 +11,7 @@ import { SCRATCH } from "./scratch.ts";
 test("Workers AI stands in for the jev command: answers and usage come back, a rejected token is an account outage", async () => {
   const seen: { auth?: string; url?: string; body?: { model: string; input: Record<string, unknown> } }[] = [];
   let status = 200;
+  let nested = false;
   const server = createServer((req, res) => {
     let b = "";
     req.on("data", (c) => (b += c));
@@ -18,7 +19,9 @@ test("Workers AI stands in for the jev command: answers and usage come back, a r
       seen.push({ auth: req.headers.authorization, url: req.url, body: JSON.parse(b) });
       res.statusCode = status;
       res.end(JSON.stringify(status === 200
-        ? { success: true, errors: [], result: { answers: { security: { noul: 0.7 } }, usage: { input_tokens: 12, output_tokens: 1 } } }
+        ? { success: true, errors: [], result: nested
+          ? { state: "Completed", result: { answers: { security: { noul: 0.6 } }, usage: { input_tokens: 9, output_tokens: 1 } } }
+          : { answers: { security: { noul: 0.7 } }, usage: { input_tokens: 12, output_tokens: 1 } } }
         : { success: false, errors: [{ message: "Authentication error" }] }));
     });
   });
@@ -38,6 +41,12 @@ test("Workers AI stands in for the jev command: answers and usage come back, a r
     assert.equal(seen[0]!.auth, "Bearer secret-token");
     assert.equal(seen[0]!.url, "/client/v4/accounts/acct/ai/run");
     assert.deepEqual(Object.keys(seen[0]!.body!.input).sort(), ["questions", "state"]);
+
+    // Workers AI's second envelope ({ state, result }) is unwrapped too.
+    nested = true;
+    const deep = JSON.parse((await askJevCloudflare(cfg, JSON.stringify({ state: { a: 1 }, questions: { security: {} } }), 5000, base)).stdout) as { answers: { security: { noul: number } } };
+    assert.equal(deep.answers.security.noul, 0.6);
+    nested = false;
 
     status = 401;
     const bad = await askJevCloudflare(cfg, "{\"state\":{},\"questions\":{}}", 5000, base);

@@ -40,7 +40,7 @@ export const HELP = [
   "`/autocraft alerts on|off` turns on direct messages about decisions you can settle, once linked.",
   "Mention @AutoCraft with a question in a watched channel, or reply to a message and mention it, to get matching issues.",
   "Right-click a message, then Apps › Find issue, to search with that message's text.",
-  "A ✅ on a message means AutoCraft counted it for the issues it names.",
+  "AutoCraft's bot reaction on a message means AutoCraft counted it for the issues it names.",
 ].join("\n");
 
 export function installAccountCommands(ix: Interactions, deps: { db: Db; keys: DiscordKeys; now?: () => number }): void {

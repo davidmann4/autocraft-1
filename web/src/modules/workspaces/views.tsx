@@ -137,7 +137,12 @@ function CallRow({ c, wsId, imageUrl }: { c: WorkspaceCall; wsId: number; imageU
         </span>
         {canOpen && (open ? <CaretDownIcon className="mt-1 shrink-0 text-ink/45" aria-hidden /> : <CaretRightIcon className="mt-1 shrink-0 text-ink/45" aria-hidden />)}
       </button>
-      {c.images > 0 && (
+      {c.images > 0 && c.notKept && (
+        <p className="num mx-4 mb-2 ml-10 break-words text-xs text-ink/60 [overflow-wrap:anywhere]">
+          Screenshot not kept ({c.notKept.bytes.toLocaleString("en")} bytes, sha256 <span className="code">{c.notKept.sha256.slice(0, 12)}</span>){c.notKept.note ? `: ${c.notKept.note}` : ""}
+        </p>
+      )}
+      {c.images > 0 && !c.notKept && (
         <a href={imageUrl(wsId, c.id)} target="_blank" rel="noopener noreferrer" aria-label={`Open the screenshot of call ${c.id} full size`} className="mx-4 mb-2 ml-10 block w-fit max-w-full">
           <img src={imageUrl(wsId, c.id)} alt={`Screenshot of call ${c.id}`} loading="lazy" className={cn("rounded border border-line object-contain", open ? "max-h-[70vh]" : "max-h-40")} />
         </a>

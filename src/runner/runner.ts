@@ -31,6 +31,7 @@ import { loadSteps, modelsOf, usesClaude, type Params } from "./steps.ts";
 import { jobBlock } from "./concurrency.ts";
 import { queueRoomPass } from "../agents/call.ts";
 import { TRY_STEP } from "../build/workspace-session.ts";
+import { pruneWorkspaceImages } from "../build/workspace-relay.ts";
 import { noTakerFor } from "../remote/takers.ts";
 import { stepDeadlineMin, stepNoProgressMin } from "./deadlines.ts";
 import { envVar } from "../env.ts";
@@ -402,6 +403,11 @@ export class Runner {
         this.o.log(`prune build tasks: ${(e as Error).message}`);
       }
       try {
+        await pruneWorkspaceImages(this.db, t);
+      } catch (e) {
+        this.o.log(`prune workspace images: ${(e as Error).message}`);
+      }
+      try {
         await pruneBench(this.db, t);
       } catch (e) {
         this.o.log(`prune nightly bench: ${(e as Error).message}`);
@@ -634,7 +640,7 @@ export class Runner {
     await this.recover();
     try {
       const read = await buildDiffFacts(this.db);
-      if (read !== null) this.o.log(`diff facts: stored from the diff cache for ${read} reviewed heads`);
+      if (read) this.o.log(`diff facts: computed again for new rules: ${read.computed} heads from the diff cache, ${read.pending} wait for a re-read`);
     } catch (e) {
       this.o.log(`diff facts: ${(e as Error).message}`);
     }

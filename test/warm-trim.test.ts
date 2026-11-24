@@ -1,9 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { staleEntries, trimTarget } from "../src/warm/trim.ts";
+import { markBuildStart, staleEntries, trimTarget } from "../src/warm/trim.ts";
 
 test("a warm trim leaves out the units the build did not use and keeps the ones it did", () => {
   const OLD = "4c68d8e5d9da9017", NEW = "9a1b2c3d4e5f6071", RUN_OLD = "e5c8bb1780f8bd7f", RUN_NEW = "0123456789abcdef", FRESH = "0db2acf210aeb36b";
@@ -61,5 +61,34 @@ test("trimTarget drops unused units in both cargo layouts and reports no profile
     try { assert.equal(trimTarget(empty, start).profiles, 0); } finally { rmSync(empty, { recursive: true }); }
   } finally {
     rmSync(root, { recursive: true });
+  }
+});
+
+test("a unit read before the build starts is still attributed: used when the build reads it, stale when it does not", (t) => {
+  const root = mkdtempSync(join(tmpdir(), "trim-read-"));
+  try {
+    const USED = "0123456789abcdef", STALE = "fedcba9876543210", old = 978_307_200;
+    const fp = (h: string) => join(root, `debug/build/a/${h}/fingerprint/dep-lib-a`);
+    for (const h of [USED, STALE]) {
+      mkdirSync(join(fp(h), ".."), { recursive: true });
+      writeFileSync(fp(h), h);
+      utimesSync(fp(h), old, old);
+      utimesSync(join(fp(h), ".."), old, old);
+    }
+    // A read after the restore set the times (the restore copying a same-content file from it) leaves the atime newer
+    // than the mtime and ctime, where relatime ignores further reads. The stamp follows at once, often in the same
+    // clock tick as that read, which must not make the stale unit look read by the build.
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 30);
+    for (const h of [USED, STALE]) readFileSync(fp(h));
+    const start = markBuildStart(root, join(root, "..", `${root.split("/").pop()}.stamp`));
+    if (!start.atime) return t.skip("reads do not update atimes here");
+    readFileSync(fp(USED));
+    const r = trimTarget(root, start);
+    assert.equal(r.unattributed, 0);
+    assert.ok(r.paths.includes(`debug/build/a/${STALE}`));
+    assert.ok(!r.paths.some((p) => p.includes(USED)));
+  } finally {
+    rmSync(root, { recursive: true });
+    rmSync(`${root}.stamp`, { force: true });
   }
 });

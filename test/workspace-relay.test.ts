@@ -8,7 +8,10 @@ import { after, before, describe, test } from "node:test";
 import { allocation } from "../src/agents/call.ts";
 import { addLogin } from "../src/access.ts";
 import { queueWorkspaceCall } from "../src/build/workspace-call.ts";
-import { relayWorkspaceCall, type ToolSession } from "../src/build/workspace-relay.ts";
+import { createHash } from "node:crypto";
+import { IMAGE_KEEP_MS, KEPT_IMAGES, pruneWorkspaceImages, relayWorkspaceCall, type ToolSession } from "../src/build/workspace-relay.ts";
+import { calls, image } from "../src/dash/api/workspaces.ts";
+import type { Req } from "../src/dash/types.ts";
 import { mcpReply } from "../src/dash/mcp/index.ts";
 import { createToken } from "../src/dash/mcp/tokens.ts";
 import { connectDb } from "../src/db/open.ts";
@@ -86,13 +89,52 @@ describe("workspace relay", async () => {
     assert.deepEqual(Object.keys(a).sort(), ["images", "text"], "the session's bookkeeping stays in the row");
     const rows = await db.all(db.k.selectFrom("workspace_calls").select(["args", "result"]).where("workspace_id", "=", s.ws).orderBy("id"));
     assert.ok(rows[0]!.args.length < 5000, "the row keeps the arguments cut once claimed");
-    assert.ok(rows.every((r) => !r.result!.includes(PNG) && r.result!.includes('"sha256"')), "a delivered image is kept as its hash");
+    assert.ok(rows.every((r) => r.result!.includes(PNG)), "a delivered image keeps its bytes for the Workspaces page");
 
     await submitCall(db, s.secret, { ok: false, error: "done", durationMs: 1 });
     assert.equal((await waiting).state, "failed");
 
     const mcp = await mcpReply({ name: "t", title: "t", tools: [], call: async () => c }, { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "screenshot" } });
     assert.deepEqual((mcp!.result as { content: unknown[] }).content.map((x) => (x as { type: string }).type), ["text", "image"]);
+  });
+
+  test("a session's screenshots serve whole from the Workspaces page up to its image limit, until their workspace has long ended", { timeout: 20_000 }, async () => {
+    const s = await session();
+    const png = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.from(Array.from({ length: 4096 }, (_, i) => (i * 131 + 7) % 256))]);
+    const sha = createHash("sha256").update(png).digest("hex");
+    const at = new Date().toISOString();
+    const earlier = JSON.stringify({ text: "shot", images: [{ data: PNG, mimeType: "image/png" }], acct: { images: 1 } });
+    for (let i = 0; i < KEPT_IMAGES - 1; i++) {
+      await db.run(db.k.insertInto("workspace_calls").values({ workspace_id: s.ws, run_id: s.runId, tool: "screenshot", args: "{}", state: "done", result: earlier, created_at: at }));
+    }
+    const fake: ToolSession = {
+      call: async (_name, _args, row) => {
+        const result = { text: "shot", images: [{ data: png.toString("base64"), mimeType: "image/png" as const }] };
+        await db.run(db.k.updateTable("workspace_calls").set({ state: "done", result: JSON.stringify({ ...result, acct: { images: 1 } }), finished_at: new Date().toISOString() }).where("id", "=", row));
+        return result;
+      },
+    };
+    const waiting = awaitCall(db, s.id, { workspace: () => fake });
+    const live = async () => true;
+    const last = await relayWorkspaceCall(db, s, "screenshot", {}, { live });
+    const over = await relayWorkspaceCall(db, s, "screenshot", {}, { live });
+    assert.deepEqual([last.images![0]!.data, over.images![0]!.data], [png.toString("base64"), png.toString("base64")], "the session gets every image whole");
+    await submitCall(db, s.secret, { ok: false, error: "done", durationMs: 1 });
+    await waiting;
+
+    const op = (params: Record<string, string>): Req =>
+      ({ params, query: new URLSearchParams(), user: { login: "op", role: "operator", canRead: async () => true, canWrite: async () => true } }) as unknown as Req;
+    const [kept, stubbed] = (await calls(db, op({ id: String(s.ws) }))).calls.slice(-2);
+    const served = await image(db, op({ id: String(s.ws), call: String(kept!.id) }));
+    assert.equal(createHash("sha256").update(served.body as Buffer).digest("hex"), sha, "the kept image serves byte for byte");
+    assert.equal(kept!.notKept, null);
+    assert.deepEqual(stubbed!.notKept && [stubbed!.notKept.bytes, stubbed!.notKept.sha256], [png.length, sha], "past the limit only the size and hash stay");
+    assert.equal((await image(db, op({ id: String(s.ws), call: String(stubbed!.id) }))).status, 404);
+
+    await db.run(db.k.updateTable("workspaces").set({ state: "ended", ended_at: new Date(Date.now() - IMAGE_KEEP_MS - 60_000).toISOString() }).where("id", "=", s.ws));
+    assert.ok(await pruneWorkspaceImages(db) >= KEPT_IMAGES);
+    assert.equal((await image(db, op({ id: String(s.ws), call: String(kept!.id) }))).status, 404, "kept bytes are dropped once the workspace has long ended");
+    assert.ok((await calls(db, op({ id: String(s.ws) }))).calls.every((c) => c.notKept !== null));
   });
 
   test("a tool call still queued when the remote call ends is refused", { timeout: 20_000 }, async () => {

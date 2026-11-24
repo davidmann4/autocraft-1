@@ -7,7 +7,7 @@ import type { ItemRef } from "../../web/src/api/types.ts";
 import { createHash } from "node:crypto";
 import { jevParallel } from "../agents/accounts.ts";
 import { askJevCloudflare, jevCloudflareConfig } from "../agents/jev-cloudflare.ts";
-import { jevAvailable, jevEnv, jevFailure, markJevUnavailable, markJevWorking } from "../agents/jev.ts";
+import { JEV_UNREADABLE_SUMMARY, jevAvailable, jevEnv, jevFailure, markJevUnavailable, markJevUnreadable, markJevWorking } from "../agents/jev.ts";
 import { accountConfigDir, itemRepos, NoTakerError, poolRoom, repoBatches, startClaudeRun, type PoolRoom, startJevRun, tryStartFollowUp, isHalt, type Started } from "../agents/call.ts";
 import { touchStore, type KeptSession, type SessionAsk } from "../prepush/resume.ts";
 import { finishRun, packText, setRunProgress } from "../agents/runs.ts";
@@ -818,9 +818,10 @@ export async function askJev(id: JevPromptId, item: Item | DupePair | { ref: str
     if (tokens && perCallUsage) await saveUsage(db, String(runId), "jev", id.split(".")[0]!, JEV_PROMPTS[id].models[0]!, 1, { ...tokens, cost: tokens.input * JEV_USD_PER_INPUT_TOKEN }, start, now());
     const outage = jevFailure(r);
     if (outage) await markJevUnavailable(db, outage.kind, outage.reason);
-    else if (r.code === 0) await markJevWorking(db, Date.parse(start));
+    else if (r.code === 0 && tokens) await markJevWorking(db, Date.parse(start));
     if (r.code === 0 && tokens) await finishRun(db, runId, { state: "done", tokens, costUsd: tokens.input * JEV_USD_PER_INPUT_TOKEN, summary: "answered", output: r.stdout });
-    else await finishRun(db, runId, { state: "failed", error: await scrubError(`${exitClass(r.code)} ${r.stderr}`), summary: r.code === 0 ? "unreadable answer" : exitClass(r.code), output: r.stdout });
+    else await finishRun(db, runId, { state: "failed", error: await scrubError(`${exitClass(r.code)} ${r.stderr}`), summary: r.code === 0 ? JEV_UNREADABLE_SUMMARY : exitClass(r.code), output: r.stdout });
+    if (r.code === 0 && !tokens) await markJevUnreadable(db);
     return r;
   } catch (e) {
     await finishRun(db, runId, { state: "failed", error: await scrubError(String((e as Error).message ?? e)), summary: "failed before the call" });

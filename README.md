@@ -171,7 +171,7 @@ Maintainers (and operators) can work the Inbox from their own agent: from the us
 
 ### Discord mentions (optional)
 
-AutoCraft can count how often tracked items are mentioned in Discord channels you choose, and answer people who mention the bot or use its `/autocraft search` form to find matching public issues and draft a new one. It reads new messages only and keeps no text and no names. See [Discord mentions, replies and search](docs/pipeline.md#discord-mentions-replies-and-search).
+AutoCraft can count how often tracked items are mentioned in Discord channels you choose, and answer people who mention the bot or use the issue panel or `/autocraft search` to find matching public issues, and `/autocraft report` (or the panel's bug and feature buttons) to draft a new one. It reads new messages only and keeps no text and no names. See [Discord mentions, replies and search](docs/pipeline.md#discord-mentions-replies-and-search).
 
 1. In the Discord developer portal, create an application and add a bot. Under Bot, turn on the Message Content intent.
 2. Invite the bot with the `bot` and `applications.commands` scopes and the View Channels, Send Messages, Send Messages in Threads, Add Reactions and Read Message History permissions. Leave everything else off. Under Installation, allow Guild Install only.
@@ -190,6 +190,8 @@ AutoCraft can count how often tracked items are mentioned in Discord channels yo
 | `post-receive`, `hook.sh`, `push.sh` | Push-to-deploy: builds a release directory and switches the `app` symlink |
 | `backup.sh` | Consistent SQLite snapshots |
 | `craft-runner.service`, `craft-worker.service` | User units for the runner and the sandbox worker |
+
+On Kubernetes, every push to `main` publishes the image with the tag `main` (`.github/workflows/docker-publish.yml`). A cluster that runs Flux image automation can follow that tag's digest: Flux commits each new digest to the cluster's GitOps repository and rolls it out, so a merge to `main` deploys itself. Roll back by reverting the commit on `main`; a digest pinned by hand is overwritten at the next scan until the automation is suspended.
 
 A Docker Compose deployment is available in `deploy/compose/compose.yaml`. This deploys the dashboard, runner, and periodic sync/backup service, while sandbox workers run separately. See [Running in a container](docs/operations.md#running-in-a-container) and [VPS with Docker Compose](docs/migration.md#vps-with-docker-compose).
 

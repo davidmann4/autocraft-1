@@ -14,7 +14,7 @@ const shot = (title: string) => {
   return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
 };
 
-const SHOTS: Record<number, string> = { 9106: shot("Photocraft: untitled project"), 9108: shot("Photocraft: layer panel open") };
+const SHOTS: Record<number, string> = { 9107: shot("Photocraft: layer panel open") };
 
 const BUILD_LOG = `   Compiling photocraft-core v0.9.0 (/work/src/crates/core)
    Compiling photocraft-ui v0.9.0 (/work/src/crates/ui)
@@ -25,7 +25,7 @@ warning: unused variable: \`dirty\`
    |             ^^^^^ help: if this is intentional, prefix it with an underscore: \`_dirty\`
     Finished \`dev\` profile [unoptimized + debuginfo] target(s) in 3m 41s`;
 
-type Raw = Pick<WorkspaceCall, "id" | "n" | "tool" | "summary" | "state"> & { output: string | null; outputChars: number; images?: number; isError?: boolean; durationMs?: number };
+type Raw = Pick<WorkspaceCall, "id" | "n" | "tool" | "summary" | "state"> & { output: string | null; outputChars: number; images?: number; notKept?: WorkspaceCall["notKept"]; isError?: boolean; durationMs?: number };
 const raw = (rows: Raw[]) => rows;
 
 const calls: Record<number, (Omit<WorkspaceCall, "hasOutput"> & { output: string | null; outputChars: number })[]> = {
@@ -37,15 +37,17 @@ const calls: Record<number, (Omit<WorkspaceCall, "hasOutput"> & { output: string
     { id: 9105, n: 2, tool: "shell", summary: "cargo build -p photocraft-app 2>&1 | tail -30", state: "done", output: `exit 0 in 221.8 s\n${BUILD_LOG}`, outputChars: BUILD_LOG.length + 20, durationMs: 221_800 },
     { id: 9106, n: null, tool: "app_start", summary: "/work/target/debug/photocraft-app", state: "done", output: "app 1 started: pid 4120, window 0x400003 (1280x800 at 0,0); log /work/.ws/app-1.log", outputChars: 90 },
     { id: 9107, n: null, tool: "screenshot", summary: "app 1", state: "done", output: "app 1, window 0x400003 (1280x800 at 0,0): image/png, 960x600, 41230 bytes", outputChars: 80, images: 1 },
-    { id: 9108, n: 3, tool: "shell", summary: "cargo test -p photocraft-ui layers:: 2>&1 | tail -20", state: "running", output: null, outputChars: 0 },
+    { id: 9108, n: null, tool: "screenshot", summary: "app 1", state: "done", output: "app 1, window 0x400003 (1280x800 at 0,0): image/png, 960x600, 40872 bytes", outputChars: 80, images: 1,
+      notKept: { bytes: 40872, sha256: "c7c4fbaf3afd25fcab2f2efce96a17485e0e5176b86684344e1db4908955fc0d", note: "session image limit" } },
+    { id: 9109, n: 3, tool: "shell", summary: "cargo test -p photocraft-ui layers:: 2>&1 | tail -20", state: "running", output: null, outputChars: 0 },
   ]).map((c, i, all) => {
     const startedAgo = (all.length - i) * 5 * MIN;
-    return { ...c, images: c.images ?? 0, isError: false, createdAt: iso(startedAgo + 500), startedAt: iso(startedAgo), finishedAt: c.state === "done" ? iso(startedAgo - (c.durationMs ?? 900)) : null };
+    return { ...c, images: c.images ?? 0, notKept: c.notKept ?? null, isError: false, createdAt: iso(startedAgo + 500), startedAt: iso(startedAgo), finishedAt: c.state === "done" ? iso(startedAgo - (c.durationMs ?? 900)) : null };
   }),
   4: raw([
     { id: 9401, n: 1, tool: "shell", summary: "cargo build --release", state: "failed", output: "exit 101 in 38.2 s\nerror[E0432]: unresolved import `crate::export::png`\n --> crates/app/src/main.rs:12:5\n  |\n12 | use crate::export::png;\n  |     ^^^^^^^^^^^^^^^^^^ no `png` in `export`\n\nerror: could not compile `photocraft-app` (bin \"photocraft-app\") due to 1 previous error", outputChars: 330 },
     { id: 9402, n: null, tool: "fetch_dependencies", summary: "", state: "failed", output: "failed: the helper's exec timed out after 600 s", outputChars: 48 },
-  ]).map((c, i) => ({ ...c, images: 0, isError: true, createdAt: iso(3 * 3_600_000 - i * 2 * MIN), startedAt: iso(3 * 3_600_000 - i * 2 * MIN), finishedAt: iso(3 * 3_600_000 - i * 2 * MIN - 38_000) })),
+  ]).map((c, i) => ({ ...c, images: 0, notKept: null, isError: true, createdAt: iso(3 * 3_600_000 - i * 2 * MIN), startedAt: iso(3 * 3_600_000 - i * 2 * MIN), finishedAt: iso(3 * 3_600_000 - i * 2 * MIN - 38_000) })),
 };
 
 const sess = (over: Partial<WorkspaceSession>): WorkspaceSession => ({ id: 1, kind: "try", item: 9962, state: "done", outcome: null, forLogin: "aiongg", requestedBy: "aiongg", createdAt: iso(25 * MIN), endedAt: null, costUsd: null, reply: null, prompt: null, jobId: 411, ...over });
@@ -82,7 +84,7 @@ export function createWorkspacesMock(me: User): Pick<Api, "workspaces"> {
         const c = (calls[id] ?? []).find((x) => x.id === call);
         return c ? wait({ output: c.output, chars: c.outputChars }) : Promise.reject(new Error("no such call"));
       },
-      imageUrl: (_id, call) => SHOTS[call] ?? SHOTS[9106]!,
+      imageUrl: (_id, call) => SHOTS[call] ?? SHOTS[9107]!,
     },
   };
 }

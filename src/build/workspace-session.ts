@@ -7,7 +7,8 @@ import { createHash } from "node:crypto";
 import type { Db } from "../db/index.ts";
 import { CLAUDE_PROMPTS } from "../prompts/index.ts";
 import { promptTier } from "../remote/bundle.ts";
-import { noTakerFor } from "../remote/takers.ts";
+import { inferenceMode } from "../remote/mode.ts";
+import { noOwnRunnerReason, ownTaker } from "../remote/takers.ts";
 import { awaitCall, type Outcome } from "../remote/calls.ts";
 import type { JobState } from "../../web/src/api/types.ts";
 import { trackedNames } from "../repos.ts";
@@ -72,9 +73,10 @@ export async function requestTrySession(db: Db, r: TryRequest): Promise<number> 
   if (!SHA.test(r.baseSha)) throw new BuildError(400, "the base must be a full 40-character commit sha");
   if (!Number.isInteger(r.item) || r.item < 1) throw new BuildError(400, "the item must be an issue or PR number");
   if (!await db.get(db.k.selectFrom("items").select("number").where("repo", "=", r.repo).where("number", "=", r.item))) throw new BuildError(404, `${r.repo}#${r.item} is not in the mirror`);
-  // Checked at the request: a job no Task Runner may take would wait queued for ever.
-  const untaken = await noTakerFor(db, r.repo, TRY_STEP);
-  if (untaken) throw new BuildError(409, untaken);
+  // Checked at the request: a call bound to this user that none of their runners may take would wait queued for ever.
+  // Only their runners count, whatever their My repos say (the call is bound to them).
+  if (await inferenceMode(db) === "user-local" && !await ownTaker(db, r.forLogin, { prompt_id: TRY_PROMPT_ID, repos: [r.repo], tier: promptTier("implement.session") }))
+    throw new BuildError(409, noOwnRunnerReason(r.forLogin));
   const bytes = Buffer.byteLength(r.prompt, "utf8");
   if (!r.prompt.trim()) throw new BuildError(400, "the prompt is empty");
   if (bytes > TRY_PROMPT_MAX_BYTES) throw new BuildError(400, `the prompt is ${bytes} bytes; at most ${TRY_PROMPT_MAX_BYTES}`);

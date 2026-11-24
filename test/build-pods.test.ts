@@ -14,7 +14,7 @@ import type { CapacityApi, ExecResult, KNode, KPod, KResourceQuota, KubeApi } fr
 import { launcherPass, LauncherState } from "../src/build/launcher.ts";
 import { DEFAULT_SETTINGS, groupsOf, kubeCapabilities, parseSettings, quantity, stepPod, type Prepared } from "../src/build/pods.ts";
 import { claim, createTask, getTask } from "../src/build/tasks.ts";
-import { queueWarm } from "../src/build/warm-queue.ts";
+import { queueWarm, WARM_PRODUCER_REV } from "../src/build/warm-queue.ts";
 import { createWorkspace } from "../src/build/workspaces.ts";
 import { warmPlan } from "../src/worker/rust.ts";
 import { startWorkerServer } from "../src/build/worker-api.ts";
@@ -398,6 +398,30 @@ test("with a compile cache, offline build steps read it at the CI runners' paths
   assert.equal(podOf(offlineGroup, { ...gate, cacheVersion: null }).metadata.labels!["craft.build/cache"], undefined, "no CI gate, no cache");
 });
 
+test("a fetch pod before a warm offline pod copies only CARGO_HOME first; only that copy mounts the node's warm dir", () => {
+  const plan = [
+    { name: "fetch deps", cmd: ["cargo", "fetch"], network: "fetch" as const, timeoutSec: 600 },
+    { name: "build", cmd: ["cargo", "build"], network: "none" as const, timeoutSec: 600 },
+  ];
+  const gate: Prepared = { env: {}, mounts: [], packages: [], craftFontsRef: null, craftI18nRev: null, cacheVersion: "v2" };
+  const [fetchGroup] = groupsOf(plan);
+  const ctx = { s: DEFAULT_SETTINGS, envId: "pods", taskId: 1, stage: 2, name: "p", pvc: "v", deadlineSec: 600 };
+  const use = { target: "pvc" as const, node: "node-1", key: "open-app-0123", commit: SHA, bytes: 1e9, sameLock: true };
+  const podOf = (u?: typeof use) => stepPod(ctx, "rust-stable:test", "autocraft:test", plan, fetchGroup!, gate, false, "open-app", undefined, u) as unknown as Pod;
+  const all = (p: Pod): Record<string, any>[] => [...(p.spec.initContainers ?? []), ...p.spec.containers];
+  const seeded = podOf(use), plain = podOf();
+  const warmMounts = all(seeded).filter((c) => (c.volumeMounts ?? []).some((m: { name: string }) => m.name === "warm-node")).map((c) => c.name);
+  assert.deepEqual(warmMounts, ["warm-copy"]);
+  const copy = all(seeded).find((c) => c.name === "warm-copy")!;
+  assert.equal(envOf(copy).AUTOCRAFT_WARM_PART, "cargo");
+  assert.equal(envOf(copy).AUTOCRAFT_WARM_SAME_LOCK, undefined, "the fetch adds what another Cargo.lock needs");
+  assert.ok(!copy.volumeMounts.some((m: { mountPath: string }) => m.mountPath.endsWith("/target")), "the copy before the fetch has no target");
+  const step = (p: Pod) => all(p).find((c) => c.name === "step-0")!;
+  assert.deepEqual(step(seeded).env, step(plain).env);
+  assert.deepEqual(step(seeded).volumeMounts, step(plain).volumeMounts);
+  assert.equal(seeded.metadata.labels!["craft.build/network"], "fetch");
+});
+
 const WARM = parseSettings({
   namespace: "craft-warm", image: "autocraft:test", toolchainImages: { "rust-stable": "rust-stable:test" }, warmWriter: true, crateMirror: "10.43.250.25",
   sccacheUrl: "http://cache.test:8080", cacheWriteUrl: "http://cache.test:8081", writerSecret: "writer", signingSecret: "signing",
@@ -470,6 +494,27 @@ test("a workspace is refused on a warm writer environment", async () => {
   const d = await connectDb(":memory:");
   await createEnv(d, { id: "warm", label: "Warm", kind: "kubernetes", slots: 1, settings: WARM }, "op");
   await assert.rejects(createWorkspace(d, { repo: "app", baseSha: "a".repeat(40), envId: "warm", owner: null }), /warm writer/);
+});
+
+test("a finished warm build blocks a new one only when it was queued under the current producer revision", async () => {
+  const d = await connectDb(":memory:");
+  await d.script("INSERT INTO tracked_repos (name, pipeline) VALUES ('app', 1); INSERT INTO repos (name, visibility) VALUES ('app', 'public')");
+  const at = "2026-01-01T00:00:00Z";
+  await d.run(d.k.insertInto("main_ci").values({
+    repo: "app", head_sha: "a".repeat(40), branch: "main", state: "green", failing: "[]", checks: "[]", committed_at: at, headline: null, first_seen_at: at, state_changed_at: at, updated_at: at,
+  }));
+  const first = await queueWarm(d, "app", WARM);
+  assert.ok(first);
+  await d.run(d.k.updateTable("build_tasks").set({ state: "done" }).where("id", "=", first));
+  assert.equal(await queueWarm(d, "app", WARM), null, "a done build of the current revision blocks");
+  for (const rev of [null, WARM_PRODUCER_REV - 1]) {
+    await d.run(d.k.updateTable("build_tasks").set({ warm_rev: rev }).where("id", "=", first));
+    const again = await queueWarm(d, "app", WARM);
+    assert.ok(again, `a done build of revision ${rev} does not block`);
+    await d.run(d.k.updateTable("build_tasks").set({ state: "cancelled" }).where("id", "=", again));
+  }
+  await d.run(d.k.updateTable("build_tasks").set({ warm_rev: WARM_PRODUCER_REV }).where("id", "=", first));
+  assert.ok(await queueWarm(d, "app", WARM, true), "a forced rebuild queues anyway");
 });
 
 test("a failed warm build is retried under a new AutoCraft version, once per version", async () => {

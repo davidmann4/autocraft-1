@@ -2,7 +2,8 @@
 //   changedSince   in the source pod: the checkout's files whose content differs from the warm commit's tree, written to
 //                  the task's volume (CHANGED_FILE)
 //   warmCopyPhase  `worker pod warm-copy`, before the steps of an offline step pod: verifies the node's warm version,
-//                  copies its target and CARGO_HOME, and sets the checkout's mtimes
+//                  copies its target and CARGO_HOME, and sets the checkout's mtimes; before the fetch of a network step pod
+//                  (PART=cargo): copies only CARGO_HOME, so the fetch downloads only what the version lacks
 // cargo decides freshness by mtime: a source file older than the dep-info of the unit that read it counts as unchanged.
 // So every checkout file is set to OLD_MTIME (before any warm build), and only the files that changed since the warm
 // commit are set to now. That is sound only when every unit in the warm target was checked by the build at the warm commit,
@@ -10,12 +11,12 @@
 // workspace crate rebuilds.
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, lstatSync, lutimesSync, linkSync, mkdirSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, join, relative } from "node:path";
+import { chmodSync, existsSync, lstatSync, lutimesSync, linkSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmdirSync, rmSync, writeFileSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 import { slugOf } from "../owners.ts";
 import { CHANGED_FILE, COPY_MARK_FILE } from "../build/warm-mount.ts";
 import { readToolchain, toolchainRefusal } from "../warm/toolchain.ts";
-import { clearDir, decodeManifest, removeCargoLocks, loadEd25519, parseLatest, verifyLatest } from "../warm/manifest.ts";
+import { clearDir, decodeManifest, isCargoLock, loadEd25519, parseLatest, verifyLatest } from "../warm/manifest.ts";
 
 /** 2001-01-01, as CI's restore-mtimes step uses: older than any warm build. */
 export const OLD_MTIME_SEC = 978307200;
@@ -45,6 +46,19 @@ function walk(root: string): string[] {
       const st = lstatSync(join(root, p));
       if (st.isDirectory()) go(p);
       else if (st.isFile() || st.isSymbolicLink()) out.push(p);
+    }
+  };
+  go("");
+  return out;
+}
+
+/** Every directory under `root` (relative, `""` for the root itself), symlinks not followed. */
+function walkDirs(root: string): string[] {
+  const out: string[] = [""];
+  const go = (rel: string) => {
+    for (const n of readdirSync(join(root, rel))) {
+      const p = rel ? `${rel}/${n}` : n;
+      if (lstatSync(join(root, p)).isDirectory()) { out.push(p); go(p); }
     }
   };
   go("");
@@ -158,12 +172,14 @@ export function setMtimes(work: string, commit: string, trimmed: boolean): strin
   }
   const touch = new Set(changed.files);
   for (const p of all) lutimesSync(join(src, p), touch.has(p) ? now : OLD_MTIME_SEC, touch.has(p) ? now : OLD_MTIME_SEC);
-  for (const d of changed.dirs ?? []) if (d === "" || safeRel(d)) if (isDir(join(src, d))) lutimesSync(join(src, d), now, now);
+  // Directories too: cargo's rerun-if-changed on a directory compares the newest mtime under it, directories included.
+  const touchDirs = new Set((changed.dirs ?? []).filter((d) => d === "" || safeRel(d)));
+  for (const d of walkDirs(src)) lutimesSync(join(src, d), touchDirs.has(d) ? now : OLD_MTIME_SEC, touchDirs.has(d) ? now : OLD_MTIME_SEC);
   return `${touch.size} source files changed since ${commit.slice(0, 12)}`;
 }
 
 /**
- * Sets every file of the gate's extra checkouts (`<work>/ext/*`, mounted read-only in the steps, so set here while the
+ * Sets every file and directory of the gate's extra checkouts (`<work>/ext/*`, mounted read-only in the steps, so set here while the
  * volume is writable) to OLD_MTIME. Cargo's fingerprints of path dependencies there (e.g. a font manifest) compare against
  * the warm build's dep-info; fresh mtimes make it rebuild every crate that reads them. Returns the file count.
  */
@@ -172,27 +188,9 @@ export function setExtMtimes(work: string): number {
   if (!isDir(ext)) return 0;
   const files = walk(ext);
   for (const p of files) lutimesSync(join(ext, p), OLD_MTIME_SEC, OLD_MTIME_SEC);
+  // After the files, so nothing changes a directory's mtime again; cargo's rerun-if-changed on a directory counts directory mtimes.
+  for (const d of walkDirs(ext)) lutimesSync(join(ext, d), OLD_MTIME_SEC, OLD_MTIME_SEC);
   return files.length;
-}
-
-/**
- * Moves every entry of `from` into `to` with renames (same file system), then removes `from`. What `to` already holds is
- * kept: an earlier step fetched it for this checkout (a newer index cache, a newly pinned crate). Each file lands whole, so
- * a CARGO_HOME never holds a half-copied file.
- */
-function mergeInto(from: string, to: string): void {
-  if (!existsSync(to)) {
-    mkdirSync(dirname(to), { recursive: true });
-    renameSync(from, to);
-    return;
-  }
-  for (const n of readdirSync(from)) {
-    const a = join(from, n), b = join(to, n);
-    const sb = lstatSync(b, { throwIfNoEntry: false });
-    if (sb?.isDirectory() && lstatSync(a).isDirectory()) mergeInto(a, b);
-    else if (!sb) renameSync(a, b);
-  }
-  rmSync(from, { recursive: true, force: true });
 }
 
 /** The summary of a failed cp: files the pod's uid cannot read get their own wording and count, so an operator sees why. */
@@ -203,10 +201,80 @@ export function copyFailure(stderr: string): string {
   return `cp: ${lines.slice(-2).join(" ")}`;
 }
 
-/** Copies run at once, directory levels below the root that are split into separate copies, and entries per `cp` call. */
+/** `cp` processes run at once. */
 export const COPY_PARALLEL = 8;
-const COPY_SPLIT_DEPTH = 4;
-const COPY_BATCH = 64;
+/**
+ * A planned copy weighs one per entry plus one per WEIGHT_BYTES of file data: on reflink storage a file costs about the same
+ * whatever its size, on other storage the data dominates, and this weight balances the copies well enough for both.
+ */
+const WEIGHT_BYTES = 100_000;
+/** No `cp` call is planned lighter than this (about 5,000 small files), so a small tree is one call. */
+const MIN_CHUNK = 5000;
+/** Bytes of paths per `cp` call, well under the kernel's argument limit. */
+const MAX_ARG_BYTES = 128 * 1024;
+/** No `cp` call is split off for less data than this. */
+const MIN_CALL_BYTES = 64 << 20;
+/**
+ * Hard links between files this large (cargo's uplifted binaries) are kept across `cp` calls, which matters for a memory-backed
+ * target. Smaller linked files (warm-sync links equal content within a version) get their own inode unless one `cp` call
+ * copies both paths: keeping those would split every dir that holds one.
+ */
+const LINK_MIN_BYTES = 1 << 20;
+/** The file in the work dir that names what the CARGO_HOME copy adds while it runs. */
+const CARGO_JOURNAL = "warm-copy-cargo.json";
+/** The file in the work dir that names the version (manifest sha256) whose CARGO_HOME a finished copy put there: a later copy of it skips CARGO_HOME. */
+export const CARGO_MARK_FILE = "warm-cargo.json";
+
+export type CopyStats = { files: number; bytes: number; calls: number; kept: number; listSecs: number; copySecs: number };
+
+type Listing = {
+  weight: Map<string, number>; bytesOf: Map<string, number>; total: number; files: number; bytes: number; later: Map<string, string>; locks: Set<string>;
+};
+
+/**
+ * One `find` over `dir`: each entry's weight and file bytes (a dir's include everything below it), the later paths of each
+ * large multi-link inode (path → its first path) and cargo's lock files, all relative to `dir`. `files` and `bytes` count
+ * every path, as cp -a would copy them without links. Holds every path in memory (a few hundred bytes each).
+ */
+function listTree(dir: string): Promise<Listing> {
+  return new Promise((resolve, reject) => {
+    execFile("find", [dir, "-mindepth", "1", "-printf", "%y\\t%n\\t%i\\t%s\\t%P\\0"], { maxBuffer: 1 << 28, timeout: 10 * 60_000, encoding: "utf8" }, (err, out, stderr) => {
+      if (err) return reject(new Error(`find: ${(stderr || err.message).trim().split("\n").slice(-2).join(" ").replace(/^find: /, "")}`));
+      const weight = new Map<string, number>(), bytesOf = new Map<string, number>();
+      const firstOf = new Map<string, string>(), later = new Map<string, string>(), locks = new Set<string>();
+      let total = 0, files = 0, bytes = 0;
+      for (const rec of out.split("\0")) {
+        const t1 = rec.indexOf("\t"), t2 = rec.indexOf("\t", t1 + 1), t3 = rec.indexOf("\t", t2 + 1), t4 = rec.indexOf("\t", t3 + 1);
+        if (t1 < 0 || t4 < 0) continue;
+        const type = rec.slice(0, t1), size = type === "f" ? Number(rec.slice(t3 + 1, t4)) : 0, rel = rec.slice(t4 + 1);
+        if (type === "f" && isCargoLock(rel)) {
+          locks.add(rel);
+          continue;
+        }
+        if (type !== "d") files++;
+        bytes += size;
+        if (size >= LINK_MIN_BYTES && rec.slice(t1 + 1, t2) !== "1") {
+          const ino = rec.slice(t2 + 1, t3), first = firstOf.get(ino);
+          if (first !== undefined) {
+            later.set(rel, first);
+            continue;
+          }
+          firstOf.set(ino, rel);
+        }
+        const w = 1 + size / WEIGHT_BYTES;
+        total += w;
+        for (let p = rel; ;) {
+          weight.set(p, (weight.get(p) ?? 0) + w);
+          if (size) bytesOf.set(p, (bytesOf.get(p) ?? 0) + size);
+          const i = p.lastIndexOf("/");
+          if (i < 0) break;
+          p = p.slice(0, i);
+        }
+      }
+      resolve({ weight, bytesOf, total, files, bytes, later, locks });
+    });
+  });
+}
 
 function cpRun(args: string[]): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -215,82 +283,190 @@ function cpRun(args: string[]): Promise<void> {
   });
 }
 
-/** `<inode>\t<path>` NUL-terminated, for the regular files under `dir` that have more than one link. */
-function listLinked(dir: string): Promise<string> {
-  return new Promise((resolve, reject) => {
-    execFile("find", [dir, "-type", "f", "-links", "+1", "-printf", "%i\\t%p\\0"], { maxBuffer: 1 << 28 }, (err, out) => (err ? reject(new Error(`find: ${err.message}`)) : resolve(out)));
-  });
+async function attrs(from: string, to: string): Promise<void> {
+  chmodSync(to, lstatSync(from).mode & 0o7777);
+  await new Promise<void>((resolve, reject) => execFile("touch", ["-r", from, "--", to], (e) => (e ? reject(e) : resolve())));
 }
 
-function attrs(from: string, to: string): Promise<void> {
-  return new Promise((resolve, reject) => {
-    execFile("chmod", [`--reference=${from}`, "--", to], (e1) => {
-      if (e1) return reject(e1);
-      execFile("touch", ["-r", from, "--", to], (e2) => (e2 ? reject(e2) : resolve()));
-    });
-  });
-}
-
-/**
- * Like `cp -a from/. to/` (modes, mtimes, symlinks), with COPY_PARALLEL `cp` processes at once: the top COPY_SPLIT_DEPTH
- * directory levels are created here and their entries copied in batches, and deeper trees are copied whole. Directory
- * modes and mtimes are set after their contents. The first failure rejects once the running copies end.
- */
-export async function copyTree(from: string, to: string): Promise<void> {
-  // Files with several links (cargo uplifts binaries as hard links): the first path of each inode is copied, the others
-  // are linked to its copy afterwards, so the copy shares inodes like the source does. A dir that holds a later path is
-  // split too, so that path can be left out of the batches.
-  const firstOf = new Map<string, string>();
-  const later = new Map<string, string>();
-  for (const rec of (await listLinked(from)).split("\0")) {
-    const t = rec.indexOf("\t");
-    if (t < 0) continue;
-    const ino = rec.slice(0, t), path = rec.slice(t + 1);
-    const first = firstOf.get(ino);
-    if (first === undefined) firstOf.set(ino, path);
-    else later.set(path, first);
-  }
-  const withLater = new Set<string>();
-  for (const path of later.keys()) for (let d = dirname(path); d.length >= from.length && !withLater.has(d); d = dirname(d)) withLater.add(d);
-  const dirs: { from: string; to: string }[] = [];
-  const jobs: string[][] = [];
-  const split = (a: string, b: string, depth: number) => {
-    dirs.push({ from: a, to: b });
-    let batch: string[] = [];
-    const flush = () => {
-      if (batch.length) jobs.push(["-a", "-t", b, "--", ...batch]);
-      batch = [];
-    };
-    for (const e of readdirSync(a, { withFileTypes: true })) {
-      if (later.has(join(a, e.name))) continue;
-      if (e.isDirectory() && (depth + 1 < COPY_SPLIT_DEPTH || withLater.has(join(a, e.name)))) {
-        mkdirSync(join(b, e.name));
-        split(join(a, e.name), join(b, e.name), depth + 1);
-        continue;
-      }
-      batch.push(join(a, e.name));
-      if (batch.length >= COPY_BATCH) flush();
-    }
-    flush();
-  };
-  mkdirSync(to, { recursive: true });
-  split(from, to, 0);
+/** Runs `fn` over `items`, `n` at once; the first failure rejects once the running calls end, and no new call starts. */
+async function pool<T>(items: T[], n: number, fn: (x: T) => Promise<void>): Promise<void> {
   let next = 0;
   let failure: Error | null = null;
   const worker = async () => {
-    while (!failure && next < jobs.length) {
+    while (!failure && next < items.length) {
       try {
-        await cpRun(jobs[next++]);
+        await fn(items[next++]!);
       } catch (e) {
         failure ??= e as Error;
       }
     }
   };
-  await Promise.all(Array.from({ length: Math.min(COPY_PARALLEL, jobs.length) }, worker));
+  await Promise.all(Array.from({ length: Math.min(n, items.length) }, worker));
   if (failure) throw failure;
-  for (const [path, first] of later) linkSync(join(to, relative(from, first)), join(to, relative(from, path)));
-  // Deepest first: setting a directory's mtime after its children keeps it.
-  for (const d of dirs.reverse()) await attrs(d.from, d.to);
+}
+
+function removeTree(p: string): void {
+  const st = lstatSync(p, { throwIfNoEntry: false });
+  if (!st) return;
+  if (st.isDirectory()) {
+    chmodSync(p, 0o700);
+    clearDir(p);
+  }
+  rmSync(p, { recursive: true, force: true });
+}
+
+/**
+ * A new entry is copied under a temp name in its own dir (`.<name>.warm-copy-tmp`), or a group of new entries into a staging
+ * dir there (`.warm-copy-tmp-<n>`), and renamed into place once whole: pods that never run warm-copy share CARGO_HOME, and
+ * cargo trusts a crate dir whose `.cargo-ok` exists. Cargo reads neither name.
+ */
+const TEMP_NAME = /^\.(?:.+\.warm-copy-tmp|warm-copy-tmp-[0-9]+)$/;
+const tempOf = (dir: string, name: string) => join(dir, `.${name}.warm-copy-tmp`);
+
+/**
+ * Removes the temp entries an interrupted copy into `to` left, as its journal names, then the journal. The journal is on a
+ * volume the steps can write, so only temp names inside `to` (or `to`'s own temp name) whose dir has no symlink on the way
+ * are removed.
+ */
+function undoJournal(journal: string, to: string): void {
+  if (!existsSync(journal)) return;
+  let paths: unknown = [];
+  try {
+    paths = JSON.parse(readFileSync(journal, "utf8"));
+  } catch {
+    // Cut short while it was written, which is before the copy starts: nothing to undo.
+  }
+  for (const p of Array.isArray(paths) ? paths : []) {
+    if (typeof p !== "string" || resolve(p) !== p || !TEMP_NAME.test(basename(p))) continue;
+    if (!p.startsWith(`${to}/`) && p !== tempOf(dirname(to), basename(to))) continue;
+    if (!existsSync(dirname(p)) || realpathSync(dirname(p)) !== dirname(p)) continue;
+    removeTree(p);
+  }
+  rmSync(journal, { force: true });
+}
+
+/** Renames a dir entry to another dir; a dir without its owner's write bit gets it for the move (the move rewrites its `..`). */
+function moveInto(from: string, to: string): void {
+  try {
+    renameSync(from, to);
+  } catch (e) {
+    const st = lstatSync(from);
+    if ((e as NodeJS.ErrnoException).code !== "EACCES" || !st.isDirectory()) throw e;
+    chmodSync(from, (st.mode & 0o7777) | 0o200);
+    renameSync(from, to);
+    chmodSync(to, st.mode & 0o7777);
+  }
+}
+
+/**
+ * Copies `from` into `to` like `cp -a from/. to/` (modes, mtimes, symlinks) with at most COPY_PARALLEL `cp -a --reflink=auto`
+ * processes at once, each over one large subtree or a group of entries of one dir: a dir is split only when it weighs more
+ * than a share of the tree or holds more than an eighth of its bytes, or holds a path left out. What `to` already holds is
+ * kept (an earlier step fetched it). Every entry new to a dir that existed before lands whole, through a temp name. Cargo's
+ * lock files are left out. Nothing in `to` is ever a link to `from`. `journal` names, while the copy runs, the temp entries
+ * it made; one left by an interrupted copy is undone first. A failed copy removes its temp entries and rejects with the
+ * first failure. `minChunk` is the lightest planned call (tests set it low to split a small tree).
+ */
+export async function copyTree(from: string, to: string, opts: { journal?: string; minChunk?: number } = {}): Promise<CopyStats> {
+  const t0 = performance.now();
+  if (opts.journal) undoJournal(opts.journal, to);
+  const list = await listTree(from);
+  const listSecs = (performance.now() - t0) / 1000;
+  const rootMade = !existsSync(to);
+  const rootFresh = rootMade || readdirSync(to).length === 0;
+  // Into a dir that already holds files a first path may be one that is kept, so links are kept only into a fresh one.
+  const keepLinks = rootFresh;
+  const mustSplit = new Set<string>();
+  for (const p of [...list.locks, ...(keepLinks ? list.later.keys() : [])]) {
+    for (let i = p.lastIndexOf("/"); i > 0; i = p.lastIndexOf("/", i - 1)) mustSplit.add(p.slice(0, i));
+  }
+  const chunk = Math.max(list.total / (2 * COPY_PARALLEL), opts.minChunk ?? MIN_CHUNK);
+  // Where data is copied, a data-heavy tree of few files keeps its parallelism.
+  const byteCap = Math.max(list.bytes / COPY_PARALLEL, MIN_CALL_BYTES);
+  // `into`: the dir a staged call's entries move into once it succeeds.
+  const calls: { dir: string; srcs: string[]; weight: number; into?: string }[] = [];
+  const made: { rel: string; at: string }[] = [];
+  const renames: { tmp: string; final: string }[] = [];
+  const links: { path: string; first: string }[] = [];
+  const root = rootMade ? tempOf(dirname(to), basename(to)) : to;
+  const added: string[] = rootMade ? [root] : [];
+  let kept = 0;
+  // `b`: where `rel` is built; `fresh`: it holds nothing yet; `track`: it existed before, so new entries go in by temp names.
+  const plan = (rel: string, b: string, fresh: boolean, track: boolean) => {
+    const a = rel ? join(from, rel) : from;
+    let srcs: string[] = [], w = 0, bytes = 0, len = 0;
+    const flush = () => {
+      if (srcs.length) {
+        const dir = track ? join(b, `.warm-copy-tmp-${calls.length}`) : b;
+        if (track) added.push(dir);
+        calls.push({ dir, srcs, weight: w, ...(track ? { into: b } : {}) });
+      }
+      srcs = [];
+      w = bytes = len = 0;
+    };
+    for (const e of readdirSync(a, { withFileTypes: true })) {
+      const r = rel ? `${rel}/${e.name}` : e.name;
+      if (list.locks.has(r)) continue;
+      const dest = join(b, e.name);
+      const there = fresh ? undefined : lstatSync(dest, { throwIfNoEntry: false });
+      if (there) {
+        if (there.isDirectory() && e.isDirectory()) plan(r, dest, false, true);
+        else kept++;
+        continue;
+      }
+      const first = keepLinks ? list.later.get(r) : undefined;
+      if (first !== undefined) {
+        links.push({ path: r, first });
+        continue;
+      }
+      const ew = list.weight.get(r) ?? 1, eb = list.bytesOf.get(r) ?? 0;
+      if (e.isDirectory() && (ew > chunk || eb > byteCap || mustSplit.has(r))) {
+        const at = track ? tempOf(b, e.name) : dest;
+        if (track) {
+          added.push(at);
+          renames.push({ tmp: at, final: dest });
+        }
+        made.push({ rel: r, at });
+        plan(r, at, true, false);
+        continue;
+      }
+      srcs.push(join(a, e.name));
+      w += ew;
+      bytes += eb;
+      len += a.length + e.name.length + 2;
+      if (w >= chunk || bytes >= byteCap || len >= MAX_ARG_BYTES) flush();
+    }
+    flush();
+  };
+  plan("", root, rootFresh, !rootMade);
+  if (opts.journal) writeFileSync(opts.journal, JSON.stringify(added));
+  try {
+    if (rootMade) mkdirSync(root, { recursive: true });
+    for (const m of made) mkdirSync(m.at);
+    for (const c of calls) if (c.into) mkdirSync(c.dir);
+    calls.sort((x, y) => y.weight - x.weight);
+    await pool(calls, COPY_PARALLEL, async (c) => {
+      await cpRun(["-a", "--reflink=auto", "-t", c.dir, "--", ...c.srcs]);
+      if (!c.into) return;
+      for (const s of c.srcs) moveInto(join(c.dir, basename(s)), join(c.into, basename(s)));
+      rmdirSync(c.dir);
+    });
+    for (const r of renames) renameSync(r.tmp, r.final);
+    if (rootMade) renameSync(root, to);
+    for (const l of links) linkSync(join(to, l.first), join(to, l.path));
+    // After everything is created in them: a later entry would change a dir's mtime, and a read-only dir is filled first.
+    await pool([...(rootFresh ? [""] : []), ...made.map((m) => m.rel)], COPY_PARALLEL, (r) => attrs(r ? join(from, r) : from, r ? join(to, r) : to));
+  } catch (e) {
+    try {
+      for (const p of added) removeTree(p);
+      if (opts.journal) rmSync(opts.journal, { force: true });
+    } catch {
+      // The journal stays, and the next copy undoes it.
+    }
+    throw e;
+  }
+  if (opts.journal) rmSync(opts.journal, { force: true });
+  return { files: list.files, bytes: list.bytes, calls: calls.length, kept, listSecs, copySecs: (performance.now() - t0) / 1000 - listSecs };
 }
 
 const isEmpty = (d: string) => !existsSync(d) || readdirSync(d).length === 0;
@@ -307,6 +483,10 @@ export type CopyMark = { state: "copying" | "done" | "cold"; commit: string; tri
  * checkout's), CARGO_LOCK (that Cargo.lock's sha256, for a pod whose checkout arrives after the copy) and MTIMES (`later`:
  * the checkout arrives after the copy, and the runner sets its mtimes then). A version that does not verify or match is a
  * cold start (exit 0); a missing setting fails the pod.
+ *
+ * PART `cargo` (a network step pod before the fetch): the same checks except the Cargo.lock, since the fetch adds what the
+ * checkout's lock needs; copies only CARGO_HOME and records the version in CARGO_MARK_FILE, so the offline pod's copy of
+ * the same version skips CARGO_HOME. It never touches the target, the copy mark or the mtimes, and a refusal leaves CARGO_HOME to the fetch.
  */
 export async function warmCopyPhase(work: string, env: NodeJS.ProcessEnv, log: Log): Promise<number> {
   const need = (n: string) => env[`AUTOCRAFT_WARM_${n}`] || (() => {
@@ -318,30 +498,40 @@ export async function warmCopyPhase(work: string, env: NodeJS.ProcessEnv, log: L
   const mark = join(work, COPY_MARK_FILE);
   const keyFiles = need("VERIFY_KEYS").split(",").map((f) => f.trim()).filter(Boolean);
   const volume = need("MODE") === "pvc";
-  const cargoTmp = `${cargoHome}.warm-copy`;
-  rmSync(cargoTmp, { recursive: true, force: true });
+  const journal = join(work, CARGO_JOURNAL);
+  const cargoOnly = env.AUTOCRAFT_WARM_PART === "cargo";
+  const cargoMark = join(work, CARGO_MARK_FILE);
   // A volume-backed target that a finished copy (or an earlier step pod) filled is kept, and so is a cold start's; a
   // half-done copy is redone.
   const state = volume && existsSync(mark) ? (JSON.parse(readFileSync(mark, "utf8")) as Partial<CopyMark>).state : undefined;
   const write = (m: CopyMark) => writeFileSync(mark, JSON.stringify(m));
-  if (state === "cold") {
+  const cold = (why: string) => {
+    if (cargoOnly) {
+      log(`warm copy: ${why}; the fetch fills CARGO_HOME`);
+      return 0;
+    }
+    if (!isEmpty(target)) clearDir(target);
+    write({ state: "cold", commit, why });
+    log(`warm copy: ${why}; cold start`);
+    return 0;
+  };
+  // The temp entries of a CARGO_HOME copy that a killed pod left are removed, cold start or not.
+  try {
+    undoJournal(journal, cargoHome);
+  } catch (e) {
+    return cold(`removing what an interrupted copy left in CARGO_HOME failed (${(e as Error).message})`);
+  }
+  if (state === "cold" && !cargoOnly) {
     log("warm copy: an earlier step pod of this task started cold; kept cold");
     return 0;
   }
-  if (!isEmpty(target)) {
+  if (!cargoOnly && !isEmpty(target)) {
     if (state !== "copying") {
       log(`warm copy: the target already holds ${state === "done" ? "the warm copy" : "a build"}; kept`);
       return 0;
     }
     clearDir(target);
   }
-  const cold = (why: string) => {
-    rmSync(cargoTmp, { recursive: true, force: true });
-    if (!isEmpty(target)) clearDir(target);
-    write({ state: "cold", commit, why });
-    log(`warm copy: ${why}; cold start`);
-    return 0;
-  };
   const at = `${key}@${commit.slice(0, 12)}`;
   // The sync agent swaps `current` with a rename while it runs: resolve it once and read everything from that version's
   // dir, which stays on disk for the grace period after it stops being current.
@@ -376,26 +566,41 @@ export async function warmCopyPhase(work: string, env: NodeJS.ProcessEnv, log: L
   const refused = toolchainRefusal({ image: header.image, rustc: header.rustc, toolchain: header.toolchain ?? null }, { image: need("IMAGE"), ...readToolchain(env.AUTOCRAFT_WARM_TOOLCHAIN_DIR) });
   if (refused) return cold(`${at} ${refused}`);
   if (header.envHash !== need("ENV_HASH")) return cold(`${at} was built with another CI env`);
-  if (env.AUTOCRAFT_WARM_SAME_LOCK === "1") {
+  if (env.AUTOCRAFT_WARM_SAME_LOCK === "1" && !cargoOnly) {
     const lock = env.AUTOCRAFT_WARM_CARGO_LOCK || cargoLockOf(join(work, "src"));
     if (!header.cargoLock || header.cargoLock !== lock) return cold(`${at} was built from another Cargo.lock`);
   }
-  const t0 = performance.now();
+  // A commit can have several versions (a republish of the same head): the mark names the version by its manifest's sha256.
+  let cargoDone = false;
   try {
-    if (volume) write({ state: "copying", commit });
-    await copyTree(join(cur, "target"), target);
-    // cp -a keeps hard links, and cargo deadlocks on flocks of lock files that share an inode.
-    await removeCargoLocks(target);
-    mkdirSync(cargoTmp, { recursive: true });
-    await copyTree(join(cur, "cargo"), cargoTmp);
+    cargoDone = existsSync(cargoMark) && (JSON.parse(readFileSync(cargoMark, "utf8")) as { manifest?: unknown }).manifest === l.sha256;
+  } catch {
+    // An unreadable mark copies CARGO_HOME again, which keeps what is there.
+  }
+  const kept = "warm copy: CARGO_HOME already holds this version's copy (an earlier step pod made it); kept";
+  if (cargoOnly && cargoDone) {
+    log(kept);
+    return 0;
+  }
+  const t0 = performance.now();
+  const logTree = (name: string, s: CopyStats) => log(`warm copy: ${name} ${s.files} files, ${(s.bytes / 1e9).toFixed(1)} GB in ${(s.listSecs + s.copySecs).toFixed(1)} s (list ${s.listSecs.toFixed(1)} s, ${s.calls} cp${s.kept ? `, ${s.kept} entries already there kept` : ""})`);
+  try {
+    if (!cargoOnly) {
+      if (volume) write({ state: "copying", commit });
+      logTree("target", await copyTree(join(cur, "target"), target));
+    }
+    if (cargoDone) log(kept);
+    else {
+      // CARGO_HOME may already hold what an earlier step fetched: that is kept.
+      logTree("CARGO_HOME", await copyTree(join(cur, "cargo"), cargoHome, { journal }));
+      writeFileSync(cargoMark, JSON.stringify({ commit, manifest: l.sha256 }));
+    }
   } catch (e) {
     return cold(`copying ${at} failed (${(e as Error).message})`);
   }
-  // CARGO_HOME may already hold what an earlier step fetched: the copy goes in beside it and then moves in with renames.
-  try {
-    mergeInto(cargoTmp, cargoHome);
-  } catch (e) {
-    return cold(`moving ${at}'s CARGO_HOME into place failed (${(e as Error).message})`);
+  if (cargoOnly) {
+    log(`warm copy: CARGO_HOME of ${at} in ${((performance.now() - t0) / 1000).toFixed(1)} s, before the fetch`);
+    return 0;
   }
   const secs = (performance.now() - t0) / 1000;
   const trimmed = header.trimmed === true;

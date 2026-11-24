@@ -17,6 +17,7 @@ import type {
   PendingRunnerLogin,
   RunnersReply,
   DiscordLinkCode,
+  DiscordFilingAdded,
   DiscordSetup,
   Home,
   OpenDecisionCounts,
@@ -375,8 +376,10 @@ export interface Api {
     setChannelRepo(channelId: string, repo: string | null): Promise<DiscordSetup>;
     setContact(contact: string): Promise<DiscordSetup>;
     setReact(on: boolean): Promise<DiscordSetup>;
+    setReactEmoji(emoji: string): Promise<DiscordSetup>;
     removeLink(id: string): Promise<DiscordSetup>;
-    addFilingRepo(repo: string): Promise<DiscordSetup>;
+    /** `added` says whether the repo is link-only, and why. */
+    addFilingRepo(repo: string): Promise<DiscordFilingAdded>;
     removeFilingRepo(repo: string): Promise<DiscordSetup>;
     setOffer(repo: string, on: boolean): Promise<DiscordSetup>;
     account(): Promise<DiscordAccount>;

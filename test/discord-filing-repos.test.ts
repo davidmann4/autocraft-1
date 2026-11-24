@@ -1,5 +1,5 @@
 // Filing-only repos: a public repo of another owner is added after GitHub confirms it (names stay unique across owners),
-// the bot offers it and "Submit for me" files there as the app under that owner, while search and tracking never see
+// the bot offers it and, where the app covers it, "Submit for me" files there as the app under that owner, while search and tracking never see
 // it. No network: the GitHub read, the token minter and `gh` are fakes.
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
@@ -29,7 +29,8 @@ const mint = async () => "ghs_install";
 test("a filing-only repo is offered and filed into as the app under its owner, and nothing else sees it", async () => {
   await assert.rejects(addFilingRepo(db, "op", "other-org/lumen", { read, mint }), /tracked/, "a tracked name is refused");
   await assert.rejects(addFilingRepo(db, "op", "example-studio/secret", { read, mint }), /not public/);
-  await assert.rejects(addFilingRepo(db, "op", "example-studio/sketchpad", { read, mint: async (o) => { throw new AppNotInstalledError(o); } }), /not installed on example-studio/);
+  assert.equal((await addFilingRepo(db, "op", "example-studio/early", { read, mint: async (o) => { throw new AppNotInstalledError(o); } })).mode, "link", "a repo the app does not cover is added link-only");
+  await removeFilingRepo(db, "op", "example-studio/early");
   await addFilingRepo(db, "op", "example-studio/Sketchpad", { read, mint });
   await assert.rejects(addFilingRepo(db, "op", "another-org/sketchpad", { read, mint }), /already on the list/, "names stay unique across owners");
 

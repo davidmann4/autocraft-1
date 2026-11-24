@@ -1,5 +1,4 @@
 // Mirror of every issue and PR of the tracked owners (storytold and any other owner of a tracked repo) into SQLite, via `gh api graphql`.
-import { refreshSnapshot } from "./itemtools/snapshot.ts";
 import { isCounted } from "./review/discussion.ts";
 import { spawn, spawnSync } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -1044,8 +1043,6 @@ async function sync(args: string[]): Promise<void> {
       const { mode, items } = await runSync(db, querier, opts).finally(() => clearInterval(mainCiTimer));
       await db.run(db.k.updateTable("sync_runs").set({ ended_at: iso(new Date()), mode, items }).where(kx.rowid("sync_runs"), "=", row));
       console.log(`sync: mode=${mode} items=${items} points=${client.spent} left=${client.remaining}`);
-      // Sandboxed calls read the item snapshot instead of GitHub. The refresh is incremental and writes nothing when nothing differs; a visibility change alone removes a repository's rows.
-      await refreshSnapshot(console.log, db);
       // Files, commits and label events of the items that changed; a failed read leaves them for the next run.
       if (!opts.full && !opts.only.length) {
         try {

@@ -6,6 +6,7 @@
 import { createHash } from "node:crypto";
 import { allocation } from "../agents/call.ts";
 import type { Db } from "../db/index.ts";
+import * as kx from "../db/kx.ts";
 import { scaled } from "../remote/time-scale.ts";
 import { assertFence } from "../db/fence.ts";
 import { guardedApi, inClusterApi } from "./kube-api.ts";
@@ -21,6 +22,12 @@ export const REPLY_CHANNEL = "workspace_reply";
 const TICK_MS = scaled(15_000);
 /** The poll behind the wake on Postgres; while a side is not listening (connecting, or the connection failed) it polls at the model queue's interval. */
 const SAFETY_POLL_MS = scaled(10_000);
+/** A session's first images keep their bytes on the row, for the Workspaces page; later ones keep only type, size and hash. */
+export const KEPT_IMAGES = 60;
+/** Kept image bytes are dropped this long after their workspace ended. */
+export const IMAGE_KEEP_MS = 30 * 24 * 3600_000;
+/** The tools whose results carry images. */
+const IMAGE_TOOLS = ["screenshot", "read"];
 
 /** What the job runs a tool call on: a WorkspaceSession, or a stand-in in tests. */
 export type ToolSession = Pick<WorkspaceSession, "call">;
@@ -94,7 +101,7 @@ export async function relayWorkspaceCall(db: Db, lease: { id: number; runId: num
       const r = await db.fresh(() => db.get(db.k.selectFrom("workspace_calls").select(["state", "result"]).where("id", "=", id)));
       if ((r?.state === "done" || r?.state === "failed") && r.result) {
         const out = parseResult(r.result);
-        if (out.images) await stubImages(db, id, r.result);
+        if (out.images) await settleImages(db, ws.id, lease.runId, id, r.result);
         return out;
       }
       const gone = opts.signal?.aborted ? "the request was cancelled" : !r ? "the call is gone" : !await opts.live() ? "the lease is gone" : null;
@@ -113,17 +120,45 @@ export async function relayWorkspaceCall(db: Db, lease: { id: number; runId: num
   }
 }
 
-/** Once the session has a result's images, the row keeps only their type, size and hash; the rest of the result stays as the record. */
-async function stubImages(db: Db, id: number, stored: string): Promise<void> {
+/**
+ * Once the session has a result's images, the row keeps their bytes while the session has kept fewer than KEPT_IMAGES;
+ * past that it keeps only their type, size and hash. The rest of the result stays as the record.
+ */
+async function settleImages(db: Db, workspaceId: number, runId: number | null, id: number, stored: string): Promise<void> {
+  const kept = await db.get(db.k.selectFrom("workspace_calls").select((eb) => eb.fn.countAll<number>().as("n"))
+    .where("workspace_id", "=", workspaceId).where("id", "<", id).where("tool", "in", IMAGE_TOOLS)
+    .where((eb) => runId === null ? eb("run_id", "is", null) : eb("run_id", "=", runId))
+    .where(kx.jsonType(db, "result", "$.images[0].data"), "=", "text"));
+  if (Number(kept?.n ?? 0) < KEPT_IMAGES) return;
+  await stubImages(db, id, stored, "session image limit");
+}
+
+/** The row's images as type, size and hash with `note` on each; the rest of the result stays as it is. */
+async function stubImages(db: Db, id: number, stored: string, note: string): Promise<void> {
   let o: { images?: { data?: unknown; mimeType?: unknown }[] };
   try { o = JSON.parse(stored) as typeof o; } catch { return; }
   if (!Array.isArray(o.images)) return;
   const images = o.images.map((i) => {
     if (typeof i?.data !== "string") return i;
     const bytes = Buffer.from(i.data, "base64");
-    return { mimeType: i.mimeType, bytes: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex") };
+    return { mimeType: i.mimeType, bytes: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex"), note };
   });
   await db.run(db.k.updateTable("workspace_calls").set({ result: JSON.stringify({ ...o, images }) }).where("id", "=", id).where("result", "=", stored));
+}
+
+/** Drops the image bytes of calls in workspaces that ended more than IMAGE_KEEP_MS ago. Returns the rows changed. */
+export async function pruneWorkspaceImages(db: Db, nowMs: number = Date.now()): Promise<number> {
+  const before = new Date(nowMs - IMAGE_KEEP_MS).toISOString();
+  let n = 0, last = 0;
+  for (;;) {
+    const rows = await db.all(db.k.selectFrom("workspace_calls as c").innerJoin("workspaces as w", "w.id", "c.workspace_id").select(["c.id", "c.result"])
+      .where("w.ended_at", "is not", null).where("w.ended_at", "<", before).where("c.tool", "in", IMAGE_TOOLS)
+      .where("c.id", ">", last).where(kx.jsonType(db, "c.result", "$.images[0].data"), "=", "text").orderBy("c.id").limit(20));
+    if (!rows.length) return n;
+    for (const r of rows) await stubImages(db, r.id, r.result!, `${IMAGE_KEEP_MS / 86_400_000} days after the workspace ended`);
+    n += rows.length;
+    last = rows.at(-1)!.id;
+  }
 }
 
 // ---- the job's side -------------------------------------------------------------

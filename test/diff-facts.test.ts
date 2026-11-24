@@ -1,11 +1,9 @@
 // The planner reads a reviewed head's diff facts from the database; the code that writes or removes the cached diff stores them.
 import assert from "node:assert/strict";
-import { rmSync } from "node:fs";
-import { join } from "node:path";
 import { afterEach, test } from "node:test";
 import { loadPrFacts } from "../src/core/facts.ts";
 import { EXTRAS_PENDING_REASON } from "../src/core/sensitive.ts";
-import { EXTRAS_TRIES, buildDiffFacts, cachedDiff, diffCacheDir, diffFactsOfCache, dropCachedDiff, noteReread, type DiffFetcher } from "../src/review/diff.ts";
+import { DIFF_FACTS_KEY, EXTRAS_TRIES, buildDiffFacts, cachedDiff, diffFactsOfCache, dropCachedDiff, noteReread, type DiffFetcher } from "../src/review/diff.ts";
 import { tmpdir, world, type World } from "./world-db.ts";
 
 // Other test files write the same fixture heads into the shared scratch cache.
@@ -48,16 +46,32 @@ test("the planner's diff facts follow the cached diff's writes, re-reads and rem
   assert.equal(f.sensitive, null);
   assert.equal(f.lines, 500);
 
-  // A diff cached before its facts were stored gets them from the startup fill, once.
+  // Facts computed by other rules are computed again at runner start, once.
   await cachedDiff(w.db, "app", 1, "sha1", fetch, "main");
   await w.db.run(w.db.k.deleteFrom("diff_facts"));
-  assert.equal(await buildDiffFacts(w.db), 1);
+  assert.ok(await buildDiffFacts(w.db));
   assert.deepEqual((await facts()).sensitive, [...file.reasons, EXTRAS_PENDING_REASON]);
   assert.equal(await buildDiffFacts(w.db), null);
 
-  // A cache directory the facts were not built from (no marker) is read again; a head whose diff is still cached keeps its row.
-  rmSync(join(diffCacheDir(), "facts-built"));
-  await w.db.run(w.db.k.insertInto("opus_reviews").values({ repo: "app", number: 1, head_oid: "sha2", at: "2027-01-01T00:00:00Z", mode: "full", verdict: "take" }));
-  assert.equal(await buildDiffFacts(w.db), 2);
-  assert.deepEqual(await w.db.all(w.db.k.selectFrom("diff_facts").select("head_oid")), [{ head_oid: "sha1" }]);
+  // A new runner pod starts with an empty diff cache: the stored facts stand, through the start and a failed re-read.
+  const before = await w.db.all(w.db.k.selectFrom("diff_facts").selectAll());
+  process.env.AUTOCRAFT_DIFF_CACHE = tmpdir("diff-facts-fresh");
+  assert.equal(await buildDiffFacts(w.db), null);
+  await noteReread(w.db, "app", 1, "sha1", 5000);
+  assert.deepEqual(await w.db.all(w.db.k.selectFrom("diff_facts").selectAll()), before.map((r) => ({ ...r, last_read: 5000 })));
+
+  // New rules with nothing cached: settled facts wait for a re-read, keeping their reasons, written one transaction per batch.
+  await w.db.run(w.db.k.updateTable("diff_facts").set({ pending: 0 }));
+  await w.db.run(w.db.k.insertInto("diff_facts").values({ repo: "app", number: 1, head_oid: "sha0", reasons: "[]", lines: 3, pending: 0, last_read: null }));
+  await w.db.run(w.db.k.updateTable("settings").set({ value: "older-rules" }).where("key", "=", DIFF_FACTS_KEY));
+  const write = w.db.write.bind(w.db);
+  let writes = 0;
+  w.db.write = (fn, o) => { writes++; return write(fn, o); };
+  assert.deepEqual(await buildDiffFacts(w.db, { batch: 1 }), { computed: 0, pending: 2 });
+  w.db.write = write;
+  assert.equal(writes, 2);
+  f = await facts();
+  assert.deepEqual(f.sensitive, [...file.reasons, EXTRAS_PENDING_REASON]);
+  assert.equal(f.diffPending?.lastRead, 5000);
+  assert.equal(await buildDiffFacts(w.db), null);
 });

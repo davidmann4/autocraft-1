@@ -69,12 +69,13 @@ export async function forgetAuthor(db: Db, keys: DiscordKeys, userId: string): P
 }
 
 /** Gateway events that change mention rows. Reads and edits happen in watched channels only; a delete always applies. Returns the message when this event newly recorded it against items, else null. */
-export async function handleDispatch(db: Db, keys: DiscordKeys, type: string, d: unknown): Promise<{ channelId: string; messageId: string } | null> {
+export async function handleDispatch(db: Db, keys: DiscordKeys, type: string, d: unknown): Promise<{ channelId: string; messageId: string; guildId?: string } | null> {
   const x = d as Record<string, unknown> & Partial<DiscordMessage> & { ids?: unknown; unavailable?: boolean };
   if (type === "MESSAGE_CREATE" || type === "MESSAGE_UPDATE") {
     if (typeof x.id !== "string" || typeof x.channel_id !== "string" || !await isWatched(db, x.channel_id)) return null;
-    const added = await recordMessage(db, keys, x as DiscordMessage, typeof x.guild_id === "string" ? x.guild_id : await channelGuild(db, x.channel_id));
-    return added > 0 ? { channelId: x.channel_id, messageId: x.id } : null;
+    const guildId = typeof x.guild_id === "string" ? x.guild_id : await channelGuild(db, x.channel_id);
+    const added = await recordMessage(db, keys, x as DiscordMessage, guildId);
+    return added > 0 ? { channelId: x.channel_id, messageId: x.id, guildId } : null;
   } else if (type === "MESSAGE_DELETE") {
     if (typeof x.id === "string") await forgetMessages(db, keys, [x.id]);
   } else if (type === "MESSAGE_DELETE_BULK") {

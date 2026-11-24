@@ -60,7 +60,10 @@ export async function askJevCloudflare(cfg: JevCloudflareConfig, body: string, t
   try { parsed = JSON.parse(text); } catch { return { code: 0, stdout: text, stderr: "" }; }
   const env = parsed as { result?: unknown; success?: boolean; errors?: { message?: string }[] } | null;
   if (env && typeof env === "object" && "success" in env && env.success === false) return fail(1, null, (env.errors ?? []).map((x) => x.message).filter(Boolean).join("; ").slice(0, 200) || "request failed");
-  const result = env && typeof env === "object" && "result" in env && env.result && typeof env.result === "object" ? env.result as Record<string, unknown> : parsed as Record<string, unknown>;
+  const outer = env && typeof env === "object" && "result" in env && env.result && typeof env.result === "object" ? env.result as Record<string, unknown> : parsed as Record<string, unknown>;
+  // Workers AI may wrap the model's own reply in a second envelope, `{ state, result: { answers, usage } }`.
+  const inner = "state" in outer && outer.result && typeof outer.result === "object" ? outer.result as Record<string, unknown> : outer;
+  if ("state" in outer && outer.state !== "Completed") return fail(1, null, `run ${String(outer.state).slice(0, 40)}`);
   // The answers come under `answers`, as in the CLI's output.
-  return { code: 0, stdout: JSON.stringify(result), stderr: "" };
+  return { code: 0, stdout: JSON.stringify(inner), stderr: "" };
 }

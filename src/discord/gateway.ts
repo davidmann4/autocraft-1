@@ -1,8 +1,8 @@
-// Minimal Discord gateway client on Node's WebSocket and fetch. It identifies with the GUILDS, GUILD_MESSAGES and
+// Minimal Discord gateway client on Node's WebSocket and fetch. It identifies with the GUILDS, GUILD_EXPRESSIONS (emoji updates), GUILD_MESSAGES and
 // MESSAGE_CONTENT intents, heartbeats, resumes or reconnects with backoff, and passes guild, channel, message and
 // interaction events on. It never reads message history; the bot sends through rest.ts only.
 const API = "https://discord.com/api/v10";
-export const INTENTS = (1 << 0) | (1 << 9) | (1 << 15);
+export const INTENTS = (1 << 0) | (1 << 3) | (1 << 9) | (1 << 15);
 
 /** Close codes after which reconnecting cannot help (bad token, intents not allowed, bad shard or version). */
 const FATAL = new Set([4004, 4010, 4011, 4012, 4013, 4014]);

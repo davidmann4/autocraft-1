@@ -617,7 +617,9 @@ export const MAX_RECHECK = 200;
  *
  * With `use` (an offline group of any other build that starts warm, src/build/warm-mount.ts): `warm-copy` fills the target
  * at the checkout from the node's warm version, in memory (`tmpfs`) or on the task's volume (`pvc`), and the steps build at
- * the CI paths, as the version was built.
+ * the CI paths, as the version was built. A `fetch` or `mirror` group with `use` (one before such an offline group) runs
+ * `warm-copy` for CARGO_HOME only before its steps, so their fetch finds the version's crates in place. The copy is the
+ * AutoCraft image and runs no repository code; only it mounts the node's warm dir.
  */
 export function stepPod(c: PodCtx, image: string, appImage: string, plan: TaskStep[], group: Group, prepared: Prepared, checkPackages: boolean, repo: string, warm?: WarmPod, use?: WarmUse) {
   const offline = group.network === "none";
@@ -626,6 +628,7 @@ export function stepPod(c: PodCtx, image: string, appImage: string, plan: TaskSt
   const cacheVersion = prepared.cacheVersion;
   const writing = !!warm && offline && !!checkout;
   const starting = !writing && !!use && offline && !!checkout;
+  const seeding = !writing && !!use && !offline && !!checkout;
   const cacheUrl = writing ? c.s.cacheWriteUrl : c.s.sccacheUrl;
   const cached = (step: TaskStep): boolean => offline && !step.bare && !!cacheUrl && !!cacheVersion && !!checkout;
   const atCi = (step: TaskStep): boolean => cached(step) || ((writing || starting) && !step.bare);
@@ -640,7 +643,7 @@ export function stepPod(c: PodCtx, image: string, appImage: string, plan: TaskSt
   const targetVolume: { name: string; subPath?: string } = extraMemory !== null || copyMemory !== null
     ? { name: "warm-target" }
     : { name: "work", subPath: "target" };
-  if (starting) {
+  if (starting || seeding) {
     volumes.push(warmNodeVolume(use!), warmVerifyVolume());
     if (copyMemory !== null) volumes.push({ name: "warm-target", emptyDir: { medium: "Memory", sizeLimit: String(copyMemory) } });
   }
@@ -699,10 +702,10 @@ export function stepPod(c: PodCtx, image: string, appImage: string, plan: TaskSt
   const spec = mp?.spec ?? {};
   if (!writing) {
     const labels: Record<string, string> = group.steps.some((i) => cached(plan[i]!)) ? { "craft.build/cache": "read" } : {};
-    const copy = starting
+    const copy = starting || seeding
       ? [
         container(TOOLCHAIN_ID_CONTAINER, image, appResources(c.s), toolchainIdParts([{ name: "check-tmp", mountPath: "/tmp" }])),
-        container(WARM_COPY_CONTAINER, appImage, stepResources(c.s, c.memory, copyMemory ?? 0), warmCopyParts(use!, { checkout: checkout!, image, envHash: warmEnvHash(prepared), targetVolume, tmpVolume: "check-tmp" })),
+        container(WARM_COPY_CONTAINER, appImage, stepResources(c.s, c.memory, copyMemory ?? 0), warmCopyParts(use!, { checkout: checkout!, image, envHash: warmEnvHash(prepared), targetVolume, tmpVolume: "check-tmp", cargoOnly: seeding })),
       ]
       : [];
     return pod(c, group.network, volumes, [disk, ...wait, ...check, ...copy, ...steps.slice(0, -1)], steps.slice(-1), labels, spec);

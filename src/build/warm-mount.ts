@@ -1,6 +1,7 @@
 // Build pods that start warm: an offline step pod of a repository with a warm target (build_sizes.warm_target) whose node
 // holds the repository's warm key (warm-sync, src/warm/sync-agent.ts) copies that version into its target dir before its
-// steps run, instead of building from an empty one.
+// steps run, instead of building from an empty one. A `fetch` or `mirror` step pod before it (the dependency fetch) copies
+// only the version's CARGO_HOME before its steps, so the fetch downloads only what the version lacks.
 //
 // The node's warm dir reaches the pod through the read-only claim `craft-warm-<node>` (a static volume over the node's
 // /var/lib/craft-warm; a hostPath volume is not allowed in the build namespace) mounted with `subPath: <key>` at /warm.
@@ -115,16 +116,17 @@ export const toolchainIdParts = (volumeMounts: object[], dir = TOOLCHAIN_ID_DIR)
 /**
  * The warm-copy container's args, env and mounts (pods.ts and workspace-pods.ts add image and resources). `target` is the
  * target volume as the steps mount it, at `checkout`/target; CARGO_HOME is /cache/cargo on the volume `work`. `env` adds
- * settings (a workspace's checkout arrives after the copy: warm-copy.ts warmCopyPhase).
+ * settings (a workspace's checkout arrives after the copy: warm-copy.ts warmCopyPhase). `cargoOnly`: the copy before a
+ * network pod's fetch, which fills only CARGO_HOME and does not mount the target.
  */
-export function warmCopyParts(use: WarmUse, o: { checkout: string; image: string; envHash: string; targetVolume: { name: string; subPath?: string }; tmpVolume: string; env?: Record<string, string> }) {
+export function warmCopyParts(use: WarmUse, o: { checkout: string; image: string; envHash: string; targetVolume: { name: string; subPath?: string }; tmpVolume: string; env?: Record<string, string>; cargoOnly?: boolean }) {
   const target = `${o.checkout}/target`;
   const env: Record<string, string> = {
     HOME: "/tmp", AUTOCRAFT_POD_WORK: "/work",
     AUTOCRAFT_WARM_KEY: use.key, AUTOCRAFT_WARM_COMMIT: use.commit, AUTOCRAFT_WARM_SOURCE: WARM_MOUNT, AUTOCRAFT_WARM_VERIFY_KEYS: `${WARM_VERIFY_DIR}/public.pem`,
     AUTOCRAFT_WARM_TARGET: target, AUTOCRAFT_WARM_CARGO_HOME: "/cache/cargo", AUTOCRAFT_WARM_CHECKOUT: o.checkout,
     AUTOCRAFT_WARM_IMAGE: o.image, AUTOCRAFT_WARM_TOOLCHAIN_DIR: TOOLCHAIN_ID_DIR, AUTOCRAFT_WARM_ENV_HASH: o.envHash, AUTOCRAFT_WARM_MODE: use.target,
-    ...(use.sameLock ? { AUTOCRAFT_WARM_SAME_LOCK: "1" } : {}),
+    ...(o.cargoOnly ? { AUTOCRAFT_WARM_PART: "cargo" } : use.sameLock ? { AUTOCRAFT_WARM_SAME_LOCK: "1" } : {}),
     ...o.env,
   };
   return {
@@ -133,7 +135,7 @@ export function warmCopyParts(use: WarmUse, o: { checkout: string; image: string
     volumeMounts: [
       { name: "warm-node", mountPath: WARM_MOUNT, subPath: use.key, readOnly: true },
       { name: "warm-copy-verify", mountPath: WARM_VERIFY_DIR, readOnly: true },
-      { ...o.targetVolume, mountPath: target },
+      ...(o.cargoOnly ? [] : [{ ...o.targetVolume, mountPath: target }]),
       { name: "work", mountPath: "/work" },
       { name: "work", mountPath: "/cache", subPath: "cache" },
       { name: o.tmpVolume, mountPath: "/tmp" },

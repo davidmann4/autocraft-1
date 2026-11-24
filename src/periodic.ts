@@ -9,6 +9,12 @@ import { setFence } from "./db/fence.ts";
 import { closeDb, openDb, setDbRole } from "./db/open.ts";
 
 const LOOP = fileURLToPath(new URL("../deploy/periodic.sh", import.meta.url));
+/**
+ * How long a stop lets a sync or backup in progress finish before the chores are killed, so the lease is released before
+ * the pod's termination grace period (40 s) ends and the standby takes over at once instead of after the lease expires.
+ * An interrupted sync is simply run again by the next leader.
+ */
+const STOP_GRACE_MS = 20_000;
 
 const killGroup = (pid: number, signal: NodeJS.Signals): void => {
   try { process.kill(-pid, signal); } catch { /* already gone */ }
@@ -35,11 +41,15 @@ async function periodic(args: string[]): Promise<void> {
     writeSync(2, `periodic: lost the leader lease (${String((lease.lost.reason as Error | undefined)?.message ?? "")}); chores killed, exiting\n`);
     process.exit(LOST_LEADER_EXIT);
   }, { once: true });
-  // A stop reaches the loop alone, which lets a sync or backup in progress finish and then exits.
-  ac.signal.addEventListener("abort", () => { try { child.kill("SIGTERM"); } catch { /* gone */ } }, { once: true });
+  // A stop reaches the loop alone, which lets a sync or backup in progress finish and then exits; one still running after
+  // STOP_GRACE_MS is killed with the loop.
+  ac.signal.addEventListener("abort", () => {
+    try { child.kill("SIGTERM"); } catch { /* gone */ }
+    setTimeout(() => { if (child.pid && child.exitCode === null && child.signalCode === null) killGroup(child.pid, "SIGKILL"); }, STOP_GRACE_MS).unref();
+  }, { once: true });
   const code = await new Promise<number>((resolve) => {
     child.on("error", (e) => (console.error(`periodic: ${cmd} did not start: ${e.message}`), resolve(1)));
-    child.on("exit", (c, sig) => resolve(c ?? (sig === "SIGTERM" ? 0 : 1)));
+    child.on("exit", (c, sig) => resolve(c ?? (sig === "SIGTERM" || (sig === "SIGKILL" && ac.signal.aborted) ? 0 : 1)));
   });
   await lease.release();
   await closeDb();

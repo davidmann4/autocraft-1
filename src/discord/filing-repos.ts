@@ -1,11 +1,12 @@
-// Filing-only repos: public repos of any owner that the Discord issue bot offers and files into as the GitHub App,
-// without tracking them. Sync, the pipeline and the bot's search never read this table. The one write such a repo gets
-// is the bot's new issue and its label (guardBotFiling in src/core/guard.ts).
+// Filing-only repos: public repos of any owner that the Discord issue bot offers without tracking them. Where the GitHub
+// App covers the repo the bot files into it as the app ("Submit for me"); elsewhere the draft offers only the prefilled
+// GitHub link. Coverage is read when it is needed (appCovers), never stored. Sync, the pipeline and the bot's search never
+// read this table. The one write such a repo gets is the bot's new issue and its label (guardBotFiling in src/core/guard.ts).
 import { execFile } from "node:child_process";
 import { audit } from "../dash/audit.ts";
 import { OWNER } from "../owners.ts";
 import { listRepoOwner, ownerAllowed } from "../github/allowed-owners.ts";
-import { appCoverage } from "../github/identity.ts";
+import { appCoverage, githubIdentity } from "../github/identity.ts";
 import { AppReadError, readEnv } from "../github/read.ts";
 import { publicRepoNames } from "../public/status.ts";
 import { trackedRepos } from "./store.ts";
@@ -14,6 +15,8 @@ import type { Db } from "../db/index.ts";
 export class FilingRepoError extends Error {}
 
 export type FilingRepo = { owner: string; name: string; addedBy: string; addedAt: string };
+/** How the bot files into a filing-only repo: "submit" when the GitHub App covers it (Submit for me), else "link" (only the GitHub link). */
+export type FilingMode = "submit" | "link";
 /** A repo the bot offers: a public tracked repo, or a filing-only one. */
 export type BotRepo = { owner: string; name: string; filingOnly: boolean };
 
@@ -50,11 +53,15 @@ export async function botRepo(db: Db, name: string): Promise<BotRepo | null> {
 export type RepoFacts = { owner: string; name: string; private: boolean; hasIssues: boolean; archived: boolean };
 export type ReadRepo = (owner: string, name: string) => Promise<RepoFacts | null>;
 
-/** Reads the repo through the read path: as the app (the owner's installation) under the app identity. */
+/**
+ * Reads the repo through the read path: under the app identity as the owner's installation, or, when the app is not
+ * installed on the owner, as the tracked owner's installation (a public repo is readable with any installation token).
+ */
 export const ghReadRepo: ReadRepo = async (owner, name) => {
   let env: Awaited<ReturnType<typeof readEnv>>;
-  try { env = await readEnv(owner); } catch (e) {
-    if (e instanceof AppReadError && e.notInstalled) throw new FilingRepoError(`The GitHub App is not installed on ${owner}.`);
+  try {
+    env = await readEnv(owner).catch(async (e: unknown) => { if (e instanceof AppReadError && e.notInstalled) return await readEnv(); throw e; });
+  } catch (e) {
     throw new FilingRepoError(`GitHub could not be read: ${(e as Error).message}`);
   }
   const jq = "{owner: .owner.login, name: .name, private: .private, hasIssues: .has_issues, archived: .archived}";
@@ -73,11 +80,13 @@ function parseSlug(input: string): { owner: string; name: string } {
 }
 
 /**
- * Adds a filing-only repo after GitHub confirms that it is public, takes issues and is in the GitHub App's installation.
+ * Adds a filing-only repo after GitHub confirms that it is public and takes issues; the GitHub App need not cover it.
  * Refuses a name that is tracked, known under another owner, or already on the list, and an owner that is not an allowed
- * owner of the GitHub App (src/github/allowed-owners.ts) while that list has accounts. Audited as `discord-filing-add`.
+ * owner of the GitHub App (src/github/allowed-owners.ts) while that list has accounts, covered or not: an installation
+ * the owner makes later is then kept. `mode` is the coverage read now ("link" also when GitHub could not confirm it, `why` says which).
+ * Audited as `discord-filing-add` with the mode.
  */
-export async function addFilingRepo(db: Db, by: string, input: string, deps: { read?: ReadRepo; mint?: (owner: string, repo: string) => Promise<string> } = {}): Promise<FilingRepo> {
+export async function addFilingRepo(db: Db, by: string, input: string, deps: { read?: ReadRepo; mint?: (owner: string, repo: string) => Promise<string> } = {}): Promise<FilingRepo & { mode: FilingMode; why?: string }> {
   const asked = parseSlug(input);
   if ((await filingRepos(db)).length >= FILING_MAX) throw new FilingRepoError(`The bot files into at most ${FILING_MAX} filing-only repos; remove one first.`);
   const facts = await (deps.read ?? ghReadRepo)(asked.owner, asked.name);
@@ -95,13 +104,48 @@ export async function addFilingRepo(db: Db, by: string, input: string, deps: { r
   const listed = await db.get(db.k.selectFrom("discord_filing_repos").select(["owner", "name"]).where((eb) => eb(eb.fn("lower", ["name"]), "=", name.toLowerCase())));
   if (listed) throw new FilingRepoError(`${listed.owner}/${listed.name} is already on the list.`);
   const c = await appCoverage(owner, name, deps.mint);
-  if (c.kind === "uncovered") throw new FilingRepoError(c.why);
-  if (c.kind === "unconfirmed") throw new FilingRepoError(`GitHub could not confirm the GitHub App's installation on ${owner}/${name}. Try again.`);
+  const mode: FilingMode = c.kind === "covered" ? "submit" : "link";
   const row = { owner, name, added_by: by, added_at: new Date().toISOString() };
   await db.run(db.k.insertInto("discord_filing_repos").values(row));
-  await audit(db, by, "discord-filing-add", name, { owner });
+  await audit(db, by, "discord-filing-add", name, { owner, mode, ...(c.kind !== "covered" && { why: c.why }) });
   await listRepoOwner(db, by, owner, "filing");
-  return { owner, name, addedBy: by, addedAt: row.added_at };
+  return { owner, name, addedBy: by, addedAt: row.added_at, mode, ...(c.kind !== "covered" && { why: c.why }) };
+}
+
+/** How long a coverage reading is kept: one Discord session or Settings visit asks GitHub once per repo. */
+export const COVERAGE_TTL_MS = 5 * 60_000;
+
+/** Whether the GitHub App covers a repo; `why` is the reason when it does not. */
+export type CoverageReading = { covered: boolean; why: string | null };
+
+/**
+ * Whether the GitHub App covers `owner/name`, read with appCoverage and kept COVERAGE_TTL_MS. A reading GitHub could not
+ * confirm is not kept and answers with the last kept one, else not covered with GitHub's reason.
+ */
+export function coverageReader(mint?: (owner: string, repo: string) => Promise<string>, now: () => number = Date.now): (owner: string, name: string) => Promise<CoverageReading> {
+  const memo = new Map<string, { at: number } & CoverageReading>();
+  return async (owner, name) => {
+    const key = `${owner}/${name}`.toLowerCase();
+    const hit = memo.get(key);
+    if (hit && now() - hit.at < COVERAGE_TTL_MS) return { covered: hit.covered, why: hit.why };
+    const c = await appCoverage(owner, name, mint);
+    if (c.kind === "unconfirmed") return hit ? { covered: hit.covered, why: hit.why } : { covered: false, why: c.why };
+    const reading = { covered: c.kind === "covered", why: c.kind === "covered" ? null : c.why };
+    memo.set(key, { at: now(), ...reading });
+    return reading;
+  };
+}
+
+/** The shared reader for the Discord draft, the Submit for me press and the Settings list. */
+export const appCovers = coverageReader();
+
+/** The filing-only repos with how the bot files into each now: Submit for me needs the app identity and the app's coverage; `why` says why a repo is link-only. */
+export async function filingReposWithMode(db: Db, covers: (owner: string, name: string) => Promise<CoverageReading> = appCovers): Promise<(FilingRepo & { mode: FilingMode; why: string | null })[]> {
+  const app = await githubIdentity(db) === "app";
+  return await Promise.all((await filingRepos(db)).map(async (r) => {
+    const c: CoverageReading = app ? await covers(r.owner, r.name) : { covered: false, why: "Filing from Discord needs the GitHub App identity." };
+    return { ...r, mode: c.covered ? "submit" as const : "link" as const, why: c.why };
+  }));
 }
 
 /** Removes a filing-only repo (`owner/name` or the bare name). Returns whether it was on the list. Audited as `discord-filing-remove`. */

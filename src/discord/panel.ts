@@ -1,11 +1,13 @@
 // The issue panel: one pinned bot message per support channel with Report a bug, Request a feature and Find an existing
-// issue, for people who do not use the slash commands. Each button opens the new-issue flow (issue-new.ts) with the
-// channel's default repo preselected; the bug and feature buttons also set the kind. An operator posts it with
+// issue, for people who do not use the slash commands. The bug and feature buttons open the new-issue form
+// (issue-new.ts) with the channel's default repo preselected and set the kind; the find button opens the search form
+// (search-commands.ts) and replies with matches only. An operator posts it with
 // `autocraft-server discord panel post <channel id>`; posting again edits the stored message in place.
 import type { Interactions } from "./interactions.ts";
 import type { IssueNew } from "./issue-new.ts";
 import type { MessageBody } from "./rest.ts";
 import { fileRepoUrl } from "./reply.ts";
+import { showSearchForm } from "./search-commands.ts";
 import type { Db } from "../db/index.ts";
 
 export const PANEL_TEXT = "**Found a problem or have an idea?**\nAutoCraft looks for an existing issue first, then helps you write a new one.";
@@ -59,7 +61,8 @@ export async function postPanel(db: Db, rest: PanelRest, channelId: string): Pro
 export function installPanel(ix: Interactions, db: Db, flow: IssueNew): void {
   ix.component("panel", async (call) => {
     const which = (call.interaction.data?.custom_id ?? "").split(":")[1];
+    if (which === "find") return void (await showSearchForm(call));
     const repo = (await fileRepoUrl(db, call.interaction.channel_id, []))?.split("/").pop() ?? null;
-    await flow.open(call, repo, "", which === "bug" ? "bug" : which === "feature" ? "feature" : undefined);
+    await flow.open(call, repo, "", which === "feature" ? "feature" : "bug");
   }, { immediate: true });
 }

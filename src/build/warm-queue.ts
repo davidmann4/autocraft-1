@@ -115,18 +115,26 @@ export async function mainHead(db: Db, repo: string): Promise<string | null> {
 
 const warmTasks = (db: Db, repo: string) => db.k.selectFrom("build_tasks").where("repo", "=", repo).where("step", "=", WARM_STEP);
 
+/**
+ * The warm producer's revision. Bump it whenever a change to the producer's build, trim or publish (src/warm/trim.ts, the
+ * warm plan, the publish path) changes what a published warm version contains, so every repo's current head is built once
+ * more: a finished warm build counts for its head only when it was queued under this revision or a later one.
+ */
+export const WARM_PRODUCER_REV = 2;
+
 /** The AutoCraft version a warm task is queued under: the runner's image. A failure under another version may have been a bug since fixed. */
 export const autocraftVersion = (): string => envVar("IMAGE") ?? "unknown";
 
 /**
  * A warm build at `head` with `image` already ended; one that failed before its environment was known counts for the image
- * it was queued with. A failed one counts only when it was queued under the current AutoCraft version (rows without a
+ * it was queued with. A finished one counts only when it was queued under
+ * WARM_PRODUCER_REV or later (rows without a revision never do). A failed one counts only when it was queued under the current AutoCraft version (rows without a
  * version never do), so each version tries a failing head once.
  */
 async function attempted(db: Db, repo: string, head: string, image: string): Promise<boolean> {
   const version = autocraftVersion();
-  const rows = await db.all(warmTasks(db, repo).select(["sandbox_env", "warm_image", "warm_version", "state"]).where("head_sha", "=", head).where("state", "in", ["done", "failed"]));
-  return rows.filter((r) => r.state === "done" || r.warm_version === version).some((r) => {
+  const rows = await db.all(warmTasks(db, repo).select(["sandbox_env", "warm_image", "warm_version", "warm_rev", "state"]).where("head_sha", "=", head).where("state", "in", ["done", "failed"]));
+  return rows.filter((r) => r.state === "done" ? (r.warm_rev ?? 0) >= WARM_PRODUCER_REV : r.warm_version === version).some((r) => {
     if (!r.sandbox_env) return !r.warm_image || r.warm_image === image;
     try {
       return (JSON.parse(r.sandbox_env) as { image?: string }).image === image;
@@ -139,16 +147,23 @@ async function attempted(db: Db, repo: string, head: string, image: string): Pro
 const open = async (db: Db, repo: string, states: string[]): Promise<boolean> =>
   !!await db.get(warmTasks(db, repo).select("id").where("state", "in", states).limit(1));
 
-/** Queues a warm build of `repo` for the writer `s` when its head needs one; returns the task id, or null. */
-export async function queueWarm(db: Db, repo: string, s: KubeSettings): Promise<number | null> {
+const forcedKey = (repo: string) => `warm_rebuild:${repo}`;
+
+/**
+ * Queues a warm build of `repo` for the writer `s` when its head needs one; returns the task id, or null. `force` queues
+ * one although the head was built already; warmClaim lets exactly that task through.
+ */
+export async function queueWarm(db: Db, repo: string, s: KubeSettings, force = false): Promise<number | null> {
   const head = await mainHead(db, repo);
   const image = toolchainImage(s, TOOLCHAINS);
-  if (!head || !image || await open(db, repo, ["queued", "claimed", "running"]) || await attempted(db, repo, head, image)) return null;
+  if (!head || !image || await open(db, repo, ["queued", "claimed", "running"]) || (!force && await attempted(db, repo, head, image))) return null;
   try {
-    return await createTask(db, {
+    const id = await createTask(db, {
       step: WARM_STEP, repo, headSha: head, baseSha: head, requires: { os: "linux", toolchains: [...TOOLCHAINS] }, priority: WARM_PRIORITY,
-      plan: warmPlan({ mirror: !!s.crateMirror }), warm: { key: warmKeyOf(repo), role: "build" }, warmImage: image, warmVersion: autocraftVersion(),
+      plan: warmPlan({ mirror: !!s.crateMirror }), warm: { key: warmKeyOf(repo), role: "build" }, warmImage: image, warmVersion: autocraftVersion(), warmRev: WARM_PRODUCER_REV,
     });
+    if (force) await writeSetting(db, forcedKey(repo), String(id));
+    return id;
   } catch (e) {
     if (e instanceof BuildError) return null;
     throw e;
@@ -177,6 +192,17 @@ export function warmTaskImage(r: { sandbox_env: string | null; warm_image: strin
   }
 }
 
+/** Queues a warm build of `repo`'s current head now, built already or not; throws when the repo is not covered or none can be queued. */
+export async function rebuildWarm(db: Db, repo: string, by: string): Promise<number> {
+  const w = (await writers(db))[0]?.s;
+  if (!w) throw new BuildError(409, "no enabled warm writer environment");
+  if (!(await warmCoverage(db)).repos.some((r) => r.repo === repo)) throw new BuildError(400, `${repo} is not tracked in the pipeline scope or not covered by warm builds`);
+  const id = await queueWarm(db, repo, w, true);
+  if (id === null) throw new BuildError(409, `${repo} has no known head, or a warm build of it is queued or running already`);
+  await audit(db, by, "warm-rebuild", "builds", { repo, task: id });
+  return id;
+}
+
 /** Queues the warm builds the covered repos need (warmCoverage); returns how many. Nothing without an enabled warm writer. */
 export async function warmPass(db: Db): Promise<number> {
   const w = (await writers(db))[0]?.s;
@@ -191,13 +217,13 @@ export async function warmPass(db: Db): Promise<number> {
  * wait (another warm build of the repo runs, the last one started under the minimum interval ago, or the newest head was
  * already built with this image).
  */
-export async function warmClaim(db: Db, repo: string, s: KubeSettings, nowMs: number): Promise<{ head: string; plan: TaskStep[] } | null> {
+export async function warmClaim(db: Db, repo: string, s: KubeSettings, nowMs: number, taskId?: number): Promise<{ head: string; plan: TaskStep[] } | null> {
   const head = await mainHead(db, repo);
   const image = toolchainImage(s, TOOLCHAINS);
   if (!head || !image || await open(db, repo, ["claimed", "running"])) return null;
   const since = new Date(nowMs - (await warmMinInterval(db)) * 60_000).toISOString();
   if (await db.get(warmTasks(db, repo).select("id").where("claimed_at", ">", since).limit(1))) return null;
-  if (await attempted(db, repo, head, image)) return null;
+  if (!(taskId !== undefined && await setting(db, forcedKey(repo)) === String(taskId)) && await attempted(db, repo, head, image)) return null;
   return { head, plan: warmPlan({ mirror: !!s.crateMirror }) };
 }
 

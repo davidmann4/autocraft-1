@@ -28,6 +28,7 @@ import { elect, LOST_LEADER_EXIT } from "../db/leader.ts";
 import { assertFence, FencedError, isFenced, setFence } from "../db/fence.ts";
 import { inClusterApi } from "../build/kube-api.ts";
 import { workerEndpointFromEnv, WorkerEndpointPublisher } from "../build/worker-endpoint.ts";
+import { keepSnapshot } from "../itemtools/keeper.ts";
 import { writeSync } from "node:fs";
 
 const USAGE = `usage: autocraft-server runner serve
@@ -83,9 +84,10 @@ async function serve(): Promise<void> {
       standbyProbes = startHealthServer(workerListen, async () => false, state).catch((e: Error) => (console.error(`runner: standby probes not started: ${e.message}`), null));
     },
   });
-  // The worker API takes the address over.
-  await (await (standbyProbes as Promise<{ close: () => Promise<void> } | null> | null))?.close();
+  // Kept answering through the startup work below, until the worker API takes the address over.
+  const closeStandbyProbes = async () => await (await (standbyProbes as Promise<{ close: () => Promise<void> } | null> | null))?.close();
   if (!lease) {
+    await closeStandbyProbes();
     await health?.close();
     release();
     await closeDb();
@@ -115,29 +117,44 @@ async function serve(): Promise<void> {
   if (lease.lost.aborted) fenced();
   lease.lost.addEventListener("abort", fenced, { once: true });
   console.log(`runner: started on ${(await loadSteps()).size} steps`);
-  // A failure to listen (port in use) must not stop the pipeline; workers just cannot connect.
   // The session key signs the dashboard's requests for the runner's files (build artifacts, Claude accounts).
   let internalKey: string | null = null;
   try { internalKey = readSecrets(envVar("SECRETS_FILE")).sessionKey; } catch { /* logged at the first dashboard request, when a split install makes it matter */ }
-  const workers = await startWorkerServer({ db, internalKey, log: (l) => console.log(l) }).then(
-    (w) => (console.log(`runner: worker API on ${w.url}`), w),
-    (e: Error) => (console.error(`runner: worker API not started: ${e.message}`), null),
-  );
   const fenceGuard = async () => {
     if (lease.lost.aborted) throw new FencedError("this process no longer leads the runner");
     await assertFence(db);
   };
+  let ep: ReturnType<typeof workerEndpointFromEnv> = null;
+  let api: ReturnType<typeof inClusterApi> = null;
   try {
-    const ep = workerEndpointFromEnv(workerListen);
-    const api = ep ? inClusterApi() : null;
+    ep = workerEndpointFromEnv(workerListen);
+    api = ep ? inClusterApi() : null;
     if (ep && !api) console.error("runner: AUTOCRAFT_WORKER_ENDPOINTSLICE is set outside a cluster; the worker API's EndpointSlice is not written");
-    if (ep && api) {
-      endpoint = new WorkerEndpointPublisher(db, api, ep, fenceGuard, (l) => console.log(l));
-      void endpoint.sync().catch((e: unknown) => { if (!isFenced(e)) console.error(`runner: worker API EndpointSlice: ${(e as Error).message}`); });
-    }
   } catch (e) {
     console.error(`runner: the worker API's EndpointSlice is not written: ${(e as Error).message}`);
   }
+  await closeStandbyProbes();
+  const workers = await startWorkerServer({ db, internalKey, log: (l) => console.log(l) }).then(
+    (w) => (console.log(`runner: worker API on ${w.url}`), w),
+    (e: Error) => (console.error(`runner: worker API not started: ${e.message}`), null),
+  );
+  if (!workers && ep && api) {
+    // A leader the EndpointSlice would name without a worker API serves no worker: it gives the lease up, so a standby
+    // takes over, and exits for its supervisor to restart it.
+    lease.lost.removeEventListener("abort", fenced);
+    await lease.release();
+    await health?.close();
+    release();
+    await closeDb();
+    console.error("runner: takeover failed without the worker API; lease released, exiting");
+    process.exit(1);
+  }
+  // Without an EndpointSlice a failure to listen (port in use) does not stop the pipeline; workers just cannot connect.
+  if (workers && ep && api) {
+    endpoint = new WorkerEndpointPublisher(db, api, ep, fenceGuard, (l) => console.log(l));
+    void endpoint.sync().catch((e: unknown) => { if (!isFenced(e)) console.error(`runner: worker API EndpointSlice: ${(e as Error).message}`); });
+  }
+  keepSnapshot(db, ac.signal, (l) => console.log(`runner: ${l}`));
   // Starts and follows the build pods of kubernetes environments; outside a cluster they report that they cannot.
   startPodLauncher(db, ac.signal, (l) => console.log(l), fenceGuard);
   // Optional: counts Discord mentions of tracked items when a bot token file is configured. A failure is logged and never stops the runner.

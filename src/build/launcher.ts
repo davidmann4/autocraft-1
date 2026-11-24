@@ -869,7 +869,10 @@ async function createStage(c: EnvCtx, run: Run, t: TaskRow, stage: number): Prom
     }
     memory = await repoMemory(db, t.repo, c.s);
     let use: WarmUse | undefined;
-    const target = g.network === "none" && !warm ? await warmTargetOf(c, t) : "none";
+    // A network group before an offline group (the dependency fetch) copies CARGO_HOME from the version that group would
+    // start from, so the fetch downloads only what it lacks; a warm producer's fetch starts empty, as its publish carries it.
+    const seeds = g.network !== "none" && t.step !== WARM_STEP && groups.slice(index + 1).some((x) => x.network === "none");
+    const target = (g.network === "none" && !warm) || seeds ? await warmTargetOf(c, t) : "none";
     if (target !== "none") {
       const step = stepMemory(c.s, memory);
       const view = target === "tmpfs" && c.cluster ? await capacityView(c) : null;
@@ -880,7 +883,8 @@ async function createStage(c: EnvCtx, run: Run, t: TaskRow, stage: number): Prom
         nodeMaxBytes: view && !("error" in view) ? view.nodeMaxMem : null,
       });
       use = d.use ?? undefined;
-      await appendLog(db, c.env.id, run.task_id, "warm copy", d.use ? `starts warm from ${d.use.key}@${d.use.commit.slice(0, 12)} (${d.use.target})\n` : `starts cold: ${d.why}\n`);
+      if (!seeds) await appendLog(db, c.env.id, run.task_id, "warm copy", d.use ? `starts warm from ${d.use.key}@${d.use.commit.slice(0, 12)} (${d.use.target})\n` : `starts cold: ${d.why}\n`);
+      else if (d.use) await appendLog(db, c.env.id, run.task_id, "warm copy", `copies CARGO_HOME from ${d.use.key}@${d.use.commit.slice(0, 12)} before "${plan[g.steps[0]!]!.name}"\n`);
     }
     // The steps' limits, a minute each to copy the source, and two minutes to start the pod and measure its volume.
     deadline = g.steps.reduce((n, i) => n + stepCap(c.s, plan[i]!) + 60, 120) + (warm ? WARM_PHASES_SEC : 0) + (use ? WARM_COPY_SEC : 0);

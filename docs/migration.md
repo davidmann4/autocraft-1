@@ -59,7 +59,7 @@ Steps marked **admin** need a person with access to the secrets or to DNS and th
    | Path | Verdict | Evidence |
    |---|---|---|
    | `reference/<repo>/` (private reference pages, about 1.5 GB) | **Carry over.** It is not rebuildable from GitHub; without it the calls that judge reference-app behaviour run without `/reference`. | `src/reference.ts:22-33`, `src/review/opus.ts:256` |
-   | `item-snapshot/items.db` (about 0.9 GB) | **Drop.** It is built from the database. The first sync after start creates it (`rebuilt`); the dashboard and a pipeline-off runner do not need it. Check that it exists before the pipeline goes on (step 9). | `src/itemtools/snapshot.ts:94-110`, `src/mirror.ts:895` |
+   | `item-snapshot/items.db` (about 0.9 GB) | **Drop.** It is built from the database. The runner leader creates it when it starts leading (`rebuilt`) and refreshes it after each sync run; the dashboard does not need it. Check that it exists before the pipeline goes on (step 9). | `src/itemtools/snapshot.ts:94-110`, `src/mirror.ts:895` |
    | `artifacts/` (task output) | **Optional.** Rows in `build_artifacts` point to these files. A missing file makes the artifact download answer 404 ("the artifact file is gone"). Tasks older than 30 days lose their artifacts anyway. Copy it only to keep recent downloads. | `src/dash/api/build.ts:77-82`, `src/build/tasks.ts:23` |
    | `backups/` | **Optional.** Keep the old files off the box as history; the container writes new ones to `/data/backups`. | `deploy/backup.sh` |
    | `<root>/cache/autocraft/jobs/` (job logs) | **Carry over.** `jobs.log_path` stores the absolute old path, and the job page shows the log from it. Copy the files and rewrite the paths (below). | `src/runner/cli-job.ts:78-80`, `src/runner/jobs.ts:182-214` |
@@ -143,7 +143,7 @@ Steps marked **admin** need a person with access to the secrets or to DNS and th
    - The runner started no job: the highest job id does not change.
    - `bwrap --unshare-all --ro-bind / / --proc /proc --dev /dev true` exits 0 inside the runner container (`docker exec autocraft-runner bwrap ...`). If it fails on rootful Docker with an AppArmor profile that restricts user namespaces, add `--security-opt apparmor=unconfined` to the runner next.
    - **admin**: open the Accounts page after signing in. Each account shows its state and usage. Do the same check on the old host's Accounts page before step 11 (see Rollback).
-   - `IMAGE backup daily 7` (with `$RUN`) writes a snapshot to `/data/backups`: the schedule of the periodic container then counts from it. `ls /data/item-snapshot/items.db` exists once the first sync has finished.
+   - `IMAGE backup daily 7` (with `$RUN`) writes a snapshot to `/data/backups`: the schedule of the periodic container then counts from it. `ls /data/item-snapshot/items.db` (in the runner container) exists once the runner leader's first build has finished.
 10. **Switch the traffic. admin.** Point DNS or the proxy at the new dashboard. If the origin changed, update the GitHub App's callback and setup URLs and the OAuth app's callback URL (Moving to a new domain in [deploy-checklist.md](deploy-checklist.md)). Point the workers at the new runner's worker API (see Running a worker); keep that port off the public network.
 11. **Pipeline on.** `docker exec autocraft-runner node --no-warnings src/cli.ts pipeline on`, or `docker run --rm $RUN IMAGE pipeline on` (the database is shared through the volume). Watch the first jobs finish on the dashboard.
 
