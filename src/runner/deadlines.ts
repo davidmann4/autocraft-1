@@ -59,6 +59,16 @@ export function stepBoundMin(step: string, items?: number): number | null {
   return total;
 }
 
+/** Environment variable through which the runner tells a job process its deadline in minutes. */
+export const JOB_DEADLINE_ENV = "AUTOCRAFT_JOB_DEADLINE_MIN";
+
+/**
+ * Share of its deadline after which a job that works in slices (StepContext.timeUp) starts no new unit. The rest covers the unit in
+ * flight and the passes after it, so the job ends as a success well before the runner would stop it. Such jobs end near this share of
+ * the deadline, so a registry floor taken as twice the longest done job stays at or above the deadline.
+ */
+export const SLICE_SHARE = 0.5;
+
 /** Margin on the bound: a quarter and a few minutes for the work around the calls (git, GitHub, the database). */
 const margin = (min: number): number => Math.ceil(min * 1.25) + 5;
 

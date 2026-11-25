@@ -84,3 +84,18 @@ test("the stored plans give each open item's flags and verdict; a refresh stores
     await t.close();
   }
 });
+
+test("an issue waiting on an open PR is not long; the PR it waits on is", async () => {
+  const t = await testDatabase();
+  const db = await t.open({ app: true });
+  try {
+    const T = "2026-01-01T00:00:00Z";
+    for (const [number, kind] of [[1, "issue"], [2, "pr"]] as const) {
+      await db.run(db.k.insertInto("items").values({ repo: "app", number, kind, state: "OPEN", title: `t${number}`, created_at: T }));
+    }
+    await db.run(db.k.insertInto("item_plans").values({ repo: "app", number: 1, kind: "issue", state: "classified", actions: "[]", wait: "open PR #2", reasons: "[]", planned_at: T }));
+    await db.run(db.k.insertInto("item_plans").values({ repo: "app", number: 2, kind: "pr", state: "review-stale", actions: "[]", wait: "CI on the latest commit to pass", reasons: "[]", planned_at: T }));
+    const res = await computeLiveness(db, Date.parse(T) + 8 * 86_400_000);
+    assert.deepEqual(res.items.map((i) => `${i.number} ${i.verdict}`), ["2 long"]);
+  } finally { await t.close(); }
+});

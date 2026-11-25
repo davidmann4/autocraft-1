@@ -31,7 +31,7 @@ import type { DatabaseSync, SQLInputValue, SQLOutputValue } from "node:sqlite";
 export type Dialect = "sqlite" | "postgres";
 
 /** What a process (or worker thread) uses its handle for; on Postgres it sets the connection pool size. */
-export type DbRole = "dashboard" | "dashboard-remote" | "runner" | "planner" | "periodic" | "cli";
+export type DbRole = "dashboard" | "dashboard-remote" | "runner" | "job" | "planner" | "periodic" | "cli";
 
 /** The table types Kysely queries are checked against, generated from the migrated schema (scripts/gen-db-types.ts). */
 export type { DB } from "./types.ts";
@@ -107,6 +107,14 @@ export interface Db {
   shareReads<T>(fn: () => Promise<T>): Promise<T>;
   /** Runs `fn` with every read going to the database, inside shareReads too: for code that reads until a row changes. */
   fresh<T>(fn: () => Promise<T>): Promise<T>;
+  /**
+   * Runs `fn` while holding the lock `name`, which excludes only other holders of the same name. Postgres: every process,
+   * through a session advisory lock on a connection of its own. SQLite: this process only, so a dashboard and a runner
+   * sharing one file are not excluded from each other. It holds no writer lock, so `fn` may wait on the network; its own
+   * reads and writes run as usual. `held()` turns false once the lock's connection failed: another process may then hold
+   * it too, so `fn` should read again before a final decision. Not inside a transaction.
+   */
+  exclusive<T>(name: string, fn: (held: () => boolean) => Promise<T>, waitMs?: number): Promise<T>;
   /**
    * Runs `fn` in one read snapshot (SQLite BEGIN; Postgres REPEATABLE READ READ ONLY). Inside an open transaction it
    * joins that one.

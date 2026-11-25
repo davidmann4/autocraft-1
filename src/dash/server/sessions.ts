@@ -1,6 +1,6 @@
 import type { Role, User } from "../types.ts";
 import { randomToken, sha256hex, type TokenBox } from "./crypto.ts";
-import { shareRefresh } from "./user-tokens.ts";
+import { refreshShared, usableAccess } from "./token-refresh.ts";
 import { REPO_NAME, WRITE_PERMISSIONS, type Provider, type Tokens } from "./provider.ts";
 import type { Db } from "../../db/index.ts";
 import { excluded, rowid } from "../../db/kx.ts";
@@ -88,52 +88,23 @@ export async function pruneExpired(db: Db): Promise<void> {
   await db.run(db.k.deleteFrom("oauth_states").where("created_at", "<=", new Date(now.getTime() - 600_000).toISOString()));
 }
 
-// One refresh per session at a time: GitHub refresh tokens are single use, so
-// two concurrent refreshes would end the session.
+// One refresh per session at a time in this process; refreshShared serialises refreshes of the login across processes.
 const refreshing = new Map<string, Promise<string | null | undefined>>();
-const EXPIRY_MARGIN = 60_000;
 
 // Returns a usable access token: null when the session can no longer get one
-// (and has been ended), undefined after a transient failure.
-async function accessToken(db: Db, box: TokenBox, provider: Provider, idHash: string, mirror: boolean, rejected?: string): Promise<string | null | undefined> {
+// (and has been ended), undefined after a transient failure. `mirror`: the
+// session holds a GitHub App token, shared with the login's user_tokens row.
+export async function accessToken(db: Db, box: TokenBox, provider: Provider, idHash: string, mirror: boolean, rejected?: string): Promise<string | null | undefined> {
   const row = await db.get(db.k.selectFrom("sessions").select(["token_enc", "login"]).where("id_hash", "=", idHash));
   if (!row) return null;
   const t = openTokens(box, row.token_enc, idHash);
   if (!t) return null;
-  const fresh = t.access !== rejected && (t.expiresAt === null || t.expiresAt - EXPIRY_MARGIN > Date.now());
-  if (fresh) return t.access;
+  if (usableAccess(t, rejected)) return t.access;
   let p = refreshing.get(idHash);
   if (!p) {
-    // Fresh reads: the retry below reads the row until the vault's new pair lands, and the promise serves other requests too.
-    p = db.fresh(async () => {
-      const end = async () => {
-        await db.run(db.k.deleteFrom("sessions").where("id_hash", "=", idHash));
-        return null;
-      };
-      if (!t.refresh || (t.refreshExpiresAt !== null && t.refreshExpiresAt <= Date.now())) return await end();
-      let next: Tokens | null;
-      try {
-        next = await provider.refresh(t.refresh);
-      } catch (e) {
-        console.error(`token refresh: ${(e as Error).message}`);
-        return undefined;
-      }
-      if (!next) {
-        // The vault (another process) may have used this single-use refresh token first and stored the new pair here.
-        for (let i = 0; i < 4; i++) {
-          const again = await db.get(db.k.selectFrom("sessions").select("token_enc").where("id_hash", "=", idHash));
-          const shared = again ? openTokens(box, again.token_enc, idHash) : null;
-          if (shared && shared.refresh !== t.refresh) return shared.access;
-          if (!mirror) break;
-          await new Promise((r) => setTimeout(r, 300));
-        }
-        return await end();
-      }
-      await db.run(db.k.updateTable("sessions").set({ token_enc: sealTokens(box, next, idHash) }).where("id_hash", "=", idHash));
-      // The old refresh token is dead now, so every other copy of it (user_tokens, sessions of the same sign-in) takes the new pair.
-      if (mirror) await shareRefresh(db, box, row.login, t.refresh, next);
-      return next.access;
-    }).finally(() => refreshing.delete(idHash));
+    p = refreshShared(db, box, provider, row.login, { kind: "session", idHash }, { rejected, heal: mirror })
+      .then((r) => (r.ok ? r.tokens.access : r.transient ? undefined : null))
+      .finally(() => refreshing.delete(idHash));
     refreshing.set(idHash, p);
   }
   return p;

@@ -135,3 +135,6 @@ export function jevFailure(r: { code: number | null; stderr: string }): { kind: 
   if (/api key/i.test(line)) return { kind: "account", reason: "key rejected" };
   return null;
 }
+
+/** The API status a failed `jev ask` printed (`jev: API error status=<N> ...`), or null when it printed none. */
+export const jevStatus = (stderr: string): string | null => /API error status=(\d+)/.exec(stderr)?.[1] ?? null;

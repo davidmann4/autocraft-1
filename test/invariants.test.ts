@@ -54,7 +54,7 @@ function randomPr(x: Rnd): PrFacts {
     verification: x.bool(0.1) ? null : { state: x.pick(["passed", "passed", "ci-enough", "failed", "error", "running", "planned", "stale", "unavailable"]) },
     decision: {
       asked: x.bool(0.3), openQuestion: x.bool(0.15), answer: x.pick([null, null, null, "merge", "merge", "hold", "close"]),
-      mergeAnswerAfterReview: x.bool(0.6), inOpenGroup: x.bool(0.05), hold: { asked: x.bool(0.3), open: x.bool(0.1), answer: x.pick([null, null, "wait", "close"]), otherOpen: x.bool(0.1) },
+      mergeAnswerAfterReview: x.bool(0.6), inOpenGroup: x.bool(0.05), execWaiting: x.bool(0.05), hold: { asked: x.bool(0.3), open: x.bool(0.1), answer: x.pick([null, null, "wait", "close"]), otherOpen: x.bool(0.1) },
     },
     premerge: x.bool(0.15) ? null : {
       tries: x.int(4), hasFindings: x.bool(0.85), unsure: false, defects: x.pick([0, 0, 0, 1, 2]), defectsAllFixable: x.bool(0.7), fixesSafe: x.bool(0.7), minor: x.int(2), error: null,

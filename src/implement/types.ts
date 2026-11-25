@@ -100,7 +100,12 @@ export type PlanReply = {
   size: "S" | "M" | "L" | "XL";
   risks: string[];
   questions: PlanQuestion[];
+  /** On the maintainer workflow: what the reply adds; absent when it had neither field. */
+  workflow?: PlanWorkflow;
 };
+
+/** A ready plan's numbered parts (each with the files it changes) and, for a plan that asks, the sentence recommending an option. */
+export type PlanWorkflow = { parts: { title: string; files: string[] }[]; recommendation: string | null };
 
 /** The session's JSON report. AutoCraft trusts only its own checks; this says what the session claims. */
 export type SessionReport = {

@@ -32,6 +32,9 @@ import * as dec from "./decisions.ts";
 import * as conv from "./conversations.ts";
 import * as mcp from "./mcp.ts";
 import * as userSettings from "./user-settings.ts";
+import * as maintain from "./maintain.ts";
+import * as maintainItem from "./maintain-item.ts";
+import { uiV2 } from "../../workflow/settings.ts";
 import * as runners from "./runners.ts";
 import * as modelQueue from "./model-queue.ts";
 import * as areas from "./areas.ts";
@@ -74,6 +77,7 @@ import { batchOne } from "./batch-page.ts";
 import { batchRemovePr, batchStop, fastTrackAdd, fastTrackRefs, fastTrackRemove, fastTrackWeight, queueAdd, heldMergeRefs, mergeHoldPr, pipelineRepoNames, queuePage } from "./queue-page.ts";
 import { VectorIndex } from "../../embed/vectors.ts";
 import { mainCiRepos, summarize } from "../../mainci/index.ts";
+import * as commands from "./commands.ts";
 import type { Db } from "../../db/index.ts";
 
 export type ApiOptions = {
@@ -122,6 +126,7 @@ async function me(db: Db, req: Req): Promise<User> {
     maintainerWrites: mw?.value === "1",
     maintainerSettles: await maintainersSettle(db),
     inference: await inferenceMode(db),
+    uiV2: await uiV2(db, req.user.login),
   };
 }
 
@@ -456,6 +461,11 @@ export function apiRoutes(opts: ApiOptions = {}): Route[] {
     { method: "POST", pattern: "/api/decisions/:id/reprepare", handler: ok(dec.reprepare) },
     post("/api/decisions/:id/reopen", dec.reopen),
     post("/api/items/:repo/:n/backlog", dec.backlogItemRoute),
+    // The maintainer workflow's commands and controls (src/workflow/apply.ts).
+    post("/api/items/:repo/:n/command", commands.itemCommand),
+    get("/api/mention", (db) => commands.mention(db)),
+    post("/api/commands", commands.listCommand),
+    post("/api/controls", commands.control),
     { method: "POST", pattern: "/api/decisions/backlog", handler: ok(dec.backlogBulk) },
     post("/api/decisions/:id/adopt", dec.adopt),
     post("/api/decisions/:id/feedback", async (db, req) => dec.feedback(db, req, limiter)),
@@ -464,6 +474,15 @@ export function apiRoutes(opts: ApiOptions = {}): Route[] {
     get("/api/mcp/tokens", mcp.tokens),
     post("/api/mcp/tokens", mcp.create),
     post("/api/mcp/tokens/revoke", mcp.revoke),
+    // The new dashboard (ui_v2).
+    scoped(get("/api/maintain/home", maintain.home)),
+    get("/api/maintain/queue", maintain.queueMeta),
+    scoped(get("/api/maintain/stats", maintain.stats)),
+    // The new Items page: four lists of the open items, the Backlog or the closed items, with filters and search.
+    scoped(get("/api/maintain/items", maintain.items)),
+    // The new item page.
+    get("/api/maintain/items/:repo/:n", maintainItem.item),
+    get("/api/maintain/repos", maintain.repos),
     get("/api/me/settings", userSettings.settings),
     { method: "PUT", pattern: "/api/me/settings", handler: ok(userSettings.setSettings) },
     get("/api/runners", runners.list),
@@ -578,12 +597,15 @@ export function apiRoutes(opts: ApiOptions = {}): Route[] {
     { method: "PUT", pattern: "/api/pipeline/state", operator: true, handler: ok(pipeline.putState) },
     { method: "GET", pattern: "/api/pipeline/judgement-model", operator: true, handler: ok(async (db) => await pipeline.getJudgementModel(db)) },
     { method: "PUT", pattern: "/api/pipeline/judgement-model", operator: true, handler: ok(pipeline.putJudgementModel) },
+    { method: "PUT", pattern: "/api/pipeline/blocker-thresholds", operator: true, handler: ok(pipeline.putBlockers) },
     { method: "PUT", pattern: "/api/pipeline/limits/:step", operator: true, handler: ok(pipeline.putLimit) },
     { method: "POST", pattern: "/api/pipeline/limits/:step/reset", operator: true, handler: ok(pipeline.resetLimit) },
     { method: "POST", pattern: "/api/pipeline/steps/:step/deadline-ack", operator: true, handler: ok(pipeline.ackStepDeadline) },
     { method: "POST", pattern: "/api/pipeline/trips/:stage/resume", handler: ok(pipeline.resumeTrip) },
     { method: "PUT", pattern: "/api/pipeline/pilot", operator: true, handler: ok(adm.putPilot) },
     { method: "PUT", pattern: "/api/pipeline/outside-limits", operator: true, handler: ok(outside.putLimits) },
+    { method: "GET", pattern: "/api/pipeline/blocker-thresholds", handler: ok((db) => outside.getBlockerThresholds(db)) },
+    { method: "PUT", pattern: "/api/pipeline/blocker-thresholds", operator: true, handler: ok(outside.putBlockerThresholds) },
     { method: "POST", pattern: "/api/pipeline/outside/release", operator: true, handler: ok(outside.releaseAll) },
     { method: "POST", pattern: "/api/items/:repo/:n/release-outside", handler: ok(outside.release) },
     scoped(get("/api/needs/outside/:author", outside.held)),

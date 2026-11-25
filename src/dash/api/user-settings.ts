@@ -1,5 +1,5 @@
 // The signed-in user's own settings (GET and PUT /api/me/settings); their Task Runners are listed by GET /api/runners (runners.ts).
-// Maintainers and operators set their own settings; a viewer writes nothing.
+// Maintainers and operators set their own settings; a viewer sets only `uiV2`, the switch for the new dashboard.
 import { pipelineRepos } from "../../pilot.ts";
 import { manualOnly, parseManualOnly, setManualOnly } from "../../remote/manual-only.ts";
 import { parseInteractiveSlots, setUserInteractiveSlots, userInteractiveSlots } from "../../remote/interactive-slots.ts";
@@ -13,6 +13,8 @@ import { parseRunnerPrivate, runnerPrivate, setRunnerPrivate } from "../../remot
 import { HttpError } from "../server/util.ts";
 import type { Req } from "../types.ts";
 import type { Db } from "../../db/index.ts";
+import { excluded } from "../../db/kx.ts";
+import { UI_V2_KEY, uiV2 } from "../../workflow/settings.ts";
 
 /** Repos with the pipeline on where the user has write permission, the permission a claim requires. */
 async function repoChoices(db: Db, req: Req): Promise<string[]> {
@@ -23,21 +25,29 @@ async function repoChoices(db: Db, req: Req): Promise<string[]> {
 
 /**
  * The reply: the protocol's settings, `manualOnly` (manual-only.ts), the ticked `tasks` of `taskChoices` (my-tasks.ts), `taskItems`
- * (task-items.ts) and `runnerPrivate` (runner-private.ts).
+ * (task-items.ts), `runnerPrivate` (runner-private.ts) and `uiV2` (src/workflow/settings.ts).
  */
-type SettingsReply = UserSettingsReply & { interactiveSlots: number; manualOnly: boolean; tasks: string[]; taskChoices: readonly TaskChoice[]; taskItems: TaskItems; runnerPrivate: boolean };
+type SettingsReply = UserSettingsReply & { interactiveSlots: number; manualOnly: boolean; tasks: string[]; taskChoices: readonly TaskChoice[]; taskItems: TaskItems; runnerPrivate: boolean; uiV2: boolean };
 
 export const settings = async (db: Db, req: Req): Promise<SettingsReply> =>
-  ({ reserve: await userReserve(db, req.user.login), repos: await userRepos(db, req.user.login), maxCalls: await userMaxCalls(db, req.user.login), interactiveSlots: await userInteractiveSlots(db, req.user.login, req.user.role), manualOnly: await manualOnly(db, req.user.login), tasks: await userTasks(db, req.user.login), taskChoices: TASK_CHOICES, taskItems: await userTaskItems(db, req.user.login), runnerPrivate: await runnerPrivate(db, req.user.login), repoChoices: await repoChoices(db, req) });
+  ({ reserve: await userReserve(db, req.user.login), repos: await userRepos(db, req.user.login), maxCalls: await userMaxCalls(db, req.user.login), interactiveSlots: await userInteractiveSlots(db, req.user.login, req.user.role), manualOnly: await manualOnly(db, req.user.login), tasks: await userTasks(db, req.user.login), taskChoices: TASK_CHOICES, taskItems: await userTaskItems(db, req.user.login), runnerPrivate: await runnerPrivate(db, req.user.login), uiV2: await uiV2(db, req.user.login), repoChoices: await repoChoices(db, req) });
+
+/** Stores the user's switch for the new dashboard (off removes the row). */
+async function setUiV2(db: Db, login: string, on: boolean): Promise<void> {
+  if (!on) await db.run(db.k.deleteFrom("main.user_settings").where("login", "=", login).where("key", "=", UI_V2_KEY));
+  else await db.run(db.k.insertInto("main.user_settings").values({ login, key: UI_V2_KEY, value: "1", updated_at: new Date().toISOString() })
+    .onConflict((oc) => oc.columns(["login", "key"]).doUpdateSet(excluded(["value", "updated_at"]))));
+}
 
 export async function setSettings(db: Db, req: Req): Promise<SettingsReply> {
-  if (req.user.role === "viewer") throw new HttpError(403, "viewers have no settings to change");
   const b = req.json;
   if (!b || typeof b !== "object" || Array.isArray(b)) throw new HttpError(400, "the body must be a UserSettings object");
   const body = b as Record<string, unknown>;
-  const known = ["reserve", "repos", "maxCalls", "interactiveSlots", "manualOnly", "tasks", "taskItems", "runnerPrivate"];
+  const known = ["reserve", "repos", "maxCalls", "interactiveSlots", "manualOnly", "tasks", "taskItems", "runnerPrivate", "uiV2"];
   for (const k of Object.keys(body)) if (!known.includes(k)) throw new HttpError(400, `unknown setting ${k}`);
-  if (known.every((k) => body[k] === undefined)) throw new HttpError(400, "send reserve, repos, maxCalls, interactiveSlots, manualOnly, tasks, taskItems, runnerPrivate or several of them");
+  if (known.every((k) => body[k] === undefined)) throw new HttpError(400, "send reserve, repos, maxCalls, interactiveSlots, manualOnly, tasks, taskItems, runnerPrivate, uiV2 or several of them");
+  if (req.user.role === "viewer" && known.some((k) => k !== "uiV2" && body[k] !== undefined)) throw new HttpError(403, "viewers have no settings to change but the new dashboard switch");
+  if (body.uiV2 !== undefined && typeof body.uiV2 !== "boolean") throw new HttpError(400, "uiV2 must be true or false");
   let reserve, repos, tasks, maxCalls: number | null | undefined, slots: number | undefined, manual: boolean | undefined, priv: boolean | undefined, items: TaskItems | undefined;
   try {
     if (body.reserve !== undefined) reserve = parseReserve(body.reserve);
@@ -57,5 +67,6 @@ export async function setSettings(db: Db, req: Req): Promise<SettingsReply> {
   if (tasks) await setUserTasks(db, req.user.login, tasks);
   if (items) await setUserTaskItems(db, req.user.login, items);
   if (priv !== undefined) await setRunnerPrivate(db, req.user.login, priv);
+  if (typeof body.uiV2 === "boolean") await setUiV2(db, req.user.login, body.uiV2);
   return settings(db, req);
 }

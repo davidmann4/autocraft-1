@@ -5,7 +5,7 @@
 // beyond the row's version is needed.
 import { createHash, randomBytes } from "node:crypto";
 import type { TokenBox } from "../dash/server/crypto.ts";
-import type { Provider, Tokens } from "../dash/server/provider.ts";
+import type { Provider, Refused, Tokens } from "../dash/server/provider.ts";
 import type { Db } from "../db/index.ts";
 
 const aad = (reporter: string): string => `reporter_tokens:${reporter}`;
@@ -68,16 +68,17 @@ async function obtain(db: Db, box: TokenBox, provider: Provider, reporter: strin
     await failReporter(db, reporter, row.version, now);
     return { ok: false, signIn: true };
   }
-  let next: Tokens | null;
+  let r: Tokens | Refused;
   try {
-    next = await provider.refresh(t.refresh);
+    r = await provider.refresh(t.refresh);
   } catch {
     return { ok: false, signIn: false };
   }
-  if (!next) {
+  if ("refused" in r) {
     await failReporter(db, reporter, row.version, now);
     return { ok: false, signIn: true };
   }
+  const next = r;
   const swapped = Number((await db.run(db.k.updateTable("reporter_tokens")
     .set((eb) => ({ token_enc: box.seal(JSON.stringify(next), aad(reporter)), version: eb("version", "+", 1), updated_at: new Date(now).toISOString(), status: "ok" }))
     .where("reporter", "=", reporter).where("version", "=", row.version).where("status", "=", "ok"))).changes) > 0;

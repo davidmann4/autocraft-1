@@ -27,9 +27,11 @@ fi
 
 start() {
   local id hostport
+  # The suite runs one test file per CPU, each opening pools of up to 8 connections plus those of the processes it
+  # spawns: about 10 to 15 a file at their peak, so 16 CPUs need more than the default 100 and than 200.
   id=$(docker run -d --rm -e POSTGRES_PASSWORD=test -p 127.0.0.1::5432 \
     --tmpfs "/var/lib/postgresql:rw,size=${TMPFS_SIZE}" "$IMAGE" \
-    -c fsync=off -c synchronous_commit=off -c full_page_writes=off -c max_connections=200)
+    -c fsync=off -c synchronous_commit=off -c full_page_writes=off -c max_connections=300)
   # The image's init runs a server on the Unix socket only, then restarts it on TCP: ready means ready over TCP.
   for _ in $(seq 1 120); do
     if docker exec "$id" pg_isready -q -h 127.0.0.1 -U postgres 2>/dev/null; then

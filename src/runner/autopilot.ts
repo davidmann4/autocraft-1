@@ -184,13 +184,27 @@ export const planCtx = async (db: Db, incremental = false): Promise<PlanCtx> => 
       const scope = await scopeRepos(db);
       const run = await latestRun(db);
       const pass = await planPass(db, { now: Date.now(), run, fullEveryMs: PLAN_FULL_EVERY_MS });
+      wakeAtRefresh(pass.plans, wake);
       return { run, tracked: (await trackedNames(db)).filter((r) => scope.has(r)), plans: pass.plans, pass, wake, notes: {}, scope };
     });
   }
   const scope = await scopeRepos(db);
   const run = await latestRun(db);
-  return { run, tracked: (await trackedNames(db)).filter((r) => scope.has(r)), plans: await loadPlanSet(db, { run }), wake, notes: {}, scope };
+  const plans = await loadPlanSet(db, { run });
+  wakeAtRefresh(plans, wake);
+  return { run, tracked: (await trackedNames(db)).filter((r) => scope.has(r)), plans, wake, notes: {}, scope };
 };
+
+/**
+ * The earliest refreshAt of the pass's facts (a timed hold, backoff, permission-read lifetime or cache lifetime ends): the
+ * Plans can change then with no logged write, and steps outside the planner take their items from the stored Plans.
+ */
+function wakeAtRefresh(plans: Pick<PlanSet, "prs" | "items">, wake: number[]): void {
+  let at = Infinity;
+  for (const { facts } of plans.prs) if (facts.refreshAt !== undefined && facts.refreshAt < at) at = facts.refreshAt;
+  for (const { facts } of plans.items) if (facts.refreshAt !== undefined && facts.refreshAt < at) at = facts.refreshAt;
+  if (at !== Infinity) wake.push(at);
+}
 
 /** The lane's candidates, detected once per planner pass (ctx.detected). */
 const detectOf = (db: Db, ctx: PlanCtx, lane: Pick<Lane, "name" | "detect">): Promise<Candidate[]> => {
@@ -243,7 +257,7 @@ function repoAllows(plans: PlanSet, repo: string, want: Want): boolean {
 }
 
 /** Topics whose changes call for a plan: content the stages read. Job logs, usage, agent runs, sandbox environments and tasks, audit entries the item-trace bookkeeping and the limits topic (its tables are already read through the jobs topic) do not. */
-export const INPUT_TOPICS = TOPICS.filter((t) => !["jobs", "usage", "agents", "envs", "tasks", "workspaces", "access", "github", "plans", "trace", "flow", "limits", "claims", "conversation-includes", "decision-choices", "held-followups", "decision-snooze", "security", "discord", "discord-links", "downloads", "build-features", "pr-builds", "nightly", "remote-helpers", "remote-queue", "rank-inputs"].includes(t));
+export const INPUT_TOPICS = TOPICS.filter((t) => !["jobs", "usage", "agents", "envs", "tasks", "workspaces", "access", "github", "plans", "trace", "flow", "limits", "claims", "conversation-includes", "decision-choices", "held-followups", "decision-snooze", "security", "discord", "discord-links", "downloads", "build-features", "pr-builds", "nightly", "remote-helpers", "remote-queue", "rank-inputs", "workflow-events"].includes(t));
 
 /** User-local mode: the Task Runners that could take calls (takerSignature). Work a pool left for want of a taker waits on it. */
 const takersOf = async (db: Db): Promise<string> => {
@@ -1073,7 +1087,7 @@ export async function stageLimits(db: Db): Promise<StageLimit[]> {
   });
 }
 
-export async function pipelineState(db: Db): Promise<Omit<PipelineState, "outside">> {
+export async function pipelineState(db: Db): Promise<Omit<PipelineState, "outside" | "blockers">> {
   return {
     judgementModel: await judgementModel(db), judgementModels: [...JUDGEMENT_MODELS],
     enabled: await isEnabled(db), draining: await isDraining(db), changedBy: await getSetting(db, KEY_BY), changedAt: await getSetting(db, KEY_AT),
@@ -1431,9 +1445,11 @@ export async function laneItems(db: Db, ctx: PlanCtx, lane: Pick<Lane, "name" | 
   }
   const repos: string[] = [];
   for (const c of await detectOf(db, ctx, lane)) { const r = repoOf(c); if (r && !repos.includes(r)) repos.push(r); }
-  const picked = (i: LaneItem) => !lane.perRepo || repos.includes(i.repo);
-  const first = lane.perRepo ? repos.flatMap((r) => all.filter((i) => i.repo === r)) : all;
-  const rest = all.filter((i) => !first.includes(i));
+  const order = new Map(repos.map((r, i) => [r, i]));
+  const picked = (i: LaneItem) => !lane.perRepo || order.has(i.repo);
+  // A stable sort keeps the planner's order within a repo; items of repos detect did not list follow.
+  const first = lane.perRepo ? all.filter(picked).sort((a, b) => order.get(a.repo)! - order.get(b.repo)!) : all;
+  const rest = lane.perRepo ? all.filter((i) => !picked(i)) : [];
   return [...first, ...rest].map((i) => ({ ...i, next: picked(i) && !i.blocked }));
 }
 

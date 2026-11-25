@@ -3,6 +3,7 @@
 // returned code into the app's keys. The keys are stored sealed in the database
 // (src/github/app-keys.ts) only; no response, log line or audit row carries the
 // private key or client secret.
+import { mentionName } from "../../github/slugs.ts";
 import type { IncomingMessage } from "node:http";
 import type { GithubAppStatus } from "../../../web/src/api/types.ts";
 import { audit } from "../audit.ts";
@@ -126,7 +127,7 @@ export async function githubAppStatus(db: Db, config: Config, deps: AppDeps): Pr
     if (boundAppKeys(config.secrets)?.unreadable()) { status.error = UNREADABLE; status.keysUnreadable = true; }
     return status;
   }
-  status.app = { id: app.id, slug: app.slug, name: null, installUrl: installUrl(app.slug), transferUrl: transferUrl(app.slug, app.owner) };
+  status.app = { id: app.id, slug: app.slug, mention: await mentionName(db), name: null, installUrl: installUrl(app.slug), transferUrl: transferUrl(app.slug, app.owner) };
   try {
     status.app.name = await appName(app, deps);
     for (const i of await installations(app, deps)) {

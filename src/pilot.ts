@@ -1,7 +1,8 @@
 // The scope of the pipeline. A repo takes part only while its pipeline flag (tracked_repos.pipeline) is on; off means sync only.
 // The pilot is an operator setting that narrows the enabled repos further to a list of items ("repo#number").
 // Empty or absent means no pilot. A Fix PR the pipeline opened for a pilot issue, a follow-up issue it filed for a pilot PR, and a Fix PR it opened for such a follow-up issue count as pilot items.
-// A fast-tracked item (src/fasttrack.ts) is in scope whatever its repo's flag and the pilot say.
+// A fast-tracked item (src/fasttrack.ts) is in scope whatever its repo's flag and the pilot say, and so is, in a repo on the
+// maintainer workflow (src/workflow), an item with a live workflow and the PR of an issue's live implement workflow.
 // No Node imports besides the type, so candidate queries can use the SQL fragments.
 import { quietExprFor, quietSqlFor } from "./security/quiet.ts";
 import { audit } from "./dash/audit.ts";
@@ -55,13 +56,19 @@ export async function baseScopeRepos(db: Db): Promise<Set<string>> {
   return items.length ? new Set([...on].filter((r) => new Set(items.map((i) => i.split("#")[0]!)).has(r))) : on;
 }
 
-/** The repos that take part: those of `baseScopeRepos` and those with a fast-tracked open item. */
+/** Live states of item_workflows (src/workflow/store.ts LIVE_STATES), spelled out here so the SQL needs no import of the store. */
+const WF_LIVE = "('running', 'waiting', 'blocked', 'recommending')";
+const WF_LIVE_LIST = ["running", "waiting", "blocked", "recommending"];
+
+/** The repos that take part: those of `baseScopeRepos` and those with a fast-tracked open item or a live workflow. */
 export async function scopeRepos(db: Db): Promise<Set<string>> {
   const out = await baseScopeRepos(db);
   // A repo with a fast-tracked open item takes part for that item alone (see pilotSqlFor).
   for (const r of await db.all(db.k.selectFrom("main.fast_track as f").innerJoin("main.tracked_repos as t", "t.name", "f.repo")
     .innerJoin("main.items as i", (j) => j.onRef("i.repo", "=", "f.repo").onRef("i.number", "=", "f.number").on("i.state", "=", "OPEN"))
     .select("f.repo").distinct())) out.add(r.repo);
+  for (const r of await db.all(db.k.selectFrom("main.item_workflows as w").innerJoin("main.tracked_repos as t", "t.name", "w.repo")
+    .where("t.workflow", "=", "new").where("w.state", "in", WF_LIVE_LIST).select("w.repo").distinct())) out.add(r.repo);
   return out;
 }
 
@@ -93,10 +100,13 @@ export async function setPilot(db: Db, by: string, input: unknown): Promise<stri
 
 const list = (db: Db): string => `(SELECT CASE WHEN ${jsonValid(db, "ps.value")} THEN ps.value ELSE '[]' END FROM main.settings ps WHERE ps.key = '${PILOT_KEY}')`;
 
-/** SQL condition on an item given by its repo and number expressions: it is fast-tracked, or its repo's pipeline flag is on, an outside-author hold (src/outside.ts) does not keep it back and, with a pilot set, it is a pilot item, the Fix PR of a pilot issue, a follow-up issue of a pilot PR or the Fix PR of such an issue. */
+/** SQL condition on an item given by its repo and number expressions: it is fast-tracked, it has a live workflow (or is the PR of an issue's live implement workflow) in a repo on the maintainer workflow, or its repo's pipeline flag is on, an outside-author hold (src/outside.ts) does not keep it back and, with a pilot set, it is a pilot item, the Fix PR of a pilot issue, a follow-up issue of a pilot PR or the Fix PR of such an issue. */
 export const pilotSqlFor = (db: Db, repo: string, number: string): string => {
   const LIST = list(db);
   return `(EXISTS (SELECT 1 FROM main.fast_track pft WHERE pft.repo = ${repo} AND pft.number = ${number})
+    OR EXISTS (SELECT 1 FROM main.item_workflows pw JOIN main.tracked_repos pwt ON pwt.name = pw.repo AND pwt.workflow = 'new'
+      WHERE pw.repo = ${repo} AND pw.state IN ${WF_LIVE} AND (pw.number = ${number}
+        OR (pw.entry = 'implement' AND EXISTS (SELECT 1 FROM main.implementations pwi WHERE pwi.repo = pw.repo AND pwi.number = pw.number AND pwi.pr_number = ${number}))))
     OR (EXISTS (SELECT 1 FROM main.tracked_repos pt WHERE pt.name = ${repo} AND pt.pipeline = 1)
     AND NOT EXISTS (SELECT 1 FROM main.outside_holds oh WHERE oh.repo = ${repo} AND oh.number = ${number})
     AND (COALESCE(${jsonArrayLength(db, LIST)}, 0) = 0
@@ -115,6 +125,21 @@ export const pilotSqlFor = (db: Db, repo: string, number: string): string => {
 /** The same for a row `alias` of items. */
 export const pilotSql = (db: Db, alias: string): string => pilotSqlFor(db, `${alias}.repo`, `${alias}.number`);
 
+/**
+ * Condition: a maintainer started work on the item, in a repo on the maintainer workflow: the item has a live workflow, or it
+ * is the PR of an issue's live implement workflow. Such an item is in scope (pilotExprFor), and steps take it first.
+ */
+export function startedExprFor(eb: kx.AnyEb, repo: kx.Ex, number: kx.Ex): AliasableExpression<SqlBool> {
+  const t = kx.schemaEb(eb), r = kx.exprOf(eb, repo), n = kx.exprOf(eb, number);
+  return eb.exists(t.selectFrom("main.item_workflows as pw").innerJoin("main.tracked_repos as pwt", (j) => j.onRef("pwt.name", "=", "pw.repo").on("pwt.workflow", "=", "new"))
+    .select(eb.lit(1).as("one")).where("pw.repo", "=", r).where("pw.state", "in", WF_LIVE_LIST)
+    .where((w) => w.or([
+      w("pw.number", "=", n),
+      w.and([w("pw.entry", "=", "implement"), w.exists(t.selectFrom("main.implementations as pwi").select(eb.lit(1).as("one"))
+        .where("pwi.repo", "=", w.ref("pw.repo")).where("pwi.number", "=", w.ref("pw.number")).where("pwi.pr_number", "=", n))]),
+    ])));
+}
+
 /** `pilotSqlFor` as an expression; `repo` and `number` are column references or expressions of the item. */
 export function pilotExprFor(db: Db, eb: kx.AnyEb, repo: kx.Ex, number: kx.Ex): AliasableExpression<SqlBool> {
   const t = kx.schemaEb(eb), r = kx.exprOf(eb, repo), n = kx.exprOf(eb, number);
@@ -125,6 +150,7 @@ export function pilotExprFor(db: Db, eb: kx.AnyEb, repo: kx.Ex, number: kx.Ex): 
   const prOf = (url: string) => kx.like(db, url, eb(eb.val("%/pull/"), "||", n));
   return eb.or([
     eb.exists(t.selectFrom("main.fast_track as pft").select(eb.lit(1).as("one")).where("pft.repo", "=", r).where("pft.number", "=", n)),
+    startedExprFor(eb, repo, number),
     eb.and([
       eb.exists(t.selectFrom("main.tracked_repos as pt").select(eb.lit(1).as("one")).where("pt.name", "=", r).where("pt.pipeline", "=", 1)),
       eb.not(eb.exists(t.selectFrom("main.outside_holds as oh").select(eb.lit(1).as("one")).where("oh.repo", "=", r).where("oh.number", "=", n))),
@@ -151,4 +177,13 @@ export const pilotExpr = (db: Db, eb: kx.AnyEb, alias: string): AliasableExpress
 /** True when the item is in scope. */
 export async function inPilot(db: Db, repo: string, number: number): Promise<boolean> {
   return !!await db.get(db.k.selectNoFrom((eb) => eb.lit(1).as("one")).where((eb) => pilotExprFor(db, eb, eb.val(repo), eb.cast<number>(eb.val(number), "bigint"))));
+}
+
+/** The items of `refs` a maintainer started work on (startedExprFor), as "repo#number": one query. */
+export async function startedRefs(db: Db, refs: readonly { repo: string; number: number }[]): Promise<Set<string>> {
+  if (!refs.length) return new Set();
+  const rows = await db.all(db.k.selectFrom(kx.refPairs(db, refs.map((x) => [x.repo, x.number] as const), "j"))
+    .select((eb) => eb(eb(eb.ref("j.repo"), "||", eb.val("#")), "||", kx.exprOf(eb, "j.number")).as("ref"))
+    .where((eb) => startedExprFor(eb, "j.repo", "j.number")));
+  return new Set(rows.map((r) => r.ref));
 }

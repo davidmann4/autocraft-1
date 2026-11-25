@@ -118,9 +118,9 @@ const refused = (why: string): HttpError => new HttpError(409, why);
  * reason when refused. `at` orders the commands of a pull request: a command older than an `off` or than the command that set
  * the row sets nothing.
  */
-export async function requestRepin(db: Db, o: { login: string; githubId: number; role: string; canWrite: boolean; repo: string; number: number; pr: boolean; ref: PrRef | null; /** Reads the `via` branch when the command is accepted; without it, or when the read fails, the branch is not checked. */ querier?: Querier; /** `via <branch>`, validated by the parser (parseBranch). */ branch?: string | null; /** When the command was given (the comment's time). */ at?: Date }): Promise<string> {
+export async function requestRepin(db: Db, o: { login: string; githubId: number; role: string; canWrite: boolean; /** The caller applied its own rule of who may act (the maintainer workflow's, src/settlers.ts actRefusal). */ authorized?: boolean; repo: string; number: number; pr: boolean; ref: PrRef | null; /** Reads the `via` branch when the command is accepted; without it, or when the read fails, the branch is not checked. */ querier?: Querier; /** `via <branch>`, validated by the parser (parseBranch). */ branch?: string | null; /** When the command was given (the comment's time). */ at?: Date }): Promise<string> {
   if (!o.pr) throw refused("autorepin is for pull requests");
-  const refusal = await settleRefusal(db, { login: o.login, role: o.role, canWrite: async (r) => r === o.repo && o.canWrite }, [o.repo], `sets autorepin on ${o.repo}`);
+  const refusal = o.authorized ? null : await settleRefusal(db, { login: o.login, role: o.role, canWrite: async (r) => r === o.repo && o.canWrite }, [o.repo], `sets autorepin on ${o.repo}`);
   if (refusal) throw refused(refusal);
   const at = (o.at ?? new Date()).toISOString();
   const me = await itemOf(db, o.repo, o.number);

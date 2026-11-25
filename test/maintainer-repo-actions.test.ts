@@ -41,8 +41,8 @@ test("a maintainer with write runs their repo's approvals, findings and jobs; ot
   for (const action of ["advisory", "publish"]) await assert.rejects(dismiss(as("maint", "maintainer", { action }, { repo: "alpha", n: "1" })), { status: 403 });
 
   // Scans spend money: a maintainer with write on the repo starts or continues one only with a cap; others are refused.
-  await db.run(db.k.insertInto("security_scans").values({ id: 1, repo: "alpha", state: "capped", cap_usd: 10, cost_usd: 5, started_by: "op", started_at: at }));
-  const cont = (who: Req["user"]["role"], cap: number | null) => continueScan(db, as("maint", who, { cap }, { id: "1" }));
+  const scan = (await db.get(db.k.insertInto("security_scans").values({ repo: "alpha", state: "capped", cap_usd: 10, cost_usd: 5, started_by: "op", started_at: at }).returning("id")))!.id;
+  const cont = (who: Req["user"]["role"], cap: number | null) => continueScan(db, as("maint", who, { cap }, { id: String(scan) }));
   const start = (login: string, role: "viewer" | "maintainer" | "operator", repo: string, capUsd?: number | null) => startScan(db, as(login, role, capUsd === undefined ? {} : { capUsd }, { repo }));
   const refused = (e: { status: number }) => e.status === 403 || e.status === 404;
   await assert.rejects(cont("maintainer", null), { status: 403 });
@@ -52,7 +52,7 @@ test("a maintainer with write runs their repo's approvals, findings and jobs; ot
   await assert.rejects(start("view", "viewer", "alpha", 5), refused);
   await assert.rejects(cont("viewer", 8), refused);
   assert.equal((await cont("maintainer", 8)).capUsd, 8);
-  await db.run(db.k.updateTable("security_scans").set({ state: "stopped" }).where("id", "=", 1));
+  await db.run(db.k.updateTable("security_scans").set({ state: "stopped" }).where("id", "=", scan));
   const started = await start("maint", "maintainer", "alpha", 3);
   assert.equal(started.capUsd, 3);
   await db.run(db.k.updateTable("security_scans").set({ state: "stopped" }).where("id", "=", started.id));

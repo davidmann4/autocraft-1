@@ -471,7 +471,8 @@ export async function createApp(opts: AppOptions & { routes: Route[] }) {
       const returnTo = safeReturnTo(url.searchParams.get("return_to"));
       const s = await loadSession(db, cookies.get(SESSION_COOKIE));
       if (!s) return { r: { redirect: `/auth/signin?${new URLSearchParams({ return_to: `/auth/authorize-app?${new URLSearchParams({ return_to: returnTo })}` })}` } };
-      if (s.role !== "operator") return { r: errorPage(nonce, 403, "Not authorised", "Only operators authorize AutoCraft to act as them.") };
+      // Merges and closes an operator or a maintainer approves run as them, so either authorizes AutoCraft to act as them.
+      if (s.role === "viewer") return { r: errorPage(nonce, 403, "Not authorised", "Only operators and maintainers authorize AutoCraft to act as them.") };
       const appProvider = appProviderNow();
       if (!appProvider) return { r: errorPage(nonce, 409, "No GitHub App", "No GitHub App is registered, so there is nothing to authorize.") };
       return await startOAuth(`${AUTHORIZE_PREFIX}${returnTo}`, false, undefined, appProvider);
@@ -516,7 +517,7 @@ export async function createApp(opts: AppOptions & { routes: Route[] }) {
       if (row.return_to?.startsWith(AUTHORIZE_PREFIX)) {
         // "Act as you": only the user token is stored. The session and the sign-in are untouched.
         const s = await loadSession(db, cookies.get(SESSION_COOKIE));
-        if (!s || s.role !== "operator" || s.login.toLowerCase() !== who.login.toLowerCase() || await checkGithubId(db, s.login, who.id) === "mismatch") {
+        if (!s || s.role === "viewer" || s.login.toLowerCase() !== who.login.toLowerCase() || await checkGithubId(db, s.login, who.id) === "mismatch") {
           // The token belongs to an account that may not act here: end it before answering.
           void (appProviderNow() ?? provider).revoke(tokens.access).catch(() => {});
           return { r: errorPage(nonce, 403, "Not authorised", "Sign in to the dashboard as the GitHub account you authorize, then try again."), cookies: clear };

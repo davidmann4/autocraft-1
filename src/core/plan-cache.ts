@@ -2,11 +2,11 @@
 // dashboard to read. The planner is its only writer. A pass writes the rows that changed, and deletes the rows of items that
 // left the Plans, in one transaction.
 import { holdWait } from "../outside.ts";
-import { cifixBucket, fixupOf, queueEntry } from "./decide.ts";
+import { cifixBucket, fixupOf, mergeEntry, queueEntry } from "./decide.ts";
 import { nextStep } from "./decide-item.ts";
 import { mergeDecisionId } from "./rules.ts";
 import { isWork } from "./assignment.ts";
-import type { ItemFacts, Plan, PrFacts, WaitKind } from "./plan.ts";
+import type { ItemFacts, MergePath, Plan, PrFacts, WaitKind } from "./plan.ts";
 import { isQueueState } from "./plan.ts";
 import { statusOf, type ItemStatus } from "./item-status.ts";
 import { loadPlanSet, type PlanSet, type PlanSetOptions } from "./plan-set.ts";
@@ -15,8 +15,8 @@ import { excluded, tupleIn } from "../db/kx.ts";
 
 /** The merge-queue fields of a PR whose Plan is in a queue state: what the Queue page and the flow counts show besides the Plan's own state, reasons and note. */
 export type QueueView = {
-  author: string | null; tier: string; head: string; size: string; label: string | null; verdict: "take" | "take-fix"; reason: string; fixes: number;
-  ci: string; mergeable: string; path: "rule" | "operator" | null; eligible: boolean; decisionId: string | null; answer: string | null; refusedReason: string | null;
+  author: string | null; tier: string; head: string; size: string; label: string | null; /** Null for a merge-entry PR, which has no review. */ verdict: "take" | "take-fix" | null; reason: string; fixes: number;
+  ci: string; mergeable: string; path: MergePath; eligible: boolean; decisionId: string | null; answer: string | null; refusedReason: string | null;
   reviewedAt: string; held: boolean; blockedLive: boolean; noCi: boolean; runsWaiting: number; runsBlocked: "off" | "failed" | "unsupported" | null;
   verify: { state: string; kind: string | null; summary: string | null; note: string | null } | null;
   conflictNote?: string; mainFix?: true;
@@ -60,13 +60,15 @@ function fixupBucketOf(f: PrFacts, plan: Plan): FixupBucket | undefined {
 }
 
 function queueViewOf(f: PrFacts, plan: Plan): QueueView {
-  const r = f.review!;
+  // A merge-entry PR is queued at its own head without a review; it joined the queue when its workflow started.
+  const r = mergeEntry(f) ? null : f.review!;
+  const head = r?.head ?? f.head ?? "";
   const merged = plan.state === "merged";
   const x = queueEntry(f, merged, !merged);
   return {
-    author: f.author, tier: f.tier, head: r.head, size: f.size, label: f.label, verdict: r.verdict as "take" | "take-fix", reason: r.reason, fixes: r.fixes, ci: f.ci, mergeable: f.mergeable,
-    path: plan.path, eligible: plan.eligible, decisionId: f.decision.asked ? mergeDecisionId(f.repo, f.number, r.head) : null, answer: x.answer, refusedReason: x.refusedReason,
-    reviewedAt: r.at, held: f.mergeHeld, blockedLive: plan.state === "changes-requested" && !!f.changesRequested?.live, noCi: x.noCi,
+    author: f.author, tier: f.tier, head, size: f.size, label: f.label, verdict: r ? r.verdict as "take" | "take-fix" : null, reason: r?.reason ?? "", fixes: r?.fixes ?? 0, ci: f.ci, mergeable: f.mergeable,
+    path: plan.path, eligible: plan.eligible, decisionId: f.decision.asked ? mergeDecisionId(f.repo, f.number, head) : null, answer: x.answer, refusedReason: x.refusedReason,
+    reviewedAt: r?.at ?? f.workflow?.startedAt ?? "", held: f.mergeHeld, blockedLive: plan.state === "changes-requested" && !!f.changesRequested?.live, noCi: x.noCi,
     runsWaiting: f.runs?.waiting ?? 0, runsBlocked: f.runs?.blocked ?? null, verify: f.verification,
     ...(plan.conflictNote !== null ? { conflictNote: plan.conflictNote } : {}), ...(f.mainFix ? { mainFix: true as const } : {}),
   };

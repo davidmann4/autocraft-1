@@ -4,6 +4,7 @@
 // stops jobs whose cancel was requested, runs the autopilot (queues jobs while the
 // pipeline switch is on) and puts jobs that a stop or an earlier runner left
 // unfinished back in the queue to resume (src/runner/resuming.ts).
+import { advanceWorkflows } from "../workflow/advance.ts";
 import { copyLogs, JobLogCopy, pruneJobLogs } from "./job-log.ts";
 import { spawn, type ChildProcess } from "node:child_process";
 import { appendFileSync, statSync, closeSync, mkdirSync, openSync, readFileSync, utimesSync } from "node:fs";
@@ -16,6 +17,7 @@ import { applyProposals, AUTOPILOT_USER, isDraining, isEnabled, planDue, type De
 import { recordUsageSamples } from "../agents/accounts.ts";
 import { AccountWatcher } from "../agents/manage.ts";
 import { failRunning, pruneRuns } from "../agents/runs.ts";
+import { pruneJevUnsure } from "../agents/step.ts";
 import { pruneTasks, reapLost } from "../build/tasks.ts";
 import { pruneBench } from "../nightly/index.ts";
 import { prunePlanHistory } from "../core/plan-cache.ts";
@@ -33,7 +35,7 @@ import { queueRoomPass } from "../agents/call.ts";
 import { TRY_STEP } from "../build/workspace-session.ts";
 import { pruneWorkspaceImages } from "../build/workspace-relay.ts";
 import { noTakerFor } from "../remote/takers.ts";
-import { stepDeadlineMin, stepNoProgressMin } from "./deadlines.ts";
+import { JOB_DEADLINE_ENV, stepDeadlineMin, stepNoProgressMin } from "./deadlines.ts";
 import { envVar } from "../env.ts";
 import { anyRepinDue } from "../repin/due.ts";
 import { jobRemoteQueue, REMOTE_WAIT_CAP_MS, withdrawJobCalls } from "../remote/calls.ts";
@@ -343,6 +345,8 @@ export class Runner {
     if (m && m.sig === sig && t < m.wakeAt) return;
     this.preapprovalMark = null;
     const next = { sig, wakeAt: Infinity };
+    // The maintainer workflow's blockers and recommendations come first: a blocker stops its merge leg before the leg moves on.
+    try { await advanceWorkflows(this.db, this.o.log); } catch (e) { this.o.log(`workflows: ${(e as Error).message}`); }
     await advancePreapprovals(this.db, this.o.log, {}, (at) => { if (at < next.wakeAt) next.wakeAt = at; });
     this.preapprovalMark = next;
   }
@@ -416,6 +420,11 @@ export class Runner {
         await pruneRuns(this.db, t);
       } catch (e) {
         this.o.log(`prune agent runs: ${(e as Error).message}`);
+      }
+      try {
+        await pruneJevUnsure(this.db, t);
+      } catch (e) {
+        this.o.log(`prune kept Jev answers: ${(e as Error).message}`);
       }
       try {
         await pruneCommands(this.db, t);
@@ -561,7 +570,7 @@ export class Runner {
       child = spawn(process.execPath, [CLI, "runner", "exec", String(id)], {
         detached: true,
         stdio: ["ignore", fd, fd],
-        env: { ...dbEnv(this.o.dbTarget), AUTOCRAFT_JOB_GROUPS: groups },
+        env: { ...dbEnv(this.o.dbTarget), AUTOCRAFT_JOB_GROUPS: groups, [JOB_DEADLINE_ENV]: String(deadlineMin) },
       });
     } finally {
       closeSync(fd);

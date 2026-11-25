@@ -4,6 +4,9 @@ import { afterEach, test } from "node:test";
 import { mergeDecisionId } from "../src/core/rules.ts";
 import { getDecision } from "../src/decisions.ts";
 import { questionDecisionId } from "../src/implement/questions.ts";
+import { pushApprovalOf, setPushApproval } from "../src/fixup/approval.ts";
+import { mergeApprovalOf, setMergeApproval } from "../src/merge/approval.ts";
+import { setStatusApproval, statusApprovalOf } from "../src/prstatus/approval.ts";
 import { FlipRefused, flipRepo } from "../src/workflow/flip.ts";
 import { insertWorkflow, liveWorkflows, repoWorkflow } from "../src/workflow/store.ts";
 import { OPERATOR, T0, world, type World } from "./world-db.ts";
@@ -49,7 +52,7 @@ const counts = async (w: World) => {
 test("a flip starts over: no workflow rows, open Merge? and scope questions withdrawn, the rest kept", async () => {
   const w = await legacyRepo();
   const db = w.db;
-  await assert.rejects(flipRepo(db, "app", { to: "new", by: OPERATOR, apply: true }), FlipRefused, "refused until the planner works workflows");
+  await assert.rejects(flipRepo(db, "app", { to: "new", by: OPERATOR, apply: true, engineReady: false }), FlipRefused, "refused until the planner works workflows");
   const was = await legacyRows(w);
   const dry = await flipRepo(db, "app", { to: "new", by: OPERATOR, apply: false, engineReady: true });
   assert.equal((await counts(w)).openDecisions, 4, "a dry run writes nothing");
@@ -65,13 +68,34 @@ test("a flip starts over: no workflow rows, open Merge? and scope questions with
   assert.equal((await getDecision(db, questionDecisionId("app", 9, 1, 1)))?.answer, null);
 });
 
-test("a second flip changes nothing", async () => {
+test("a flip turns the PR status comment, merging and pushing on; a second flip changes nothing unless a switch was turned off", async () => {
   const w = await legacyRepo();
-  await flipRepo(w.db, "app", { to: "new", by: OPERATOR, apply: true, engineReady: true });
+  const db = w.db;
+  const switches = async () => [await statusApprovalOf(db, "app"), await mergeApprovalOf(db, "app"), await pushApprovalOf(db, "app")].map((a) => a?.by ?? null);
+  await setMergeApproval(db, OPERATOR, "app", false);
+  await setPushApproval(db, OPERATOR, "app", false);
+  await db.run(db.k.insertInto("main.tracked_repos").values({ name: "other", added_by: OPERATOR, added_at: T0 }));
+  assert.deepEqual(await switches(), [null, null, null]);
+  const dry = await flipRepo(db, "app", { to: "new", by: OPERATOR, apply: false, engineReady: true });
+  assert.deepEqual(dry.switchesOn.sort(), ["merge", "push", "status"], "a dry run reports the switches");
+  assert.deepEqual(await switches(), [null, null, null], "and leaves them");
+  await flipRepo(db, "app", { to: "new", by: OPERATOR, apply: true, engineReady: true });
+  assert.deepEqual(await switches(), [OPERATOR, OPERATOR, OPERATOR]);
+  assert.equal(await mergeApprovalOf(db, "other"), null, "a repo that stays on legacy keeps its switches");
+  assert.equal(await pushApprovalOf(db, "other"), null);
   const before = await counts(w);
-  const again = await flipRepo(w.db, "app", { to: "new", by: OPERATOR, apply: true, engineReady: true });
+  const again = await flipRepo(db, "app", { to: "new", by: OPERATOR, apply: true, engineReady: true });
   assert.equal(again.applied, false);
   assert.deepEqual(await counts(w), before);
+  // A repo whose switches were turned off since gets them back on a re-flip, as the person who flips it.
+  await setStatusApproval(db, OPERATOR, "app", false);
+  await setMergeApproval(db, OPERATOR, "app", false);
+  const fixed = await flipRepo(db, "app", { to: "new", by: "maint", apply: true, engineReady: true });
+  assert.ok(fixed.applied);
+  assert.deepEqual(await switches(), ["maint", "maint", OPERATOR]);
+  assert.equal(await repoWorkflow(db, "app"), "new");
+  await flipRepo(db, "app", { to: "legacy", by: OPERATOR, apply: true });
+  assert.ok((await switches()).every((by) => by !== null), "a rollback leaves the switches as they are");
 });
 
 test("a flip back to legacy stops the workflows and leaves the legacy rows working", async () => {

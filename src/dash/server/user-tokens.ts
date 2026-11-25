@@ -2,7 +2,7 @@
 // sign-in while the GitHub identity is the app. It holds the sealed JSON of
 // the whole token set, like sessions.token_enc, but is keyed by login so the
 // act stage can act for a login without a live session. The vault
-// (src/github/vault.ts) refreshes it.
+// (src/github/vault.ts) refreshes it through refreshShared (token-refresh.ts).
 import type { TokenBox } from "./crypto.ts";
 import type { Tokens } from "./provider.ts";
 import type { Db } from "../../db/index.ts";
@@ -14,7 +14,7 @@ export async function saveUserTokens(db: Db, box: TokenBox, login: string, githu
     .values({ login, github_id: githubId, token_enc: box.seal(JSON.stringify(tokens), aad(login)), version: 1, updated_at: new Date().toISOString(), status: "ok" })
     .onConflict((oc) => oc.column("login").doUpdateSet((eb) => ({
       github_id: eb.ref("excluded.github_id"), token_enc: eb.ref("excluded.token_enc"), version: eb("user_tokens.version", "+", 1),
-      updated_at: eb.ref("excluded.updated_at"), status: "ok",
+      updated_at: eb.ref("excluded.updated_at"), status: "ok", refresh_error: null,
     }))));
 }
 
@@ -41,19 +41,19 @@ export async function readUserTokens(db: Db, box: TokenBox, login: string): Prom
 }
 
 /**
- * Stores a refreshed pair if the row still has `version` (compare-and-swap: a refresh in another process or a new
- * sign-in may have written first). Returns false when it lost.
+ * Stores a token set if the row still has `version` (compare-and-swap: a new sign-in may have written first), whatever
+ * its status: a row healed from a session's newer token set is usable again. Returns false when it lost.
  */
 export async function swapUserTokens(db: Db, box: TokenBox, login: string, version: number, tokens: Tokens): Promise<boolean> {
   return Number((await db.run(db.k.updateTable("user_tokens")
-    .set((eb) => ({ token_enc: box.seal(JSON.stringify(tokens), aad(login)), version: eb("version", "+", 1), updated_at: new Date().toISOString(), status: "ok" }))
-    .where("login", "=", login).where("version", "=", version).where("status", "=", "ok"))).changes) > 0;
+    .set((eb) => ({ token_enc: box.seal(JSON.stringify(tokens), aad(login)), version: eb("version", "+", 1), updated_at: new Date().toISOString(), status: "ok", refresh_error: null }))
+    .where("login", "=", login).where("version", "=", version))).changes) > 0;
 }
 
-/** Marks the row as needing a new sign-in, if it still has `version`. Returns false when it lost. */
-export async function failUserTokens(db: Db, login: string, version: number): Promise<boolean> {
+/** Marks the row as needing a new sign-in, with the reason (never a token value), if it still has `version`. Returns false when it lost. */
+export async function failUserTokens(db: Db, login: string, version: number, reason: string): Promise<boolean> {
   return Number((await db.run(db.k.updateTable("user_tokens")
-    .set((eb) => ({ status: "refresh-failed", version: eb("version", "+", 1), updated_at: new Date().toISOString() }))
+    .set((eb) => ({ status: "refresh-failed", refresh_error: reason, version: eb("version", "+", 1), updated_at: new Date().toISOString() }))
     .where("login", "=", login).where("version", "=", version).where("status", "=", "ok"))).changes) > 0;
 }
 
@@ -81,22 +81,3 @@ export async function dropSessionTokens(db: Db, login: string, idHash: string, t
 }
 
 export const revocationAad = aad;
-
-/**
- * A refresh consumed `oldRefresh` (GitHub refresh tokens are single use), so every stored copy of that token set must
- * take the new pair: the login's user_tokens row and each of its sessions that holds the same refresh token. Copies
- * with another refresh token come from another sign-in and are left alone. The sessions keep running.
- */
-export async function shareRefresh(db: Db, box: TokenBox, login: string, oldRefresh: string, next: Tokens): Promise<void> {
-  const u = await readUserTokens(db, box, login);
-  if (u?.status === "ok" && u.tokens?.refresh === oldRefresh) await swapUserTokens(db, box, login, u.version, next);
-  const sessions = await db.all(db.k.selectFrom("sessions").select(["id_hash", "token_enc"]).$narrowType<{ token_enc: string }>().where("login", "=", login).where("token_enc", "is not", null));
-  for (const s of sessions) {
-    const plain = box.open(s.token_enc, s.id_hash);
-    let t: Tokens | null = null;
-    try {
-      t = plain ? (JSON.parse(plain) as Tokens) : null;
-    } catch { /* unreadable: leave it */ }
-    if (t?.refresh === oldRefresh) await db.run(db.k.updateTable("sessions").set({ token_enc: box.seal(JSON.stringify(next), s.id_hash) }).where("id_hash", "=", s.id_hash).where("token_enc", "=", s.token_enc));
-  }
-}

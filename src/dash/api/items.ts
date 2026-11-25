@@ -48,7 +48,7 @@ const hitsScored = (db: Db, fts: Search) => db.k.selectFrom(
     .as("m"))
   .select(["m.rid", (eb) => eb.fn.min<number>("m.score").as("score")]).groupBy("m.rid");
 
-const textCond = (db: Db, fts: Search): Cond => (eb) => eb(kx.rowid("items", "i"), "in", hitRids(db, fts));
+export const textCond = (db: Db, fts: Search): Cond => (eb) => eb(kx.rowid("items", "i"), "in", hitRids(db, fts));
 
 const STATUSES: SettledStatus[] = ["settled", "waiting", "disagree", "unclassified"];
 const STATES: Record<string, string> = { open: "OPEN", closed: "CLOSED", merged: "MERGED" };

@@ -3,7 +3,7 @@
 // everything, and every write to a shadowed table, names the table with `main.`.
 //
 // - SQLite: TEMP views on the handle's connection (`sqliteScopeSql`).
-// - Postgres: permanent views in schema `scoped`, kept current by migratePg (`pgScopeSql`). A scoped handle connects with
+// - Postgres: permanent views in schema `scoped`, kept current by migratePg (`pgScopeViews`). A scoped handle connects with
 //   `search_path=scoped,<app schema>`, so unqualified names find the views first, and its statements turn `main.x` into
 //   `<app schema>.x` (src/db/params.ts rewriteForPostgres).
 import { jsonEach, jsonText } from "./portable.ts";
@@ -46,14 +46,13 @@ export function plainSchema(name: string): string {
 }
 
 /**
- * The Postgres views over the tables of `schema` (the app schema), recreated from scratch so they pick up added columns.
- * The tables carry rowid as a column there, so `*` includes it.
+ * The Postgres views over the tables of `schema` (the app schema), each replaced in place so it picks up added columns
+ * (`*` is expanded when a view is created). The tables carry rowid as a column there, so `*` includes it.
  */
-export function pgScopeSql(schema: string): string {
+export function pgScopeViews(schema: string): { view: string; sql: string }[] {
   const app = plainSchema(schema);
-  return [
-    `DROP SCHEMA IF EXISTS ${SCOPED_SCHEMA} CASCADE;`,
-    `CREATE SCHEMA ${SCOPED_SCHEMA};`,
-    ...views("postgres").map(([t, where]) => `CREATE VIEW ${SCOPED_SCHEMA}.${t} AS SELECT * FROM ${app}.${t} WHERE ${where.replaceAll("main.", `${app}.`)};`),
-  ].join("\n");
+  return views("postgres").map(([t, where]) => ({
+    view: `${SCOPED_SCHEMA}.${t}`,
+    sql: `CREATE OR REPLACE VIEW ${SCOPED_SCHEMA}.${t} AS SELECT * FROM ${app}.${t} WHERE ${where.replaceAll("main.", `${app}.`)}`,
+  }));
 }

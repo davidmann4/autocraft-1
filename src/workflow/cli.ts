@@ -26,7 +26,7 @@ async function status(repo: string | undefined): Promise<void> {
 
 export const commands = {
   workflow: {
-    summary: "workflow flip <repo> [--dry-run] [--legacy] | status [repo]: move a repo to the maintainer workflow (its open Merge?, Hold and scope questions withdrawn) or back, or list it",
+    summary: "workflow flip <repo> [--dry-run] [--legacy] | status [repo]: move a repo to the maintainer workflow (its open Merge?, Hold and scope questions withdrawn, its PR status comment, merging and pushing approved) or back, or list it",
     async run(args: string[]): Promise<void> {
       const [sub, ...rest] = args;
       try {

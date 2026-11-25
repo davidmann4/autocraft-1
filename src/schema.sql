@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS items (
   embed_hash TEXT,                    -- hash of the embedded text, set at sync (src/itemhash.ts)
   class_hash TEXT,                    -- the classifier's input hash under class_scheme
   class_scheme TEXT,
+  jev_failed_hash TEXT,               -- class_hash at which a classify.jev request gave no valid verdict while Jev was up
   PRIMARY KEY (repo, number)
 );
 CREATE INDEX IF NOT EXISTS items_state ON items(repo, kind, state);
@@ -596,7 +597,7 @@ CREATE TABLE IF NOT EXISTS stage_limits (
   updated_by TEXT, updated_at TEXT
 );
 INSERT OR IGNORE INTO stage_limits (step, per_day) VALUES
-  ('classify-new', 2000), ('embed', NULL), ('decide', 100), ('checks', NULL),
+  ('embed', NULL), ('decide', 100), ('checks', NULL),
   ('labels-apply', NULL), ('merge', 10), ('act', 20), ('fixup', 20), ('verify', 30), ('opus-review', 40);
 
 -- One row per `autocraft-server sync` run, kept for two days, for the Pipeline page.
@@ -630,7 +631,7 @@ CREATE TABLE IF NOT EXISTS github_commands (
   repo TEXT NOT NULL,
   number INTEGER NOT NULL,
   pr INTEGER NOT NULL,                -- 1: the comment is on a pull request
-  command TEXT NOT NULL,              -- merge-queue | autorepin
+  command TEXT NOT NULL,              -- merge-queue | autorepin | answer (maintainer workflow repos)
   weight INTEGER,                     -- the fast-track weight given, or null for the default
   login TEXT NOT NULL,                -- the commenter, as GitHub sent it
   github_id INTEGER NOT NULL,         -- the commenter's numeric GitHub id
@@ -732,6 +733,7 @@ CREATE TABLE IF NOT EXISTS opus_reviews (
   risks TEXT,                         -- JSON [string]
   -- public_review (added column): JSON {summary, points}, the text posted on the PR; NULL when the reply had none
   -- base_ref (added column): the base branch the reviewed diff was computed against; NULL for reviews stored before it was recorded
+  -- workflow (added column): for an item on the maintainer workflow, JSON {outside_purpose: {lines, note} | null, recommendation: string | null}
   PRIMARY KEY (repo, number, head_oid)
 );
 
@@ -1369,7 +1371,17 @@ CREATE TABLE IF NOT EXISTS item_priority (
   PRIMARY KEY (repo, number)
 );
 CREATE INDEX IF NOT EXISTS item_priority_score ON item_priority(score);
-INSERT OR IGNORE INTO stage_limits (step, per_day) VALUES ('prioritize', 3000);
+-- An unsure Jev answer of a Jev step with a Haiku fallback whose Haiku tier did not answer (src/agents/step.ts runTiered):
+-- the next pass reuses it while the Jev request (input_hash: sha256 of its body) is unchanged, instead of asking Jev again.
+-- answer: the step's parsed value as JSON. Not a result: the step stores nothing until the fallback answers.
+CREATE TABLE IF NOT EXISTS jev_unsure (
+  prompt_id TEXT NOT NULL,
+  ref TEXT NOT NULL,
+  input_hash TEXT NOT NULL,
+  answer TEXT NOT NULL,
+  at TEXT NOT NULL,
+  PRIMARY KEY (prompt_id, ref)
+) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS verifications_finished ON verifications(finished_at);
 
 -- Duplicate candidates (Duplicates stage). a < b. A pair is checked once per pair of text hashes
@@ -2268,14 +2280,15 @@ CREATE TABLE IF NOT EXISTS item_workflows (
   started_by TEXT NOT NULL,
   started_at TEXT NOT NULL,
   started_via TEXT NOT NULL,          -- github | discord | agent | dashboard | cli
-  base_head TEXT,                     -- the PR head when it started: author commits after it are a blocker
+  base_head TEXT,                     -- the PR head the workflow accepted: author commits after it are a blocker; for an implement issue, the implementation PR head its files beyond the plan were shown at
   approved_by TEXT, approved_at TEXT, approved_via TEXT,
   stopped_by TEXT, stopped_at TEXT,
   blocker TEXT, blocker_params TEXT,
   rec TEXT, rec_at TEXT, rec_head TEXT,
   plan TEXT NOT NULL DEFAULT '[]',
   legacy_preapproval_id INTEGER,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  step TEXT                           -- the step it is at (src/workflow/status.ts StepName), written by the advance pass
 );
 CREATE UNIQUE INDEX IF NOT EXISTS item_workflows_live ON item_workflows(repo, number) WHERE state IN ('running', 'waiting', 'blocked', 'recommending');
 CREATE INDEX IF NOT EXISTS item_workflows_item ON item_workflows(repo, number, id);
@@ -2294,6 +2307,7 @@ CREATE TABLE IF NOT EXISTS workflow_events (
   at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS workflow_events_item ON workflow_events(repo, number, id);
+CREATE INDEX IF NOT EXISTS workflow_events_login ON workflow_events(login, via, at);
 -- The last "link your account" reply to a GitHub commenter with no AutoCraft login; one a week per login. Bookkeeping: no live topic.
 CREATE TABLE IF NOT EXISTS github_link_nudges (
   login TEXT PRIMARY KEY COLLATE NOCASE,

@@ -94,13 +94,40 @@ function MainCiLine({ name }: { name: string }) {
   );
 }
 
+/** The tracked repo's GitHub writes, build features, optional checks and label plan. */
+export function RepoSettings({ r, write, staff }: { r: TrackedRepo; write: Write; staff: boolean }) {
+  const l = r.labels;
+  return (
+    <>
+      {staff && <SecuritySection repo={r.name} />}
+      <Block className="mt-4" flush title="GitHub writes" aside={<AllWrites r={r} write={write} />}>
+        <ul>
+          {WRITES.map((w) => (
+            <WriteRow key={w.field} r={r} w={w} write={write} />
+          ))}
+        </ul>
+      </Block>
+      <BuildFeatures r={r} write={write} />
+      <OptionalChecks r={r} write={write} />
+      {l && (
+        <Block className="mt-4" title="Labels plan">
+          <div className="num flex flex-wrap gap-x-6 gap-y-1 text-sm">
+            <span>{num(l.toAdd)} to add</span>
+            <span>{num(l.skipped)} skipped</span>
+            <span>{num(l.conflicts)} conflicts</span>
+          </div>
+        </Block>
+      )}
+    </>
+  );
+}
+
 export function RepoDetailView({ params }: ViewProps) {
   useNow();
   const name = params.name ?? "";
   const { data, error } = useQuery("repo-admin", (a) => a.repoAdmin.list());
   const write = useRepoWrite();
   const r = data?.find((x) => x.name === name);
-  const l = r?.labels;
   const staff = useUser().role !== "viewer";
 
   return (
@@ -133,29 +160,7 @@ export function RepoDetailView({ params }: ViewProps) {
             <Stat label="Rows in mirror" value={num(r.mirrored)} />
             <Stat label="Last synced" value={synced(r)} title={r.syncedAt ?? undefined} />
           </div>
-          {r.tracked && (
-            <>
-              {staff && <SecuritySection repo={r.name} />}
-              <Block className="mt-4" flush title="GitHub writes" aside={<AllWrites r={r} write={write} />}>
-                <ul>
-                  {WRITES.map((w) => (
-                    <WriteRow key={w.field} r={r} w={w} write={write} />
-                  ))}
-                </ul>
-              </Block>
-              <BuildFeatures r={r} write={write} />
-              <OptionalChecks r={r} write={write} />
-              {l && (
-                <Block className="mt-4" title="Labels plan">
-                  <div className="num flex flex-wrap gap-x-6 gap-y-1 text-sm">
-                    <span>{num(l.toAdd)} to add</span>
-                    <span>{num(l.skipped)} skipped</span>
-                    <span>{num(l.conflicts)} conflicts</span>
-                  </div>
-                </Block>
-              )}
-            </>
-          )}
+          {r.tracked && <RepoSettings r={r} write={write} staff={staff} />}
         </>
       )}
     </Page>

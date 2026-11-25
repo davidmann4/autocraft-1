@@ -45,6 +45,12 @@ export interface Engine {
   configure(b: TransactionBuilder<DB>, mode: Tx["mode"]): TransactionBuilder<DB>;
   /** A new listener on a connection of its own; absent where the backend has no notifications (SQLite). */
   listener?(): Listener;
+  /**
+   * Takes the lock `name` across processes, waiting at most `waitMs`. It holds no writer lock and no pooled connection.
+   * `held()` turns false when the lock's connection fails. Absent on SQLite, where Db.exclusive excludes only the holders
+   * in this process.
+   */
+  exclusiveLock?(name: string, waitMs: number): Promise<{ release: () => Promise<void>; held: () => boolean }>;
   close(): Promise<void>;
 }
 
@@ -93,6 +99,11 @@ const strayThrows = (): boolean => process.env.NODE_TEST_CONTEXT !== undefined;
 
 /** The most statements one shareReads scope keeps. */
 const SHARED_READS_MAX = 2000;
+
+/** Statements that write the settings table, which a settings snapshot must notice whoever issues them. */
+const SETTINGS_WRITE = /^\s*(?:insert\s+into|update|delete\s+from)\s+"?(?:main"?\."?)?settings"?(?![\w.])/i;
+let settingsWriteHook: ((db: object) => void) | null = null;
+export const onSettingsWrite = (fn: (db: object) => void): void => { settingsWriteHook = fn; };
 
 export class Handle implements Db {
   readonly dialect: Dialect;
@@ -176,6 +187,49 @@ export class Handle implements Db {
     }
   }
 
+  /**
+   * Runs a statement, telling the settings hook about it before and after it runs (a parallel read between the two must not keep the old
+   * rows), and again once the enclosing transaction ends, since a read inside it may have cached a value that rolled back.
+   */
+  async #settingsWrite<T>(text: string, go: () => Promise<T>): Promise<T> {
+    if (!settingsWriteHook || !SETTINGS_WRITE.test(text)) return await go();
+    const tx = this.#current();
+    if (tx) this.#settingsTx.add(tx);
+    settingsWriteHook(this);
+    try {
+      return await go();
+    } finally {
+      settingsWriteHook(this);
+    }
+  }
+
+  #settingsTx = new WeakSet<Tx>();
+
+  #exclusive = new Map<string, Promise<void>>();
+
+  async exclusive<T>(name: string, fn: (held: () => boolean) => Promise<T>, waitMs = 30_000): Promise<T> {
+    if (this.#current()) throw new Error(`db.exclusive("${name}") inside a transaction`);
+    // One holder per name in this process, then (Postgres) one across processes: a session-level lock alone would let this
+    // process in twice. SQLite has no cross-process step, so a runner sharing the file is not excluded.
+    const prev = this.#exclusive.get(name) ?? Promise.resolve();
+    let done!: () => void;
+    const tail = prev.then(() => new Promise<void>((r) => (done = r)));
+    this.#exclusive.set(name, tail);
+    try {
+      await prev;
+      const lock = await this.#engine.exclusiveLock?.(name, waitMs);
+      try {
+        return await fn(lock?.held ?? (() => true));
+      } finally {
+        await lock?.release();
+      }
+    } finally {
+      // `done` is set once `prev` settled, which it has by now unless the wait above threw (it never rejects).
+      done?.();
+      if (this.#exclusive.get(name) === tail) this.#exclusive.delete(name);
+    }
+  }
+
   async fresh<T>(fn: () => Promise<T>): Promise<T> {
     if (!this.#sharedReads()) return await fn();
     return await this.#shared.run({ open: false, rows: new Map() }, fn);
@@ -193,7 +247,8 @@ export class Handle implements Db {
   }
 
   async run(q: Compilable<unknown>): Promise<RunResult> {
-    const r = await this.#forgetting(() => this.k.executeQuery(q.compile()));
+    const compiled = q.compile();
+    const r = await this.#settingsWrite(compiled.sql, () => this.#forgetting(() => this.k.executeQuery(compiled)));
     const changes = Number(r.numAffectedRows ?? 0n);
     return this.dialect === "postgres" ? withoutInsertId(changes) : { changes, lastInsertRowid: Number(r.insertId ?? 0n) };
   }
@@ -201,7 +256,7 @@ export class Handle implements Db {
   prepare(text: string): Statement {
     const exec = async (op: Op, args: Args) => {
       const go = () => this.#engine.exec(op, text, args, this.#current());
-      return op === "run" ? await this.#forgetting(go) : await go();
+      return op === "run" ? await this.#settingsWrite(text, () => this.#forgetting(go)) : await go();
     };
     async function* iterate(args: Args): AsyncGenerator<Row> {
       yield* (await exec("all", args)) as Row[];
@@ -283,6 +338,7 @@ export class Handle implements Db {
       );
     } finally {
       tx.state = "closed";
+      if (settingsWriteHook && this.#settingsTx.has(tx)) settingsWriteHook(this);
       if (site && lockedAt !== undefined) {
         const holdMs = performance.now() - lockedAt;
         if (holdMs > SLOW_HOLD_MS) console.warn(`db: ${tx.lock ? `lock "${tx.lock}"` : "write lock"} held ${Math.round(holdMs)} ms by ${callSite(site)}`);

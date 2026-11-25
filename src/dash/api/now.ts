@@ -15,6 +15,7 @@ import { clip, stepTitle, writeEvent } from "./trace.ts";
 import { tripOf } from "../../core/push-outcome.ts";
 import { shownLater } from "./shown.ts";
 import { canSeeInternals } from "./staff.ts";
+import { t } from "../../i18n/index.ts";
 import { blankIfHidden, hiddenRepos } from "./visible.ts";
 import { filtered, hiddenTestExpr, isHiddenRepo, type HiddenRepos } from "../../hidden-sql.ts";
 import { touchesHiddenExpr } from "../../agents/runs.ts";
@@ -87,7 +88,7 @@ const paramItem = (j: { step: string; repo: string | null; params: string | null
 /** The health checks that are not ok, as the warnings list shows them; viewers get the short text and no checks of repos they cannot see. */
 export async function checkProblems(db: Db, hidden: HiddenRepos, internals: boolean, nowMs: number): Promise<NowProblem[]> {
   const area = (id: string): NowProblem["area"] =>
-    id === "runner" ? "runner" : id.startsWith("deadline:") ? "deadline" : id === "liveness" ? "liveness" : id.startsWith("worker:") || id === "build-queue" ? "workers" : id === "accounts" ? "account" : "sync";
+    id === "runner" ? "runner" : id.startsWith("deadline:") ? "deadline" : id === "liveness" ? "liveness" : id.startsWith("worker:") || id === "build-queue" ? "workers" : id === "accounts" || id === "user-tokens" ? "account" : "sync";
   return (await computeChecks(db, nowMs))
     .filter((c) => c.state !== "ok" && !(c.repo !== undefined && isHiddenRepo(hidden, c.repo)))
     .map((c) => ({ id: c.id, area: area(c.id), tone: c.state === "fail" ? "bad" : "warn", text: internals ? c.text : c.brief, to: c.to, since: c.since, ...(c.ackStep ? { ackStep: c.ackStep } : {}), ...(c.ack ? { ack: c.ack } : {}) }));
@@ -425,9 +426,17 @@ export async function nowFeed(db: Db, req: Req): Promise<NowFeed> {
   return { entries, nextCursor };
 }
 
+/** The signed-in person's own stored GitHub App token can no longer be refreshed, so merges and closes they approve cannot run as them. */
+async function ownTokenProblem(db: Db, req: Req): Promise<NowProblem | null> {
+  if (req.user.role === "viewer") return null;
+  const row = await db.get(db.k.selectFrom("user_tokens").select("updated_at").where("login", "=", req.user.login).where("status", "=", "refresh-failed"));
+  return row ? { id: "user-token:own", area: "account", tone: "bad", text: t("AutoCraft can no longer act as you on GitHub. Authorize again"), to: "/auth/authorize-app", fullPage: true, since: row.updated_at } : null;
+}
+
 export async function now(db: Db, req: Req): Promise<Now> {
   const hidden = await hiddenRepos(db, req);
   const nowMs = Date.now();
-  const [f, health] = await Promise.all([feed(db, hidden, canSeeInternals(req), req.user.role === "operator", null, nowMs), healthOf(db, hidden, canSeeInternals(req), nowMs)]);
+  const [f, health, own] = await Promise.all([feed(db, hidden, canSeeInternals(req), req.user.role === "operator", null, nowMs), healthOf(db, hidden, canSeeInternals(req), nowMs), ownTokenProblem(db, req)]);
+  if (own) health.problems.unshift(own);
   return { health, alsoRunning: f.also, entries: f.entries, nextCursor: f.nextCursor };
 }

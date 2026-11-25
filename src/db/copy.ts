@@ -16,7 +16,7 @@ import { planChangesSql } from "../core/plan-changes.ts";
 import type { Db, Param, Row, Value } from "./index.ts";
 import { connect } from "../db.ts";
 import { connectDb, dbFor, isPgUrl, loadPg } from "./open.ts";
-import { applyPgSchema, MIGRATION_LOCK_KEY, pgSchemaSql } from "./pg-migrate.ts";
+import { MIGRATION_LOCK_KEY, pgSchemaSql } from "./pg-migrate.ts";
 import { migratePg } from "./pg-triggers.ts";
 import { pgConnectionString } from "./postgres.ts";
 import { HAND_TRIGGERS } from "./pg-schema.ts";
@@ -29,10 +29,10 @@ import { HAND_TRIGGERS } from "./pg-schema.ts";
 export const RUNTIME_TABLES = new Set(["change_seq", "item_changes", "plan_full", "plan_full_causes", "plan_shadow_diffs", "plan_pass_stats", "plan_bulk", "review_blockers", "live_flush"]);
 
 /**
- * Rows a copy leaves where they are and a comparison leaves out: the schema stamp belongs to each database's own
- * migration (SQLite and Postgres stamps differ), so the target keeps or writes its own.
+ * Rows a copy leaves where they are and a comparison leaves out: the schema stamp and the Postgres schema generation
+ * belong to each database's own migration (SQLite and Postgres stamps differ), so the target keeps or writes its own.
  */
-const ROW_FILTER: Record<string, string> = { settings: "key <> 'schema_stamp'" };
+const ROW_FILTER: Record<string, string> = { settings: "key NOT IN ('schema_stamp', 'schema_generation')" };
 
 /**
  * Columns that Postgres stores as bytea and SQLite rows may hold as plain text from before texts were gzipped
@@ -354,16 +354,19 @@ export function pgSchemaWithoutTriggers(sql: string = pgSchemaSql()): string {
 }
 
 /**
- * Brings a Postgres target to the app's schema and triggers once the copied rows are in, in one transaction under the
- * migration lock, so the copied rows fire nothing. This is the one place the copy migrates: `migratePg` applies the schema
- * file with its hand-translated triggers, creates the RUNTIME_TABLES with their runtime triggers and stores the stamp.
+ * Brings a Postgres target to the app's schema and triggers once the copied rows are in, under the migration lock; the
+ * triggers are created after the rows, so the copied rows fire nothing. This is the one place the copy migrates: `migratePg`
+ * applies the schema file with its hand-translated triggers, creates the RUNTIME_TABLES with their runtime triggers and
+ * stores the stamp. With no other session working on the target, the indexes are built plainly, which is faster than
+ * CONCURRENTLY.
  */
 async function migratePgTarget(url: string): Promise<void> {
   const pg = await loadPg();
   const client = new pg.Client({ connectionString: pgConnectionString(url), application_name: "autocraft-copy" });
   await client.connect();
   try {
-    await migratePg(client);
+    const busy = (await client.query("SELECT count(*)::int AS n FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid() AND state <> 'idle'")).rows[0]!.n as number;
+    await migratePg(client, { plainIndexes: busy === 0 });
   } finally {
     await client.end();
   }

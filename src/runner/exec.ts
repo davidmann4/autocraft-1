@@ -4,16 +4,22 @@
 import type { JobUsage } from "../../web/src/api/types.ts";
 import { NoTakerError, setCallContext, StoppedError } from "../agents/call.ts";
 import { trackedNames } from "../repos.ts";
-import { AUTOPILOT_USER, isDraining, isEnabled } from "./autopilot.ts";
+import { AUTOPILOT_USER, isDraining, isEnabled, KEY_ENABLED } from "./autopilot.ts";
+import { JEV_PARALLEL_KEY, USAGE_PAUSE_KEY } from "../agents/accounts.ts";
+import { withSettingsSnapshot } from "../settings-read.ts";
 import { leaseSkipKeys, leaseSkips } from "./leases.ts";
 import { DEADLINE_ERROR, jobRow, scrub, type JobRow } from "./jobs.ts";
 import { loadSteps, validateParams, type StepContext } from "./steps.ts";
+import { JOB_DEADLINE_ENV, SLICE_SHARE } from "./deadlines.ts";
 import type { Db } from "../db/index.ts";
 import { openDb } from "../db/open.ts";
 import { stopWrites } from "../github/write.ts";
 
 /** How long a stopping job waits for its GitHub writes in flight: inside the runner's 10 s before SIGKILL, with time left to record usage. */
 const WRITE_SETTLE_MS = 7000;
+
+/** Settings a running step re-reads to stop or to size its parallelism: the pipeline switch and the account limits. */
+const LIVE_SETTINGS = [KEY_ENABLED, JEV_PARALLEL_KEY, USAGE_PAUSE_KEY];
 
 const oneLine = (s: string, max = 500): string => scrub(s.replace(/\s+/g, " ").trim()).slice(0, max);
 
@@ -94,6 +100,9 @@ async function runJob(db: Db, id: number, row: JobRow, o: { runs: Set<string>; s
   }
 
   let lastProgress = 0;
+  // The runner passes the deadline it enforces.
+  const deadlineMin = Number(process.env[JOB_DEADLINE_ENV]);
+  const sliceMs = deadlineMin > 0 ? deadlineMin * 60_000 * SLICE_SHARE : null;
   const ctx: StepContext = {
     db,
     job: { id, requestedBy: row.requested_by, startedAt, resumes: Number(row.resumes ?? 0) },
@@ -115,12 +124,19 @@ async function runJob(db: Db, id: number, row: JobRow, o: { runs: Set<string>; s
       return !!r.cancel_requested_at || DEADLINE_ERROR.test(r.error ?? "");
     },
     stopping: async () => await ctx.cancelled() || (row.requested_by === AUTOPILOT_USER && !await isEnabled(db)),
+    // Read from the row on each call: started_at is the runner's claim time, the start its deadline counts from.
+    timeUp: async () => {
+      if (sliceMs === null) return false;
+      const r = await db.get(db.k.selectFrom("jobs").select("started_at").where("id", "=", id));
+      return Date.now() - Date.parse(r?.started_at ?? startedAt) >= sliceMs;
+    },
   };
   setCallContext({ jobId: id, step: step.name, stage: step.stage, class: step.priority ?? 0, ...(typeof params.repo === "string" && { repo: params.repo }), cancelled: ctx.cancelled,
     // Model calls (local and remote) are withdrawn when the pipeline is switched off, not during a drain: running jobs finish with their calls.
     stopping: async () => await ctx.cancelled() || (row.requested_by === AUTOPILOT_USER && !await isEnabled(db) && !await isDraining(db)) });
   try {
-    const summary = await step.run(ctx);
+    // One reading of the settings table serves the step's reads; the keys it polls to stop or throttle stay live.
+    const summary = await withSettingsSnapshot(db, () => step.run(ctx), undefined, { live: LIVE_SETTINGS, watchWrites: true });
     await saveUsage();
     // Items skipped for a lease are work left for a later job: the planner retries once no job holds a lease (unchangedSinceIdle).
     if (leaseSkips()) await db.run(db.k.updateTable("jobs").set({ lease_skips: leaseSkips(), lease_skip_keys: JSON.stringify(leaseSkipKeys()) }).where("id", "=", id));

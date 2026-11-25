@@ -321,6 +321,22 @@ export async function replaceRow<T extends keyof DB & string>(db: Db, table: T, 
   await db.run(k.insertInto(table).values(row));
 }
 
+/**
+ * replaceRow for many rows: one statement per BATCH_ROWS rows (two on Postgres: the delete by `key`, then the insert). Rows get
+ * rowids in the order given. Call inside `db.write`.
+ */
+export async function replaceRows<T extends keyof DB & string>(db: Db, table: T, key: readonly string[], rows: readonly InsertObject<DB, T>[]): Promise<void> {
+  const k = db.k as any;
+  for (const chunk of batches(rows)) {
+    if (db.dialect !== "postgres") {
+      await db.run(k.insertInto(table).orReplace().values(chunk));
+      continue;
+    }
+    await db.run(k.deleteFrom(table).where((eb: ExpressionBuilder<any, any>) => eb.or(chunk.map((row) => eb.and(key.map((c) => eb(c, "=", (row as Record<string, unknown>)[c])))))));
+    await db.run(k.insertInto(table).values(chunk));
+  }
+}
+
 // ---- full-text search -----------------------------------------------------------------------------------------------
 
 /** Snippet marks: `open`/`close` around each match, about `words` words, `…` where cut. */

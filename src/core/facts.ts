@@ -26,6 +26,7 @@ import { mergeHolds } from "../merge/holds.ts";
 import { reposWithNoCi } from "../merge/no-ci.ts";
 import { effectiveCi } from "../optional-checks.ts";
 import { inPilot, pilotExpr, pipelineRepos } from "../pilot.ts";
+import { loadWorkflowFacts } from "../workflow/facts.ts";
 import { holdMap } from "../outside.ts";
 import { attemptsIn, parseFixes } from "../fixup/candidates.ts";
 import { operatorTries, operatorTriesLeft, operatorWork, queuedOperatorFix } from "../preapproval/state.ts";
@@ -178,6 +179,7 @@ export async function loadPrFacts(db: Db, opts: LoadOptions = {}): Promise<PrFac
   const tripped = await activeTrips(db);
   const brokeAt = await brokeHeads(db, opts.repo);
   const implPrs = await implementationPrs(db, opts.repo);
+  const wfs = await loadWorkflowFacts(db, opts.repo);
   // The per-PR rows below are independent reads: they run together (on Postgres, over the pool).
   const { ourFixupHead, ourSameDiffMerge, pushedHere, pushedOffAt, carries, fixupsOf, fixupAt, lintFixup, lintOperator, lintCifix, carryRows, conflictRowsOf, lintConflict, cifixOf, merges, waiting, verifRows, otherOpen, openQuestion, unsureAt, reviewRows } = await allOf({
     // carriedReview only carries our own plain fix-up (no carry or pre-merge source) as the head: skip its compiles for other PRs.
@@ -250,7 +252,8 @@ export async function loadPrFacts(db: Db, opts: LoadOptions = {}): Promise<PrFac
   const taskEnded = async (id: number | null): Promise<boolean> => { const t = id != null ? await getTask(db, id) : null; return !t || TERMINAL.includes(t.state); };
   const authorWrites = await authorWritesOf(db, now);
   const postSource = await postSourcesOf(db, rows.filter((r) => r.r_mode === CARRIED && r.r_head).map((r) => `${r.repo}#${r.number}`));
-  const queued = rows.filter((r) => r.in_pilot && r.not_integration && (r.r_verdict === "take" || r.r_verdict === "take-fix") && r.author);
+  // In a repo on the maintainer workflow the tier also decides, before any review, whether a PR is on the auto path.
+  const queued = rows.filter((r) => r.in_pilot && r.not_integration && (r.r_verdict === "take" || r.r_verdict === "take-fix" || wfs.model(r.repo) === "new") && r.author);
   const tiers = await tiersOf(db, queued.map((r) => ({ login: r.author!, id: r.author_id })));
 
   const repoMemo = new Map<string, { f: PrFacts["repoFacts"]; pub: boolean; longLived: LongLived; defaultBranch: string | null }>();
@@ -267,7 +270,7 @@ export async function loadPrFacts(db: Db, opts: LoadOptions = {}): Promise<PrFac
       m = {
         f: { mergeApproved: !!await mergeApprovalOf(db, repo), pushApproved: await pushApprovalOf(db, repo) !== null, commentApproved: await commentApprovalOf(db, repo) !== null, ciApproved: await ciApprovalOf(db, repo) !== null,
           noCi: t.noCi.has(repo), mainRed: mainRed.has(repo), fixIssueApproved: await fixIssueApprovalOf(db, repo) !== null,
-          implementOn: await featureOn(db, "implement", repo) },
+          implementOn: await featureOn(db, "implement", repo), workflow: wfs.model(repo) },
         pub: row?.visibility === "public",
         longLived: t.longLived(repo),
         defaultBranch: row?.default_branch ?? null,
@@ -287,9 +290,19 @@ export async function loadPrFacts(db: Db, opts: LoadOptions = {}): Promise<PrFac
     .orderBy("i.number"))) (openByHead.get(o.k) ?? openByHead.set(o.k, []).get(o.k)!).push(o.number);
   const retriedAfter = (target: string, at: string) => db.get(db.k.selectFrom("audit").select((eb) => eb.lit(1).as("one")).where("target", "=", target).where("action", "=", "retry").where("at", ">", at).limit(1));
   const verifAt = (ref: string, head: string) => verifRows.get(`${ref}@${head}`)?.[0];
+  // The current head of an open merge-entry PR (src/workflow) in a repo on the maintainer workflow: the head its queue facts are read at; null for every other PR.
+  const mergeEntryHead = (r: (typeof rows)[number]): string | null =>
+    r.state === "OPEN" && !!r.not_integration && wfs.model(r.repo) === "new" && wfs.ofPr(r.repo, r.number, implPrs.get(`${r.repo}#${r.number}`)?.issue ?? null)?.entry === "merge" ? headOf(r) : null;
+  // The cached diff facts at those heads (a reviewed PR's come with its row, at the review head).
+  const mxKeys = rows.flatMap((r) => { const h = mergeEntryHead(r); return h ? [`${r.repo}#${r.number}@${h}`] : []; });
+  const mxDiff = new Map(mxKeys.length ? (await db.all(db.k.selectFrom("diff_facts as x").select((eb) => [keyOf(eb, "x", "head_oid").as("k"), "x.reasons", "x.lines", "x.pending", "x.last_read"])
+    .where((eb) => inList(db, keyOf(eb, "x", "head_oid"), mxKeys)))).map((x) => [x.k, x]) : []);
   // The answer of the merge and hold decisions at each reviewed head, by id (null: not answered yet); the loop looks up no others.
-  const decisionIds = rows.filter((r) => r.r_head && r.r_verdict && r.r_at).flatMap((r) => [mergeDecisionId(r.repo, r.number, r.r_head!), holdDecisionId(r.repo, r.number, r.r_head!)]);
-  const decisionAnswers = new Map((await db.all(db.k.selectFrom("decisions").select(["id", "answer"]).where(inList(db, "id", decisionIds)))).map((d) => [d.id, d.answer]));
+  const decisionIds = rows.flatMap((r) => { const h = mergeEntryHead(r) ?? (r.r_head && r.r_verdict && r.r_at ? r.r_head : null); return h ? [mergeDecisionId(r.repo, r.number, h), holdDecisionId(r.repo, r.number, h)] : []; });
+  const decisionRows = await db.all(db.k.selectFrom("decisions").select(["id", "answer", "exec_state"]).where(inList(db, "id", decisionIds)));
+  const decisionAnswers = new Map(decisionRows.map((d) => [d.id, d.answer]));
+  // Answered, but its person has no sign-in or access yet, or it is disputed: the same states the merge step leaves out (src/github/user-lane.ts isWaiting).
+  const execWaiting = new Set(decisionRows.filter((d) => d.exec_state === "waiting-token" || d.exec_state === "waiting-permission" || d.exec_state === "disputed").map((d) => d.id));
   const holdQuestionOf = (ref: string, id: string): PrFacts["decision"]["hold"] => {
     const asked = decisionAnswers.has(id), answer = decisionAnswers.get(id) ?? null;
     return { asked, open: asked && answer === null, answer, otherOpen: otherOpen.has(ref) };
@@ -300,14 +313,15 @@ export async function loadPrFacts(db: Db, opts: LoadOptions = {}): Promise<PrFac
   const answeredAfter = (id: string, at: string): boolean => { const a = mergeAnsweredAt.get(id); return a !== undefined && a > at; };
   const pushChain = await pushChainOf(db);
   const ownHead = await ownHeadOf(db);
-  // Pre-merge reviews at the head of each PR's latest review (r_head), the only ones the loop reads.
-  const premergeKeys = rows.filter((r) => r.r_head).map((r) => `${r.repo}#${r.number}@${r.r_head}`);
+  // Pre-merge reviews at the queue head of each PR (its latest review's head, a merge entry's current head), the only ones the loop reads.
+  const premergeKeys = rows.flatMap((r) => { const h = mergeEntryHead(r) ?? r.r_head; return h ? [`${r.repo}#${r.number}@${h}`] : []; });
   const premerge = await premergeRows(db, (eb) => eb.and([narrow(eb, "p"), inList(db, keyOf(eb, "p", "head_oid"), premergeKeys)]));
   // The owner statements the reviews' and pre-merge reviews' conflicts name, in one read.
   const statementIds = new Set<number>();
   for (const r of rows) {
-    if (!r.r_head || !r.r_verdict || !r.r_at) continue;
-    for (const v of [safeJson(r.r_conflicts), safeJson(premerge.get(`${r.repo}#${r.number}@${r.r_head}`)?.conflicts ?? null)]) {
+    const mxh = mergeEntryHead(r);
+    if (!mxh && (!r.r_head || !r.r_verdict || !r.r_at)) continue;
+    for (const v of [mxh ? null : safeJson(r.r_conflicts), safeJson(premerge.get(`${r.repo}#${r.number}@${mxh ?? r.r_head}`)?.conflicts ?? null)]) {
       if (Array.isArray(v)) for (const h of v as { id?: unknown }[]) if (typeof h?.id === "number") statementIds.add(h.id);
     }
   }
@@ -335,6 +349,11 @@ export async function loadPrFacts(db: Db, opts: LoadOptions = {}): Promise<PrFac
     return { waiting, reread: !!w.reread, crossRepo: !!w.cross_repo, approvable: runs.filter((x) => x.event === "pull_request" && (failed[x.id] ?? 0) < MAX_FAILURES).length, blocked };
   };
 
+  // The pipeline's own Fix PRs count as whitelisted at a head the pipeline itself pushed (others may push to the branch); an operator's deny still wins.
+  const tierOf = async (r: { repo: string; number: number; author: string | null; author_id: number | null }, head: string | null): Promise<PrFacts["tier"]> => {
+    const t = (r.author ? tiers.get(tierKey({ login: r.author, id: r.author_id })) : undefined) ?? "not";
+    return t === "not" && !!r.author && await own.isOwn(r.repo, r.author) && own.prs.has(`${r.repo}#${r.number}`) && !!head && await ownHead(r.repo, r.number, head) ? "whitelisted" : t;
+  };
   const holdOf = await reviewHolds(db, now, refs);
   const outsideHolds = await holdMap(db);
   const out: PrFacts[] = [];
@@ -360,11 +379,12 @@ export async function loadPrFacts(db: Db, opts: LoadOptions = {}): Promise<PrFac
       review: null, post: { postable: false, posted: null },
       checksHere: false, checksOpen: false, ci: "unknown", mergeable: r.i_mergeable ?? "UNKNOWN", unknown: null, runs: null,
       lastMerge: null, runsApprovedAfterMerge: false, verifyOverride: false, verification: null, verifyUnavailable: null,
-      decision: { asked: false, openQuestion: false, answer: null, mergeAnswerAfterReview: false, inOpenGroup: grouped.has(ref), hold: { asked: false, open: false, answer: null, otherOpen: otherOpen.has(ref) } },
+      decision: { asked: false, openQuestion: false, answer: null, mergeAnswerAfterReview: false, inOpenGroup: grouped.has(ref), execWaiting: false, hold: { asked: false, open: false, answer: null, otherOpen: otherOpen.has(ref) } },
       premerge: null, premergeFixUsed: false, sensitive: null, statementConflicts: [], pushable: false, pushChain: [], conflict: null, inActiveBatch: activeBatched.has(ref), fixup: null, carry: [], lint: [], cifix: null, postmerge: null, batch: null, mainFix: false, baseOffDefault: false, stackedOn: null, changesRequested: null, gateFailureNote: null,
     };
     base.inFlight = r.state === "OPEN" && !integration && !!r.author && await own.isOwn(r.repo, r.author) && own.prs.has(ref);
     base.implementation = implPrs.get(ref) ?? null;
+    if (rf.f.workflow === "new") { base.workflow = wfs.ofPr(r.repo, r.number, base.implementation?.issue ?? null); base.endedWorkflow = wfs.ended(r.repo, r.number); }
     if (integration) {
       base.runs = runsOf(await batchTip(r.repo, r.number), rf.f.ciApproved);
       out.push(base);
@@ -384,10 +404,11 @@ export async function loadPrFacts(db: Db, opts: LoadOptions = {}): Promise<PrFac
     base.label = labelWithScopeAnswer(s.label ?? null, base.scopeAnswer);
     base.needsDecisionFlag = s.flags.includes("needs decision") || (unsettled.has(ref) && !scope.has(ref));
     base.labelUnsure = s.status === "settled" && !!s.referee && !s.referee.sure && refereeClosed(s.referee);
+    if (rf.f.workflow === "new") base.tier = await tierOf(r, head);
     const pm = mergedByPipeline.get(ref);
     if (pm) base.postmerge = { mergedAt: pm.merged_at, head: pm.head, since, review: pmReviews.get(ref) ?? null };
     // Checks describe the PR when they were fetched for the reviewed head (or, without a review, the current one).
-    const checksAtHead = r.c_head === (r.r_head ?? head);
+    const checksAtHead = r.c_head === (mergeEntryHead(r) ?? r.r_head ?? head);
     base.mergeable = (checksAtHead ? r.c_mergeable : r.i_mergeable) ?? "UNKNOWN";
     // An author whose permission has not been read yet counts as able to write: the job that pushes reads it first.
     base.pushable = pushable(r.head_repo, r.repo, checksAtHead ? r.c_can : r.i_can, r.head_ref, rf.longLived, false, sameRepo(r.head_repo, r.repo) && authorWrites(r.repo, r, (t) => refresh.soon(ref, t)) !== "no");
@@ -412,30 +433,38 @@ export async function loadPrFacts(db: Db, opts: LoadOptions = {}): Promise<PrFac
       }
     }
     if (r.state === "OPEN" && head && !base.draft) { const hold = await holdOf(r.repo, r.number, head, (t) => refresh.soon(ref, t)); if (hold) base.reviewHold = hold; }
-    if (!r.r_head || !r.r_verdict || !r.r_at) { out.push(base); continue; }
+    // A merge-entry PR has no review: its queue facts below are read at its current head (the queue head), and it entered the queue when its workflow started.
+    const mxh = mergeEntryHead(r);
+    if (!mxh && (!r.r_head || !r.r_verdict || !r.r_at)) { out.push(base); continue; }
+    const mx = mxh !== null;
+    const qh = mxh ?? r.r_head!;
+    const qAt = mx ? base.workflow!.startedAt : r.r_at!;
 
-    const take = r.r_verdict === "take" || r.r_verdict === "take-fix";
-    const chain = take ? pushChain(r.repo, r.number, r.r_head) : [r.r_head];
-    const unsure = take && (r.r_sure === 0 || chain.some((h) => unsureAt.has(`${ref}@${h}`)));
-    base.review = {
-      head: r.r_head, at: r.r_at, verdict: r.r_verdict, unsure, mode: r.r_mode, reason: r.r_reason ?? "", fixes: parseList(r.r_fixes).length,
-      stale: stale.has(`${ref}@${r.r_head}`), staleActionable: staleActionable.has(`${ref}@${r.r_head}`),
-    };
+    const take = mx || r.r_verdict === "take" || r.r_verdict === "take-fix";
+    const chain = take ? pushChain(r.repo, r.number, qh) : [qh];
+    if (!mx) {
+      const unsure = take && (r.r_sure === 0 || chain.some((h) => unsureAt.has(`${ref}@${h}`)));
+      base.review = {
+        head: qh, at: qAt, verdict: r.r_verdict!, unsure, mode: r.r_mode, reason: r.r_reason ?? "", fixes: parseList(r.r_fixes).length,
+        stale: stale.has(`${ref}@${qh}`), staleActionable: staleActionable.has(`${ref}@${qh}`),
+      };
+      base.decision.hold = holdQuestionOf(ref, holdDecisionId(r.repo, r.number, qh));
+      if (r.state === "OPEN" && head && head !== qh && (ourFixupHead.has(`${ref}@${head}`) || ourSameDiffMerge.has(`${ref}@${head}`)) && await carriedReview(db, { repo: r.repo, number: r.number, head_oid: head }, stale)) base.carriable = true;
+    }
     base.pushChain = chain;
-    base.decision.hold = holdQuestionOf(ref, holdDecisionId(r.repo, r.number, r.r_head));
-    if (r.state === "OPEN" && head && head !== r.r_head && (ourFixupHead.has(`${ref}@${head}`) || ourSameDiffMerge.has(`${ref}@${head}`)) && await carriedReview(db, { repo: r.repo, number: r.number, head_oid: head }, stale)) base.carriable = true;
     if (r.state === "OPEN" && (chain.length > 1 || (!!head && pushedHere.has(`${ref}@${head}`)))) base.inFlight = true;
-    // The facts of the review head's cached diff (src/review/diff.ts writes them with the cache); null when it is not cached.
-    const diffFacts = r.d_lines === null ? null : { reasons: parseList(r.d_reasons) as string[], lines: r.d_lines, pending: r.d_pending === 1, lastRead: r.d_last_read };
+    // The facts of the queue head's cached diff (src/review/diff.ts writes them with the cache); null when it is not cached.
+    const d = mx ? mxDiff.get(`${ref}@${qh}`) ?? null : r.d_lines === null ? null : { reasons: r.d_reasons, lines: r.d_lines, pending: r.d_pending, last_read: r.d_last_read };
+    const diffFacts = d === null ? null : { reasons: parseList(d.reasons) as string[], lines: d.lines, pending: d.pending === 1, lastRead: d.last_read };
     // While the extras are pending the reasons are the conservative ones, and the wait itself keeps the PR off the rule.
     base.sensitive = diffFacts ? (diffFacts.pending ? [...diffFacts.reasons, EXTRAS_PENDING_REASON] : diffFacts.reasons) : null;
     if (diffFacts?.pending) base.diffPending = { lastRead: diffFacts.lastRead };
     if (diffFacts) { base.lines = diffFacts.lines; base.size = sizeOf(diffFacts.lines); }
-    base.statementConflicts = await statementConflicts(statement, [safeJson(r.r_conflicts), safeJson(premerge.get(`${ref}@${r.r_head}`)?.conflicts ?? null)]);
+    base.statementConflicts = await statementConflicts(statement, [mx ? null : safeJson(r.r_conflicts), safeJson(premerge.get(`${ref}@${qh}`)?.conflicts ?? null)]);
     const p = posts.get(ref);
     // A carried review has no text of its own: the post uses the text of the review it was carried from.
-    const src = r.r_mode === CARRIED ? await postSource(r.repo, r.number, r.r_head) : null;
-    const hasPublic = src ? src.hasPublic : r.r_public !== null;
+    const src = !mx && r.r_mode === CARRIED ? await postSource(r.repo, r.number, qh) : null;
+    const hasPublic = src ? src.hasPublic : !mx && r.r_public !== null;
     const pub = src ? src.public : !hasPublic ? { ok: true } : parsePublic({ summary: r.r_public, points: [] });
     base.post = {
       postable: (hasPublic || !!p?.review_id) && !!pub,
@@ -460,15 +489,15 @@ export async function loadPrFacts(db: Db, opts: LoadOptions = {}): Promise<PrFac
       };
     };
     // A non-take review at an earlier head while the review gate waits on red CI at the new head: the CI fix cannot start, so the contributor is asked (src/core/decide.ts unreviewedRed).
-    if (!take && r.state === "OPEN" && head && head !== r.r_head && base.reviewHold?.kind === "ci" && base.reviewHold.red && r.c_head === head && await effectiveCi(db, r.repo, r.overall ?? "none", r.c_checks) === "failure") {
+    if (!take && r.state === "OPEN" && head && head !== qh && base.reviewHold?.kind === "ci" && base.reviewHold.red && r.c_head === head && await effectiveCi(db, r.repo, r.overall ?? "none", r.c_checks) === "failure") {
       base.ci = "failure";
       base.gateRed = true;
       base.cifix = await cifixAt(head);
     }
     if (!take) { out.push(base); continue; }
 
-    const wait: Wait | undefined = waiting.get(`${ref}@${r.r_head}`)?.[0];
-    const checksHere = r.c_head === r.r_head;
+    const wait: Wait | undefined = waiting.get(`${ref}@${qh}`)?.[0];
+    const checksHere = r.c_head === qh;
     base.checksHere = checksHere;
     base.checksOpen = checksHere && r.c_state === "OPEN" && !r.c_draft;
     const approvedPending = parseList(wait?.approved ?? "[]").length > 0;
@@ -478,7 +507,7 @@ export async function loadPrFacts(db: Db, opts: LoadOptions = {}): Promise<PrFac
     // A head that our own push or the review's CI gate (red CI at a new head, reviewed earlier) left red is repaired against that head.
     const redNow = r.c_head === head && await effectiveCi(db, r.repo, r.overall ?? "none", r.c_checks) === "failure";
     base.brokeByUs = brokeAt.get(ref) === head && redNow;
-    base.gateRed = !base.brokeByUs && !!base.reviewHold?.red && !!head && head !== r.r_head && redNow;
+    base.gateRed = !base.brokeByUs && !!base.reviewHold?.red && !!head && head !== qh && redNow;
     if (r.state === "OPEN") {
       const from = carriedSources(carryRows.get(ref) ?? []);
       if (from.length) {
@@ -486,34 +515,33 @@ export async function loadPrFacts(db: Db, opts: LoadOptions = {}): Promise<PrFac
         base.carriedFrom = from.map((x) => ({ number: x.number, author: x.author, tier: (x.author ? t.get(tierKey({ login: x.author, id: x.id })) : undefined) ?? "not" }));
       }
     }
-    base.tier = (r.author ? tiers.get(tierKey({ login: r.author, id: r.author_id })) : undefined) ?? "not";
-    // The pipeline's own Fix PRs count as whitelisted at a head the pipeline itself pushed (others may push to the branch); an operator's deny still wins.
+    base.tier = await tierOf(r, head);
     const ownHere = !!r.author && await own.isOwn(r.repo, r.author) && own.prs.has(ref) && !!head && await ownHead(r.repo, r.number, head);
-    if (base.tier === "not" && ownHere) base.tier = "whitelisted";
 
-    const last = merges.get(`${ref}@${r.r_head}`)?.[0];
+    const last = merges.get(`${ref}@${qh}`)?.[0];
     // An operator's Retry after a refusal asks for another try now, without waiting for CI or the mergeable state to change.
     // A fresh Merge answer after a refusal asks for another try, as a Retry does.
-    if (last && !(last.outcome === "refused" && (await retriedAfter(mergeDecisionId(r.repo, r.number, r.r_head), last.at) || answeredAfter(mergeDecisionId(r.repo, r.number, r.r_head), last.at)))) {
+    if (last && !(last.outcome === "refused" && (await retriedAfter(mergeDecisionId(r.repo, r.number, qh), last.at) || answeredAfter(mergeDecisionId(r.repo, r.number, qh), last.at)))) {
       base.lastMerge = { outcome: last.outcome, reason: last.reason, ci: last.ci, mergeable: last.mergeable, refusals: last.refusals };
       base.runsApprovedAfterMerge = !!wait?.approved_at && wait.approved_at > last.at;
     }
-    base.verification = (verifAt(ref, r.r_head) as PrFacts["verification"] | undefined) ?? null;
-    if (base.verification?.state === "failed" || base.verification?.state === "error") base.verifyOverride = await verifyOverride(db, r.repo, r.number, r.r_head);
+    base.verification = (verifAt(ref, qh) as PrFacts["verification"] | undefined) ?? null;
+    if (base.verification?.state === "failed" || base.verification?.state === "error") base.verifyOverride = await verifyOverride(db, r.repo, r.number, qh);
     if (!base.verification || base.verification.state === "stale") {
-      base.verifyUnavailable = !rf.pub ? PRIVATE_REASON : rf.f.noCi && cachedRust(r.repo, r.r_head) === false ? NOT_RUST_REASON : null;
+      base.verifyUnavailable = !rf.pub ? PRIVATE_REASON : rf.f.noCi && cachedRust(r.repo, qh) === false ? NOT_RUST_REASON : null;
     }
-    if (r.state === "OPEN" && base.mergeable !== "MERGEABLE" && base.mergeable !== "CONFLICTING") base.unknown = await unknownOf(db, r.repo, r.number, r.r_head);
-    const id = mergeDecisionId(r.repo, r.number, r.r_head);
+    if (r.state === "OPEN" && base.mergeable !== "MERGEABLE" && base.mergeable !== "CONFLICTING") base.unknown = await unknownOf(db, r.repo, r.number, qh);
+    const id = mergeDecisionId(r.repo, r.number, qh);
     const given = answers.get(id) ?? null;
     base.decision = {
       asked: decisionAnswers.has(id), openQuestion: r.state === "OPEN" && openQuestion.has(ref), answer: given,
-      mergeAnswerAfterReview: given === "merge" && answeredAfter(id, r.r_at), inOpenGroup: grouped.has(ref),
+      mergeAnswerAfterReview: given === "merge" && answeredAfter(id, qAt), inOpenGroup: grouped.has(ref),
+      execWaiting: execWaiting.has(id),
       hold: base.decision.hold,
     };
     if (r.state !== "OPEN") { out.push(base); continue; }
 
-    const row = premerge.get(`${ref}@${r.r_head}`) ?? null;
+    const row = premerge.get(`${ref}@${qh}`) ?? null;
     if (row) {
       const all = findingsOf(row);
       const defects = all.filter((f) => f.severity === "defect");
@@ -522,30 +550,30 @@ export async function loadPrFacts(db: Db, opts: LoadOptions = {}): Promise<PrFac
     }
     if (base.mergeable === "CONFLICTING" && r.base_ref) {
       const rows = conflictRowsOf.get(ref) ?? [];
-      const bucket = conflictBucketOf(rows, { head: r.r_head, pushable: base.pushable }, { push: rf.f.pushApproved, comment: rf.f.commentApproved }, now);
-      const until = bucket === "capped" ? nextUtcMidnight(now) : bucket === "ask-retry" ? conflictAskRetryAtOf(rows, r.r_head, now) : undefined;
+      const bucket = conflictBucketOf(rows, { head: qh, pushable: base.pushable }, { push: rf.f.pushApproved, comment: rf.f.commentApproved }, now);
+      const until = bucket === "capped" ? nextUtcMidnight(now) : bucket === "ask-retry" ? conflictAskRetryAtOf(rows, qh, now) : undefined;
       base.conflict = { bucket, base: r.base_ref, baseOk: BASE_NAME.test(r.base_ref), ...(until !== undefined ? { until } : {}) };
     }
-    if (r.r_verdict === "take-fix") {
+    if (!mx && r.r_verdict === "take-fix") {
       base.fixup = {
-        fixes: parseFixes(r.r_fixes).length, attempts: attemptsIn(fixupsOf.get(ref) ?? []), recorded: (fixupAt.get(`${ref}@${r.r_head}`) ?? []).filter((x) => x.state !== "comment-unsent").map((x) => x.state),
-        ...unsentOf((fixupAt.get(`${ref}@${r.r_head}`) ?? []).filter((x) => x.state === "comment-unsent").map((x) => x.created_at)),
+        fixes: parseFixes(r.r_fixes).length, attempts: attemptsIn(fixupsOf.get(ref) ?? []), recorded: (fixupAt.get(`${ref}@${qh}`) ?? []).filter((x) => x.state !== "comment-unsent").map((x) => x.state),
+        ...unsentOf((fixupAt.get(`${ref}@${qh}`) ?? []).filter((x) => x.state === "comment-unsent").map((x) => x.created_at)),
       };
     }
     {
       const ended = taskEnded;
-      for (const x of lintFixup.get(`${ref}@${r.r_head}`) ?? []) {
+      for (const x of lintFixup.get(`${ref}@${qh}`) ?? []) {
         base.lint.push({ step: "fixup", source: x.source === "premerge" || x.source === "carry" || x.source === "operator" ? x.source : "review", ended: await ended(x.lint_task) });
       }
-      for (const x of lintCifix.get(`${ref}@${base.brokeByUs || base.gateRed ? head : r.r_head}`) ?? []) base.lint.push({ step: "cifix", source: "review", ended: await ended(x.lint_task) });
-      for (const x of lintConflict.get(`${ref}@${r.r_head}`) ?? []) base.lint.push({ step: "conflict", source: "review", ended: await ended(x.lint_task) });
+      for (const x of lintCifix.get(`${ref}@${base.brokeByUs || base.gateRed ? head : qh}`) ?? []) base.lint.push({ step: "cifix", source: "review", ended: await ended(x.lint_task) });
+      for (const x of lintConflict.get(`${ref}@${qh}`) ?? []) base.lint.push({ step: "conflict", source: "review", ended: await ended(x.lint_task) });
       if (base.lint.length && r.state === "OPEN") base.inFlight = true;
     }
     if (base.ci === "failure" || base.brokeByUs || base.gateRed) {
-      const cfHead = base.brokeByUs || base.gateRed || (head && head !== r.r_head) ? head : r.r_head;
-      base.cifix = await cifixAt(cfHead ?? r.r_head!);
+      const cfHead = base.brokeByUs || base.gateRed || (head && head !== qh) ? head : qh;
+      base.cifix = await cifixAt(cfHead ?? qh);
     }
-    base.batch = inBatch.get(`${ref}@${r.r_head}`) ?? null;
+    base.batch = inBatch.get(`${ref}@${qh}`) ?? null;
     if (r.base_ref && r.state === "OPEN") base.stackedOn = (openByHead.get(`${r.repo} ${r.base_ref} ${`${slugOf(r.repo)}`.toLowerCase()}`) ?? []).find((n) => n !== r.number) ?? null;
     base.baseOffDefault = !!r.base_ref && !!rf.defaultBranch && r.base_ref !== rf.defaultBranch;
     base.mainFix = !!r.head_ref?.startsWith(MAIN_FIX_BRANCH_PREFIX) && ownHere;

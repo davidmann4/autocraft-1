@@ -269,6 +269,8 @@ export function callTool(db: DatabaseSync, cfg: Config, name: string, raw: unkno
     return { text: cut(r.text, MAX_RESULT + 1000) };
   } catch (e) {
     if (e instanceof BadArgs) return { text: e.message, isError: true };
+    // A read-only connection cannot roll back the journal of an interrupted refresh; the runner's next build does.
+    if (((e as { errcode?: number })?.errcode ?? 0) % 256 === 8) return { text: "the item snapshot is being repaired after an interrupted refresh; try again in a minute", isError: true };
     return { text: `the tool failed: ${String((e as Error).message).slice(0, 200)}`, isError: true };
   }
 }

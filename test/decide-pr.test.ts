@@ -1,13 +1,13 @@
 // The decision table for open PRs, review to merge: facts overrides in, state, path and due actions out.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { decidePr } from "../src/core/decide.ts";
+import { NOT_STARTED_WAIT, decidePr } from "../src/core/decide.ts";
 import { PREMERGE_DEFECT_REASON, PREMERGE_FAILED_REASON, PREMERGE_UNSURE_REASON, UNSURE_REASON } from "../src/core/rules.ts";
 import { QUEUE_STATES, type Plan, type PrFacts } from "../src/core/plan.ts";
 import { NOW, REVIEW_AT, prFacts } from "./world.ts";
 
 type Over = Parameters<typeof prFacts>[0];
-type Row = { name: string; facts: Over; expect: { state?: string; path?: "rule" | "operator" | null; actions?: string[]; reasons?: string[]; eligible?: boolean; note?: string | null; conflictNote?: string | null; wait?: string | null } };
+type Row = { name: string; facts: Over; expect: { state?: string; path?: "rule" | "operator" | "maintainer" | null; actions?: string[]; reasons?: string[]; eligible?: boolean; note?: string | null; conflictNote?: string | null; wait?: string | null } };
 
 const tokens = (p: Plan): string[] => p.actions.map((a) => {
   const bucket = typeof a.params?.bucket === "string" ? a.params.bucket : null;
@@ -15,6 +15,8 @@ const tokens = (p: Plan): string[] => p.actions.map((a) => {
   return bucket ? `${a.kind}:${bucket}` : a.kind;
 }).sort();
 const SIZE_L = { size: "L", lines: 900 } as const;
+const NEW_REPO = { repoFacts: { workflow: "new" } } as const;
+const MERGE_ENTRY = { entry: "merge", approved: true, startedBy: "maint", startedAt: "2026-11-04T09:00:00.000Z", own: true } as const;
 const answered = (answer: string, after = true) => ({ asked: true, answer, mergeAnswerAfterReview: after });
 const premerge = (o: Partial<NonNullable<PrFacts["premerge"]>>) => ({ at: "2026-11-04T10:30:00.000Z", tries: 0, hasFindings: true, unsure: false, defects: 0, defectsAllFixable: true, minor: 0, error: null, ...o });
 const TAKE_FIX = { review: { verdict: "take-fix" } } as const;
@@ -48,6 +50,8 @@ const rows: Row[] = [
 
   // ---- unsure heads and operator answers
   { name: "unsure head does not merge by rule", facts: { review: { unsure: true } }, expect: { state: "needs-decision", path: null, actions: ["ask-merge"], reasons: [UNSURE_REASON] } },
+  { name: "an operator Merge answer waiting for its person's sign-in proposes no merge", facts: { ...SIZE_L, decision: { ...answered("merge"), execWaiting: true } }, expect: { state: "decision-answered-merge", path: "operator", actions: [] } },
+  { name: "the same Merge answer merges once the sign-in arrived", facts: { ...SIZE_L, decision: { ...answered("merge"), execWaiting: false } }, expect: { state: "decision-answered-merge", path: "operator", actions: ["merge"] } },
   { name: "unsure head, Merge answer given before the review, does not merge", facts: { review: { unsure: true }, decision: answered("merge", false) }, expect: { state: "needs-decision", path: null, actions: [] } },
   { name: "unsure head, Merge answer after the review, merges as operator", facts: { review: { unsure: true }, decision: answered("merge", true) }, expect: { state: "decision-answered-merge", path: "operator", actions: ["merge"], reasons: [UNSURE_REASON] } },
   { name: "unsure head, Hold answer is declined and does not merge", facts: { review: { unsure: true }, decision: answered("hold") }, expect: { state: "declined", actions: [] } },
@@ -270,6 +274,15 @@ const rows: Row[] = [
   { name: "postmerge: final error is not retried", facts: { ghState: "MERGED", postmerge: merged({ review: { at: new Date(NOW - 7_200_000).toISOString(), error: "too large" } }) }, expect: { actions: [] } },
   { name: "postmerge: outside the queue", facts: { ghState: "CLOSED", review: null, postmerge: merged() }, expect: { state: "closed", actions: ["postmerge"] } },
   { name: "postmerge: nothing for a closed PR the pipeline did not merge", facts: { ghState: "CLOSED", review: null }, expect: { state: "closed", actions: [] } },
+
+  // ---- a repo on the maintainer workflow
+  { name: "workflow repo: an unstarted PR off the auto path plans no model work", facts: { ...NEW_REPO, review: null, label: "missing feature" }, expect: { state: "not-started", actions: [], wait: NOT_STARTED_WAIT } },
+  { name: "workflow repo: an unstarted reviewed PR off the auto path is neither merged nor asked about", facts: { ...NEW_REPO, ...SIZE_L }, expect: { state: "not-started", actions: [] } },
+  { name: "workflow repo: a stopped auto-eligible PR is left alone", facts: { ...NEW_REPO, endedWorkflow: "stopped" }, expect: { state: "not-started", actions: [] } },
+  { name: "workflow repo: an auto-eligible PR is reviewed", facts: { ...NEW_REPO, review: null }, expect: { state: "not-reviewed", actions: ["review"] } },
+  { name: "workflow repo: an auto-eligible PR merges by rule", facts: NEW_REPO, expect: { state: "ready", path: "rule", actions: ["merge"], eligible: true } },
+  { name: "workflow repo: merge entry is verified without a review", facts: { ...NEW_REPO, ...SIZE_L, workflow: MERGE_ENTRY, review: null, verification: null, premerge: null }, expect: { state: "waiting-verify", path: "maintainer", actions: ["verify:plan"] } },
+  { name: "workflow repo: merge entry gets its pre-merge review, not an Opus review", facts: { ...NEW_REPO, ...SIZE_L, workflow: MERGE_ENTRY, review: null, premerge: null }, expect: { state: "waiting-premerge", path: "maintainer", actions: ["premerge"], eligible: false } },
 ];
 
 test("broke: the CI fix comes first among the PR's actions", () => {
@@ -368,7 +381,7 @@ test("a PR our push moved off its mirrored head is left alone and stays assigned
 });
 
 test("every plan state is one of the declared states", () => {
-  const all = new Set<string>([...QUEUE_STATES, "out-of-scope", "integration", "pushed", "backlog", "duplicate", "draft", "opus-hold", "opus-close", "review-stale", "label-not-reviewed", "scope", "not-reviewed", "closed"]);
+  const all = new Set<string>([...QUEUE_STATES, "out-of-scope", "integration", "pushed", "backlog", "duplicate", "draft", "opus-hold", "opus-close", "review-stale", "label-not-reviewed", "scope", "not-reviewed", "not-started", "closed"]);
   for (const row of rows) assert.ok(all.has(decidePr(prFacts(row.facts)).state), row.name);
   assert.equal(REVIEW_AT.length > 0, true);
 });

@@ -7,6 +7,8 @@ import { createMcpMock } from "./mcpMock";
 import { createAgentsMock } from "./agentsMock";
 import { createTraceMock } from "./traceMock";
 import { createNowMock } from "./nowMock";
+import { createMaintainMock } from "./maintainMock";
+import { createMaintainItemMock } from "./maintainItemMock";
 import { createActivityMock } from "./activityMock";
 import { createAreasMock } from "./areasMock";
 import { createConversationMock } from "./conversationMock";
@@ -80,10 +82,32 @@ export function setMockRole(r: MockRole) {
   location.replace(u.toString());
 }
 
+const UI_KEY = "autocraft:mock-ui-v2";
+
+/** Mock switch for the new dashboard: `?ui=2` or `?ui=1`, else the last one set, else off. */
+export function mockUiV2(): boolean {
+  const q = new URLSearchParams(location.search).get("ui");
+  if (q) return q === "2";
+  try {
+    return localStorage.getItem(UI_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+export function setMockUiV2(on: boolean) {
+  try {
+    if (on) localStorage.setItem(UI_KEY, "1");
+    else localStorage.removeItem(UI_KEY);
+  } catch {
+    /* storage blocked */
+  }
+}
+
 /** In-memory API over the fixture. Writes change the in-memory copy until reload. */
 export function createMockApi(): Api {
   setClock(() => NOW);
-  const me: User = MOCK_USERS[mockRole()];
+  const me: User = { ...MOCK_USERS[mockRole()], uiV2: mockUiV2() };
   const decisions = structuredClone(DECISIONS);
   // As on the server: the viewer's own flag per decision (an operator, or a maintainer under `maintainer_writes` with write access).
   for (const d of decisions) {
@@ -190,7 +214,19 @@ export function createMockApi(): Api {
   const lag = () => Number(globalThis.localStorage?.getItem("mockSlow")) || 10;
   const mcpMock = createMcpMock(me, changed);
   const api: Omit<Api, keyof RedesignApi> = {
-    me: Object.assign(() => wait(me, 10), { settings: mcpMock.meSettings }),
+    me: Object.assign(() => wait(me, 10), {
+      settings: {
+        get: async () => ({ ...(await mcpMock.meSettings.get()), uiV2: me.uiV2 }),
+        put: async (body: Parameters<Api["me"]["settings"]["put"]>[0]) => {
+          const { uiV2, ...rest } = body;
+          if (uiV2 !== undefined) {
+            setMockUiV2(uiV2);
+            me.uiV2 = uiV2;
+          }
+          return { ...(Object.keys(rest).length ? await mcpMock.meSettings.put(rest) : await mcpMock.meSettings.get()), uiV2: me.uiV2 };
+        },
+      },
+    }),
     repos: () => wait(REPOS, 10),
     repoOwners: () => wait(MOCK_REPO_OWNERS, 10),
     decisions: {
@@ -458,8 +494,11 @@ export function createMockApi(): Api {
     ...createNightlyMock(me, changed),
     ...createSecurityMock(me, changed),
     ...createQueueMock(me, changed),
+    ...createMaintainMock(me),
+    ...createMaintainItemMock(me, changed),
     prompts: () => wait(promptsReport(null), 60),
     next: () => wait(nextPageFixture(), 60),
+    mention: () => wait({ mention: "autocraft" }, 20),
     queue: (f) => wait(queueList(f), 60),
     needs: (f) => wait(needsPage(f), 60),
     needsFixes: (repo, cursor) => wait(needsFixesPage(repo, cursor), 60),

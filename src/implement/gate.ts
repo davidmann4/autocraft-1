@@ -1,14 +1,20 @@
 // What an implement job needs before it starts, checked again at the run: the repo's issue implementation approval, its
-// Implement switch, and a fast_track row on the issue by someone who settles on the repo (src/settlers.ts). A job that only
-// ends an attempt whose PR merged or closed needs none of them.
+// Implement switch, and a fast_track row on the issue by someone who settles on the repo (src/settlers.ts); in a repo on the
+// maintainer workflow, a live implement workflow started by such a person instead. A job that only ends an attempt whose PR
+// merged or closed needs none of them.
 import { fixIssueApprovalOf } from "./approval.ts";
 import { featureOn } from "../build/features.ts";
 import { settlesNow } from "../settlers.ts";
 import { currentImplementation } from "./store.ts";
+import { liveWorkflow, repoWorkflow } from "../workflow/store.ts";
 import type { Db } from "../db/index.ts";
 
-/** The login that queued the issue (its fast_track row), or null. */
+/** The login that queued the issue (its fast_track row; in a repo on the maintainer workflow, who started its live implement workflow), or null. */
 export async function queuerOf(db: Db, repo: string, number: number): Promise<string | null> {
+  if (await repoWorkflow(db, repo) === "new") {
+    const w = await liveWorkflow(db, repo, number);
+    return w?.entry === "implement" ? w.startedBy : null;
+  }
   return (await db.get(db.k.selectFrom("main.fast_track").select("added_by").where("repo", "=", repo).where("number", "=", number)))?.added_by ?? null;
 }
 

@@ -22,7 +22,7 @@ const PR_PHASE = {
   "batch-checking": "In queue", "in-batch": "In queue", "ci-approval": "In queue", "waiting-main-ci": "In queue", integration: "In queue",
   "ci-failed": "Fixing", conflict: "Fixing", "needs-fix-up": "Fixing", "verify-failed": "Fixing", "batch-failed": "Fixing", pushed: "Fixing",
   "waiting-verify": "Verifying", "verify-error": "Verifying",
-  "needs-decision": "Waiting for a person", "changes-requested": "Waiting for a person", scope: "Waiting for a person",
+  "needs-decision": "Waiting for a person", "changes-requested": "Waiting for a person", scope: "Waiting for a person", "not-started": "Waiting for a person",
   "opus-hold": "Held", declined: "Held", "held-duplicate": "Held", "held-backlog": "Held", backlog: "Held", duplicate: "Held", draft: "Held", "label-not-reviewed": "Held",
   "out-of-scope": "Pipeline off", "opus-close": "Out of scope",
   "not-reviewed": "Review", "review-stale": "Review",

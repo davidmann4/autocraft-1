@@ -1,4 +1,5 @@
 // Instance thresholds of the maintainer workflow's blockers 5 and 6, and each user's switch for the new dashboard.
+import { audit } from "../dash/audit.ts";
 import type { Db } from "../db/index.ts";
 import { setting } from "../settings-read.ts";
 
@@ -26,4 +27,34 @@ export async function outsidePurposeMin(db: Db): Promise<number> {
 
 export async function uiV2(db: Db, login: string): Promise<boolean> {
   return await db.get(db.k.selectFrom("main.user_settings").select("value").where("login", "=", login).where("key", "=", UI_V2_KEY).where("value", "=", "1")) !== undefined;
+}
+
+export type BlockerThresholds = { largeFixLines: number; outsidePurposeMin: number };
+const THRESHOLD_KEYS: Record<keyof BlockerThresholds, string> = { largeFixLines: LARGE_FIX_KEY, outsidePurposeMin: OUTSIDE_PURPOSE_KEY };
+const THRESHOLD_MAX = 100_000;
+
+/** A threshold outside 1..THRESHOLD_MAX, or not a whole number. */
+export class ThresholdError extends Error {}
+
+export async function blockerThresholds(db: Db): Promise<BlockerThresholds> {
+  return { largeFixLines: await largeFixLines(db), outsidePurposeMin: await outsidePurposeMin(db) };
+}
+
+/** Stores the given thresholds (an instance setting; operators only, checked by the caller) and audits a change. */
+export async function setBlockerThresholds(db: Db, by: string, input: unknown): Promise<BlockerThresholds> {
+  const b = (input && typeof input === "object" ? input : {}) as Record<string, unknown>;
+  const was = await blockerThresholds(db);
+  const next = { ...was };
+  for (const k of Object.keys(THRESHOLD_KEYS) as (keyof BlockerThresholds)[]) {
+    const v = b[k];
+    if (v === undefined) continue;
+    if (typeof v !== "number" || !Number.isInteger(v) || v < 1 || v > THRESHOLD_MAX) throw new ThresholdError(`${k} must be a whole number from 1 to ${THRESHOLD_MAX}`);
+    next[k] = v;
+  }
+  if (JSON.stringify(was) === JSON.stringify(next)) return next;
+  for (const k of Object.keys(THRESHOLD_KEYS) as (keyof BlockerThresholds)[]) {
+    await db.run(db.k.insertInto("main.settings").values({ key: THRESHOLD_KEYS[k], value: String(next[k]) }).onConflict((oc) => oc.column("key").doUpdateSet({ value: String(next[k]) })));
+  }
+  await audit(db, by, "blocker-thresholds", "pipeline", { ...next, was });
+  return next;
 }

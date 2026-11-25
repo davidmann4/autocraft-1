@@ -287,7 +287,7 @@ function AddEnv({ onDone }: { onDone: () => void }) {
 // "Online" ages out of last_seen_at with no database write, so the list also refreshes on a timer.
 const useEnvs = () => useQuery<BuildEnv[]>("envs", (a) => a.envs.list(), { pollMs: 30_000 });
 
-function EnvsPanel() {
+export function EnvsPanel() {
   const q = useEnvs();
   const operator = useUser().role === "operator";
   const [adding, setAdding] = useState(false);
@@ -407,7 +407,7 @@ function Filters({ f, update }: { f: Record<string, string | undefined>; update:
   );
 }
 
-function Tasks({ selected }: { selected?: number }) {
+export function Tasks({ selected }: { selected?: number }) {
   const { state: f, update } = useUrlState();
   const t = useTasks({ state: f.state as TaskFilter["state"], env: f.env, repo: f.repo, limit: 50 });
   useNow(t.rows.some((r) => ACTIVE.includes(r.state)) ? 1000 : undefined);

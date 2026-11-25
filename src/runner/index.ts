@@ -179,6 +179,7 @@ async function serve(): Promise<void> {
 async function exec(args: string[]): Promise<void> {
   const id = Number(args[0]);
   if (!Number.isInteger(id)) die(USAGE);
+  setDbRole("job");
   process.exit(await execJob(id));
 }
 

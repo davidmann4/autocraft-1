@@ -70,7 +70,7 @@ export const preparesTodaySql = (_db: Db, d: string): string => `(SELECT count(*
 /** The select list for the columns above, for open decisions only; binds one `?` (the UTC day start). */
 export const prepareStateSql = (db: Db, d: string): string => `CASE WHEN ${d}.answer IS NULL THEN ${discussionKeySql(db, d)} END AS discussion_key,
   CASE WHEN ${d}.answer IS NULL THEN ${reviewedAtSql(db, d)} END AS reviewed_at, CASE WHEN ${d}.answer IS NULL THEN ${preparesTodaySql(db, d)} END AS prepares_today,
-  CASE WHEN ${d}.answer IS NULL THEN ${staleChoicesSql(db, d)} END AS stale_choices, ${reviewQueuedSql(db, d)} AS review_queued`;
+  CASE WHEN ${d}.answer IS NULL THEN ${staleChoicesSql(db, d)} END AS stale_choices, CASE WHEN ${d}.answer IS NULL THEN ${reviewQueuedSql(db, d)} END AS review_queued`;
 
 // Typed twins of the SQL fragments above, for queries built with `db.k`; `d` names the decisions row in the caller's query.
 
@@ -124,7 +124,7 @@ export function prepareStateExpr(db: Db, eb: kx.AnyEb, d: string, since: string)
     open(reviewedAtExpr(db, eb, d)).as("reviewed_at"),
     open(preparesTodayExpr(db, eb, d, since)).as("prepares_today"),
     open(staleChoicesExpr(db, eb, d)).as("stale_choices"),
-    reviewQueuedExpr(db, eb, d).as("review_queued"),
+    open(reviewQueuedExpr(db, eb, d)).as("review_queued"),
   ];
 }
 
@@ -185,7 +185,7 @@ export function openSubjectExpr(db: Db, eb: kx.AnyEb, d: string, i: string): Ali
       .select(eb.lit(1).as("one")).where("gi.decision_id", "=", eb.ref(`${d}.id`)).where("gi.role", "=", "close").where("m.state", "=", "OPEN"))])]);
 }
 
-type Subject = { dkind: string; kind: string; head_oid: string | null; prepares_today: number | null; review_queued: SqlBool } & Pick<PrepareColumns, "discussion_key" | "reviewed_at" | "stale_choices">;
+type Subject = { dkind: string; kind: string; head_oid: string | null; prepares_today: number | null; review_queued: SqlBool | null } & Pick<PrepareColumns, "discussion_key" | "reviewed_at" | "stale_choices">;
 
 type Open = Partial<PrepareColumns> & { id: string; answer: string | null; repo: string | null; number: number | null };
 

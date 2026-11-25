@@ -6,6 +6,7 @@
 //   fix 1 and 2, drop 3, then merge  an answer naming plan parts by number
 //   drop export dialog               a part named by words from its title (resolve.ts matches them)
 //   merge: photocraft#12 #15         a list of items after a colon; a bare number takes the repo before it
+//   review photocraft#12 urgent      items written inline: repo#n, owner/repo#n, a GitHub link, or #n after one (or in an item's context)
 //   yes / lgtm / go                  runs the open recommendation
 import { commentLines } from "../github/comment-lines.ts";
 import { parseBranch, parsePrRef } from "../repin/manifest.ts";
@@ -13,9 +14,9 @@ import { WEIGHT_MAX, WEIGHT_MIN, WEIGHT_WORDS, type CommandPart, type ItemRef, t
 import { commandOf, weightWord, YES_TRAILERS, YES_WORDS } from "./vocab.ts";
 
 export type ParseOptions = {
-  /** The app's slug: a leading `@<slug>` (or `@<slug>[bot]`) is not part of the command. */
-  slug?: string;
-  /** The repo of the item the text was written on: a bare number before any `repo#n` in a list takes it. */
+  /** The app's slug, and its mention name when set: a leading `@<slug>` (or `@<slug>[bot]`) is not part of the command. */
+  slug?: string | readonly string[];
+  /** The repo of the item the text was written on: a bare number before any `repo#n` in a list, or an inline `#n`, takes it. */
   repo?: string;
 };
 
@@ -23,7 +24,7 @@ export type ParseOptions = {
 const BODY_MAX = 65_536;
 
 const escape = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-const mentionRe = (slug: string): RegExp => new RegExp(`^@${escape(slug)}(?:\\[bot\\])?(?=[\\s,:]|$)[\\s,:]*`, "i");
+const mentionRe = (names: readonly string[]): RegExp => new RegExp(`^@(?:${names.map(escape).join("|")})(?:\\[bot\\])?(?=[\\s,:]|$)[\\s,:]*`, "i");
 const isWeightWord = (w: string): w is WeightWord => Object.hasOwn(WEIGHT_WORDS, w);
 const norm = (s: string): string => s.toLowerCase().replace(/\s+/g, " ").trim();
 
@@ -34,24 +35,27 @@ export function describe(parts: readonly CommandPart[], items: readonly ItemRef[
     if ("weight" in p) return weightWord(p.weight) ?? `weight ${p.weight}`;
     return p.args ? `${p.word} ${p.args}` : p.word;
   }).join(", ");
-  return items.length ? `${words}: ${items.map((i) => `${i.repo}#${i.number}`).join(" ")}` : words;
+  const refs = items.map((i) => `${i.repo}#${i.number}`).join(" ");
+  return items.length ? (words ? `${words}: ${refs}` : refs) : words;
 }
 
 /** Reads text written to AutoCraft. */
 export function parse(text: string, opts: ParseOptions = {}): Parsed {
   let s = text.trim();
-  if (opts.slug) s = s.replace(mentionRe(opts.slug), "");
-  let items: ItemRef[] = [];
+  const names = [opts.slug ?? []].flat().filter(Boolean);
+  if (names.length) s = s.replace(mentionRe(names), "");
   // The list form: the command, a colon, then the items. A colon that starts `://` belongs to a URL.
   const list = /^([^:\n]+?):(?!\/\/)([\s\S]*)$/.exec(s);
+  const inline = pullItems(list ? list[1]! : s, opts.repo);
+  let items = inline.items;
+  s = inline.text;
   if (list) {
-    const read = readItems(list[2]!, opts.repo);
+    const read = readItems(list[2]!, inline.last ?? opts.repo);
+    items = addItems(items, read.items);
     if (read.bad.length || !read.items.length) {
-      const head = readWords(list[1]!);
-      return { kind: "ambiguous", understood: describe(head.parts, read.items), rest: [...head.unknown, ...read.bad].join(" ") };
+      const head = readWords(s);
+      return { kind: "ambiguous", understood: describe(head.parts, items), rest: [...head.unknown, ...read.bad].join(" ") };
     }
-    items = read.items;
-    s = list[1]!;
   }
   const yes = readYes(s);
   if (yes) return { kind: "yes", ...(items.length ? { items } : {}), ...(yes.weight === null ? {} : { weight: yes.weight }) };
@@ -66,10 +70,11 @@ export function parse(text: string, opts: ParseOptions = {}): Parsed {
  * `@<slug> merge:` up to the next blank or hidden line are the items. Several addressed lines are read as one text, so an unclear
  * mix is ambiguous rather than half run.
  */
-export function parseComment(body: unknown, slug: string, opts: Omit<ParseOptions, "slug"> = {}): Parsed | null {
-  if (typeof body !== "string" || !slug) return null;
+export function parseComment(body: unknown, slug: string | readonly string[], opts: Omit<ParseOptions, "slug"> = {}): Parsed | null {
+  const names = [slug].flat().filter(Boolean);
+  if (typeof body !== "string" || !names.length) return null;
   const lines = commentLines(body.slice(0, BODY_MAX));
-  const mention = mentionRe(slug);
+  const mention = mentionRe(names);
   const texts: string[] = [];
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]!;
@@ -110,6 +115,14 @@ function readYes(s: string): { weight: number | null } | null {
   return !bad && YES_WORDS.includes(rest) ? { weight } : null;
 }
 
+/**
+ * Filler a maintainer writes around a command word: "please merge it now", "ok go ahead and merge", "yes, merge the PR". A small
+ * explicit list; words that change a meaning (don't, not, no, wait, hold, later, unless, but, if, instead) are never in it, so such
+ * a reply stays unread.
+ */
+const FILLER = /(?<![\w-])(?:thank you|the pull request|the pr|the rest|go ahead|sounds good|lgtm|yes|yep|yeah|ok|okay|sure|please|pls|thanks|thx|now|it|this|that)(?![\w-])/gi;
+const stripFiller = (seg: string): string => seg.replace(FILLER, " ").replace(/\s+/g, " ").trim();
+
 /** Commands, separated by commas, semicolons, new lines, `and` or `then`. */
 function readWords(src: string): Read {
   const parts: CommandPart[] = [];
@@ -133,8 +146,12 @@ function readWords(src: string): Read {
     if (!parts.some((q) => JSON.stringify(q) === key)) parts.push(p);
   };
   for (const raw of s.split(/\s*[,;\n]\s*|\s+(?:and\s+then|then|and|&)\s+/i)) {
-    const seg = raw.trim().replace(/^(?:(?:and\s+then|then|and|please)\s+)+/i, "").trim();
+    let seg = raw.trim().replace(/\s+/g, " ").replace(/^(?:(?:and then|then|and|please) )+/i, "").replace(/(?: (?:and|&))+$/i, "").trim();
     if (!seg) continue;
+    if (!/^auto[-\s]?repin(?:\s|$)/i.test(seg)) {
+      seg = stripFiller(seg);
+      if (!seg) continue;
+    }
     const repin = /^auto[-\s]?repin(?:\s+(.+))?$/i.exec(seg);
     if (repin) {
       const args = repin[1]?.trim().replace(/\s+/g, " ") ?? "";
@@ -203,6 +220,47 @@ function validRepin(args: string): boolean {
   return !!parsePrRef(m[1]!) && (m[2] === undefined || !!parseBranch(m[2]));
 }
 
+const URL_RE = /^https?:\/\/github\.com\/([\w.-]+)\/([\w.-]+)\/(?:pull|issues)\/(\d+)(?:[/?#]\S*)?$/i;
+const FULL_RE = /^((?:[\w.-]+\/)?[\w.-]+)#(\d+)$/;
+
+/** The item a token names: a GitHub link or `[owner/]repo#n`; null for anything else. */
+function refOf(tok: string): ItemRef | null {
+  const url = URL_RE.exec(tok);
+  const full = FULL_RE.exec(tok);
+  const ref = url ? { repo: `${url[1]}/${url[2]}`, number: Number(url[3]) } : full ? { repo: full[1]!, number: Number(full[2]) } : null;
+  return ref && Number.isSafeInteger(ref.number) && ref.number > 0 ? ref : null;
+}
+
+const addItems = (into: ItemRef[], more: readonly ItemRef[]): ItemRef[] => {
+  for (const r of more) if (!into.some((i) => i.repo === r.repo && i.number === r.number)) into.push(r);
+  return into;
+};
+
+/**
+ * Items written inline, taken out of the text: `[owner/]repo#n` and GitHub links anywhere, and `#n` when a repo is known (the last
+ * one written before it, else `repo`). A `#n` after `drop` or `fix` stays a plan part, and the argument of autorepin stays its own.
+ */
+function pullItems(text: string, repo: string | undefined): { text: string; items: ItemRef[]; last: string | null } {
+  const items: ItemRef[] = [];
+  let last = repo ?? null;
+  const out = text.replace(/(^|[\s,;(])(https?:\/\/[^\s,;]+|(?:[\w.-]+\/)?[\w.-]*#\d+)(?=$|[\s,;)!?]|\.(?:\s|$))/g, (m, pre: string, raw: string, at: number) => {
+    const before = text.slice(0, at + pre.length);
+    if (/auto[-\s]?repin\s*$/i.test(before)) return m;
+    const tok = raw.replace(/[.)!?]+$/, "");
+    let ref = refOf(tok);
+    if (!ref && /^#\d+$/.test(tok)) {
+      if (!last || /\b(?:drop|fix)(?:\s+(?:parts?|findings?|changes?))?(?:(?:\s*[,;]\s*|\s+and\s+|\s+)#?\d+)*(?:\s*[,;]\s*|\s+and\s+|\s+)$/i.test(before)) return m;
+      ref = { repo: last, number: Number(tok.slice(1)) };
+      if (!Number.isSafeInteger(ref.number) || ref.number < 1) return m;
+    }
+    if (!ref) return m;
+    last = ref.repo;
+    addItems(items, [ref]);
+    return `${pre} `;
+  });
+  return { text: out, items, last };
+}
+
 /** Items in a list: `owner/name#12`, `name#12`, a GitHub URL, or a bare `#12`/`12` taking the repo before it. */
 function readItems(text: string, repo: string | undefined): { items: ItemRef[]; bad: string[] } {
   const items: ItemRef[] = [];
@@ -211,13 +269,8 @@ function readItems(text: string, repo: string | undefined): { items: ItemRef[]; 
   for (const raw of text.split(/[\s,;]+/)) {
     const tok = raw.replace(/[.)]+$/, "");
     if (!tok || /^(?:and|&)$/i.test(tok)) continue;
-    const url = /^https?:\/\/github\.com\/([\w.-]+)\/([\w.-]+)\/(?:pull|issues)\/(\d+)(?:[/?#]\S*)?$/i.exec(tok);
-    const full = /^((?:[\w.-]+\/)?[\w.-]+)#(\d+)$/.exec(tok);
     const short = /^#?(\d+)$/.exec(tok);
-    let ref: ItemRef | null = null;
-    if (url) ref = { repo: `${url[1]}/${url[2]}`, number: Number(url[3]) };
-    else if (full) ref = { repo: full[1]!, number: Number(full[2]) };
-    else if (short && last) ref = { repo: last, number: Number(short[1]) };
+    const ref = refOf(tok) ?? (short && last ? { repo: last, number: Number(short[1]) } : null);
     if (!ref || !Number.isSafeInteger(ref.number) || ref.number < 1) { bad.push(tok); continue; }
     last = ref.repo;
     if (!items.some((i) => i.repo === ref.repo && i.number === ref.number)) items.push(ref);

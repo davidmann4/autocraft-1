@@ -87,3 +87,18 @@ export async function testDb(schema = ""): Promise<Db> {
   const db = await t.open();
   return Object.assign(db, { close: () => t.close() });
 }
+
+/**
+ * The item snapshot built from the mirror at `file` into `dest`: the incremental copy from the SQLite file, or under the
+ * Postgres suite, where the mirror is a Postgres database, the copy through a handle that production uses on Postgres.
+ */
+export async function writeTestSnapshot(file: string, dest?: string): Promise<import("../src/itemtools/snapshot.ts").SnapshotStats> {
+  const { writeSnapshot, writeSnapshotFromDb } = await import("../src/itemtools/snapshot.ts");
+  if (!pgSuite) return writeSnapshot(file, dest);
+  const db = await connectDb(file);
+  try {
+    return await writeSnapshotFromDb(db, dest);
+  } finally {
+    await db.close();
+  }
+}

@@ -8,7 +8,7 @@ import { connect, dbPath } from "../db.ts";
 import { envVar } from "../env.ts";
 import { Handle } from "./handle.ts";
 import type { Db, DbRole } from "./index.ts";
-import { migratePg, pgStamp, storedPgStamp } from "./pg-triggers.ts";
+import { migratePg, newerPgSchema, pgStamp, storedPgStamp } from "./pg-triggers.ts";
 import { pgConnectionString, postgresEngine } from "./postgres.ts";
 import { bindSql } from "./sql.ts";
 import { sqliteEngine } from "./sqlite.ts";
@@ -117,8 +117,10 @@ export async function connectDb(target: string = dbTarget(), opts: ConnectOption
   const db = new Handle((ctx) => postgresEngine(k, pg, target, { role: opts.role ?? role, busyTimeoutMs: opts.busyTimeoutMs, idleInTransactionMs: opts.idleInTransactionMs, rowWrites: opts.rowWrites }, ctx));
   if (opts.migrate === false) return db;
   try {
-    // A current database costs two reads on the pool; only a stale one opens a connection of its own for the migration.
-    if (await storedPgStamp((sql) => db.prepare(sql).all()) !== pgStamp()) {
+    // A current database costs two reads on the pool; only a stale one opens a connection of its own for the migration, and
+    // only when no newer version has migrated it.
+    const rows = (sql: string) => db.prepare(sql).all() as Promise<Record<string, unknown>[]>;
+    if (await storedPgStamp(rows) !== pgStamp() && !(await newerPgSchema(rows))) {
       const client = new pg.Client({ connectionString: pgConnectionString(target), application_name: "autocraft-migrate" });
       await client.connect();
       try {

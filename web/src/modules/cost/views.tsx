@@ -1,3 +1,4 @@
+import { PageFrame, PageTitle } from "../../ui/organisms/Page";
 import { useSearchParams } from "react-router-dom";
 import { useQuery } from "../../api/client";
 import { Pending } from "../../ui/atoms/Pending";
@@ -127,10 +128,9 @@ export function Cost(_: ViewProps) {
   // Each model's calls count the same item again, so the headline uses distinct classified items.
   const items = r.itemsClassified || Math.max(0, ...models.map((m) => m.items));
   return (
-    <div className="h-full overflow-y-auto">
-      <div className="mx-auto max-w-[1180px] px-4 pb-12 pt-5 md:px-6">
+    <PageFrame>
         <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
-          <h1 className="text-xl font-semibold">Cost</h1>
+          <PageTitle>Cost</PageTitle>
           <Select
             label="Run"
             value={r.run}
@@ -163,8 +163,7 @@ export function Cost(_: ViewProps) {
         <Block title="By repo" className="mt-4" flush>
           {r.repos.length ? <UsageTable name="Repo" rows={r.repos.map((x) => ({ key: x.repo, u: x }))} /> : <p className="p-4 text-sm text-ink/55">No call recorded a repo.</p>}
         </Block>
-      </div>
-    </div>
+    </PageFrame>
   );
 }
 

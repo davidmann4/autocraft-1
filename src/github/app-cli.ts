@@ -9,6 +9,9 @@ import { openDb } from "../db/open.ts";
 import { installations } from "./app.ts";
 import { allowedOwners, AllowedOwnerError, allowOwner, removeOwner, rowFor } from "./allowed-owners.ts";
 import { readAppSecrets } from "./install-token.ts";
+import { MENTION_KEY, mentionName, validMentionName } from "./slugs.ts";
+import { deleteSetting, writeSetting } from "../settings-read.ts";
+import { audit } from "../dash/audit.ts";
 
 function registerUrl(): string {
   const base = envVar("BASE_URL")?.replace(/\/+$/, "") ?? `http://${envVar("LISTEN") ?? "127.0.0.1:8993"}`;
@@ -52,7 +55,35 @@ async function app(args: string[]): Promise<void> {
   }
 }
 
+const MENTION_USAGE = "usage: autocraft-server github mention [<name> | --clear]";
+
+/** `github mention`: shows, sets or clears the name people type to address the app in a comment (default: the app's slug). */
+async function mention(args: string[]): Promise<void> {
+  const [sub, name] = args;
+  if (sub !== "mention" || args.length > 2) die(MENTION_USAGE);
+  const db = await openDb();
+  const by = "cli";
+  if (name === undefined) {
+    const m = await mentionName(db);
+    console.log(m ? `@${m}` : `not set: comments address the app by its slug${readAppSecrets()?.slug ? ` (@${readAppSecrets()!.slug})` : ""}`);
+  } else if (name === "--clear") {
+    await deleteSetting(db, MENTION_KEY);
+    await audit(db, by, "github-mention-clear", null);
+    console.log("cleared: comments address the app by its slug");
+  } else {
+    const n = name.replace(/^@/, "");
+    if (!validMentionName(n)) die("a mention name is a GitHub login: letters, digits and single hyphens, at most 39 characters");
+    await writeSetting(db, MENTION_KEY, n);
+    await audit(db, by, "github-mention-set", n);
+    console.log(`set: comments may address the app as @${n}, besides its slug`);
+  }
+}
+
 export const commands = {
+  github: {
+    summary: "github mention [<name> | --clear]: the name people type to address the app in a comment (without @; default: the app's slug)",
+    run: (args: string[]) => mention(args),
+  },
   "github-app": {
     summary: "github-app register: print the page that registers the GitHub App",
     run: (args: string[]) => {

@@ -81,6 +81,26 @@ test("a write under a named lock, and a lone write of a rowWrites handle, run wh
   }
 });
 
+test("db.exclusive excludes holders of one name across handles, and a holder that throws releases it", { skip: needsPg }, async () => {
+  const t = await testDatabase(SCHEMA);
+  try {
+    const [a, b] = [await t.open(), await t.open()];
+    let inside = 0;
+    let overlapped = false;
+    const hold = (db: Db) => db.exclusive("refresh:x", async () => {
+      overlapped ||= ++inside > 1;
+      await new Promise((r) => setTimeout(r, 30));
+      inside--;
+    });
+    await Promise.all([hold(a), hold(b), hold(a), hold(b)]);
+    assert.equal(overlapped, false);
+    await assert.rejects(a.exclusive("refresh:x", async () => { throw new Error("boom"); }), /boom/);
+    assert.equal(await b.exclusive("refresh:x", async () => "free", 1000), "free");
+  } finally {
+    await t.close();
+  }
+});
+
 test("a nested write joins the outer one on its connection and rolls back with it", { skip: needsPg }, async () => {
   const t = await testDatabase(SCHEMA);
   try {

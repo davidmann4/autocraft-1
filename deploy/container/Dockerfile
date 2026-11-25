@@ -63,21 +63,20 @@ RUN set -eux; \
     # in backup.sh), grep and sed, tar and gzip (src/reference.ts, src/worker/warm.ts),
     # and bsdutils (`script`, src/agents/login.ts).
     packages="bash bsdutils bubblewrap ca-certificates coreutils curl dash findutils git grep gzip sed sqlite3 tar tini zstd"; \
-    # The full dependency closure, flattened from apt-cache's indented tree;
-    # `apt-get download` fetches them whether or not this stage already has them.
-    apt-cache depends --recurse --no-recommends --no-suggests --no-conflicts \
-      --no-breaks --no-replaces --no-enhances $packages \
-      | sed -e 's/^[[:space:]|]*//' -e 's/^[A-Za-z-]*: //' \
-      | grep -E '^[a-z0-9][a-z0-9.+-]*(:[a-z0-9]+)?$' | sort -u > /tmp/packages; \
-    mkdir -p /rootfs /tmp/debs; \
+    # Resolve the closure as apt would install it onto an empty system, and fetch
+    # it. The empty dpkg status keeps this stage's own installed versions out of the
+    # choice: after a repository rebuild they can sort above every version left in
+    # the index, and apt would then pick a version it has nowhere to download from.
+    # apt picks one provider per dependency and honours Conflicts, and a package it
+    # cannot fetch fails the build.
+    mkdir -p /rootfs /tmp/apt-empty /tmp/debs/partial; \
+    : > /tmp/apt-empty/status; \
+    apt-get install -y --download-only --no-install-recommends \
+      -o Dir::State::status=/tmp/apt-empty/status -o Dir::Cache::archives=/tmp/debs \
+      $packages; \
     cd /tmp/debs; \
-    # One call fetches the whole list in a single pass. A name with no
-    # download candidate fails it, and then each package is fetched on its own,
-    # skipping those names.
-    apt-get download $(cat /tmp/packages) \
-      || xargs -r -n1 sh -c 'apt-get download "$0" || true' < /tmp/packages; \
     for deb in *.deb; do dpkg -x "$deb" /rootfs; done; \
-    rm -rf /var/lib/apt/lists/* /tmp/debs /tmp/packages; \
+    rm -rf /var/lib/apt/lists/* /tmp/debs /tmp/apt-empty; \
     # `dpkg -x` runs no postinst, so make sure /bin/sh exists whatever the packages shipped.
     [ -e /rootfs/usr/bin/sh ] || ln -s dash /rootfs/usr/bin/sh; \
     # Prove the unpacked tree runs on its own libraries before it is copied into

@@ -9,7 +9,7 @@ import { cn } from "../ui/cn";
 export const projectPath = (repo: string | null) => (repo ? `/projects/${encodeURIComponent(repo)}` : "/");
 
 /** `onPicked` runs after a pick, for the phone drawer to close. */
-export function ScopePicker({ className, onPicked }: { className?: string; onPicked?: () => void }) {
+export function ScopePicker({ className, onPicked, modal }: { className?: string; onPicked?: () => void; modal?: boolean }) {
   const scope = useScope();
   const counts = useQuery("count:by-repo", (api) => api.decisions.openCounts());
   const navigate = useNavigate();
@@ -20,7 +20,7 @@ export function ScopePicker({ className, onPicked }: { className?: string; onPic
     if (pathname === "/" || pathname.startsWith("/projects/")) navigate(projectPath(repo));
     onPicked?.();
   };
-  return <RepoSelect value={scope} onChange={pick} counts={counts.data} allLabel="All projects" align="start" className={cn("w-full max-w-none justify-between", scope && "border-accent-ink/50", className)} />;
+  return <RepoSelect value={scope} onChange={pick} counts={counts.data} allLabel="All projects" align="start" modal={modal} className={cn("w-full max-w-none justify-between", scope && "border-accent-ink/50", className)} />;
 }
 
 /** A list page's own repo filter: shown only under All projects; with a project picked, the picker is the repo control. */

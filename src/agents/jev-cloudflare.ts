@@ -29,6 +29,13 @@ function readToken(path: string): string {
 
 const fail = (code: number, status: number | null, message: string): JevProc => ({ code, stdout: "", stderr: `jev: ${status === null ? "" : `API error status=${status}: `}${message}\n` });
 
+/** The retry and rate-limit headers of a response, as ` (name: value; ...)`, or "" when it has none: they say which limit a 429 hit. */
+export function limitHeaders(h: Headers): string {
+  const kept: string[] = [];
+  h.forEach((v, k) => { if (k === "retry-after" || /ratelimit/.test(k)) kept.push(`${k}: ${v.slice(0, 80)}`); });
+  return kept.length ? ` (${kept.sort().join("; ")})` : "";
+}
+
 /** Sends a request in the `jev ask` format (`{state, questions, model?}` as JSON text) to Workers AI. */
 export async function askJevCloudflare(cfg: JevCloudflareConfig, body: string, timeoutMs: number, base = "https://api.cloudflare.com"): Promise<JevProc> {
   let token: string;
@@ -54,7 +61,7 @@ export async function askJevCloudflare(cfg: JevCloudflareConfig, body: string, t
   if (!res.ok) {
     let detail = "";
     try { detail = ((JSON.parse(text) as { errors?: { message?: string }[] }).errors ?? []).map((x) => x.message).filter(Boolean).join("; "); } catch { /* no detail */ }
-    return fail(1, res.status, detail.slice(0, 200) || res.statusText);
+    return fail(1, res.status, `${detail.slice(0, 200) || res.statusText}${limitHeaders(res.headers)}`);
   }
   let parsed: unknown;
   try { parsed = JSON.parse(text); } catch { return { code: 0, stdout: text, stderr: "" }; }

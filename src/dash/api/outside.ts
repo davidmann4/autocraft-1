@@ -8,6 +8,7 @@ import type { Req } from "../types.ts";
 import { hiddenRepos, needVisible } from "./visible.ts";
 import type { Db } from "../../db/index.ts";
 import { mayRunRepo } from "../repo-access.ts";
+import { blockerThresholds, setBlockerThresholds, ThresholdError } from "../../workflow/settings.ts";
 
 const operator = (req: Req, what: string): void => {
   if (req.user.role !== "operator") throw new HttpError(403, `only operators ${what}`);
@@ -21,6 +22,22 @@ const wrap = async <T>(f: () => Promise<T>): Promise<T> => {
     throw e;
   }
 };
+
+/** The maintainer workflow's thresholds for blockers 5 (a large fix) and 6 (a change outside the purpose). */
+export async function getBlockerThresholds(db: Db) {
+  return await blockerThresholds(db);
+}
+
+/** Operator: sets the blocker thresholds, an instance setting. */
+export async function putBlockerThresholds(db: Db, req: Req) {
+  operator(req, "change the blocker thresholds");
+  try {
+    return await setBlockerThresholds(db, req.user.login, req.json);
+  } catch (e) {
+    if (e instanceof ThresholdError) throw new HttpError(400, e.message);
+    throw e;
+  }
+}
 
 /** Operator: sets the daily budgets and the surge threshold; 0 turns a protection off. */
 export async function putLimits(db: Db, req: Req) {

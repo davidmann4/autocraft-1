@@ -73,7 +73,7 @@ export function ModelQueueView({ user }: ViewProps) {
   );
 }
 
-function QueueRow({ c, user, waited, write }: { c: ModelQueueCall; user: User; waited: number; write: ReturnType<typeof useWrite> }) {
+export function QueueRow({ c, user, waited, write }: { c: ModelQueueCall; user: User; waited: number; write: ReturnType<typeof useWrite> }) {
   const api = useApi();
   const staff = user.role !== "viewer";
   const mine = !!c.picked?.login && c.picked.login.toLowerCase() === user.login.toLowerCase();

@@ -219,7 +219,7 @@ export function PromptCard({ p, fold }: { p: PromptInfo; fold?: boolean }) {
   );
 }
 
-function CommentCard({ c }: { c: CommentTemplate }) {
+export function CommentCard({ c }: { c: CommentTemplate }) {
   const [open, setOpen] = useState(false);
   useHashTarget(c.id, () => setOpen(true));
   return (

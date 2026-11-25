@@ -9,6 +9,7 @@ import { itemInput, type Item } from "./classify/parse.ts";
 import { LABELS, RULES } from "./classify/rules.ts";
 import { itemText, textHash } from "./embed/text.ts";
 import type { Db } from "./db/index.ts";
+import * as kx from "./db/kx.ts";
 
 export const SCHEME = createHash("sha256").update(JSON.stringify(LABELS)).update(RULES).digest("hex");
 export const SCHEME_ID = SCHEME.slice(0, 16);
@@ -52,19 +53,19 @@ export async function fillClassHashes(db: Db): Promise<number> {
 
 type Fill = {
   source: string;
-  read: (db: Db) => Promise<Fields[]>; write: (db: Db, r: Fields) => Promise<unknown>;
+  read: (db: Db) => Promise<Fields[]>; write: (db: Db, rows: Fields[]) => Promise<unknown>;
 };
 
 const EMBED: Fill = {
   source: "embed-hashes",
   read: (db) => db.all(db.k.selectFrom("main.items").select(FIELD_COLUMNS).where("embed_hash", "is", null).limit(BATCH)),
-  write: (db, r) => db.run(db.k.updateTable("main.items").set({ embed_hash: embedHash(r.title, r.body) }).where("repo", "=", r.repo).where("number", "=", r.number)),
+  write: (db, rows) => db.run(db.k.updateTable("main.items").set({ embed_hash: kx.refCase(rows.map((r) => [r.repo, r.number, embedHash(r.title, r.body)] as const)) }).where(kx.refIn(db, "main.items", rows.map((r) => [r.repo, r.number] as const)))),
 };
 
 const CLASS: Fill = {
   source: "class-hashes",
   read: (db) => db.all(db.k.selectFrom("main.items").select(FIELD_COLUMNS).where("state", "=", "OPEN").where("class_scheme", "is distinct from", SCHEME_ID).limit(BATCH)),
-  write: (db, r) => db.run(db.k.updateTable("main.items").set({ class_hash: classifyHash(r), class_scheme: SCHEME_ID }).where("repo", "=", r.repo).where("number", "=", r.number)),
+  write: (db, rows) => db.run(db.k.updateTable("main.items").set({ class_hash: kx.refCase(rows.map((r) => [r.repo, r.number, classifyHash(r)] as const)), class_scheme: SCHEME_ID }).where(kx.refIn(db, "main.items", rows.map((r) => [r.repo, r.number] as const)))),
 };
 
 async function fill(db: Db, { source, read, write: put }: Fill): Promise<number> {
@@ -73,7 +74,7 @@ async function fill(db: Db, { source, read, write: put }: Fill): Promise<number>
     const rows = await read(db);
     if (!rows.length) return total;
     await db.write(async () => {
-      const write = async (): Promise<void> => { for (const r of rows) await put(db, r); };
+      const write = async (): Promise<void> => { for (const b of kx.batches(rows)) await put(db, b); };
       // A batch of a backfill takes one full-pass mark instead of a log row per item (src/core/plan-changes.ts).
       if (rows.length >= BULK_ROWS) await bulkWrites(db, source, write); else await write();
     });

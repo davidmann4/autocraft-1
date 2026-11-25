@@ -84,7 +84,7 @@ async function needs(db: Db, req: Req, hidden: HiddenRepos, staff: boolean, page
   return { total, byKind, oldest: [...asked, ...found].sort((a, b) => a.askedAt.localeCompare(b.askedAt)).slice(0, OLDEST) };
 }
 
-async function problems(db: Db, hidden: string[], staff: boolean, stops: NeedsStoppedRow[]): Promise<HomeProblem[]> {
+export async function problems(db: Db, hidden: string[], staff: boolean, stops: NeedsStoppedRow[]): Promise<HomeProblem[]> {
   const out: HomeProblem[] = [];
   for (const s of stops) out.push({ kind: "stopped", title: s.repo ? `${s.title} in ${s.repo}` : s.title, detail: staff ? s.reason : "", to: "/needs/stopped" });
   const seen = new Set(stops.map((s) => s.id));

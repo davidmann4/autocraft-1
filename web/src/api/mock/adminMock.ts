@@ -205,7 +205,7 @@ export function createAdminMock(me: User, changed: () => void): AdminApi {
     const registered = !appRemoved && (typeof location === "undefined" || !location.search.includes("unregistered"));
     return {
       configured: registered, identity: githubIdentity, canRegister: true, keysUnreadable: false, defaultName: "AutoCraft", csrf: "mock", authorized: registered ? false : null,
-      app: registered ? { id: "1234567", slug: "autocraft-demo", name: "AutoCraft", installUrl: "https://github.com/apps/autocraft-demo/installations/new", transferUrl: "https://github.com/settings/apps/autocraft-demo/advanced" } : null,
+      app: registered ? { id: "1234567", slug: "autocraft-demo", mention: "autocraft", name: "AutoCraft", installUrl: "https://github.com/apps/autocraft-demo/installations/new", transferUrl: "https://github.com/settings/apps/autocraft-demo/advanced" } : null,
       links: [...setupLinks],
       installations: registered ? [
         { id: 101, owner: "glasswing", type: "Organization" as const, selection: "selected" as const, repos: ["glasswing/photocraft", "glasswing/designcraft", "glasswing/filmcraft"], createdAt: new Date(NOW - 40 * D).toISOString() },

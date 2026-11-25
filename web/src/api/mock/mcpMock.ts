@@ -23,7 +23,7 @@ const TASKS = [
 
 export function createMcpMock(me: User, changed: () => void): Pick<Api, "mcp" | "inference" | "runners" | "modelQueue"> & { meSettings: Api["me"]["settings"] } {
   let inference: InferenceSettings = { mode: me.inference, models: { top: ["opus", "astra"], mid: ["sonnet"], small: ["haiku"] }, minEffort: { top: "high" } };
-  let settings: MySettings = { reserve: { fiveHour: 20, weekly: 10 }, maxCalls: null, interactiveSlots: 1, manualOnly: false, tasks: TASKS.map((t) => t.id), taskChoices: TASKS, taskItems: "all", runnerPrivate: false, repos: ["designcraft", "photocraft", "textcraft"], repoChoices: ["designcraft", "fontcraft", "gridcraft", "iconcraft", "pdfcraft", "photocraft", "Sheetcraft", "wordcraft"] };
+  let settings: MySettings = { reserve: { fiveHour: 20, weekly: 10 }, maxCalls: null, interactiveSlots: 1, manualOnly: false, tasks: TASKS.map((t) => t.id), taskChoices: TASKS, taskItems: "all", runnerPrivate: false, uiV2: false, repos: ["designcraft", "photocraft", "textcraft"], repoChoices: ["designcraft", "fontcraft", "gridcraft", "iconcraft", "pdfcraft", "photocraft", "Sheetcraft", "wordcraft"] };
   const at = (ms: number) => new Date(NOW + ms).toISOString();
   const wait = <T>(v: T) => new Promise<T>((r) => setTimeout(() => r(v), 60));
 

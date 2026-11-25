@@ -66,7 +66,7 @@ export function gates(f: PrFacts | ItemFacts, a: Want, by: By): string | null {
   if (tripped) return `${stage[0]!.toUpperCase()}${stage.slice(1)} is paused: ${tripped}`;
   const need = approvalOf(f as { pushable?: boolean }, a);
   if (!need) return null;
-  const r = f.repoFacts as Record<string, boolean | undefined>;
+  const r = f.repoFacts as Partial<Record<"mergeApproved" | "pushApproved" | "commentApproved" | "ciApproved" | "labelsApproved" | "fixIssueApproved", boolean>>;
   const ok = { merge: r.mergeApproved, push: r.pushApproved, comment: r.commentApproved, ci: r.ciApproved, labels: r.labelsApproved, "fix-issue": r.fixIssueApproved, "main-fix": undefined, status: undefined }[need];
   return ok ? null : `${WHAT[need]} in ${f.repo} are not approved`;
 }

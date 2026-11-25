@@ -8,9 +8,10 @@ import { cn } from "../cn";
 const SHOWN = 80;
 
 /** `counts`: a number shown beside each repo that has one, and `total` beside the every-repo option. */
+// `modal`: inside a Radix Dialog, whose scroll lock would otherwise swallow wheel and touch scrolling in the portalled list.
 export function RepoSelect({
-  value, onChange, className, allLabel = "Every repo", align = "end", counts,
-}: { value: string | null; onChange: (repo: string | null) => void; className?: string; allLabel?: string; align?: "start" | "end"; counts?: { total: number; byRepo: Record<string, number> } }) {
+  value, onChange, className, allLabel = "Every repo", align = "end", counts, modal,
+}: { value: string | null; onChange: (repo: string | null) => void; className?: string; allLabel?: string; align?: "start" | "end"; counts?: { total: number; byRepo: Record<string, number> }; modal?: boolean }) {
   const { data: repos } = useQuery("repos", (api) => api.repos());
   const [open, setOpen] = useState(false);
   const [q, setQ] = useState("");
@@ -27,7 +28,7 @@ export function RepoSelect({
     setQ("");
   };
   return (
-    <Popover.Root open={open} onOpenChange={setOpen}>
+    <Popover.Root open={open} onOpenChange={setOpen} modal={modal}>
       <Popover.Trigger asChild>
         <button
           aria-label="Repo"

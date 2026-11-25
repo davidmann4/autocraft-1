@@ -7,7 +7,7 @@
  */
 export type Topic =
   | "repos" | "sync" | "items" | "ranks" | "stages" | "flow" | "checks" | "classify" | "dupes" | "decisions" | "reviews" | "queue" | "jobs" | "usage" | "accounts" | "agents"
-  | "envs" | "tasks" | "workspaces" | "actions" | "fixes" | "verify" | "postmerge" | "access" | "settings" | "trace" | "github" | "fasttrack" | "outside" | "plans" | "conversations" | "held-followups" | "conversation-includes" | "decision-choices" | "decision-snooze" | "steps" | "mainci" | "limits" | "claims" | "preapprovals" | "security" | "discord" | "discord-links" | "downloads" | "build-features" | "pr-builds" | "nightly" | "remote-helpers" | "remote-queue";
+  | "envs" | "tasks" | "workspaces" | "actions" | "fixes" | "verify" | "postmerge" | "access" | "settings" | "trace" | "github" | "fasttrack" | "outside" | "plans" | "conversations" | "held-followups" | "conversation-includes" | "decision-choices" | "decision-snooze" | "steps" | "mainci" | "limits" | "claims" | "preapprovals" | "security" | "discord" | "discord-links" | "downloads" | "build-features" | "pr-builds" | "nightly" | "remote-helpers" | "remote-queue" | "workflows" | "workflow-events";
 
 /** What moves an item's queue position (src/rank/position.ts), for every query that carries the badge. */
 const withSlot = (...topics: Topic[]): Topic[] => [...new Set<Topic>([...topics, "steps", "repos"])];
@@ -30,6 +30,14 @@ const RULES: [prefix: string, topics: Topic[]][] = [
   ["items-status:", withSlot("items", "stages", "flow", "classify", "decisions", "plans", "pr-builds", "verify")],
   // The Live board: jobs, model calls (their progress lines too), build tasks (each step's log) and integration batches.
   ["live", ["jobs", "agents", "tasks", "queue", "remote-helpers", "accounts"]],
+  ["maintain-queue", ["workflows", "items", "repos"]],
+  // The new item page: the workflow row and its events, signals, findings, holds and breakers.
+  ["maintain-item:", ["workflows", "trace", "items", "dupes", "decisions", "security", "outside", "plans", "limits", "preapprovals", "access", "settings", "repos"]],
+  ["maintain-repos", ["workflows", "items", "repos", "limits", "settings", "access"]],
+  ["maintain-home", ["workflows", "items", "remote-helpers", "access", "settings", "decisions", "plans", "jobs", "limits", "accounts", "security", "repos"]],
+  ["maintain-stats:", withSlot("items", "stages", "reviews", "usage", "repos")],
+  ["maintain-items:", ["workflows", "workflow-events", "items", "plans", "ranks", "classify", "dupes", "decisions", "access", "security", "repos"]],
+  ["maintain-home", ["workflows", "workflow-events", "items", "remote-helpers", "access", "settings", "decisions", "plans", "jobs", "limits", "accounts", "security", "repos"]],
   ["home", withSlot("decisions", "decision-snooze", "plans", "jobs", "limits", "accounts", "settings", "queue", "items", "mainci", "github", "usage", "security")],
   // One opened event row: its detail reads what the timeline does; the run, task and decision behind it read one table each.
   ["item-trace-detail:", TRACE],
@@ -86,6 +94,7 @@ const RULES: [prefix: string, topics: Topic[]][] = [
   ["agents-recent:", ["agents"]],
   ["agent-", ["agents"]],
   ["queue:", ["queue", "items", "checks", "classify", "decisions", "reviews", "verify", "fixes", "tasks", "settings", "repos", "pr-builds", "build-features"]],
+  ["mention", ["settings"]],
   ["next-page", ["plans", "jobs", "settings", "repos", "items", "ranks", "fasttrack", "usage", "accounts", "stages", "flow", "tasks"]],
   ["batch:", ["queue", "tasks", "items", "checks", "access"]],
   ["queue-batches:", ["queue", "tasks", "items"]],

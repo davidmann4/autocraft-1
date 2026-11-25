@@ -3,7 +3,7 @@
 // threshold, not a pipeline wait). The runner refreshes the stored result after planner passes (refreshLiveness); the health check,
 // the Stuck items page and `autocraft-server liveness` read it.
 import type { Expression, SqlBool } from "kysely";
-import { fixStoppedWait, TRIAGE_WAIT } from "./core/decide-item.ts";
+import { fixStoppedWait, isOpenPrWait, TRIAGE_WAIT } from "./core/decide-item.ts";
 import type { WaitKind } from "./core/plan.ts";
 import { blockersOfWait } from "./review/blockers.ts";
 import { setting, writeSetting } from "./settings-read.ts";
@@ -128,7 +128,8 @@ export async function computeLiveness(db: Db, nowMs: number = Date.now()): Promi
       items.push({ ...base, verdict: "stuck", cause: verdict.cause });
       causes[verdict.cause] = (causes[verdict.cause] ?? 0) + 1;
     } else if (verdict.cause !== "parked" && verdict.cause !== "question" && verdict.cause !== "dispute" && verdict.cause !== "stopped"
-      && !asked && nowMs - Date.parse(since) > longMs) {
+      // An issue waiting on an open PR does not age on its own: the PR carries the age and is counted itself.
+      && !(r.kind === "issue" && isOpenPrWait(r.wait)) && !asked && nowMs - Date.parse(since) > longMs) {
       items.push({ ...base, verdict: "long", cause: verdict.cause });
     }
   }

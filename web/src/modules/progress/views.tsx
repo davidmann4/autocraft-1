@@ -1,3 +1,4 @@
+import { PageFrame, PageTitle } from "../../ui/organisms/Page";
 import { useState, type ReactNode } from "react";
 import { Link } from "react-router-dom";
 import { ArrowDownIcon, ArrowUpIcon, CaretUpDownIcon } from "@phosphor-icons/react";
@@ -47,10 +48,9 @@ export function Overview(_: ViewProps) {
   const startOpen = p.repos.reduce((a, r) => a + (r.openTrend[0] ?? 0), 0);
   const since = day(p.trackingSince);
   return (
-    <div className="h-full overflow-y-auto">
-      <div className="mx-auto max-w-[1180px] px-4 pb-12 pt-5 md:px-6">
+    <PageFrame>
         <div className="flex flex-wrap items-baseline gap-x-3 gap-y-0.5">
-          <h1 className="text-xl font-semibold">Progress</h1>
+          <PageTitle>Progress</PageTitle>
           <span className="text-sm text-ink/55">
             Tracking since {since} · {p.repos.length} repos
           </span>
@@ -107,8 +107,7 @@ export function Overview(_: ViewProps) {
         <Block title="By repo" aside={phone ? undefined : "Click a column header to sort"} className="mt-4" flush>
           {phone ? <RepoCards p={p} /> : <RepoTable p={p} />}
         </Block>
-      </div>
-    </div>
+    </PageFrame>
   );
 }
 

@@ -85,7 +85,8 @@ export function blockerSync(dialect: Dialect): Record<Op, { cond: string; body: 
 }
 
 /** Fills review_blockers from every stored review (migration). */
-export const blockerFill = (dialect: Dialect): string => `INSERT INTO review_blockers (b_repo, b_number, repo, number, head_oid) ${blockerRows(dialect, "o", "opus_reviews o, ")};`;
+export const blockerFill = (dialect: Dialect): string =>
+  `INSERT INTO review_blockers (b_repo, b_number, repo, number, head_oid) ${blockerRows(dialect, "o", "opus_reviews o, ")}${dialect === "postgres" ? " ON CONFLICT DO NOTHING" : ""};`;
 
 const on = (sql: string, alias: "new" | "old"): string => sql.replace(/\br\./g, `${alias}.`);
 

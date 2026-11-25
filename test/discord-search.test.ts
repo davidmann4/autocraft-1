@@ -63,6 +63,15 @@ class FakeRest implements DiscordRest {
 
 
 const rest = new FakeRest();
+/** Waits until `ok` holds: replies are asynchronous, and on Postgres slower than on SQLite. */
+const until = async (ok: () => boolean): Promise<void> => {
+  for (let k = 0; k < 1000 && !ok(); k++) await new Promise((r) => setTimeout(r, 5));
+};
+/** The reply edit that follows the first `seen` edits. */
+const editAfter = async (seen: number): Promise<EditBody> => {
+  await until(() => rest.edits.length > seen);
+  return rest.edits.at(-1)!;
+};
 const search = new Search({ db, embedder, index: new VectorIndex(embedder), log: () => {} });
 const pings = new Pings({ db, keys, rest, search, log: (l) => assert.fail(l) });
 // The handler startDiscord gives the gateway: mention rows first, then pings, so a delete finds our reply.
@@ -190,18 +199,22 @@ describe("commands", () => {
     await new Promise((r) => setTimeout(r, 20));
     assert.equal(rest.commands.length, 1);
     assert.deepEqual(rest.commands[0]!.commands.map((c) => [c.name, c.type]), [["autocraft", 1], ["Find issue", 3]]);
+    const seen = rest.edits.length;
     ix.dispatch("INTERACTION_CREATE", { id: "i1", token: "t", type: 2, application_id: "app1", channel_id: "c1", member: { user: { id: "u9" } }, data: { name: "Find issue", type: 3, target_id: "m1", resolved: { messages: { m1: { content: "dark mode layers" } } } } });
-    await new Promise((r) => setTimeout(r, 50));
+    const edit = await editAfter(seen);
     assert.deepEqual(rest.callbacks.at(-1), { type: 5, ephemeral: true, choices: undefined });
-    assert.match(v2text(rest.edits.at(-1)!), /photocraft#2 Dark mode for the layers panel/);
+    assert.match(v2text(edit), /photocraft#2 Dark mode for the layers panel/);
   });
 
   test("/autocraft link, status, and stats: a code links the caller, hidden items are not found, repo choices are public repos", async () => {
     const ix = new Interactions(rest, (l) => assert.fail(l));
     installAccountCommands(ix, { db, keys });
-    const call = (id: string, sub: string, options: unknown[], user = "u50") =>
+    let seen = 0;
+    const call = (id: string, sub: string, options: unknown[], user = "u50") => {
+      seen = rest.edits.length;
       ix.dispatch("INTERACTION_CREATE", { id, token: "t", type: 2, application_id: "app1", channel_id: "c1", member: { user: { id: user } }, data: { name: "autocraft", type: 1, options: [{ name: sub, type: 1, options }] } });
-    const settle = () => new Promise((r) => setTimeout(r, 30));
+    };
+    const settle = () => editAfter(seen);
     const { code } = await createLinkCode(db, keys, "mira");
     call("i2", "link", [{ name: "code", type: 3, value: code }]);
     await settle();
@@ -214,11 +227,38 @@ describe("commands", () => {
     await settle();
     assert.match(rest.edits.at(-1)!.content!, /photocraft#2 Dark mode for the layers panel\nNew/);
     ix.dispatch("INTERACTION_CREATE", { id: "i5", token: "t", type: 4, application_id: "app1", data: { name: "autocraft", options: [{ name: "stats", type: 1, options: [{ name: "repo", type: 3, value: "ph", focused: true }] }] } });
-    await settle();
+    await until(() => rest.callbacks.at(-1)?.type === 8);
     assert.deepEqual(rest.callbacks.at(-1), { type: 8, ephemeral: undefined, choices: [{ name: "photocraft", value: "photocraft" }] });
     call("i6", "unlink", []);
     await settle();
     assert.equal(await loginOf(db, keys, "u50"), null);
+  });
+});
+
+describe("/autocraft do", () => {
+  test("an unlinked user, a linked user without write access and a repo not switched on are refused; write access runs it", async () => {
+    const ix = new Interactions(rest, (l) => assert.fail(l));
+    installAccountCommands(ix, { db, keys });
+    const run = async (id: string, user: string, text: string) => {
+      const seen = rest.edits.length;
+      ix.dispatch("INTERACTION_CREATE", { id, token: "t", type: 2, application_id: "app1", channel_id: "c1", member: { user: { id: user } }, data: { name: "autocraft", type: 1, options: [{ name: "do", type: 1, options: [{ name: "text", type: 3, value: text }] }] } });
+      return (await editAfter(seen)).content!;
+    };
+    const workflows = async () => Number((await db.get(db.k.selectFrom("main.item_workflows").select((eb) => eb.fn.countAll<number>().as("n"))))!.n);
+    assert.match(await run("d1", "u70", "review: photocraft#4"), /Link your account/);
+    const { code } = await createLinkCode(db, keys, "nora");
+    const linked = rest.edits.length;
+    ix.dispatch("INTERACTION_CREATE", { id: "d2", token: "t", type: 2, application_id: "app1", channel_id: "c1", member: { user: { id: "u70" } }, data: { name: "autocraft", type: 1, options: [{ name: "link", type: 1, options: [{ name: "code", type: 3, value: code }] }] } });
+    await editAfter(linked);
+    await db.run(db.k.insertInto("main.access").values({ login: "nora", role: "maintainer" }).onConflict((oc) => oc.doNothing()));
+    assert.match(await run("d3", "u70", "review: photocraft#4"), /not switched on/);
+    await db.run(db.k.updateTable("main.tracked_repos").set({ workflow: "new" }).where("name", "=", "photocraft"));
+    await db.run(db.k.insertInto("main.settings").values({ key: "github_identity", value: "app" }).onConflict((oc) => oc.column("key").doUpdateSet({ value: "app" })));
+    assert.match(await run("d4", "u70", "review: photocraft#4"), /no write access/);
+    assert.equal(await workflows(), 0);
+    await db.run(db.k.insertInto("main.repo_permissions").values({ login: "nora", repo: "photocraft", permission: "write", checked_at: new Date().toISOString() }));
+    await run("d5", "u70", "review: photocraft#4");
+    assert.equal(await workflows(), 1);
   });
 });
 
@@ -227,9 +267,12 @@ describe("account command limits", () => {
     let now = 1_000_000;
     const ix = new Interactions(rest, (l) => assert.fail(l));
     installAccountCommands(ix, { db, keys, now: () => now });
-    const status = (id: string, user: string) =>
+    let seen = 0;
+    const status = (id: string, user: string) => {
+      seen = rest.edits.length;
       ix.dispatch("INTERACTION_CREATE", { id, token: "t", type: 2, application_id: "app1", channel_id: "c1", member: { user: { id: user } }, data: { name: "autocraft", type: 1, options: [{ name: "status", type: 1, options: [{ name: "item", type: 3, value: "photocraft#2" }] }] } });
-    const settle = () => new Promise((r) => setTimeout(r, 5));
+    };
+    const settle = () => editAfter(seen);
     for (let i = 0; i < 10; i++) { status(`s${i}`, "u60"); await settle(); assert.match(rest.edits.at(-1)!.content!, /photocraft#2/); }
     status("s10", "u60"); await settle();
     assert.match(rest.edits.at(-1)!.content!, /Too many requests/);

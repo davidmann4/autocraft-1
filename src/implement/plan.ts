@@ -23,16 +23,18 @@ import { settleMemo, settlesNow } from "../settlers.ts";
 import { endWorkspace } from "../build/workspaces.ts";
 import type { StepContext } from "../runner/steps.ts";
 import { queuerOf } from "./gate.ts";
+import { repoWorkflow } from "../workflow/store.ts";
 import {
   PLAN_ACCEPTANCE_MAX, PLAN_BODY_CHARS, PLAN_COMMENT_CHARS, PLAN_COMMENTS_MAX, PLAN_GUIDANCE_CHARS, PLAN_GUIDANCE_MAX, PLAN_ITEM_CHARS, PLAN_ITEMS_MAX, PLAN_MAX_TURNS,
-  PLAN_OPTIONS_MAX, PLAN_QUESTION_CHARS, PLAN_QUESTIONS_MAX, PLAN_SUMMARY_CHARS, PLAN_TEXT_CHARS, PLAN_TIMEOUT_SEC,
+  PLAN_OPTIONS_MAX, PLAN_PART_FILES_MAX, PLAN_PART_TITLE_CHARS, PLAN_PARTS_MAX, PLAN_QUESTION_CHARS, PLAN_QUESTIONS_MAX, PLAN_RECOMMENDATION_CHARS, PLAN_SUMMARY_CHARS,
+  PLAN_TEXT_CHARS, PLAN_TIMEOUT_SEC,
   type PlanAsked, type PlanGuidance, type PlanInput, type PlanIssue,
 } from "./plan-types.ts";
 import { closeOnAnswer } from "./close.ts";
 import { askedSoFar, askQuestions, IMPLEMENT_ASKER, isLimitDecision, LIMIT_CLOSE, LIMIT_CLOSE_COMMENT, LIMIT_IMPLEMENT, settleQuestions, type QuestionDeps } from "./questions.ts";
 import { addRound, currentImplementation, roundsOf, setImplementationState, startImplementation, updateImplementation } from "./store.ts";
 import { attemptGuidance, markStuck, STUCK_CAUSES, type StuckCause } from "./stuck.ts";
-import type { AskFailedRound, Implementation, PlanQuestion, PlanReply } from "./types.ts";
+import type { AskFailedRound, Implementation, PlanQuestion, PlanReply, PlanWorkflow } from "./types.ts";
 import { mainHeadOf, readyWorkspace, resetTree, runBoundCall, WorkspaceUnavailable, type CallResult } from "./workspace.ts";
 
 export const PLAN_PROMPT_ID = "implement.plan";
@@ -82,6 +84,22 @@ function question(v: unknown, i: number): PlanQuestion {
   return { audience: q.audience, text: q.text.trim(), options, recommended: rec };
 }
 
+/**
+ * The maintainer-workflow fields of a reply (`parts`, `recommendation`); null when it has neither. Anything malformed reads as
+ * absent, so these fields never make a reply unusable: a part without a title is left out, a path is kept relative to the root.
+ */
+export function parsePlanWorkflow(o: Record<string, unknown>): PlanWorkflow | null {
+  if (!("parts" in o) && !("recommendation" in o)) return null;
+  const parts: PlanWorkflow["parts"] = [];
+  for (const p of Array.isArray(o.parts) ? o.parts.slice(0, PLAN_PARTS_MAX) : []) {
+    const x = p as { title?: unknown; files?: unknown } | null;
+    if (!x || typeof x !== "object" || !isText(x.title)) continue;
+    const files = (Array.isArray(x.files) ? x.files : []).filter(isText).map((f) => f.trim().replace(/^(\.\/|\/+)/, "")).filter(Boolean).slice(0, PLAN_PART_FILES_MAX);
+    parts.push({ title: x.title.replace(/\s+/g, " ").trim().slice(0, PLAN_PART_TITLE_CHARS), files: [...new Set(files)] });
+  }
+  return { parts, recommendation: isText(o.recommendation) ? o.recommendation.replace(/\s+/g, " ").trim().slice(0, PLAN_RECOMMENDATION_CHARS) : null };
+}
+
 /** Reads a plan reply; throws with what is wrong. `assume`: a maintainer chose to go on, so the reply must be ready. */
 export function parsePlanReply(text: string, assume = false): PlanReply {
   let o: Record<string, unknown>;
@@ -107,6 +125,8 @@ export function parsePlanReply(text: string, assume = false): PlanReply {
     size: o.size as PlanReply["size"], risks: texts(o.risks ?? [], "risks"),
     questions: ((o.questions ?? []) as unknown[]).map(question),
   };
+  const workflow = parsePlanWorkflow(o);
+  if (workflow) reply.workflow = workflow;
   if (reply.ready && (!reply.acceptance.length || reply.questions.length)) throw new Error(`a ready reply needs 1 to ${PLAN_ACCEPTANCE_MAX} acceptance criteria and no questions`);
   // An XL change does not fit one PR: it is not ready, and asks the maintainers how to split it.
   if (reply.ready && reply.size === "XL") throw new Error("a ready reply cannot be size XL: a change of that size does not fit one pull request, so set ready to false and ask the maintainers how to split it");
@@ -122,6 +142,9 @@ export function publicTexts(r: PlanReply): PublicText[] {
     ...r.acceptance.map((text, i) => ({ field: `acceptance[${i}]`, text })), ...r.risks.map((text, i) => ({ field: `risks[${i}]`, text })),
     ...r.verification.tests.map((text, i) => ({ field: `verification.tests[${i}]`, text })), ...(r.verification.app ? [{ field: "verification.app", text: r.verification.app }] : []),
     ...r.questions.flatMap((q, i) => (q.audience === "author" ? [{ field: `questions[${i}].text`, text: q.text }] : [])),
+    // The status comment on GitHub shows the parts and the recommendation.
+    ...(r.workflow?.parts ?? []).map((p, i) => ({ field: `parts[${i}].title`, text: p.title })),
+    ...(r.workflow?.recommendation ? [{ field: "recommendation", text: r.workflow.recommendation }] : []),
   ];
 }
 
@@ -166,7 +189,10 @@ export async function planInput(db: Db, o: { repo: string; number: number; sha: 
     for (const g of await attemptGuidance(db, o.implementationId)) guidance.push({ from: "try-again", login: g.by ?? "", at: g.at, text: cut(g.text, PLAN_GUIDANCE_CHARS) });
     guidance.sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0));
   }
-  return { ref: `${o.repo}#${o.number}`, repo: o.repo, sha: o.sha, issue, guidance: guidance.slice(-PLAN_GUIDANCE_MAX), asked: o.asked, assume: o.assume };
+  return {
+    ref: `${o.repo}#${o.number}`, repo: o.repo, sha: o.sha, issue, guidance: guidance.slice(-PLAN_GUIDANCE_MAX), asked: o.asked, assume: o.assume,
+    ...(await repoWorkflow(db, o.repo) === "new" ? { workflow: true } : {}),
+  };
 }
 
 // ---- recording a reply -------------------------------------------------------------------------------------------
@@ -259,7 +285,9 @@ async function callPlan(ctx: StepContext, o: { repo: string; number: number; sha
     const first = reply;
     r = await turn(fixTurnMessage(flagged), r.callId);
     if (r.outcome.state !== "done") return failed(r);
-    const merged = mergeFixFields(JSON.stringify(first), r.outcome.text, flagged);
+    // The reply as the model wrote it: the maintainer-workflow fields are top-level there, as parsePlanReply reads them.
+    const { workflow: own, ...plain } = first;
+    const merged = mergeFixFields(JSON.stringify(own ? { ...plain, ...own } : plain), r.outcome.text, flagged);
     if (merged !== null) {
       try {
         const fixed = parsePlanReply(merged, o.input.assume);

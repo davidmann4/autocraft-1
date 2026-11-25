@@ -22,6 +22,9 @@ export type Tokens = {
 // renamed or released, so access is bound to it.
 export type GithubUser = { login: string; id: number };
 
+/** The token endpoint refused a refresh token: GitHub's `error` and `error_description` fields (never token values). */
+export type Refused = { refused: { error: string; description: string | null } };
+
 /** GitHub answered a revoke with a refusal; `status` is its HTTP status (404/422: the token is expired or already gone). */
 export class RevokeRefused extends Error {
   status: number;
@@ -34,10 +37,9 @@ export class RevokeRefused extends Error {
 export interface Provider {
   /** With selectAccount the provider shows its account picker even when someone is already signed in there. */
   authorizeUrl(state: string, challenge: string, redirectUri: string, selectAccount?: boolean, scopes?: string[]): Promise<string>;
-  // Each returns null when the provider rejects the code or refresh token, and
-  // throws on a transport failure.
+  // Each throws on a transport failure. exchange returns null when the provider rejects the code; refresh says why it was refused.
   exchange(code: string, verifier: string, redirectUri: string): Promise<Tokens | null>;
-  refresh(refreshToken: string): Promise<Tokens | null>;
+  refresh(refreshToken: string): Promise<Tokens | Refused>;
   identity(access: string): Promise<GithubUser | null>;
   /** Revokes a token at the provider; throws RevokeRefused when the provider refuses, another error on a transport failure. */
   revoke(access: string): Promise<void>;
@@ -61,6 +63,12 @@ function tokensFrom(body: Record<string, unknown>, now = Date.now()): Tokens | n
   };
 }
 
+const clipped = (v: unknown): string | null => (typeof v === "string" && v ? v.slice(0, 200) : null);
+
+function refusedFrom(body: Record<string, unknown>): Refused {
+  return { refused: { error: clipped(body.error) ?? "no access token in the answer", description: clipped(body.error_description) } };
+}
+
 export class GitHubProvider implements Provider {
   #id: string;
   #secret: string;
@@ -78,13 +86,14 @@ export class GitHubProvider implements Provider {
     if (scopes.length) q.set("scope", scopes.join(" "));
     return `https://github.com/login/oauth/authorize?${q}`;
   }
-  exchange(code: string, verifier: string, redirectUri: string): Promise<Tokens | null> {
-    return this.#token({ code, redirect_uri: redirectUri, code_verifier: verifier });
+  async refresh(refreshToken: string): Promise<Tokens | Refused> {
+    const body = await this.#token({ grant_type: "refresh_token", refresh_token: refreshToken });
+    return tokensFrom(body) ?? refusedFrom(body);
   }
-  refresh(refreshToken: string): Promise<Tokens | null> {
-    return this.#token({ grant_type: "refresh_token", refresh_token: refreshToken });
+  async exchange(code: string, verifier: string, redirectUri: string): Promise<Tokens | null> {
+    return tokensFrom(await this.#token({ code, redirect_uri: redirectUri, code_verifier: verifier }));
   }
-  async #token(params: Record<string, string>): Promise<Tokens | null> {
+  async #token(params: Record<string, string>): Promise<Record<string, unknown>> {
     const r = await fetch("https://github.com/login/oauth/access_token", {
       method: "POST",
       headers: { accept: "application/json", "content-type": "application/x-www-form-urlencoded", "user-agent": UA },
@@ -93,7 +102,7 @@ export class GitHubProvider implements Provider {
     });
     if (!r.ok) throw new Error(`token endpoint: HTTP ${r.status}`);
     // A rejected code or refresh token answers 200 with an `error` field.
-    return tokensFrom((await r.json()) as Record<string, unknown>);
+    return (await r.json()) as Record<string, unknown>;
   }
   revoke(access: string): Promise<void> {
     return this.#deleteApplication("token", access);
@@ -157,7 +166,13 @@ export class FakeProvider implements Provider {
   #permsFile: string | null;
   tokenTtlMs: number;
   refreshes = 0;
+  /** Every refresh request, refused ones included. */
+  refreshCalls = 0;
   rejectRefresh = false;
+  /** How long a refresh takes, so tests can overlap two of them. */
+  refreshDelayMs = 0;
+  /** Runs while a refresh is at the endpoint, before it answers. */
+  duringRefresh: (() => Promise<void>) | null = null;
   constructor(permsFile: string | null, tokenTtlMs = 8 * 3_600_000) {
     this.#permsFile = permsFile;
     this.tokenTtlMs = tokenTtlMs;
@@ -202,10 +217,13 @@ export class FakeProvider implements Provider {
     for (const [a, v] of this.#access) if (v.login === t.login) this.#access.delete(a);
     for (const [r, l] of this.#refresh) if (l === t.login) this.#refresh.delete(r);
   }
-  async refresh(refreshToken: string): Promise<Tokens | null> {
+  async refresh(refreshToken: string): Promise<Tokens | Refused> {
+    this.refreshCalls++;
     const login = this.#refresh.get(refreshToken);
     this.#refresh.delete(refreshToken);
-    if (!login || this.rejectRefresh) return null;
+    if (this.refreshDelayMs) await new Promise((r) => setTimeout(r, this.refreshDelayMs));
+    await this.duringRefresh?.();
+    if (!login || this.rejectRefresh) return { refused: { error: "bad_refresh_token", description: "The refresh token passed is incorrect or expired." } };
     this.refreshes++;
     return this.#issue(login);
   }

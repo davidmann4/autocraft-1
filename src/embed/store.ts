@@ -7,7 +7,6 @@ import { itemText } from "./text.ts";
 import { plannedItems } from "../core/select-items.ts";
 import type { PlanSet } from "../core/plan-set.ts";
 import { embedStatements, statementsDue } from "../memory/statements.ts";
-import { forEachSeq, mapSeq } from "../async-seq.ts";
 import type { Db } from "../db/index.ts";
 import * as kx from "../db/kx.ts";
 
@@ -15,9 +14,19 @@ export type Todo = { repo: string; number: number; text: string; hash: string };
 
 export const toBlob = (v: Float32Array): Uint8Array => new Uint8Array(v.buffer, v.byteOffset, v.byteLength);
 
-const todoOf = async (db: Db, repo: string, number: number, hash: string): Promise<Todo> => {
-  const t = (await db.get(db.k.selectFrom("main.items").select(["title", "body"]).where("repo", "=", repo).where("number", "=", number)))!;
-  return { repo, number, text: itemText(t.title, t.body), hash };
+/** The embed texts of `rows`, in the order given: one query per BATCH_ROWS rows. */
+const todosOf = async (db: Db, rows: readonly { repo: string; number: number; hash: string }[]): Promise<Todo[]> => {
+  const found = new Map<string, { title: string | null; body: string | null }>();
+  for (const chunk of kx.batches(rows)) {
+    for (const t of await db.all(db.k.selectFrom("main.items as i")
+      .innerJoin(kx.refPairs(db, chunk.map((r) => [r.repo, r.number] as const), "j"), (j) => j.onRef("j.repo", "=", "i.repo").onRef("j.number", "=", "i.number"))
+      .select(["i.repo", "i.number", "i.title", "i.body"]))) found.set(`${t.repo}#${t.number}`, t);
+  }
+  return rows.map((r) => {
+    const t = found.get(`${r.repo}#${r.number}`);
+    if (!t) throw new Error(`${r.repo}#${r.number} is not in the database`);
+    return { repo: r.repo, number: r.number, text: itemText(t.title, t.body), hash: r.hash };
+  });
 };
 
 const diffQuery = (db: Db, all: boolean, model: string) => db.k.selectFrom("main.items as i")
@@ -40,7 +49,7 @@ export async function pending(db: Db, modelId: string, all = false, plans?: Plan
   const planned = all ? [] : (await plannedItems(db, "embed", { model: modelId, run: null, ...(plans ? { plans } : {}) })).map((p) => ({ repo: p.facts.repo, number: p.facts.number, hash: p.facts.embedHash }));
   // A row without a hash waits for fillEmbedHashes (embedItems runs it first).
   const hashed = [...planned, ...diff].filter((r): r is { repo: string; number: number; hash: string } => r.hash !== null);
-  return (await mapSeq(hashed, async (r) => await todoOf(db, r.repo, r.number, r.hash))).sort((a, b) => a.text.length - b.text.length);
+  return (await todosOf(db, hashed)).sort((a, b) => a.text.length - b.text.length);
 }
 
 /** Whether the embed step has work: open items the Plans send here, or closed ones with a missing or stale vector. */
@@ -76,9 +85,7 @@ export async function embedItems(db: Db, embedder: Embedder,
     const at = new Date().toISOString();
     await db.write(async () => {
       // A replace, not an upsert: the rewritten row gets a rowid above every other, which is how the vector index (vectors.ts) sees it changed.
-      await forEachSeq(batch, async (t, k) => {
-        await kx.replaceRow(db, "main.item_embeddings", ["repo", "number"], { repo: t.repo, number: t.number, model: embedder.id, hash: t.hash, vec: toBlob(vecs[k]!), at });
-      });
+      await kx.replaceRows(db, "main.item_embeddings", ["repo", "number"], batch.map((t, k) => ({ repo: t.repo, number: t.number, model: embedder.id, hash: t.hash, vec: toBlob(vecs[k]!), at })));
     });
     done += batch.length;
     opts.onProgress?.({ done, total: todo.length, ms: performance.now() - start });

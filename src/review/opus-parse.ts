@@ -52,6 +52,8 @@ export type OpusPr = {
   repo_dir?: string;
   /** Set when the repo's reference folder is mounted at /reference; not part of the quoted JSON. */
   reference?: boolean;
+  /** Set for an item on the maintainer workflow: the prompt asks for titled parts, `major`, `outside_purpose` and `recommendation`. Not part of the quoted JSON. */
+  workflow?: boolean;
   title: string;
   body: string;
   author_association: string | null;
@@ -103,8 +105,10 @@ export type OpusReview = {
   verdict: ReviewVerdict;
   sure: boolean;
   reason: string;
-  fixes: { file: string; change: string }[];
+  fixes: ReviewFix[];
   risks: string[];
+  /** What a review of an item on the maintainer workflow adds; absent or null when the reply had neither field. */
+  workflow?: ReviewWorkflow | null;
   /** Two or three plain sentences for the person who decides; null when the reply had none. */
   summary: string | null;
   /** One short sentence: why the verdict, for a recommendation; null when the reply had none. */
@@ -215,6 +219,41 @@ export function parsePublic(v: unknown, drop: ReadonlySet<string> = new Set()): 
   return { summary: o.summary.trim().slice(0, 600), points };
 }
 
+/** A fix of the review. On the maintainer workflow it is a numbered plan part: `title` names it in a few words, `major` marks a finding a person must see before a merge. */
+export type ReviewFix = { file: string; change: string; title?: string; major?: boolean };
+/** What the review recommends: one sentence, and what a yes runs (the fixes it makes, by number from 1; whether it then merges or closes). */
+export type ReviewRecommendation = { text: string; fix: number[]; merge: boolean; close: boolean };
+/** Lines the change has outside what the pull request sets out to do, and the review's one recommendation. */
+export type ReviewWorkflow = { outside_purpose: { lines: number; note: string } | null; recommendation: ReviewRecommendation | null };
+
+export const PART_TITLE_CHARS = 80;
+export const OUTSIDE_NOTE_CHARS = 200;
+export const RECOMMENDATION_CHARS = 300;
+
+/**
+ * The maintainer-workflow fields of a reply; null when it has neither. Anything malformed reads as absent. `partOf` maps a fix number of
+ * the model's own list to its number in the stored fixes (null when that fix was left out); `keepRec` is false when the verdict was
+ * rewritten. A recommendation that names a fix that was left out, that came with a rewritten verdict, or whose yes would run nothing is
+ * dropped (the workflow builds one from the verdict). When the stored numbers differ from the model's, `text` is empty: the sentence
+ * named other numbers, so the workflow writes it again.
+ */
+export function parseReviewWorkflow(r: Record<string, unknown>, partOf: (n: number) => number | null = (n) => n, keepRec = true): ReviewWorkflow | null {
+  const o = r.outside_purpose as { lines?: unknown; note?: unknown } | null | undefined;
+  const lines = o && typeof o === "object" && typeof o.lines === "number" && Number.isFinite(o.lines) && o.lines > 0 ? Math.round(o.lines) : 0;
+  const note = lines && typeof o!.note === "string" ? o!.note : "";
+  const outside = lines ? { lines, note: note.replace(/\s+/g, " ").trim().slice(0, OUTSIDE_NOTE_CHARS) } : null;
+  const x = r.recommendation as { text?: unknown; fix?: unknown; merge?: unknown; close?: unknown } | null | undefined;
+  const text = x && typeof x === "object" && typeof x.text === "string" && x.text.trim() && !REFERENCE_LEAK.test(x.text) ? firstSentence(x.text.replace(/\s+/g, " ").trim()).slice(0, RECOMMENDATION_CHARS) : null;
+  const named = text && Array.isArray(x!.fix) ? [...new Set(x!.fix)] : [];
+  const fix = named.map((n) => (Number.isInteger(n) ? partOf(n as number) : null));
+  const close = !!text && x!.close === true && !named.length;
+  const merge = !!text && !close && x!.merge === true;
+  const usable = keepRec && !!text && fix.every((n) => n !== null) && (fix.length > 0 || merge || close);
+  const exact = fix.every((n, i) => n === named[i]);
+  const rec = usable ? { text: exact ? text! : "", fix: fix as number[], merge, close } : null;
+  return outside || rec ? { outside_purpose: outside, recommendation: rec } : null;
+}
+
 export const OPUS_REASON_WORDS = 60;
 export const OPUS_MAX_FIXES = 20;
 const words = (s: string, n: number) => s.trim().split(/\s+/).slice(0, n).join(" ");
@@ -242,10 +281,16 @@ export function parseOpusReply(text: string, ref: string, last = true, drop: Rea
   const verdict = r.verdict;
   if (typeof verdict !== "string" || !(VERDICTS as readonly string[]).includes(verdict)) return null;
   if (typeof r.reason !== "string" || !r.reason.trim() || typeof r.sure !== "boolean") return null;
-  const fixes = (Array.isArray(r.fixes) ? r.fixes : [])
-    .map((f) => (f && typeof f.file === "string" && typeof f.change === "string" ? { file: stripSandboxPath(f.file.trim()).replace(/^\.\//, ""), change: f.change } : null))
-    .filter((f): f is { file: string; change: string } => !!f && safePath(f.file) && !!f.change.trim() && !drop.has(f.change) && (keepLeaky || (!REFERENCE_LEAK.test(f.file) && !REFERENCE_LEAK.test(f.change))))
-    .slice(0, OPUS_MAX_FIXES).map((f) => ({ file: f.file.slice(0, 200), change: f.change.slice(0, 800) }));
+  // `src`: the model's own number of each kept fix, for the recommendation's fix numbers.
+  const kept = (Array.isArray(r.fixes) ? r.fixes : [])
+    .map((f, i) => (f && typeof f.file === "string" && typeof f.change === "string" ? { file: stripSandboxPath(f.file.trim()).replace(/^\.\//, ""), change: f.change, title: f.title, major: f.major, src: i + 1 } : null))
+    .filter((f): f is { file: string; change: string; title: unknown; major: unknown; src: number } => !!f && safePath(f.file) && !!f.change.trim() && !drop.has(f.change) && (keepLeaky || (!REFERENCE_LEAK.test(f.file) && !REFERENCE_LEAK.test(f.change))))
+    .slice(0, OPUS_MAX_FIXES);
+  const src = kept.map((f) => f.src);
+  const fixes = kept.map((f): ReviewFix => {
+      const title = typeof f.title === "string" && f.title.trim() && !REFERENCE_LEAK.test(f.title) ? f.title.replace(/\s+/g, " ").trim().slice(0, PART_TITLE_CHARS) : null;
+      return { file: f.file.slice(0, 200), change: f.change.slice(0, 800), ...(title ? { title } : {}), ...(f.major === true ? { major: true } : {}) };
+    });
   const risks = Array.isArray(r.risks) ? r.risks.filter((x): x is string => typeof x === "string").slice(0, 8).map((x) => x.slice(0, 300)) : [];
   const summary = proseField(r.summary, SUMMARY_MAX_WORDS, last), why = proseField(r.why, WHY_MAX_WORDS, last);
   if (!summary.ok || !why.ok) return null;
@@ -255,11 +300,11 @@ export function parseOpusReply(text: string, ref: string, last = true, drop: Rea
   // A take-fix needs a fix: its own list, or the fix of every claim that shows wrong code.
   if (verdict === "take-fix" && !fixes.length && !(bad.length && bad.every((c) => c.fix))) return null;
   const unproven = parsed === null ? !!body.trim() : parsed.rejected > 0 || !!unknownClaim;
-  let outVerdict = verdict as ReviewVerdict, outFixes = verdict === "take-fix" ? fixes : [], outReason = r.reason, sure = r.sure;
+  let outVerdict = verdict as ReviewVerdict, outFixes: ReviewFix[] = verdict === "take-fix" ? fixes : [], outReason = r.reason, sure = r.sure, shift = 0;
   const notes: string[] = [];
   if (bad.length && (outVerdict === "take" || outVerdict === "take-fix")) {
     const withFix = bad.filter((c) => c.fix);
-    if (withFix.length === bad.length) { outVerdict = "take-fix"; outFixes = [...withFix.map((c) => c.fix!), ...outFixes].slice(0, OPUS_MAX_FIXES); }
+    if (withFix.length === bad.length) { outVerdict = "take-fix"; shift = withFix.length; outFixes = [...withFix.map((c) => c.fix!), ...outFixes].slice(0, OPUS_MAX_FIXES); }
     else { outVerdict = "hold"; outFixes = []; }
     outReason = `Claim shows wrong code: ${bad[0]!.claim} ${r.reason}`;
     notes.push(...bad.map((c) => `claim ${c.status}, code wrong: ${c.claim}: ${c.evidence}`.slice(0, 300)));
@@ -268,7 +313,10 @@ export function parseOpusReply(text: string, ref: string, last = true, drop: Rea
     sure = false;
     notes.push(parsed === null ? "the PR description's claims were not checked" : unknownClaim ? `claim ${unknownClaim.status}, impact unknown: ${unknownClaim.claim}`.slice(0, 300) : `${parsed.rejected} entries of the claims list were not read`);
   }
-  return { ref, verdict: outVerdict, sure, reason: words(outReason, OPUS_REASON_WORDS), fixes: outFixes, risks: [...risks, ...notes], summary: summary.text, why: oneSentence(why.text), public: parsePublic(r.public, drop), conflicts: parseStatementConflicts(r.conflicts, known), claims: listed, blocked_by: outVerdict === "hold" ? parseBlockedBy(r.blocked_by, ref) : [] };
+  return { ref, verdict: outVerdict, sure, reason: words(outReason, OPUS_REASON_WORDS), fixes: outFixes, risks: [...risks, ...notes], workflow: parseReviewWorkflow(r, (n) => {
+    const i = verdict === "take-fix" ? src.indexOf(n) : -1;
+    return i < 0 || i + shift >= outFixes.length ? null : i + shift + 1;
+  }, outVerdict === verdict), summary: summary.text, why: oneSentence(why.text), public: parsePublic(r.public, drop), conflicts: parseStatementConflicts(r.conflicts, known), claims: listed, blocked_by: outVerdict === "hold" ? parseBlockedBy(r.blocked_by, ref) : [] };
 }
 
 /** The reply's reason before the word cut that the stored review applies. */

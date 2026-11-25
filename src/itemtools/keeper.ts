@@ -3,9 +3,11 @@
 // builds it, once at start and again after each sync run that finished since its last build. A build runs as a child
 // process, so its file writes never hold the leader's event loop; the snapshot's file lock keeps two builds apart.
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import type { Db } from "../db/index.ts";
 import { dbEnv, dbTarget } from "../db/open.ts";
+import { snapshotFile } from "./snapshot.ts";
 
 const CLI = fileURLToPath(new URL("../cli.ts", import.meta.url));
 const CHECK_MS = 10_000;
@@ -41,7 +43,7 @@ function buildChild(signal: AbortSignal): Promise<string> {
 
 /**
  * Keeps the item snapshot current until `signal` aborts: a build at start, then one whenever a newer successful sync run
- * has ended. A failed build is logged and waits for the next sync run. Writes nothing to the database.
+ * has ended or the snapshot has a journal (a refresh was interrupted, or is running and the build waits for it). A failed build is logged and waits for the next sync run. Writes nothing to the database.
  */
 export function keepSnapshot(db: Db, signal: AbortSignal, log: (line: string) => void, opts: { everyMs?: number; build?: (signal: AbortSignal) => Promise<string> } = {}): void {
   const build = opts.build ?? buildChild;
@@ -52,7 +54,8 @@ export function keepSnapshot(db: Db, signal: AbortSignal, log: (line: string) =>
     busy = true;
     try {
       const t = await lastSync(db);
-      if (seen !== undefined && t === seen) return;
+      // A journal left by a refresh that was killed keeps read-only readers out until a build rolls it back.
+      if (seen !== undefined && t === seen && !existsSync(`${snapshotFile()}-journal`)) return;
       seen = t;
       log(`item snapshot: ${await build(signal)}`);
     } catch (e) {

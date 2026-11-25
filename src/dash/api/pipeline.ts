@@ -15,7 +15,7 @@ import { mayResumeTrip, resumeStage, TripError } from "../../push-outcomes.ts";
 import { HttpError } from "../server/util.ts";
 import type { Req } from "../types.ts";
 import { blankIfHidden, hiddenRepos, visibleRepos } from "./visible.ts";
-import { cols } from "../../db/kx.ts";
+import { cols, excluded } from "../../db/kx.ts";
 import { filtered, hiddenTestExpr, isHiddenRepo, type HiddenRepos } from "../../hidden-sql.ts";
 import { isQuiet } from "../../security/quiet.ts";
 import { canSeeInternals } from "./staff.ts";
@@ -23,6 +23,7 @@ import { SECURITY_PREFIX, SECURITY_STEP } from "../../security/rules.ts";
 import { mapSeq } from "../../async-seq.ts";
 import type { Db } from "../../db/index.ts";
 import { setting } from "../../settings-read.ts";
+import { LARGE_FIX_KEY, OUTSIDE_PURPOSE_KEY, largeFixLines, outsidePurposeMin } from "../../workflow/settings.ts";
 
 // Stages of docs/pipeline.md. A stage with registered steps shows them; the
 // mirror also runs on its own timer.
@@ -49,7 +50,7 @@ async function pipelineState(db: Db, req: Req): Promise<PipelineState> {
     const shown = await mapSeq((trips ?? []).filter((t) => t.repo === null || !isHiddenRepo(hidden, t.repo)), async (t) => ({ ...t, reason: blankIfHidden(t.reason, hidden), canResume: await mayResumeTrip(req.user, t.key) }));
     return { ...l, pausedReason: blankIfHidden(l.pausedReason, hidden) || null, status: blankIfHidden(l.status, hidden) || null, ...(shown.length ? { trips: shown } : {}) };
   });
-  return { ...s, outside: await outsideState(db, hidden), limits };
+  return { ...s, outside: await outsideState(db, hidden), limits, blockers: { largeFixLines: await largeFixLines(db), outsidePurposeMin: await outsidePurposeMin(db) } };
 }
 
 /** Viewers read that a job failed, not why: the error carries log and command text. */
@@ -228,6 +229,22 @@ export async function putJudgementModel(db: Db, req: Req) {
   const was = await judgementModel(db);
   await setJudgementModel(db, m);
   await audit(db, req.user.login, "judgement-model", "pipeline", { model: m, was });
+  return pipelineState(db, req);
+}
+
+/** The two thresholds of the workflow blockers: a fix above `largeFixLines` changed lines, a change of at least `outsidePurposeMin` lines outside the PR's purpose. */
+export async function putBlockers(db: Db, req: Req) {
+  requireOperator(req);
+  const b = body(req);
+  const rows: [string, string, number][] = [[LARGE_FIX_KEY, "largeFixLines", await largeFixLines(db)], [OUTSIDE_PURPOSE_KEY, "outsidePurposeMin", await outsidePurposeMin(db)]];
+  const was = { largeFixLines: rows[0]![2], outsidePurposeMin: rows[1]![2] };
+  for (const [key, field] of rows) {
+    const v = b[field];
+    if (v === undefined) continue;
+    if (typeof v !== "number" || !Number.isInteger(v) || v < 1 || v > 1_000_000) throw new HttpError(400, `${field} must be a whole number from 1 to 1000000`);
+    await db.run(db.k.insertInto("settings").values({ key, value: String(v) }).onConflict((oc) => oc.column("key").doUpdateSet(excluded(["value"]))));
+  }
+  await audit(db, req.user.login, "blocker-thresholds", "pipeline", { was, ...b });
   return pipelineState(db, req);
 }
 

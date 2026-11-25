@@ -13,7 +13,7 @@ import { ask } from "../decisions.ts";
 import { takersFirst } from "../agents/call.ts";
 import { decisionRefs, prepare, prepareIds } from "./prepare.ts";
 import { type Candidate, type Reason } from "./select.ts";
-import { latestRun, settledLookup } from "../classify/settled.ts";
+import { latestRun, settledSet } from "../classify/settled.ts";
 import { scopeReason } from "../core/decide-item.ts";
 import { unsettledScope } from "../review/candidates.ts";
 import { setAsideLapsedScope } from "../merge/withdraw.ts";
@@ -80,9 +80,9 @@ export async function runDecide(db: Db, params: DecideParams = {}, log: Log = co
   const picked: Candidate[] = [];
   if (!run) log("decide: no classification run with Jev verdicts");
   else {
-    const lookup = settledLookup(db, run);
-    const all: Candidate[] = await mapSeq((await plannedItems(db, "decide", { run, bucket: "new" }))
-      .filter((p) => !params.repos?.length || params.repos.includes(p.facts.repo)), async (p) => ({ repo: p.facts.repo, number: p.facts.number, reason: scopeReason(p.facts)!, settled: await lookup(p.facts.repo, p.facts.number) }));
+    const planned = (await plannedItems(db, "decide", { run, bucket: "new" })).filter((p) => !params.repos?.length || params.repos.includes(p.facts.repo));
+    const lookup = await settledSet(db, run, planned.map((p) => `${p.facts.repo}#${p.facts.number}`));
+    const all: Candidate[] = await mapSeq(planned, async (p) => ({ repo: p.facts.repo, number: p.facts.number, reason: scopeReason(p.facts)!, settled: await lookup(p.facts.repo, p.facts.number) }));
     picked.push(...all.slice(0, total));
     const reasonKey: Record<Reason, "needsDecision" | "scopeDisagreement"> = { "needs-decision": "needsDecision", "scope-disagreement": "scopeDisagreement" };
     for (const c of picked) {

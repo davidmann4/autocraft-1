@@ -193,6 +193,26 @@ export function createHttpApi(): Api {
     items: (f) => get(`/api/items${itemQuery(f)}`),
     progress: () => get("/api/progress"),
     home: () => get("/api/home"),
+    maintain: {
+      home: () => get("/api/maintain/home"),
+      queue: () => get("/api/maintain/queue"),
+      stats: (period) => get(`/api/maintain/stats${qs({ period })}`),
+      items: (q) => get(`/api/maintain/items${qs({ ...q, filters: undefined, filter: q.filters?.join(","), areas: undefined, area: q.areas?.join(","), refs: q.refs?.join(",") })}`),
+      command: (text) => post("/api/commands", { text }),
+      repos: () => get("/api/maintain/repos"),
+      control: (input) => post("/api/controls", input),
+    },
+    maintainItem: {
+      get: (repo, number) => get(`/api/maintain/items/${encodeURIComponent(repo)}/${encodeURIComponent(String(number))}`),
+      command: async (repo, number, text) => {
+        const r = await post<{ items: { outcome: string }[]; lines: string[] }>(`/api/items/${encodeURIComponent(repo)}/${encodeURIComponent(String(number))}/command`, { text });
+        return { ok: r.items.length > 0 && r.items.every((i) => i.outcome === "run"), lines: r.lines };
+      },
+      control: async (body) => {
+        const r = await post<{ ok: boolean; line: string }>("/api/controls", body);
+        return { ok: r.ok, lines: [r.line] };
+      },
+    },
     itemPage: (repo, number, since) => get(`/api/items/${encodeURIComponent(repo)}/${number}/page${qs({ since })}`),
     itemPeek: (repo, number) => get(`/api/items/${encodeURIComponent(repo)}/${encodeURIComponent(String(number))}/peek`),
     itemStatusList: (f) => get(`/api/items/status${qs({ q: f.q, phase: f.phase, kind: f.kind, repo: f.repo?.join(","), area: f.area?.join(","), discord: f.discord ? "1" : undefined, cursor: f.cursor })}`),
@@ -315,6 +335,7 @@ export function createHttpApi(): Api {
       setOutsideLimits: (input) => put("/api/pipeline/outside-limits", input),
       releaseOutsideAuthor: async (author) => void (await post("/api/pipeline/outside/release", { author })),
       setJudgementModel: (model) => put("/api/pipeline/judgement-model", { model }),
+      setBlockers: (input) => put("/api/pipeline/blocker-thresholds", input),
     },
     accounts: {
       list: () => get("/api/accounts"),
@@ -397,7 +418,9 @@ export function createHttpApi(): Api {
     fastTrack: () => get("/api/fast-track"),
     heldMerges: () => get("/api/merge/held"),
     next: () => get("/api/next"),
+    mention: () => get("/api/mention"),
     queuePage: (f) => get(`/api/queue/page${qs(f)}`),
+    controls: { run: (input) => post("/api/controls", input) },
     queueControl: {
       fastTrackAdd: (item) => post("/api/fast-track", { item }),
       fastTrackRemove: (item) => post("/api/fast-track/remove", { item }),

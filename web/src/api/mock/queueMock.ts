@@ -19,7 +19,7 @@ const WAITS: Record<string, [MergeWait, string, number]> = {
 const tabOf = (next: string): QueueTab | null =>
   next === "Review" || next === "Opus review" ? "review" : next.startsWith("Fix") ? "fix" : next.startsWith("Verify") ? "verify" : null;
 
-export function createQueueMock(me: User, changed: () => void): Pick<Api, "pipelineRepos" | "fastTrack" | "heldMerges" | "queuePage" | "queueControl"> {
+export function createQueueMock(me: User, changed: () => void): Pick<Api, "pipelineRepos" | "fastTrack" | "heldMerges" | "queuePage" | "queueControl" | "controls"> {
   const wait = <T,>(v: T) => new Promise<T>((r) => setTimeout(() => r(structuredClone(v)), 40));
   const allWork = workList({ limit: 10000 }).rows;
   const allMerge = queueList({ limit: 10000 }).rows;
@@ -133,6 +133,18 @@ export function createQueueMock(me: User, changed: () => void): Pick<Api, "pipel
       items.sort((a, b) => (a.w[2] === 9 ? 1 : 0) - (b.w[2] === 9 ? 1 : 0) || rank(a.e) - rank(b.e) || a.w[2] - b.w[2]);
       out.nextMerges = items.slice(0, 10).map(({ e, w }): NextMerge => ({ repo: e.repo, number: e.number, title: e.title, waitsFor: w[0], label: w[1], fast: pos(e), batch: batchOf.get(key(e)) ?? null }));
       return wait(out);
+    },
+    controls: {
+      async run(input) {
+        need();
+        if (input.control === "resume-breaker") return { ok: true, line: `Resumed ${input.key}` };
+        const { control, item } = input;
+        const k = key(item);
+        if (control === "hold-merge") held.add(k);
+        else held.delete(k);
+        changed();
+        return { ok: true, line: control === "hold-merge" ? `${k} is held out of the next merge.` : `${k} can merge again.` };
+      },
     },
     queueControl: {
       async fastTrackAdd(item) {

@@ -50,3 +50,37 @@ test("priority and dupes Jev calls are saved under their own stage", async () =>
   assert.equal(row.model, "jev-latest");
   assert.ok(Math.abs(row.c! - 0.021) < 1e-9);
 });
+
+test("runJev saves a chunk's verdicts and usage together, with the input hash", async () => {
+  const db = await fresh();
+  const restore = setRunner(async () => ({ code: 0, stderr: "", stdout: JSON.stringify({ answers, usage: { input_tokens: 10, output_tokens: 1 } }) }));
+  try {
+    const items = [1, 2, 3].map((number) => ({ repo: "a", number, kind: "pr" as const, title: "t", body: "b", lines_changed: 1, files_changed: 1, author_association: null }));
+    const { saved } = await runJev(db, "run1", items, 3, new Map([["a#1", "h1"], ["a#3", "h3"]]));
+    assert.deepEqual([...saved].sort(), ["a#1", "a#2", "a#3"]);
+  } finally { restore(); }
+  const rows = await db.all(db.k.selectFrom("classifications").select(["number", "input_hash"]).orderBy("number"));
+  assert.deepEqual(rows.map((r) => r.input_hash), ["h1", null, "h3"]);
+  assert.equal((await db.all(db.k.selectFrom("token_usage").select("agent"))).length, 3);
+});
+
+test("a classify request that also asks the impact and area questions splits its usage over the three steps", async () => {
+  const db = await fresh();
+  const bodies: string[] = [];
+  const restore = setRunner(async (_cmd: string, _args: string[], stdin: string) => {
+    bodies.push(stdin);
+    return { code: 0, stderr: "", stdout: JSON.stringify({ answers: { ...answers, impact: { choice: "P2", probabilities: { P2: 0.95 } }, area: { choice: "Export", probabilities: { Export: 0.6 } } }, usage: { input_tokens: 1001, output_tokens: 7 } }) };
+  });
+  let r: Awaited<ReturnType<typeof runJev>>;
+  try {
+    const item = { repo: "a", number: 1, kind: "issue" as const, title: "t", body: "b", lines_changed: null, files_changed: null, author_association: null };
+    r = await runJev(db, "run1", [item], 1, undefined, new Map([["a#1", { impact: true, areas: [{ name: "Export", description: "Saving files" }] }]]));
+  } finally { restore(); }
+  assert.equal(bodies.length, 1, "one request for the item");
+  assert.equal(r.impact.get("a#1")?.impact, "P2", "the impact answer is returned for priority to settle");
+  const rows = await db.all(db.k.selectFrom("token_usage").select(["stage", "input_tokens as i", "output_tokens as o"]));
+  assert.deepEqual(rows.map((x) => x.stage).sort(), ["areas", "classify", "priority"]);
+  assert.ok(rows.every((x) => (x.i ?? 0) > 0), "every step pays a share");
+  assert.equal(rows.reduce((n, x) => n + (x.i ?? 0), 0), 1001, "the shares add up to the call");
+  assert.equal(rows.reduce((n, x) => n + (x.o ?? 0), 0), 7);
+});

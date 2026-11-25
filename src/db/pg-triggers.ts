@@ -14,12 +14,13 @@ import { createHash } from "node:crypto";
 import { BOOKKEEPING_COLUMNS, CHANGE_SEQ_TABLE, liveTriggers, TOPICS } from "../live.ts";
 import { blockerFill, blockerSync, PG_BULK, PLAN_TABLES, planTriggers } from "../core/plan-changes.ts";
 import { pgExpr } from "../core/pg-expr.ts";
-import { applyPgSchema, pgSchemaStamp, type PgQueryable } from "./pg-migrate.ts";
+import { PIN_SEARCH_PATH, pgSchemaSql, pgSchemaStamp, withMigrationLock, type MigrationOpts, type PgClient } from "./pg-migrate.ts";
 import { translateSqlite } from "./pg-schema.ts";
-import { pgScopeSql, SCOPED_SCHEMA } from "./scoped.ts";
+import { pgScopeViews, SCOPED_SCHEMA } from "./scoped.ts";
 import { splitStageTripsPg, TRIP_SPLIT_VERSION } from "./trip-split.ts";
 import { featuresRepoOnlyPg, FEATURES_REPO_ONLY_VERSION } from "./feature-repo-only.ts";
 import { retireFixAttemptsPg } from "./fix-retire.ts";
+import { PG_SCHEMA_GENERATION } from "./pg-generation.ts";
 
 const OPS = ["INSERT", "UPDATE", "DELETE"] as const;
 type Op = (typeof OPS)[number];
@@ -76,25 +77,28 @@ BEGIN
   RETURN NULL;
 END $$;`;
 
-/** Drops every trigger this module made, so a trigger whose registry entry is gone does not stay behind. */
-const DROP_OLD = `DO $$
-DECLARE t record;
-BEGIN
-  FOR t IN SELECT tg.tgname, c.relname FROM pg_trigger tg JOIN pg_class c ON c.oid = tg.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace
-    WHERE n.nspname = current_schema() AND NOT tg.tgisinternal AND tg.tgname LIKE 'ac\\_%'
-  LOOP
-    EXECUTE format('DROP TRIGGER %I ON %I', t.tgname, t.relname);
-  END LOOP;
-END $$;`;
-
 const ifThen = (cond: string, body: string, indent: string): string =>
   cond ? `${indent}IF ${cond} THEN\n${indent}  ${body}\n${indent}END IF;` : `${indent}${body}`;
+
+/** The parts of the live topics and the change log, in the order a migration applies them. */
+export interface PgTriggerParts {
+  /** Helper functions, the tables the triggers write to and their seed rows: idempotent DDL for Migration.ddl. */
+  ddl: string;
+  /** Every trigger function (CREATE OR REPLACE FUNCTION): no table locks. */
+  functions: string[];
+  /** CREATE OR REPLACE TRIGGER per table. */
+  triggers: Map<string, { name: string; sql: string }[]>;
+  /** Creates the commit-time flush trigger when it is missing (a constraint trigger cannot be replaced). */
+  flush: string;
+  /** Rebuilds review_blockers from opus_reviews. */
+  blockers: string[];
+}
 
 /**
  * The tables, functions, triggers and rows of the live topics and the change log, for a database that has the schema of
  * src/schema.pg.sql. Idempotent. With `columns` (pgColumns), an UPDATE counts only when a watched column changed.
  */
-export function pgTriggerSql(columns?: Map<string, string[]>): string {
+export function pgTriggerParts(columns?: Map<string, string[]>): PgTriggerParts {
   // Indexes on schema tables are plain SQL both dialects take; the translator only knows the tables it is given.
   const ddl = [CHANGE_SEQ_TABLE, ...PLAN_TABLES].map((s) => s.replaceAll("main.", ""));
   const own = (s: string) => !/^CREATE INDEX/.test(s) || /\bON review_blockers\(/.test(s);
@@ -117,25 +121,45 @@ export function pgTriggerSql(columns?: Map<string, string[]>): string {
   }
   const sync = blockerSync("postgres");
   for (const op of OPS) group("opus_reviews", op);
-  const out = [PROLOGUE, tables, DROP_OLD];
+  const functions: string[] = [];
+  const triggers = new Map<string, { name: string; sql: string }[]>();
   for (const { table, op, topics, plan } of [...groups.values()].sort((a, b) => (`${a.table}|${a.op}` < `${b.table}|${b.op}` ? -1 : 1))) {
     const o = op[0]!.toLowerCase();
     const lines: string[] = [];
     if (table === "opus_reviews") lines.push(ifThen(sync[op].cond, sync[op].body, "  "));
     for (const [topic, conds] of topics) lines.push(ifThen(conds.includes("") ? "" : conds.map((c) => `(${c})`).join(" OR "), `PERFORM ac_touch('${topic}');`, "  "));
     if (plan.length) lines.push(`  IF current_setting('${PG_BULK}', true) IS DISTINCT FROM '1' THEN\n${plan.join("\n")}\n  END IF;`);
-    out.push(`CREATE OR REPLACE FUNCTION ac_trg_${table}_${o}() RETURNS trigger LANGUAGE plpgsql AS $f$
+    functions.push(`CREATE OR REPLACE FUNCTION ac_trg_${table}_${o}() RETURNS trigger LANGUAGE plpgsql AS $f$
 BEGIN
 ${lines.join("\n")}
   RETURN NULL;
-END $f$;
-CREATE TRIGGER ac_${table}_${o} AFTER ${op} ON ${table} FOR EACH ROW EXECUTE FUNCTION ac_trg_${table}_${o}();`);
+END $f$;`);
+    const name = `ac_${table}_${o}`;
+    triggers.set(table, [...(triggers.get(table) ?? []), { name, sql: `CREATE OR REPLACE TRIGGER ${name} AFTER ${op} ON ${table} FOR EACH ROW EXECUTE FUNCTION ac_trg_${table}_${o}();` }]);
   }
-  out.push("CREATE CONSTRAINT TRIGGER ac_flush AFTER INSERT ON live_flush DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION ac_flush();");
-  out.push(`INSERT INTO change_seq (topic, seq, at) VALUES ${TOPICS.map((t) => `('${t}', 0, NULL)`).join(", ")} ON CONFLICT (topic) DO NOTHING;`);
-  out.push("INSERT INTO plan_full (id, seq) VALUES (1, 0) ON CONFLICT (id) DO NOTHING;");
-  out.push("DELETE FROM review_blockers;", blockerFill("postgres"));
-  return out.join("\n");
+  const seeds = [
+    `INSERT INTO change_seq (topic, seq, at) VALUES ${TOPICS.map((t) => `('${t}', 0, NULL)`).join(", ")} ON CONFLICT (topic) DO NOTHING;`,
+    "INSERT INTO plan_full (id, seq) VALUES (1, 0) ON CONFLICT (id) DO NOTHING;",
+  ];
+  return {
+    ddl: [PROLOGUE, tables, ...seeds].join("\n"),
+    functions,
+    triggers,
+    flush: `DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'ac_flush' AND tgrelid = 'live_flush'::regclass) THEN
+    CREATE CONSTRAINT TRIGGER ac_flush AFTER INSERT ON live_flush DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION ac_flush();
+  END IF;
+END $$;`,
+    // SHARE keeps opus_reviews writes (whose triggers maintain review_blockers) out until the rebuild commits.
+    blockers: ["LOCK TABLE opus_reviews IN SHARE MODE;", "DELETE FROM review_blockers;", blockerFill("postgres")],
+  };
+}
+
+/** The whole of pgTriggerParts as one text, for the stamp. */
+export function pgTriggerSql(columns?: Map<string, string[]>): string {
+  const p = pgTriggerParts(columns);
+  return [p.ddl, ...p.functions, ...[...p.triggers.values()].flat().map((t) => t.sql), p.flush, ...p.blockers].join("\n");
 }
 
 /** Column names of every table, as the SQLite schema has them: no generated search columns, no added rowid. */
@@ -148,59 +172,80 @@ export function pgColumns(rows: { t: string; c: string }[]): Map<string, string[
   return out;
 }
 
-/**
- * Pins the search path of every plpgsql function in the app schema (trigger bodies and their helpers) to that schema, so a
- * trigger fired from a scoped handle (src/db/scoped.ts) reads the tables, as SQLite resolves a trigger's names in its
- * own schema. SQL-language functions are left alone: a SET clause would stop them being inlined.
- */
-const PIN_SEARCH_PATH = `DO $$
-DECLARE f record;
-BEGIN
-  FOR f IN SELECT p.oid::regprocedure AS sig FROM pg_proc p JOIN pg_language l ON l.oid = p.prolang
-    WHERE p.pronamespace = current_schema()::regnamespace AND l.lanname = 'plpgsql'
-  LOOP
-    EXECUTE format('ALTER FUNCTION %s SET search_path = %I', f.sig, current_schema());
-  END LOOP;
-END $$;`;
-
 /** The schema stamp a migrated Postgres database stores in settings: the schema file's stamp and the trigger and view generators. */
 export function pgStamp(): string {
-  return createHash("sha256").update(pgSchemaStamp()).update(pgTriggerSql()).update(pgScopeSql("app")).update(PIN_SEARCH_PATH)
+  return createHash("sha256").update(pgSchemaStamp()).update(pgTriggerSql()).update(JSON.stringify(pgScopeViews("app"))).update(PIN_SEARCH_PATH)
     .update(JSON.stringify(BOOKKEEPING_COLUMNS)).update(`trip-split ${TRIP_SPLIT_VERSION}`).update(`features-repo-only ${FEATURES_REPO_ONLY_VERSION}`).digest("hex").slice(0, 16);
 }
 
-/** A connection that returns rows: a pg Client. */
-export interface PgClient extends PgQueryable {
-  query(text: string, values?: unknown[]): Promise<{ rows: Record<string, unknown>[] }>;
-}
+export type { PgClient };
 
 const STAMP_SQL = "SELECT value FROM settings WHERE key = 'schema_stamp'";
 
 /** The stamp the database stores, or null before its first migration. `rows` runs one statement. */
 export async function storedPgStamp(rows: (sql: string) => Promise<Record<string, unknown>[]>): Promise<string | null> {
-  // A missing table would abort the migration's transaction, so its existence is asked first.
+  // A missing table would abort a transaction, so its existence is asked first.
   if (!(await rows("SELECT to_regclass('settings') IS NOT NULL AS ok"))[0]?.ok) return null;
   return ((await rows(STAMP_SQL))[0]?.value as string | undefined) ?? null;
 }
 
+/** The schema generation the database stores (src/db/pg-generation.ts), 0 before any. `rows` runs one statement. */
+export async function storedPgGeneration(rows: (sql: string) => Promise<Record<string, unknown>[]>): Promise<number> {
+  if (!(await rows("SELECT to_regclass('settings') IS NOT NULL AS ok"))[0]?.ok) return 0;
+  return Number((await rows("SELECT value FROM settings WHERE key = 'schema_generation'"))[0]?.value ?? 0) || 0;
+}
+
+let newerSaid = false;
+
 /**
- * Brings the database at `client` to the current schema and triggers in one transaction under the migration lock, unless it
- * already stores the current stamp (checked again under the lock, so concurrent openers migrate once).
+ * True when a newer version migrated the database: an older process (a rollout's old pods and their job processes) serves
+ * on the newer schema as it is rather than migrate it back. Said in the log once per process.
  */
-export async function migratePg(client: PgClient): Promise<void> {
+export async function newerPgSchema(rows: (sql: string) => Promise<Record<string, unknown>[]>): Promise<boolean> {
+  const stored = await storedPgGeneration(rows);
+  if (stored <= PG_SCHEMA_GENERATION.generation) return false;
+  if (!newerSaid) console.warn(`schema migration: skipped: the database has schema generation ${stored}, newer than this version's ${PG_SCHEMA_GENERATION.generation}`);
+  newerSaid = true;
+  return true;
+}
+
+/**
+ * Brings the database at `client` to the current schema, triggers and views under the migration lock, in small steps that
+ * each lock at most one table (src/db/pg-migrate.ts), unless it already stores the current stamp (checked again under the
+ * lock, so concurrent openers migrate once) or a newer version migrated it (newerPgSchema). The stamp and the generation
+ * are written last, so they mark a database with every step applied.
+ */
+export async function migratePg(client: PgClient, opts: MigrationOpts = {}): Promise<void> {
   const stamp = pgStamp();
   const rows = async (sql: string) => (await client.query(sql)).rows;
-  await applyPgSchema(client, async () => {
-    await client.query(pgTriggerSql(pgColumns(await rows(PG_COLUMNS_SQL) as { t: string; c: string }[])));
-    await client.query(pgScopeSql((await rows("SELECT current_schema() AS s"))[0]!.s as string));
-    await client.query(PIN_SEARCH_PATH);
-    await splitStageTripsPg(client);
-    await retireFixAttemptsPg(client);
-    await featuresRepoOnlyPg(client);
-    await client.query("INSERT INTO settings (key, value) VALUES ('schema_stamp', $1) ON CONFLICT (key) DO UPDATE SET value = excluded.value", [stamp]);
-  }, {
-    unless: async () => (await storedPgStamp(rows)) === stamp,
-    // The views name the tables' columns: dropped first, so the schema may change any column, and recreated after it.
-    before: async () => void (await client.query(`DROP SCHEMA IF EXISTS ${SCOPED_SCHEMA} CASCADE`)),
-  });
+  await withMigrationLock(client, async (m) => {
+    if ((await storedPgStamp(rows)) === stamp || (await newerPgSchema(rows))) return;
+    // Columns are only ever added, which the views over the tables allow, so the views are replaced after the schema.
+    await m.ddl(pgSchemaSql(), "schema");
+    const parts = pgTriggerParts(pgColumns(await rows(PG_COLUMNS_SQL) as { t: string; c: string }[]));
+    await m.ddl(parts.ddl, "live tables");
+    await m.step({ label: "trigger functions", sql: [...parts.functions, PIN_SEARCH_PATH] });
+    // Triggers this module made whose registry entry is gone are dropped with the others on their table.
+    const old = new Map<string, string[]>();
+    for (const r of await rows(`SELECT tg.tgname::text AS name, c.relname::text AS tbl FROM pg_trigger tg JOIN pg_class c ON c.oid = tg.tgrelid
+        WHERE c.relnamespace = current_schema()::regnamespace AND NOT tg.tgisinternal AND tg.tgname LIKE 'ac\\_%' AND tg.tgname <> 'ac_flush'`) as { name: string; tbl: string }[]) {
+      if (!parts.triggers.get(r.tbl)?.some((t) => t.name === r.name)) old.set(r.tbl, [...(old.get(r.tbl) ?? []), `DROP TRIGGER IF EXISTS ${r.name} ON ${r.tbl}`]);
+    }
+    for (const table of [...new Set([...parts.triggers.keys(), ...old.keys()])].sort()) {
+      await m.step({ label: `triggers: ${table}`, table, sql: [...(parts.triggers.get(table) ?? []).map((t) => t.sql), ...(old.get(table) ?? [])] });
+    }
+    await m.step({ label: "flush trigger", table: "live_flush", sql: [parts.flush] });
+    await m.step({ label: "review blockers", table: "opus_reviews", sql: parts.blockers });
+    await m.step({ label: "scoped schema", sql: [`CREATE SCHEMA IF NOT EXISTS ${SCOPED_SCHEMA}`] });
+    const views = pgScopeViews((await rows("SELECT current_schema() AS s"))[0]!.s as string);
+    for (const v of views) await m.step({ label: `view ${v.view}`, table: v.view, sql: [v.sql], fallback: [`DROP VIEW IF EXISTS ${v.view}`, v.sql.replace("CREATE OR REPLACE VIEW", "CREATE VIEW")] });
+    for (const r of await rows(`SELECT table_schema || '.' || table_name AS v FROM information_schema.views WHERE table_schema = '${SCOPED_SCHEMA}'`) as { v: string }[]) {
+      if (!views.some((v) => v.view === r.v)) await m.step({ label: `view ${r.v}`, table: r.v, sql: [`DROP VIEW IF EXISTS ${r.v}`] });
+    }
+    await m.step({ label: "stage trips", run: () => splitStageTripsPg(client) });
+    await m.step({ label: "fix attempts", run: () => retireFixAttemptsPg(client) });
+    await m.step({ label: "features", run: () => featuresRepoOnlyPg(client) });
+    await m.step({ label: "stamp", run: async () => void (await client.query(`INSERT INTO settings (key, value) VALUES ('schema_stamp', $1), ('schema_generation', $2)
+      ON CONFLICT (key) DO UPDATE SET value = excluded.value`, [stamp, String(PG_SCHEMA_GENERATION.generation)])) });
+  }, opts);
 }

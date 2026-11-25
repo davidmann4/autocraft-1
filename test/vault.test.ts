@@ -1,13 +1,13 @@
-// The user-token vault: a refresh race between two processes, a final refresh failure, and removal.
+// The user-token vault: refresh races (two vaults, a session and the vault), healing from a session, a final refresh failure, and removal.
 import assert from "node:assert/strict";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 import { addLogin, removeLogin } from "../src/access.ts";
-import { pkceChallenge, TokenBox } from "../src/dash/server/crypto.ts";
+import { pkceChallenge, sha256hex, TokenBox } from "../src/dash/server/crypto.ts";
 import { FakeProvider, type Tokens } from "../src/dash/server/provider.ts";
-import { createSession, openTokens } from "../src/dash/server/sessions.ts";
-import { dropSessionTokens, saveUserTokens } from "../src/dash/server/user-tokens.ts";
+import { accessToken, createSession, openTokens, sealTokens } from "../src/dash/server/sessions.ts";
+import { dropSessionTokens, readUserTokens, saveUserTokens } from "../src/dash/server/user-tokens.ts";
 import { Vault } from "../src/github/vault.ts";
 import { SCRATCH } from "./scratch.ts";
 import { connectDb } from "../src/db/open.ts";
@@ -35,7 +35,6 @@ test("two vaults refreshing one expired token end with one refresh and the same 
   const sid = await createSession(db, box, "example-user", old, undefined);
   const a = new Vault(db, box, provider);
   const b = new Vault(db, box, provider);
-  a.waitMs = b.waitMs = 0;
   const [ra, rb] = await Promise.all([a.userToken("example-user"), b.userToken("example-user")]);
   assert.ok(ra.ok && rb.ok);
   assert.equal(provider.refreshes, 1);
@@ -47,14 +46,59 @@ test("two vaults refreshing one expired token end with one refresh and the same 
   assert.ok(sid);
 });
 
+// Under the app identity the sessions hold tokens of the same app as the row.
+const useApp = (db: Awaited<ReturnType<typeof setup>>["db"]) => db.run(db.k.insertInto("settings").values({ key: "github_identity", value: "app" }));
+
+test("a session and the vault refreshing one login at once make one endpoint call and share the new pair", async () => {
+  const { db, box, provider, signIn } = await setup("vault-session-race");
+  await useApp(db);
+  const old = await signIn("example-user", -1000);
+  const idHash = sha256hex(await createSession(db, box, "example-user", old, undefined));
+  // Slow enough that both callers are past their first read before either refresh returns.
+  provider.refreshDelayMs = 50;
+  // The endpoint call runs outside any transaction, so it holds no writer lock: an unrelated write finishes while the
+  // endpoint has not answered yet.
+  let inTransaction = false;
+  provider.duringRefresh = () => (inTransaction ||= db.inTransaction(), Promise.race([
+    db.run(db.k.insertInto("settings").values({ key: "unrelated", value: "1" })).then(() => undefined),
+    new Promise<void>((_, reject) => setTimeout(() => reject(new Error("a write waited for the refresh")), 3000)),
+  ]));
+  const [fromVault, fromSession] = await Promise.all([new Vault(db, box, provider).userToken("example-user"), accessToken(db, box, provider, idHash, true)]);
+  assert.equal(provider.refreshCalls, 1);
+  assert.ok(fromVault.ok);
+  assert.equal(inTransaction, false);
+  assert.ok(await db.get(db.k.selectFrom("settings").select("value").where("key", "=", "unrelated")));
+  assert.notEqual(fromVault.access, old.access);
+  assert.equal(fromSession, fromVault.access);
+  const row = (await readUserTokens(db, box, "example-user"))!;
+  assert.equal(row.status, "ok");
+  assert.equal(row.tokens?.access, fromVault.access);
+});
+
+test("a refused refresh heals the row from a session holding a newer token set instead of failing", async () => {
+  const { db, box, provider, signIn } = await setup("vault-heal");
+  await useApp(db);
+  const old = await signIn("example-user", -1000);
+  const idHash = sha256hex(await createSession(db, box, "example-user", old, undefined));
+  // A refresh that stored the new pair in the session only: the row keeps the refresh token GitHub has already used.
+  const next = (await provider.refresh(old.refresh!)) as Tokens;
+  await db.run(db.k.updateTable("sessions").set({ token_enc: sealTokens(box, next, idHash) }).where("id_hash", "=", idHash));
+  const r = await new Vault(db, box, provider).userToken("example-user");
+  assert.deepEqual(r, { ok: true, access: next.access });
+  const row = (await readUserTokens(db, box, "example-user"))!;
+  assert.equal(row.status, "ok");
+  assert.equal(row.tokens?.refresh, next.refresh);
+});
+
 test("a refresh GitHub rejects marks the row and answers needs-sign-in, never another identity", async () => {
   const { db, box, provider, signIn } = await setup("vault-fail");
   await signIn("example-user", -1000);
   provider.rejectRefresh = true;
   const v = new Vault(db, box, provider);
-  v.waitMs = 0;
   assert.deepEqual(await v.userToken("example-user"), { ok: false, needsSignIn: true, why: "refresh-failed" });
-  assert.equal((await db.get(db.k.selectFrom("user_tokens").select("status")))!.status, "refresh-failed");
+  const failed = (await db.get(db.k.selectFrom("user_tokens").select(["status", "refresh_error"])))!;
+  assert.equal(failed.status, "refresh-failed");
+  assert.match(failed.refresh_error ?? "", /^bad_refresh_token: /);
   provider.rejectRefresh = false;
   assert.equal((await v.userToken("example-user")).ok, false);
   assert.equal(provider.refreshes, 0);

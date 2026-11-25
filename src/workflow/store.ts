@@ -3,6 +3,7 @@
 // reads and writes. Every write moves updated_at, which is bookkeeping for the live topic `workflows` (src/live.ts): a
 // write that changes nothing else does not wake the planner.
 import type { Selectable } from "kysely";
+import type { RepoWorkflow } from "../core/plan.ts";
 import type { Db } from "../db/index.ts";
 import type { DB } from "../db/types.ts";
 import type { Blocker, Entry, ItemKind, ItemWorkflow, Parsed, PlanPart, Recommendation, Surface, WorkflowEventKind, WorkflowState } from "./types.ts";
@@ -13,7 +14,7 @@ export const LIVE_STATES = ["running", "waiting", "blocked", "recommending"] as 
 export const isLive = (s: WorkflowState): boolean => (LIVE_STATES as readonly string[]).includes(s);
 
 /** Which model a tracked repo runs: `legacy` (the decision pipeline) or `new` (the maintainer workflow). */
-export type RepoWorkflow = "legacy" | "new";
+export type { RepoWorkflow };
 
 type Row = Selectable<DB["main.item_workflows"]>;
 
@@ -34,7 +35,7 @@ export function workflowOf(r: Row): ItemWorkflow {
     stoppedBy: r.stopped_by, stoppedAt: r.stopped_at,
     blocker: r.blocker as Blocker | null, blockerParams: json<Record<string, unknown> | null>(r.blocker_params, null),
     rec: json<Recommendation | null>(r.rec, null), recAt: r.rec_at, recHead: r.rec_head,
-    plan: json<PlanPart[]>(r.plan, []), legacyPreapprovalId: r.legacy_preapproval_id, updatedAt: r.updated_at,
+    plan: json<PlanPart[]>(r.plan, []), step: r.step, legacyPreapprovalId: r.legacy_preapproval_id, updatedAt: r.updated_at,
   };
 }
 
@@ -70,7 +71,7 @@ export async function insertWorkflow(db: Db, w: NewWorkflow, at = new Date().toI
     stopped_by: w.stoppedBy ?? null, stopped_at: w.stoppedAt ?? null,
     blocker: w.blocker ?? null, blocker_params: w.blockerParams ? JSON.stringify(w.blockerParams) : null,
     rec: w.rec ? JSON.stringify(w.rec) : null, rec_at: w.recAt ?? null, rec_head: w.recHead ?? null,
-    plan: JSON.stringify(w.plan ?? []), legacy_preapproval_id: w.legacyPreapprovalId ?? null, updated_at: at,
+    plan: JSON.stringify(w.plan ?? []), step: w.step ?? null, legacy_preapproval_id: w.legacyPreapprovalId ?? null, updated_at: at,
   }).returning("id"));
   return r!.id;
 }
@@ -95,6 +96,7 @@ export async function updateWorkflow(db: Db, id: number, p: WorkflowPatch, at = 
   if (p.recAt !== undefined) set.rec_at = p.recAt;
   if (p.recHead !== undefined) set.rec_head = p.recHead;
   if (p.plan !== undefined) set.plan = JSON.stringify(p.plan);
+  if (p.step !== undefined) set.step = p.step;
   if (p.legacyPreapprovalId !== undefined) set.legacy_preapproval_id = p.legacyPreapprovalId;
   return (await db.run(db.k.updateTable("main.item_workflows").set(set).where("id", "=", id))).changes === 1;
 }
@@ -141,4 +143,48 @@ export async function lastNudge(db: Db, login: string): Promise<string | null> {
 
 export async function recordNudge(db: Db, login: string, at = new Date().toISOString()): Promise<void> {
   await db.run(db.k.insertInto("main.github_link_nudges").values({ login, at }).onConflict((oc) => oc.column("login").doUpdateSet({ at })));
+}
+
+/** What a pre-approved merge needs to know of the maintainer workflow it is the merge leg of. */
+export type LegContext = {
+  workflowId: number;
+  entry: Entry;
+  /** When a person last started the workflow or answered its recommendation: what they had seen by then, they chose to go on with. */
+  since: string;
+};
+
+/**
+ * The events that say a person chose to go on with what the workflow showed them: its start, and an answer to its recommendation
+ * (also one that approves the merge). A plain approval with no recommendation open is not one: it does not accept a review nobody
+ * was shown.
+ */
+export const GO_ON_EVENTS = ["started", "answered"] as const satisfies readonly WorkflowEventKind[];
+
+/** When a person last started the workflow or answered its recommendation; its start when no such event is recorded. */
+export async function goOnAt(db: Db, w: Pick<ItemWorkflow, "id" | "startedAt">): Promise<string> {
+  const r = await db.get(db.k.selectFrom("main.workflow_events").select((eb) => eb.fn.max("at").as("at")).where("workflow_id", "=", w.id).where("kind", "in", GO_ON_EVENTS));
+  const at = r?.at ?? null;
+  return at !== null && at > w.startedAt ? at : w.startedAt;
+}
+
+/**
+ * What a pre-approved merge in a repo on the maintainer workflow is: the merge leg of a live workflow; `ended`, the leg of a workflow
+ * that stopped, finished, closed or went to the backlog (it must not go on as a legacy pre-approval); or `unlinked`, a row no workflow
+ * owns (it never acts as a legacy one either). Null in a repo on the decision pipeline.
+ */
+export async function legContext(db: Db, preapprovalId: number): Promise<LegContext | "ended" | "unlinked" | null> {
+  const p = await db.get(db.k.selectFrom("main.preapprovals as p").innerJoin("main.tracked_repos as t", "t.name", "p.repo")
+    .select(["p.repo", "p.number", "p.workflow_id", "t.workflow"]).where("p.id", "=", preapprovalId));
+  if (!p || p.workflow !== "new") return null;
+  let id = p.workflow_id;
+  if (id === null) {
+    // A start writes its pre-approval just before the workflow row that owns it: adopt it once that row exists.
+    const own = await liveWorkflow(db, p.repo, p.number);
+    if (!own) return "unlinked";
+    await db.run(db.k.updateTable("main.preapprovals").set({ workflow_id: own.id }).where("id", "=", preapprovalId).where("workflow_id", "is", null));
+    id = own.id;
+  }
+  const w = await db.get(db.k.selectFrom("main.item_workflows").select(["id", "entry", "started_at", "state"]).where("id", "=", id));
+  if (!w || !isLive(w.state as WorkflowState)) return "ended";
+  return { workflowId: w.id, entry: w.entry as Entry, since: await goOnAt(db, { id: w.id, startedAt: w.started_at }) };
 }

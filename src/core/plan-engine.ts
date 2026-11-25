@@ -41,7 +41,7 @@ const states = new WeakMap<Db, State>();
 
 /** Pass counts not yet written to plan_pass_stats, per connection. */
 const records = new WeakMap<Db, { flushedAt: number; counts: Map<string, { passes: number; refs: number; at: string; ms: number; maxMs: number }> }>();
-/** Quiet passes write their counts and prune the change log at most this often. */
+/** Quiet passes write their counts at most this often. */
 const RECORD_EVERY_MS = 60_000;
 
 type Diff = { ref: string; side: "pr" | "item"; fields: string[]; detail: string };
@@ -54,7 +54,7 @@ export type PlanPass = {
   refs: number;
   /** Differences the shadow check found (empty when it did not run). */
   diffs: Diff[];
-  /** Records the pass with its duration (ms) and prunes the change log it consumed (a quiet pass: at most once a minute); call after the pass's writes succeeded. */
+  /** Prunes the change log rows the pass read and records the pass with its duration (ms; a quiet pass: at most once a minute); call after the pass's writes, the Plan cache among them, succeeded. */
   finish: (passMs?: number) => Promise<void>;
 };
 
@@ -217,9 +217,13 @@ export async function planPass(db: Db, o: PlanPassOptions): Promise<PlanPass> {
       add(kind, refs, Math.round(passMs));
       if (shadowRan) add(diffs.length ? "shadow:different" : "shadow:same", diffs.length);
       if (refreshUnchanged) add("refresh:unchanged", refreshUnchanged);
-      // A quiet pass writes nothing: the counts and the log's pruning wait for a difference, a full load or the next minute.
-      if (!diffs.length && !reason && Date.now() - rec.flushedAt < RECORD_EVERY_MS) return;
-      await pruneChanges(db, cursor);
+      // The stored Plans cover the rows this pass read once its writes succeeded: the log keeps only changes no stored Plan
+      // covers yet, which is what a step outside the planner decides again (plan-read.ts dueCandidates).
+      // A failed delete leaves the rows for the next pass to prune; the counts are written first, then the error is thrown.
+      let pruneError: unknown = null;
+      if (cursor.seen.size) { try { await pruneChanges(db, cursor); } catch (e) { pruneError = e; } }
+      // A quiet pass writes no counts: they wait for a difference, a full load or the next minute.
+      if (!diffs.length && !reason && Date.now() - rec.flushedAt < RECORD_EVERY_MS) { if (pruneError) throw pruneError; return; }
       for (const [k, c] of rec.counts) {
         await db.run(db.k.insertInto("main.plan_pass_stats").values({ kind: k, passes: c.passes, refs: c.refs, last_at: c.at, ms: c.ms, max_ms: c.maxMs })
           .onConflict((oc) => oc.column("kind").doUpdateSet((eb) => ({
@@ -233,6 +237,7 @@ export async function planPass(db: Db, o: PlanPassOptions): Promise<PlanPass> {
         for (const d of diffs) await db.run(db.k.insertInto("main.plan_shadow_diffs").values({ at, ref: d.ref, side: d.side, fields: d.fields.join(","), detail: d.detail.slice(0, 2000) }));
         await db.run(db.k.deleteFrom("main.plan_shadow_diffs").where(kx.rowid("plan_shadow_diffs"), "<=", (eb) => eb(eb.selectFrom("main.plan_shadow_diffs").select((s) => s.fn.max<number>(kx.rowid("plan_shadow_diffs")).as("m")), "-", SHADOW_ROWS)));
       }
+      if (pruneError) throw pruneError;
     },
   };
 }

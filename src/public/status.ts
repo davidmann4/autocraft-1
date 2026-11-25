@@ -23,7 +23,8 @@ export type PublicStatus = {
 // Mapping from stored data to a step (first match wins; open items only):
 //
 //   items.state MERGED / CLOSED                                   -> Merged / Closed
-//   an open decisions row for the item (any kind)                 -> Needs a maintainer decision
+//   an open decisions row for the item (any kind), or a workflow
+//     waiting for an answer (recommending, or at a blocker)        -> Needs a maintainer decision
 //   issue: no item_stage row                                      -> New
 //   issue: any other                                              -> Triaged
 //   PR plan state in-batch, batch-checking, ready,
@@ -41,7 +42,7 @@ export type PublicStatus = {
 const QUEUED = ["in-batch", "batch-checking", "ready", "decision-answered-merge"];
 const FIXING = ["needs-fix-up"];
 const WAITING = ["waiting-ci", "waiting-premerge", "waiting-verify", "ci-approval", "waiting-main-ci"];
-const NEVER_REVIEWED = ["not-reviewed", "label-not-reviewed", "out-of-scope", "scope", "draft"];
+const NEVER_REVIEWED = ["not-reviewed", "label-not-reviewed", "out-of-scope", "scope", "draft", "not-started"];
 
 /** True for a repo that is tracked and public. */
 export const isPublicRepo = async (db: Db, repo: string): Promise<boolean> =>
@@ -80,7 +81,8 @@ async function statusRows(db: Db, repo: string, numbers: number[]) {
     .leftJoin("main.item_plans as p", (j) => j.onRef("p.repo", "=", "i.repo").onRef("p.number", "=", "i.number"))
     .select((eb) => ["i.number", "i.title", "i.url", "i.kind", "i.state", hiddenExpr(db, eb, "i.repo", "i.number", "i.labels").as("hidden"),
       "s.stage", "s.reviewed", "p.state as plan", "p.view",
-      eb.exists(eb.selectFrom("main.decisions as d").select(eb.lit(1).as("one")).whereRef("d.repo", "=", "i.repo").whereRef("d.number", "=", "i.number").where("d.answer", "is", null)).as("decision")])
+      eb.exists(eb.selectFrom("main.decisions as d").select(eb.lit(1).as("one")).whereRef("d.repo", "=", "i.repo").whereRef("d.number", "=", "i.number").where("d.answer", "is", null)).as("decision"),
+      eb.exists(eb.selectFrom("main.item_workflows as w").select(eb.lit(1).as("one")).whereRef("w.repo", "=", "i.repo").whereRef("w.number", "=", "i.number").where("w.state", "in", ["recommending", "blocked"])).as("answer")])
     .where("i.repo", "=", repo).where("i.number", "in", numbers));
 }
 type StatusRow = Awaited<ReturnType<typeof statusRows>>[number];
@@ -94,7 +96,7 @@ async function statusOf(repo: string, row: StatusRow, place: () => Promise<{ pos
   if (row.state === "MERGED") return { ...base, state: "merged", step: "Merged" };
   if (row.state === "CLOSED") return { ...base, state: "closed", step: "Closed" };
   const open = { ...base, state: "open" } as const;
-  if (row.decision) return { ...open, step: "Needs a maintainer decision" };
+  if (row.decision || row.answer) return { ...open, step: "Needs a maintainer decision" };
   if (kind === "issue") return { ...open, step: row.stage === null ? "New" : "Triaged" };
   let view: { fixup?: string; cifix?: string; queue?: { held?: boolean } } = {};
   try {

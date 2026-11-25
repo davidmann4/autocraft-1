@@ -12,13 +12,19 @@ import { bindParams, parseParams, rewriteForPostgres, rewriteScriptForPostgres, 
 import { plainSchema, SCOPED_SCHEMA } from "./scoped.ts";
 import { fenceSql } from "./fence.ts";
 
-/** Connections per process role: the database allows 100 direct connections, shared by every process of the instance. */
-export const POOL_MAX: Record<DbRole, number> = { dashboard: 8, "dashboard-remote": 4, runner: 4, planner: 2, periodic: 2, cli: 1 };
+/**
+ * Connections per process role: the database allows 100 direct connections, shared by every process of the instance, and each
+ * process that listens holds one more outside its pool. Up to 32 job processes run at once (DEFAULT_MAX_JOBS): 32 x (1 pool + 1 listener) = 64,
+ * the dashboard 8 + 4 + 2 listeners, runner 4 + 1, planner 2, periodic 2 + 1 come to about 88, leaving room for CLI sessions; a job pool of 2 would reach about 120.
+ */
+export const POOL_MAX: Record<DbRole, number> = { dashboard: 8, "dashboard-remote": 4, runner: 4, job: 1, planner: 2, periodic: 2, cli: 1 };
 
 /** Key of the one writer lock every write takes (a write transaction, or a write statement outside one), so writes run one at a time as on SQLite. */
 const WRITER_LOCK = 0x61637772; // "acwr"
 /** First key of the named locks (WriteOptions.lock), taken as two 32-bit keys: a space apart from the single-key writer and migration locks. */
 const NAMED_LOCKS = 0x61636e6c; // "acnl"
+/** First key of the session locks of Db.exclusive, taken on a connection of their own. */
+const EXCLUSIVE_LOCKS = 0x61636578; // "acex"
 
 const DEFAULT_LOCK_TIMEOUT_MS = 30_000;
 /** A transaction whose client sends nothing for this long is ended by the server, so a dead process cannot keep the writer lock. */
@@ -30,6 +36,11 @@ const DEFAULT_IDLE_IN_TRANSACTION_MS = 60_000;
  */
 export const SERVER_KEEPALIVE = { tcp_keepalives_idle: 5, tcp_keepalives_interval: 2, tcp_keepalives_count: 3, tcp_user_timeout: 10_000 } as const;
 const DEFAULT_STATEMENT_TIMEOUT_MS = 120_000;
+/**
+ * JIT compilation off (0 is a boolean's false). The planner's cost estimates for the facts loads' correlated subqueries pass
+ * jit_above_cost while the queries run in milliseconds, and each compile costs 100 ms or more, up to seconds for the full load.
+ */
+const NO_JIT = { jit: 0 } as const;
 
 /** Parsed statement texts kept per handle. */
 const PARSE_CACHE = 1000;
@@ -206,7 +217,7 @@ export function postgresEngine(k: typeof K, pg: typeof Pg.default, url: string, 
     client.on("error", () => {});
   });
   const raw = (text: string, values?: unknown[]) => k.CompiledQuery.raw(text, values);
-  const sessionSettings = { ...SERVER_KEEPALIVE, idle_in_transaction_session_timeout: opts.idleInTransactionMs ?? DEFAULT_IDLE_IN_TRANSACTION_MS };
+  const sessionSettings = { ...SERVER_KEEPALIVE, ...NO_JIT, idle_in_transaction_session_timeout: opts.idleInTransactionMs ?? DEFAULT_IDLE_IN_TRANSACTION_MS };
   /**
    * The driver awaits this once per new pool client before the client's first statement (pg's own `connect` event cannot
    * wait), so every statement runs with the session settings in effect.
@@ -303,6 +314,30 @@ export function postgresEngine(k: typeof K, pg: typeof Pg.default, url: string, 
     dialect: "postgres",
     kysely,
     listener: () => pgListener(pg, url),
+    exclusiveLock: async (name: string, waitMs: number) => {
+      // A connection of its own, outside the pool (a job's pool has one connection), closed with the lock: closing the
+      // session releases it, and so does the server when this process dies (SERVER_KEEPALIVE).
+      const wait = Math.max(1, Math.floor(waitMs));
+      const c = new pg.Client({ connectionString: pgConnectionString(url), application_name: "autocraft-lock", keepAlive: true, connectionTimeoutMillis: 10_000, query_timeout: wait + 5_000 });
+      let held = false;
+      c.on("error", () => (held = false));
+      c.on("end", () => (held = false));
+      const end = async (): Promise<void> => {
+        held = false;
+        await c.end().catch(() => undefined);
+      };
+      try {
+        await c.connect();
+        await setSession((text) => c.query(text), SERVER_KEEPALIVE, "the lock connection", (l) => console.warn(l), 10_000);
+        await c.query(`SET lock_timeout = ${wait}`);
+        await c.query(`SELECT pg_advisory_lock(${EXCLUSIVE_LOCKS}, hashtext($1))`, [name]);
+        held = true;
+      } catch (e) {
+        await end();
+        throw e;
+      }
+      return { release: end, held: () => held };
+    },
     exec: async (op: Op, text: string, args: Args, tx: Tx | undefined) => {
       const { text: q, values } = bindParams(parse(text), args, (i) => `$${i + 1}`);
       const r = await on(tx, (conn) => conn.executeQuery<Row>(raw(q, values)));

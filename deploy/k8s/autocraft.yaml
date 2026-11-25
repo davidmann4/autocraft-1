@@ -60,6 +60,11 @@ spec:
                 secretKeyRef: { name: autocraft-github, key: token, optional: true }
           ports:
             - { name: dashboard, containerPort: 3005 }
+          # A Postgres schema migration may wait up to 10 minutes for table locks before the process serves.
+          startupProbe:
+            httpGet: { path: /healthz, port: dashboard }
+            periodSeconds: 10
+            failureThreshold: 66
           livenessProbe:
             httpGet: { path: /healthz, port: dashboard }
             periodSeconds: 10
@@ -85,6 +90,11 @@ spec:
                 secretKeyRef: { name: autocraft-github, key: token, optional: true }
           ports:
             - { name: worker-api, containerPort: 8981 }
+          # A Postgres schema migration may wait up to 10 minutes for table locks before the process serves.
+          startupProbe:
+            httpGet: { path: /healthz, port: worker-api }
+            periodSeconds: 10
+            failureThreshold: 66
           livenessProbe:
             httpGet: { path: /healthz, port: worker-api }
             periodSeconds: 10

@@ -51,6 +51,9 @@ const rows: Row[] = [
   // ---- prioritize, embed
   { name: "no priority row", facts: { priorityHash: null }, expect: { state: "classified", actions: ["prioritize"] } },
   { name: "priority made at older text", facts: { priorityHash: "old" }, expect: { state: "classified", actions: ["prioritize"] } },
+  { name: "no priority row while Jev's classify call is due: that request asks the impact", facts: { priorityHash: null, classification: { jev: jev({ changed: true }) } }, expect: { state: "classified", actions: ["classify"] } },
+  { name: "no priority row after a classify request failed for the item's current input: prioritize asks it", facts: { priorityHash: null, classification: { jev: jev({ changed: true }), jevFailed: true } }, expect: { state: "classified", actions: ["classify", "prioritize"] } },
+  { name: "no priority row while only Haiku's classify call is due: prioritize asks it", facts: { priorityHash: null, classification: { status: "waiting", label: null, jev: jev({ unsure: true }) } }, expect: { state: "waiting-haiku", actions: ["classify", "prioritize"] } },
   { name: "no vector for the current model", facts: { embeddedHash: null }, expect: { state: "classified", actions: ["embed"] } },
   { name: "vector of older text: embed again, no scan until it is current", facts: { embeddedHash: "old", scannedHash: null }, expect: { state: "classified", actions: ["embed"] } },
   { name: "embed does not depend on scope", facts: { inScope: false, embeddedHash: null }, expect: { state: "classified", actions: ["embed"] } },
@@ -140,6 +143,11 @@ const rows: Row[] = [
 
   // ---- next-step text of issues
   { name: "issue that is not a bugfix", facts: { classification: { label: "infra" }, labels: { existing: ["infra"] } }, expect: { state: "classified", next: "Triage by a person" } },
+
+  // ---- a repo on the maintainer workflow
+  { name: "workflow repo: a needs-decision item gets no scope question", facts: { ...needsDecision, repoFacts: { workflow: "new" } }, expect: { state: "classified", actions: [] } },
+  { name: "workflow repo: an open decision is not prepared", facts: { repoFacts: { workflow: "new" }, scope: { recommend: { failures: 0, failedAt: null } } }, expect: { state: "classified", actions: [] } },
+  { name: "workflow repo: a Close answer that ended the workflow is carried out outside the scope", facts: { inScope: false, repoFacts: { workflow: "new" }, endedWorkflow: "closed", answeredClose: [closed()] }, expect: { state: "classified", actions: ["act"] } },
 ];
 
 for (const r of rows) {

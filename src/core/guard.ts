@@ -20,7 +20,7 @@ import { loadItemFact } from "./issue-facts.ts";
 import type { ActionKind, PrFacts } from "./plan.ts";
 import { identityOfDecision, type Identity } from "../github/identity.ts";
 import { disputeOn } from "../answers/hold.ts";
-import { setting } from "../settings-read.ts";
+import { freshSettings, setting } from "../settings-read.ts";
 import { botRepo } from "../discord/filing-repos.ts";
 import type { Db } from "../db/index.ts";
 
@@ -146,7 +146,9 @@ export async function guardItem(db: Db, ref: Ref, action: ItemWant, by: By, asDe
 }
 
 /** The approvals of a repo and the global switch, read now. */
-export async function repoApprovals(db: Db, repo: string): Promise<Parameters<typeof gateRepo>[0]> {
+export const repoApprovals = (db: Db, repo: string): Promise<Parameters<typeof gateRepo>[0]> => freshSettings(() => repoApprovalsNow(db, repo));
+
+async function repoApprovalsNow(db: Db, repo: string): Promise<Parameters<typeof gateRepo>[0]> {
   const on = pipelineWrites(await setting(db, "pipeline_enabled"));
   return {
     merge: !!await mergeApprovalOf(db, repo), push: await pushApprovalOf(db, repo) !== null, comment: await commentApprovalOf(db, repo) !== null, ci: await ciApprovalOf(db, repo) !== null,

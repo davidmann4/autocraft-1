@@ -5,9 +5,11 @@
 // src/merge/withdraw.ts sets a question aside; a scope question's asked stage is cleared too), so nothing waits on a question
 // the new model does not ask. Duplicate, close, split, backlog, implement and stuck questions stay. Pre-approvals, fast track
 // and operator fix-ups are left as they are. Old reviews, decisions and conversations stay as the item's history. A flip
-// writes nothing to GitHub.
+// writes nothing to GitHub. A repo on the maintainer workflow is one we maintain, so it has the PR status comment, merging and
+// pushing approved (the Repos page switches): a flip to `new` turns the ones that are off on as the flipper, and so does a flip
+// of a repo already on `new`. The automatic merges and pushes the workflow keeps need them.
 //
-// To `legacy` (rollback), the repo's live workflows stop and their pre-approvals lose the link. The old planner carries on
+// To `legacy` (rollback), the repo's live workflows stop and their pre-approvals lose the link; the switches stay as they are. The old planner carries on
 // from the legacy rows and asks the withdrawn questions again as new rows.
 //
 // Idempotent, like src/db/fix-retire.ts: a repo already on the target model, with nothing left to stop, changes nothing.
@@ -17,7 +19,10 @@ import { audit } from "../dash/audit.ts";
 import type { Db } from "../db/index.ts";
 import { clearAskedStage } from "../decisions.ts";
 import { githubIdentity } from "../github/identity.ts";
+import { pushApprovalOf, setPushApproval } from "../fixup/approval.ts";
+import { mergeApprovalOf, setMergeApproval } from "../merge/approval.ts";
 import { renameDecision, WITHDRAWN } from "../merge/withdraw.ts";
+import { setStatusApproval, statusApprovalOf } from "../prstatus/approval.ts";
 import { addEvent, liveWorkflows, repoWorkflow, type RepoWorkflow } from "./store.ts";
 
 export const FLIP_WITHDRAWN_NOTE = "withdrawn when the repo moved to the maintainer workflow";
@@ -29,12 +34,20 @@ const WITHDRAWN_KINDS = ["merge", "hold", "scope"];
  * Whether the planner works item_workflows. Until it does, a flip to `new` would only withdraw questions the legacy planner
  * asks again, so a real flip is refused; a dry run still reports what it would do.
  */
-export const WORKFLOW_ENGINE_READY = false;
+export const WORKFLOW_ENGINE_READY = true;
 const ENGINE_NOT_READY = "the planner does not work maintainer workflows yet: a flip now would only withdraw questions the legacy planner asks again";
 
 export class FlipRefused extends Error {}
 
 export type FlipDecision = { id: string; kind: string; number: number };
+
+/** The Repos page switches every repo on the maintainer workflow has on, with how each is read and set. */
+const SWITCHES = {
+  status: { on: statusApprovalOf, set: setStatusApproval, line: "turn the PR status comment on" },
+  merge: { on: mergeApprovalOf, set: setMergeApproval, line: "approve merging" },
+  push: { on: pushApprovalOf, set: setPushApproval, line: "approve pushing fix-ups" },
+} satisfies Record<string, { on: (db: Db, repo: string) => Promise<unknown>; set: (db: Db, by: string, repo: string, approved: boolean) => Promise<boolean>; line: string }>;
+export type RepoSwitch = keyof typeof SWITCHES;
 export type FlipReport = {
   repo: string;
   from: RepoWorkflow;
@@ -47,6 +60,8 @@ export type FlipReport = {
   stopped: { id: number; number: number }[];
   /** Rollback: questions an earlier flip withdrew on items still open, which the legacy planner asks again. */
   reasked: number;
+  /** To `new`: the switches that were off and the flip turns on (a dry run: would turn on). */
+  switchesOn: RepoSwitch[];
 };
 
 /** The open questions a flip of `repo` to `new` withdraws, read in the caller's transaction. */
@@ -66,12 +81,17 @@ export async function flipRepo(db: Db, repo: string, o: { to: RepoWorkflow; by: 
   const work = async (): Promise<FlipReport> => {
     if (!await db.get(db.k.selectFrom("main.tracked_repos").select("name").where("name", "=", repo))) throw new FlipRefused(`${repo} is not tracked`);
     const from = await repoWorkflow(db, repo);
-    const report: FlipReport = { repo, from, to: o.to, applied: false, refused: null, withdrawn: [], stopped: [], reasked: 0 };
+    const report: FlipReport = { repo, from, to: o.to, applied: false, refused: null, withdrawn: [], stopped: [], reasked: 0, switchesOn: [] };
     if (o.to === "new") {
-      if (from === "new") return report;
-      if (await githubIdentity(db) === "box") report.refused = "the GitHub identity is box: switch it to the app first, so merges and closes are made as the person";
-      else if (!(o.engineReady ?? WORKFLOW_ENGINE_READY)) report.refused = ENGINE_NOT_READY;
-      report.withdrawn = await toWithdraw(db, repo);
+      for (const k of Object.keys(SWITCHES) as RepoSwitch[]) if (await SWITCHES[k].on(db, repo) === null) report.switchesOn.push(k);
+      // A repo already on `new` whose switches were turned off since gets them back, and nothing else.
+      if (from === "new") {
+        if (!report.switchesOn.length) return report;
+      } else {
+        if (await githubIdentity(db) === "box") report.refused = "the GitHub identity is box: switch it to the app first, so merges and closes are made as the person";
+        else if (!(o.engineReady ?? WORKFLOW_ENGINE_READY)) report.refused = ENGINE_NOT_READY;
+        report.withdrawn = await toWithdraw(db, repo);
+      }
     } else {
       report.stopped = (await liveWorkflows(db, repo)).map((w) => ({ id: w.id, number: w.number }));
       if (from === "legacy" && !report.stopped.length) return report;
@@ -96,7 +116,8 @@ export async function flipRepo(db: Db, repo: string, o: { to: RepoWorkflow; by: 
       await addEvent(db, { workflowId: w.id, repo, number: w.number, login: o.by, via: "cli", kind: "stopped", at });
     }
     if (from !== o.to) await db.run(db.k.updateTable("main.tracked_repos").set({ workflow: o.to }).where("name", "=", repo));
-    await audit(db, o.by, "workflow-flip", repo, { from, to: o.to, withdrawn: report.withdrawn.map((d) => d.id), stopped: report.stopped.map((w) => w.number) });
+    for (const k of report.switchesOn) await SWITCHES[k].set(db, o.by, repo, true);
+    await audit(db, o.by, "workflow-flip", repo, { from, to: o.to, withdrawn: report.withdrawn.map((d) => d.id), stopped: report.stopped.map((w) => w.number), switchesOn: report.switchesOn });
     report.applied = true;
     return report;
   };
@@ -107,8 +128,9 @@ export async function flipRepo(db: Db, repo: string, o: { to: RepoWorkflow; by: 
 export function flipLines(r: FlipReport): string[] {
   const out: string[] = [];
   if (r.refused) out.push(`refused: ${r.refused}`);
-  if (r.from === r.to && !r.withdrawn.length && !r.stopped.length) return [...out, `${r.repo} already runs ${r.to}; nothing to change`];
+  if (r.from === r.to && !r.withdrawn.length && !r.stopped.length && !r.switchesOn.length) return [...out, `${r.repo} already runs ${r.to}; nothing to change`];
   out.push(`${r.repo}: ${r.from} -> ${r.to}${r.applied ? "" : " (dry run)"}`);
+  for (const k of r.switchesOn) out.push(`  ${SWITCHES[k].line}`);
   for (const d of r.withdrawn) out.push(`  withdraw ${d.kind} question ${d.id}`);
   for (const w of r.stopped) out.push(`  stop workflow ${w.id} on #${w.number}`);
   if (r.to === "legacy" && r.reasked) {

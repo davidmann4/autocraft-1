@@ -35,6 +35,7 @@ import { markReviewsStale, staleReviews } from "../review/discussion.ts";
 import { reviewHold } from "../review/gate.ts";
 import type { PrFacts } from "../core/plan.ts";
 import { openOperatorFixups, operatorTriesLeft, queuedOperatorFix } from "./state.ts";
+import { legContext } from "../workflow/store.ts";
 import { refreshSettlers, type RefreshDeps } from "./permissions.ts";
 import { lockLiveExpr } from "../answers/hold.ts";
 import type { Db } from "../db/index.ts";
@@ -232,7 +233,7 @@ export class PreapprovalRefused extends Error {
  * The PR's label does not matter (the pre-approval lifts the label gate); a draft, the backlog, a duplicate hold or a scope question still refuse it.
  * `head`, when given, is the only head it may pre-approve: the head the person saw (a command's comment-time head).
  */
-export async function preapproveMerge(db: Db, o: { repo: string; number: number; by: string; via?: string; head?: string }): Promise<{ label: string }> {
+export async function preapproveMerge(db: Db, o: { repo: string; number: number; by: string; via?: string; head?: string; workflowId?: number }): Promise<{ label: string }> {
   const { repo, number, by, via } = o;
   const ref = `${repo}#${number}`;
   const it = await prRow(db, repo, number);
@@ -252,7 +253,8 @@ export async function preapproveMerge(db: Db, o: { repo: string; number: number;
   await db.write(async () => {
     // Checked again under the write lock: another writer may have started one since the first check.
     if (await active()) throw new PreapprovalRefused(`${ref} already has a pre-approved merge in progress`, true);
-    const id = (await db.get(db.k.insertInto("preapprovals").values({ repo, number, by, at, instructions: "", state: "review", from_head: head, head, updated_at: at, fix_id: null }).returning("id")))!.id;
+    // `workflowId`: the maintainer workflow whose merge leg this is, written with the row so no pass sees it unowned.
+    const id = (await db.get(db.k.insertInto("preapprovals").values({ repo, number, by, at, instructions: "", state: "review", from_head: head, head, updated_at: at, fix_id: null, workflow_id: o.workflowId ?? null }).returning("id")))!.id;
     await audit(db, by, "preapproval", ref, { id, state: "review", head, queued: "merge-queue", ...(via ? { via } : {}) });
   });
   await say(db, repo, number, `${by} added the PR to the merge queue at ${short(head)}: it merges once the review there says take, the pre-merge review is clean and CI is green.`);
@@ -292,9 +294,10 @@ type Hand = { done: true } | { gone: true } | { wait: true } | { stop: string };
  * Moves the row from ci to queued and answers the PR's Merge? decision at `head` with Merge for the operator, as the dashboard would,
  * in one transaction: a cancel that ran first leaves the row cancelled and nothing answered. Idempotent.
  */
-async function handOver(db: Db, p: Row, head: string, held: ReadonlySet<string>): Promise<Hand> {
+async function handOver(db: Db, p: Row, head: string, held: ReadonlySet<string>, unsure = false): Promise<Hand> {
   const id = mergeDecisionId(p.repo, p.number, head);
   const at = iso();
+  const premergeWord = unsure ? "found no defect but could not verify every claim of the description" : "is clean";
   // Nothing is written before an early return, so committing leaves the database as a rollback would.
   const stopped = await db.write(async (): Promise<Hand | null> => {
     if (!await isOperator(db, p.by, p.repo, held)) return { stop: `${p.by} no longer settles decisions on ${p.repo}` };
@@ -310,8 +313,8 @@ async function handOver(db: Db, p: Row, head: string, held: ReadonlySet<string>)
       await ask(db, [{
         id, kind: "merge", repo: p.repo, number: p.number, question: "Merge this PR?",
         context: p.fix_id !== null
-          ? `${p.by} approved this merge ahead of a fix-up; the fix-up was pushed, its review says take, CI is green and its pre-merge review is clean.`
-          : `${p.by} approved this merge ahead of its review and CI; the review says take, CI is green and the pre-merge review is clean.`,
+          ? `${p.by} approved this merge ahead of a fix-up; the fix-up was pushed, its review says take, CI is green and its pre-merge review ${premergeWord}.`
+          : `${p.by} approved this merge ahead of its review and CI; the review says take, CI is green and the pre-merge review ${premergeWord}.`,
         facts: [
           ...(p.fix_id !== null ? [`fix-up pushed by the pipeline from ${short(p.from_head)} to ${short(head)}`] : head !== p.from_head ? [`base merge pushed by the pipeline from ${short(p.from_head)} to ${short(head)}`] : []),
           `${HEAD_FACT}${head}`,
@@ -329,26 +332,28 @@ async function handOver(db: Db, p: Row, head: string, held: ReadonlySet<string>)
     return null;
   });
   if (stopped) return stopped;
-  await say(db, p.repo, p.number, "CI is green and the pre-merge review is clean: the PR is in the merge queue, which checks it as for any Merge answer.");
+  await say(db, p.repo, p.number, unsure
+    ? "CI is green and the pre-merge review found no defect, though it could not verify every claim of the description: the merge was approved, so the PR is in the merge queue, which checks it as for any Merge answer."
+    : "CI is green and the pre-merge review is clean: the PR is in the merge queue, which checks it as for any Merge answer.");
   return { done: true };
 }
 
-type ReviewRead = { kind: "none" | "stale" | "take" | "takefix" | "bad"; why: string; unsure: boolean };
+type ReviewRead = { kind: "none" | "stale" | "take" | "takefix" | "bad"; why: string; unsure: boolean; at?: string };
 
 /**
  * The Opus review at `head`. A take or take-fix that is not stale goes on, sure or unsure: the merge approval says the change is wanted,
  * so a take-fix is the pipeline's own fix-up to make and the pre-approval goes on with its push. Any other verdict stops it.
  */
 async function reviewAt(db: Db, p: Row, head: string, wake?: Wake): Promise<ReviewRead> {
-  const r = await db.get(db.k.selectFrom("opus_reviews").select(["verdict", "sure", "reason"]).$narrowType<{ verdict: NotNull }>()
+  const r = await db.get(db.k.selectFrom("opus_reviews").select(["verdict", "sure", "reason", "at"]).$narrowType<{ verdict: NotNull }>()
     .where("repo", "=", p.repo).where("number", "=", p.number).where("head_oid", "=", head).where("verdict", "is not", null));
   if (!r) return { kind: "none", why: "", unsure: false };
   const ref = `${p.repo}#${p.number}`;
   if ((await staleReviews(db, p.repo, false, { refresh: (r, at) => (r === ref ? wake?.(at) : undefined) })).has(`${ref}@${head}`)) return { kind: "stale", why: "", unsure: false };
   const unsure = r.sure !== 1;
-  if (r.verdict === "take") return { kind: "take", why: "", unsure };
-  if (r.verdict === "take-fix") return { kind: "takefix", why: r.reason ? oneLine(r.reason, 160) : "", unsure };
-  return { kind: "bad", why: `the review says ${r.verdict}${unsure ? " (unsure)" : ""}${r.reason ? `: ${oneLine(r.reason, 160)}` : ""}`, unsure };
+  if (r.verdict === "take") return { kind: "take", why: "", unsure, at: r.at };
+  if (r.verdict === "take-fix") return { kind: "takefix", why: r.reason ? oneLine(r.reason, 160) : "", unsure, at: r.at };
+  return { kind: "bad", why: `the review says ${r.verdict}${unsure ? " (unsure)" : ""}${r.reason ? `: ${oneLine(r.reason, 160)}` : ""}`, unsure, at: r.at };
 }
 
 /** Why an unsure review or a take-fix does not stop the row, for its thread line. */
@@ -404,13 +409,28 @@ function stepRuns(f: PrFacts, step: "cifix" | "conflict"): boolean {
 
 const FAILED_FIXUP = ["failed", "refused", "rejected", "cannot-push", "too-large", "push-denied", "asked", "comment-failed", "superseded"];
 
-/** One pre-approved merge: reads what the other steps recorded and makes at most one transition. */
+/**
+ * One pre-approved merge: reads what the other steps recorded and makes at most one transition.
+ *
+ * The merge leg of a maintainer workflow (`legContext`) differs in three ways: a stop asks no Merge? question (the workflow stops at a
+ * blocker and gives its recommendation, src/workflow/advance.ts); a merge-queue entry has no Opus review to wait for; and a review the
+ * person answered after (a yes past a major finding) counts as a take.
+ */
 async function advance(db: Db, p: Row, held: ReadonlySet<string>, factOf: () => Promise<PrFacts | null>, wake: Wake): Promise<void> {
   const it = await prRow(db, p.repo, p.number);
+  const ctx = await legContext(db, p.id);
   const cancel = async (reason: string) => void await cancelRow(db, p.id, ACTOR, reason, `The pre-approved merge was cancelled: ${reason}.`);
+  // In a repo on the maintainer workflow a row never acts as a legacy pre-approval: the leg of an ended workflow ends with it, and a
+  // row no workflow owns waits for the start that is writing its workflow (stop, backlog and close cancel it by its PR).
+  if (ctx === "ended") return cancel("its workflow ended");
+  if (ctx === "unlinked") return;
+  const leg = ctx;
   const stop = async (to: "asked" | "failed", why: string, head: string, facts: string[] = [why]) => {
+    if (leg) return void await move(db, p, to, { reason: why, line: `The pre-approved merge stopped: ${why}.` });
     if (await move(db, p, to, { reason: why, line: `The pre-approved merge stopped: ${why}. A Merge? question was asked.` })) await askMerge(db, p, head, why, facts);
   };
+  // A review the person had seen when they last answered: they chose to go on.
+  const accepted = (r: ReviewRead): ReviewRead => (leg && r.kind === "bad" && r.at !== undefined && r.at <= leg.since ? { ...r, kind: "take" } : r);
   if (!it) return cancel("the PR is gone");
   const cur = it.head_oid;
   const mergedByQueue = !!p.head && !!await db.get(db.k.selectFrom("merges").select((eb) => eb.lit(1).as("one")).where("repo", "=", p.repo).where("number", "=", p.number).where("head_oid", "=", p.head).where("outcome", "=", "merged"));
@@ -456,8 +476,11 @@ async function advance(db: Db, p: Row, held: ReadonlySet<string>, factOf: () => 
     if (!lag) return cancel(cur === p.from_head ? `the head went back to ${short(cur)}` : `another push moved the head to ${short(cur)}`);
   }
 
+  if (p.state === "review" && leg?.entry === "merge") {
+    return void await move(db, p, "ci", { line: `In the merge queue at ${short(head)} with no review; waiting for CI and a clean pre-merge review.` });
+  }
   if (p.state === "review") {
-    const r = await reviewAt(db, p, head, wake);
+    const r = accepted(await reviewAt(db, p, head, wake));
     if (r.kind === "stale") return;
     if (r.kind === "none") {
       // No review is coming for a PR the planner does not review (an open scope question, a draft, a hold).
@@ -491,8 +514,8 @@ async function advance(db: Db, p: Row, held: ReadonlySet<string>, factOf: () => 
   if (!await mergeApprovalOf(db, p.repo)) return p.state === "queued" ? cancel("merging is no longer approved for the repo") : await stop("asked", "merging is no longer approved for the repo", head);
 
   if (p.state === "ci") {
-    // A re-review since the move to ci counts: the hand-over needs a take at this head now.
-    const r = await reviewAt(db, p, head, wake);
+    // A re-review since the move to ci counts: the hand-over needs a take at this head now. A merge-queue entry has no review.
+    const r: ReviewRead = leg?.entry === "merge" ? { kind: "take", why: "", unsure: false } : accepted(await reviewAt(db, p, head, wake));
     if (r.kind === "none" || r.kind === "stale") return void await move(db, p, "review", { line: `The review of ${headName(p)} is out of date; Opus reviews it again.` });
     if (r.kind === "takefix") return void await move(db, p, "review", { line: `The review of ${headName(p)} now asks for fixes; the pipeline's fix-up comes first.` });
     if (r.kind === "bad") return await stop("asked", r.why, head, [reviewFact(p, r.why)]);
@@ -519,10 +542,12 @@ async function advance(db: Db, p: Row, held: ReadonlySet<string>, factOf: () => 
     if (pm.findings === null) return await stop("asked", `the pre-merge review of ${headName(p)} failed`, head);
     const defects = findingsOf(pm).filter((x) => x.severity === "defect").length;
     if (defects) return await stop("asked", `the pre-merge review found ${defects} defect${defects === 1 ? "" : "s"}`, head);
-    if (pm.unsure === 1) return await stop("asked", "the pre-merge review is unsure", head);
-    const h = await handOver(db, p, head, held);
+    // A workflow's merge approval says the change is wanted: an unsure pre-merge review (a claim of the description it could not
+    // verify) with no defect goes on to the merge queue; only a defect, or another blocker, brings the item back.
+    if (pm.unsure === 1 && !leg) return await stop("asked", "the pre-merge review is unsure", head);
+    const h = await handOver(db, p, head, held, pm.unsure === 1);
     if ("stop" in h) {
-      if (await move(db, p, "asked", { reason: h.stop, line: `The pre-approved merge stopped: ${h.stop}.` }) && !h.stop.includes("was answered")) await askMerge(db, p, head, h.stop, [h.stop]);
+      if (await move(db, p, "asked", { reason: h.stop, line: `The pre-approved merge stopped: ${h.stop}.` }) && !leg && !h.stop.includes("was answered")) await askMerge(db, p, head, h.stop, [h.stop]);
     }
     return;
   }

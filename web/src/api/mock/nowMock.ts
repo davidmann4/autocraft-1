@@ -15,6 +15,8 @@ const D = item("pdfcraft", 877, "Export fails on pages with spot colors");
 const HEALTH: Now["health"] = {
   pipeline: { enabled: true, by: "operator", at: at(60 * 30) },
   problems: [
+    { id: "user-token:own", area: "account", tone: "bad", text: "AutoCraft can no longer act as you on GitHub. Authorize again", to: "/auth/authorize-app", fullPage: true, since: at(5 * 3600) },
+    { id: "user-tokens", area: "account", tone: "warn", text: "AutoCraft can no longer act on GitHub as operator until they authorize it again", to: "/admin/github-app", since: at(5 * 3600) },
     { id: "worker:sandbox", area: "workers", tone: "bad", text: "Build worker Sandbox has not reported for 4 h", to: "/envs", since: at(4 * 3600) },
     { id: "build-queue", area: "workers", tone: "bad", text: "3 build tasks have waited over 10 min for a worker", to: "/envs", since: at(1500) },
     { id: "sync-repo:stencilcraft", area: "sync", tone: "warn", text: "storytold/stencilcraft no longer resolves on GitHub (moved, renamed or deleted)", to: "/repos", since: at(3 * 3600) },

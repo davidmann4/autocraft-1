@@ -15,7 +15,7 @@ type Source = { table: string; ops?: ("INSERT" | "UPDATE" | "DELETE")[]; when?: 
 export const BOOKKEEPING_COLUMNS: Record<string, string[]> = {
   workspaces: ["updated_at", "last_call_at", "next_call", "create_tries", "pod_created_at"],
   repos: ["synced_at", "high_water", "reconciled_at"],
-  items: ["embed_hash", "class_hash", "class_scheme", "text_refs"],
+  items: ["embed_hash", "class_hash", "class_scheme", "text_refs", "jev_failed_hash"],
   classifications: ["at", "input_hash"],
   pr_checks: ["fetched_at"],
   main_ci: ["updated_at"],
@@ -34,7 +34,7 @@ export const BOOKKEEPING_COLUMNS: Record<string, string[]> = {
 
 /** Settings the runner, the sync and the planner write for their own use; the dashboard shows none of them. */
 export const BOOKKEEPING_SETTINGS = [
-  "runner_heartbeat", "schema_stamp", "fts_built", "hashes_built", "text_refs_built", "diff_facts_built", "mentions_built", "item_stage_built", "tracking_started_at",
+  "runner_heartbeat", "schema_stamp", "schema_generation", "fts_built", "hashes_built", "text_refs_built", "diff_facts_built", "mentions_built", "item_stage_built", "tracking_started_at",
   "pipeline_planned_at", "pipeline_seqs_seen", "pipeline_wake_at", "pipeline_status", "pipeline_sync_seen", "pipeline_sync_at", "pipeline_review_cursor", "pipeline_verify_cursor",
   "full_sync_cursor", "org_high_water", "main_ci_polled_at", "releases_polled_at", "releases_offset", "search_catchup_at", "repos_refreshed_at", "sync_rate_remaining", "sync_rate_reset_at",
   "flow_summary_marks", "warm_gc_at", "warm_report", "liveness_at", "liveness_open", "classify_run", "worker_update_pending", "worker_update_failures",
@@ -72,6 +72,8 @@ export const TOPIC_TABLES: Record<string, Source[]> = {
   fasttrack: [{ table: "fast_track" }],
   // Started items of the maintainer workflow: entry, approval, weight, plan, blocker, recommendation. Planner input.
   workflows: [{ table: "item_workflows" }],
+  // What people said to items of the maintainer workflow: an unclear answer lives only here. Lists only; not planner input.
+  "workflow-events": [{ table: "workflow_events" }],
   // An operator released an outside-author item from its hold: the planner plans for it at once.
   outside: [{ table: "outside_released" }, { table: "stage_trips", when: "new.stage = 'outside-surge'" }],
   // The planner's Plan cache; its own output, so the planner does not plan again for it.

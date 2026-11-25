@@ -1,3 +1,4 @@
+import { PageFrame, PageTitle } from "../../ui/organisms/Page";
 import { useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { useQuery } from "../../api/client";
@@ -165,10 +166,9 @@ export function Classifiers(_: ViewProps) {
   const cur = r.runs.find((x) => x.id === r.run)!;
   const hasBands = r.bands.length > 0;
   return (
-    <div className="h-full overflow-y-auto">
-      <div className="mx-auto max-w-[1180px] px-4 pb-12 pt-5 md:px-6">
+    <PageFrame>
         <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
-          <h1 className="text-xl font-semibold">Classifiers</h1>
+          <PageTitle>Classifiers</PageTitle>
           <Select label="Run" value={r.run} onChange={(v) => set({ run: v, a: "", b: "", label: "", band: "" })} options={r.runs.map((x) => ({ value: x.id, label: `${x.id} · ${day(x.at)}` }))} />
           <Select
             label="Pair"
@@ -263,8 +263,7 @@ export function Classifiers(_: ViewProps) {
         <div className="mt-4">
           <Disagreements r={r} label={label} band={band} setFilter={(k, v) => set({ [k]: v })} />
         </div>
-      </div>
-    </div>
+    </PageFrame>
   );
 }
 

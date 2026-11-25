@@ -20,6 +20,15 @@ import type {
   DiscordFilingAdded,
   DiscordSetup,
   Home,
+  MaintainHome,
+  MaintainRepo,
+  MaintainQueueMeta,
+  MaintainStats,
+  MaintainItems,
+  MaintainItemsQuery,
+  MaintainCommandResult,
+  MaintainItem,
+  MaintainReply,
   OpenDecisionCounts,
   ItemPageData,
   ItemStatusFilter,
@@ -245,6 +254,31 @@ export interface Api {
   progress(): Promise<Progress>;
   /** Home: needs, problems, phase counts, progress and what was done today, in one payload; the page's project narrows all of it. */
   home(): Promise<Home>;
+  /** The new dashboard (ui_v2). */
+  maintain: {
+    /** Home: what waits for the reader's answer, what they started, their Task Runner line and problems; the page's project narrows it. */
+    home(): Promise<MaintainHome>;
+    /** Work queue: the repos on the new workflow and who approved each started item for merge. */
+    queue(): Promise<MaintainQueueMeta>;
+    /** Stats: headline numbers and merges per day for 7 or 30 days. */
+    stats(period: "7d" | "30d"): Promise<MaintainStats>;
+    /** Items: four lists of the open items (or the Backlog, or the closed items) with filters, search and the priority order; the page's project narrows it. */
+    items(query: MaintainItemsQuery): Promise<MaintainItems>;
+    /** Sends a command written in the dashboard's box; the list form (`merge:` then items) names the items. */
+    command(text: string): Promise<MaintainCommandResult>;
+    /** Repos: every tracked repo the reader may see with its counts, Automatic state and paused steps. */
+    repos(): Promise<MaintainRepo[]>;
+    /** A registered workflow control (resume a breaker, switch Automatic); answers with the line every surface shows. */
+    control(input: { control: "resume-breaker"; key: string } | { control: "set-automatic"; repo: RepoName; on: boolean }): Promise<{ ok: boolean; line: string }>;
+  };
+  /** The new item page (ui_v2): the item's workflow read, its command box and its controls. */
+  maintainItem: {
+    get(repo: RepoName, number: number): Promise<MaintainItem>;
+    /** A command written on the item; the reply is the confirmation, or what was understood when nothing ran. */
+    command(repo: RepoName, number: number, text: string): Promise<MaintainReply>;
+    /** A registered control on the item: release an outside hold, or resume a breaker by its key. */
+    control(body: { control: "release-outside"; repo: RepoName; number: number } | { control: "resume-breaker"; key: string }): Promise<MaintainReply>;
+  };
   /** The item page's AutoCraft and GitHub sides: status, reviews with earlier ones, result cards, history, GitHub's own sections. `since` as for `itemTrace`. */
   itemPage(repo: RepoName, number: number, since?: string): Promise<ItemPageData | ItemPageUnchanged>;
   /** The Items list with a status per row, one page at a time. */
@@ -399,6 +433,8 @@ export interface Api {
   queue(filter: QueueFilter): Promise<QueueList>;
   /** Per pipeline step, the items its next job takes, in order, and what each step waits on. */
   next(): Promise<NextPage>;
+  /** The name to type to address the app in a GitHub comment; null when no app is registered. */
+  mention(): Promise<{ mention: string | null }>;
   /** What waits on a person: counts for the tabs, feedback nobody answered yet (newest first, paged by cursor) and stopped stages. */
   needs(filter: { feedback?: boolean; cursor?: string }): Promise<NeedsPage>;
   /** A repo's issues with a stopped fix, 25 per page. */
@@ -430,6 +466,8 @@ export interface Api {
     ackDeadline(step: string): Promise<{ ok: true }>;
     /** Operator only: the model of the prepare step, one of `judgementModels`. */
     setJudgementModel(model: string): Promise<PipelineState>;
+    /** Operator only: the two blocker thresholds (changed lines). */
+    setBlockers(input: Partial<PipelineState["blockers"]>): Promise<PipelineState>;
     /** Limits the whole pipeline to these items ("repo#number"); an empty list clears the pilot. */
     setPilot(items: string[]): Promise<PipelineState>;
   };
@@ -550,6 +588,8 @@ export interface Api {
     batchRemove(item: string): Promise<void>;
     stopBatch(id: number): Promise<void>;
   };
+  /** A registered workflow control (src/workflow/apply.ts `runControl`): hold or release a merge. The reply is the line every surface shows. */
+  controls: { run(input: { control: "hold-merge" | "release-merge"; item: { repo: RepoName; number: number } } | { control: "resume-breaker"; key: string }): Promise<{ ok: boolean; line: string }> };
 }
 
 export const ApiContext = createContext<Api | null>(null);

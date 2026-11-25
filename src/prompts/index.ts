@@ -15,7 +15,7 @@ import { markHarness, stripMarks } from "./harness.ts";
 import { WORKSPACE_BUILD_COMMANDS } from "../worker/rust-targets.ts";
 import { AGENT_TOOL, EXPLORER, EXPLORER_MODEL, EXPLORER_TOOLS, MCP_PATH, mcpTools } from "../sandbox/agents.ts";
 import { AGENTS_PATH, DENIED_READS, REFERENCE_PATH, REPO_DOCS_PATH, REPOS_ROOT, REPO_PATH, WORK_PATH, sandboxCommand } from "../sandbox/command.ts";
-import { CLAIM_CHARS, CLAIM_EVIDENCE_CHARS, MAX_CLAIMS, OPUS_MAX_FIXES, OPUS_REASON_WORDS, STATEMENT_PROMPT_CHARS, statementsList, type OpusPr } from "../review/opus-parse.ts";
+import { CLAIM_CHARS, CLAIM_EVIDENCE_CHARS, MAX_CLAIMS, OPUS_MAX_FIXES, OPUS_REASON_WORDS, PART_TITLE_CHARS, STATEMENT_PROMPT_CHARS, statementsList, type OpusPr } from "../review/opus-parse.ts";
 import { BODY_CHARS, MAX_FINDINGS, MAX_MERGED_DIFF_CHARS, SAMPLE_POSTMERGE_PRS, TITLE_CHARS, type PostmergePr } from "../postmerge/parse.ts";
 import { PREMERGE_MAX_FINDINGS, PREMERGE_SCENARIO_CHARS, PREMERGE_TITLE_CHARS } from "../premerge/parse.ts";
 import { COMMENT_TEMPLATES, REASON_MAX } from "../act/templates.ts";
@@ -41,7 +41,7 @@ import { REPORT_LIST_MAX, REPORT_SHOTS_MAX, REPORT_TEXT_MAX, SAMPLE_SESSION, SES
 import { FOLLOW_UPS, ISSUE_BODY_CHARS, ISSUE_TITLE_CHARS, SAMPLE_ISSUE_DRAFT, SAMPLE_ISSUE_QUESTIONS, type IssueDraftInput, type IssueQuestionsInput } from "../discord/issue-prompt.ts";
 import { JUNK_JEV_YES, JUNK_QUESTION, JUNK_TEXT_CHARS, SAMPLE_JUNK, junkState, type JunkAsk } from "../discord/junk-ask.ts";
 import { SAMPLE_SIGNAL, SIGNAL_JEV_YES, SIGNAL_QUESTION, SIGNAL_TEXT_CHARS, signalState, type SignalAsk } from "../discord/signal-ask.ts";
-import { PLAN_ACCEPTANCE_MAX, PLAN_BODY_CHARS, PLAN_COMMENT_CHARS, PLAN_COMMENTS_MAX, PLAN_GUIDANCE_CHARS, PLAN_GUIDANCE_MAX, PLAN_ITEM_CHARS, PLAN_ITEMS_MAX, PLAN_MAX_TURNS, PLAN_OPTIONS_MAX, PLAN_QUESTION_CHARS, PLAN_QUESTIONS_MAX, PLAN_SUMMARY_CHARS, PLAN_TEXT_CHARS, PLAN_TIMEOUT_SEC, SAMPLE_PLAN, type PlanInput } from "../implement/plan-types.ts";
+import { PLAN_ACCEPTANCE_MAX, PLAN_BODY_CHARS, PLAN_COMMENT_CHARS, PLAN_COMMENTS_MAX, PLAN_GUIDANCE_CHARS, PLAN_GUIDANCE_MAX, PLAN_ITEM_CHARS, PLAN_ITEMS_MAX, PLAN_MAX_TURNS, PLAN_OPTIONS_MAX, PLAN_PART_FILES_MAX, PLAN_PART_TITLE_CHARS, PLAN_PARTS_MAX, PLAN_QUESTION_CHARS, PLAN_QUESTIONS_MAX, PLAN_RECOMMENDATION_CHARS, PLAN_SUMMARY_CHARS, PLAN_TEXT_CHARS, PLAN_TIMEOUT_SEC, SAMPLE_PLAN, type PlanInput } from "../implement/plan-types.ts";
 import { REASON_WORDS as MAINFIX_REASON_WORDS, SAMPLE_MAIN_FIX, type MainFixInput } from "../mainfix/types.ts";
 import { MAX_COMPARE_WORDS, MAX_CRATES, MAX_FILTERS, MAX_SHOT_REASON_WORDS, MAX_SHOT_STEPS, MAX_SHOTS, MAX_SUMMARY_WORDS, MAX_TEST_LINES, PLAN_BODY_LIMIT, SAMPLE_SCREENSHOT_COMPARE, SAMPLE_SCREENSHOT_PLAN, SAMPLE_VERIFY_PLAN, SAMPLE_VERIFY_SUMMARY, SUMMARY_LOG_BYTES, type ScreenshotCompareInput, type ScreenshotPlanInput, type VerifyPlanInput, type VerifySummaryInput } from "../verify/types.ts";
 
@@ -152,7 +152,7 @@ const JEV: JevPrompt = {
   id: "classify.jev",
   stage: "Classify",
   runner: "jev",
-  purpose: "First sort: the type label with a probability per label, and a yes-probability for each flag, one item per call.",
+  purpose: "First sort: the type label with a probability per label, and a yes-probability for each flag, one item per call. The same request also asks priority.jev's impact question when the item's priority is due, and areas.jev's area question when an issue's area is due, so an item takes one Jev request.",
   models: ["jev-latest"],
   placeholders: { item: `The item as one JSON string (the request's state) with ${ITEM_FIELDS}.` },
   request: {
@@ -169,7 +169,7 @@ const JEV: JevPrompt = {
     },
   },
   output: `{"answers": {"type": {"choice", "confidence", "probabilities": {label: p}}, "security": {"noul": p}, "needs_decision": {"noul": p}}, "usage": {"input_tokens", "output_tokens"}}`,
-  validation: "The answer is kept only when type.choice is one of the six labels and both noul answers are numbers. Each flag is a yes from its own noul (security 0.9, needs_decision 0.8), a no below 0.3, and unsure in between; when Jev is unsure, Haiku's answer decides. The probabilities are stored with the verdict. A call without a valid answer is made once more; after that the item is logged and stays unclassified.",
+  validation: "The answer is kept only when type.choice is one of the six labels and both noul answers are numbers. Each flag is a yes from its own noul (security 0.9, needs_decision 0.8), a no below 0.3, and unsure in between; when Jev is unsure, Haiku's answer decides. The probabilities are stored with the verdict. A call without a valid answer is made once more; after that the item is logged and stays unclassified. Impact and area answers in the same reply are read and settled as priority.jev and areas.jev read theirs; one that is not valid leaves its question to its own step. The reply's tokens are split over the three steps' usage rows in proportion to the length of the request each step would have sent alone.",
   limits: { perCall: 1, attempts: 2, timeoutSeconds: 600 },
 };
 
@@ -192,6 +192,23 @@ const CLAIMS_PUBLIC_RULE = `The claim and evidence texts of claims are posted pu
 
 const STATEMENTS_RULE = `Owner statements: the <owner_statements> block after the pull request lists things the repository owners said earlier about related work, each with an id. Name in "conflicts" only a statement this change actually goes against: judge what the statement asks for, not whether the topic is the same. A change that follows a statement, or only shares its topic, is not a conflict. Each entry is {"id": <the number>, "reason": "<one line: what the statement asks for and how the change goes against it>"}. A PR with a conflict is not merged without a person's answer, so name one only when the change really goes against it. Use the ids as given; with no statements, or none that the change goes against, "conflicts" is [].`;
 
+/** The review block for a pull request on the maintainer workflow: a person answers one recommendation, and blockers stop an approved merge. */
+const REVIEW_WORKFLOW_RULE = `
+
+Maintainer workflow: a maintainer reads your fixes as a numbered plan and answers one recommendation, so add these to the JSON object of the reply:
+- Each entry of fixes also has "title": a few plain words naming the finding (at most ${PART_TITLE_CHARS} characters, no file paths), and "major": true when a maintainer must see it before a merge (a wrong behaviour users would notice, data loss, a security problem, a design choice), false for a small mechanical fix. A hold or close verdict always comes back to a person, so major marks findings only.
+- "outside_purpose": {"lines": <changed lines that do something other than what the title and body set out to do>, "note": "<one line: what they do>"}, or null when every changed line serves the pull request's purpose. Count only lines of the diff, not your fixes.
+- "recommendation": {"text": "<one plain sentence>", "fix": [<numbers of the fixes to make, 1 being the first entry of fixes>], "merge": true|false, "close": true|false}. text says what AutoCraft does next and whether it then merges, closes or comes back to the maintainer, for example "Fix 1 and 2, then merge." or "Close it: the main branch already has this fix.", naming findings by their number; fix, merge and close say exactly the same, because a maintainer's yes runs them. It is shown to the maintainer, not posted on the pull request.
+`;
+
+/** The plan block for an issue on the maintainer workflow: a person reads the plan as numbered parts and answers one recommendation. */
+const IMPLEMENT_WORKFLOW_RULE = `
+
+Maintainer workflow: a maintainer reads your plan as numbered parts and answers one recommendation, so add these to the JSON object of the reply:
+- "parts": for a ready reply, 1 to ${PLAN_PARTS_MAX} entries {"title": "<a few plain words naming one separate piece of the change, at most ${PLAN_PART_TITLE_CHARS} characters, no file paths>", "files": ["<a path relative to the repository root that this part changes or adds>"]}, in the order you would build them, with at most ${PLAN_PART_FILES_MAX} files each. Every file the change will touch belongs to a part: the pull request comes back to the maintainer when it changes a file no part names. For a reply that is not ready, parts is [].
+- "recommendation": for a reply that is not ready, one plain sentence (at most ${PLAN_RECOMMENDATION_CHARS} characters) recommending an option of the first maintainer question by its number (1 being its first option) and a few words of its label, saying that AutoCraft then plans and implements it, for example "Go with 2, a folder per document, then implement it." It must name the same option as that question's recommended label. For a ready reply, recommendation is null. Parts and recommendation are shown to the maintainers and in a status comment on the issue: plain and factual, no mention of models, automation or the reference documentation.
+`;
+
 const OPUS_REVIEW: ClaudePrompt = {
   id: "review.opus",
   stage: "Review",
@@ -204,6 +221,7 @@ const OPUS_REVIEW: ClaudePrompt = {
     discussion: DISCUSSION_DOC,
     owner_statements: STATEMENTS_DOC,
     repo_access: REPO_ACCESS_DOC,
+    workflow: `Empty, except for a pull request on the maintainer workflow (a person started it, or it is a small or medium bug fix the workflow runs by itself): then the rules for titled parts, major findings, outside_purpose and recommendation.`,
   },
   sandbox: { docs: true, tools: ["Read", "Grep", "Glob"], maxTurns: 40, workspace: true, reference: true },
   lint: true,
@@ -271,7 +289,7 @@ Reply with ONLY one JSON object:
 
 <owner_statements>
 {{owner_statements}}
-</owner_statements>`,
+</owner_statements>{{workflow}}`,
   output: `One JSON object: {"ref", "verdict", "sure", "reason", "fixes", "risks", "summary", "why", "public", "conflicts", "claims", "blocked_by"?}.`,
   validation: `${CLAUDE_RESULT} The reply must be exactly one JSON value: with a fenced code block the reply holds exactly one block, its whole content is the JSON, and the text outside it may not hold a second JSON value with one of its keys; without a fence the answer is the first object with a key (or list holding an object) and the text around it may not hold another JSON value with one of its keys; an object that repeats a key makes the reply invalid. The object is kept only when its ref is the one asked, verdict is one of ${VERDICTS.join(", ")}, reason is text, sure is a boolean, and a take-fix has at least one fix with a file and a change. reason is cut to ${OPUS_REASON_WORDS} words. ${FIX_TURN} Lint problems: ${SUMMARY_LINT} When unapplied_fixes is present, a take with no fixes whose reason does not name the file of an unapplied fix is a problem for that fix. A mention of the reference folder or a page file in the public summary, a public point or a fix (file or change) is a problem; for a repo with reference documentation, so is a run of ${QUOTE_WORDS} or more consecutive words of the public text that appears in the reference pages, and a public summary or point that refers to documentation, a manual, a user guide or help pages of another product, or names a commercial application or vendor (Jev first, at ${REFERENCE_JEV_ACCEPT} or more yes and below ${REFERENCE_JEV_REJECT} no, Haiku for the rest and while Jev is unavailable: lint.reference.jev, lint.reference.haiku). Fallback: the offending public summary (which drops the whole public text), public point or fix is left out; an unapplied-fix problem has no fallback and the reply is kept as it is. A reply that is not a valid review is no kept object and counts as no answer: the call is repeated once, then the PR stays without an Opus review and is tried again by a later job. A take or take-fix with sure false keeps its verdict; the merge queue asks a person before merging it. public is kept when it has a summary and a points list (at most 8 points); otherwise it is stored empty and the review still counts, but nothing is posted on the PR for that head. conflicts is optional: an entry is kept only when its id is one of the numbers shown and it has a reason of text (cut to 300 characters); one entry per id, others are dropped. claims: at most ${MAX_CLAIMS} entries are kept, each with a claim, a status of verified, contradicted or unverified, and evidence (a claim and its evidence are cut to ${CLAIM_CHARS} and ${CLAIM_EVIDENCE_CHARS} characters); a claim without a path:line in its evidence counts as unverified with unknown impact; impact (code-wrong, description-only or unknown; unknown when missing) is kept on a contradicted or unverified claim, and fix only on a code-wrong one. Code applies the claims: a code-wrong claim turns a take or take-fix into take-fix when every such claim has a fix (added to fixes), and into hold otherwise; an unknown claim, or no claims list when the PR has a body (a lint problem the fix turn handles first), makes a take or take-fix not sure; description-only changes nothing. Claims are posted on the pull request, so they get the same reference checks as the public text.`,
   limits: { perCall: 1, attempts: 2, timeoutSeconds: 1200 },
@@ -752,7 +770,7 @@ const PRIORITY_JEV: JevPrompt = {
   id: "priority.jev",
   stage: "Priority",
   runner: "jev",
-  purpose: "Priority level of an open issue or pull request (P0 to P4, P4 = backlog) with a probability per level, one item per call.",
+  purpose: "Priority level of an open issue or pull request (P0 to P4, P4 = backlog) with a probability per level, one item per call. In a classify job the question goes in the item's classify.jev request when both are due, and the answer is settled and stored as here.",
   models: ["jev-latest"],
   placeholders: { item: `The item as one JSON string (the request's state) with ${ITEM_FIELDS}.` },
   request: {
@@ -1074,7 +1092,7 @@ const AREAS_JEV: JevPrompt = {
   id: "areas.jev",
   stage: "Classify",
   runner: "jev",
-  purpose: "Names the area of the app an item belongs to, among the repo's area list plus \"none of these\" (the list's names and descriptions fill the question's criteria), one item per call. Asked only for repos that have an area list.",
+  purpose: "Names the area of the app an item belongs to, among the repo's area list plus \"none of these\" (the list's names and descriptions fill the question's criteria), one item per call. Asked only for repos that have an area list. In a classify job an issue's question goes in its classify.jev request when both are due (a pull request's state adds its paths, so it is asked on its own).",
   models: ["jev-latest"],
   placeholders: { item: `The item as one JSON string (the request's state) with ${AREA_ITEM_FIELDS}.` },
   request: {
@@ -1487,6 +1505,8 @@ const IMPLEMENT_PLAN: ClaudePrompt = {
     task: "A JSON object indented by one space: ref, repo, sha (the default branch head checked out in the workspace) and assume (true when a maintainer chose to go on with the stated assumptions).",
     issue: `The issue as a JSON object indented by one space: number, title, body (first ${PLAN_BODY_CHARS} characters), author, labels and comments (author, at, body; at most ${PLAN_COMMENTS_MAX}, each cut to ${PLAN_COMMENT_CHARS} characters), comments of bots and of the pipeline left out.`,
     guidance: `A JSON object indented by one space: guidance (messages of operators and of maintainers with write access in the item's thread, their answers to our questions, and from try-again the note given with Try again after an earlier attempt got stuck; at most ${PLAN_GUIDANCE_MAX}, each cut to ${PLAN_GUIDANCE_CHARS} characters) and asked (the questions earlier rounds asked, with the answer when a maintainer gave one).`,
+
+    workflow: "Empty, except for an issue in a repository on the maintainer workflow: then the rules for numbered parts and the recommendation.",
   },
   session: { tools: "The workspace tools (shell, shell_status, shell_kill, read, write, edit, glob, grep, app_start, screenshot, app_stop) on the issue's repository at the default branch head in a workspace pod with no network; the item tools; the reference tools when the repository has reference documentation", maxTurns: PLAN_MAX_TURNS },
   template: `You plan the implementation of one GitHub issue of a storytold craft app, an open-source reimplementation of a reference application. You work in a workspace: a checkout of the repository at the default branch head in /work/src, in a container with no network access. The task names the repository, the commit and the issue.
@@ -1522,9 +1542,9 @@ A ready reply has 1 to ${PLAN_ACCEPTANCE_MAX} acceptance criteria and no questio
 
 <guidance>
 {{guidance}}
-</guidance>`,
-  output: "One JSON object: ready, kind, summary, plan, acceptance, verification, size, risks and questions.",
-  validation: `${CLAUDE_RESULT} The reply must be exactly one JSON object, bare or as the whole content of one fenced block. It is kept only when ready is a boolean, kind and size are one of their words, summary and plan are text (summary at most ${PLAN_SUMMARY_CHARS} characters, plan at most ${PLAN_TEXT_CHARS}), acceptance, risks and verification.tests are lists of text (at most ${PLAN_ITEMS_MAX} entries of at most ${PLAN_ITEM_CHARS} characters each), verification.app is text of at most ${PLAN_ITEM_CHARS} characters or null, and each question has an audience of author or maintainer, a text of at most ${PLAN_QUESTION_CHARS} characters, options of label and hint (none for an author question, 2 to ${PLAN_OPTIONS_MAX} for a maintainer question) and a recommended label of one of its options or null. A ready reply needs 1 to ${PLAN_ACCEPTANCE_MAX} acceptance criteria, no questions and a size below XL; a reply that is not ready needs 1 to ${PLAN_QUESTIONS_MAX} questions, and with assume the reply must be ready. An invalid reply gets one follow-up turn in the same session naming what is wrong; a second invalid reply leaves the implementation stuck. Lint problems: the public texts (summary, plan, acceptance, verification, risks, which the PR body carries, and the author questions, which are posted on the issue) are checked for a mention of the reference folder or a page file and, for a repo with reference documentation, for a run of ${QUOTE_WORDS} or more consecutive words of the reference pages and for a reference to outside documentation or a vendor (Jev first, Haiku for the rest: lint.reference.jev, lint.reference.haiku). Problems get the same follow-up turn naming them, whose reply holds only the corrected fields and is merged into the first reply; after it a flagged author question goes to a maintainer as a decision instead of being posted, and flagged plan text leaves the implementation stuck.`,
+</guidance>{{workflow}}`,
+  output: "One JSON object: ready, kind, summary, plan, acceptance, verification, size, risks and questions; on the maintainer workflow also parts and recommendation.",
+  validation: `${CLAUDE_RESULT} The reply must be exactly one JSON object, bare or as the whole content of one fenced block. It is kept only when ready is a boolean, kind and size are one of their words, summary and plan are text (summary at most ${PLAN_SUMMARY_CHARS} characters, plan at most ${PLAN_TEXT_CHARS}), acceptance, risks and verification.tests are lists of text (at most ${PLAN_ITEMS_MAX} entries of at most ${PLAN_ITEM_CHARS} characters each), verification.app is text of at most ${PLAN_ITEM_CHARS} characters or null, and each question has an audience of author or maintainer, a text of at most ${PLAN_QUESTION_CHARS} characters, options of label and hint (none for an author question, 2 to ${PLAN_OPTIONS_MAX} for a maintainer question) and a recommended label of one of its options or null. A ready reply needs 1 to ${PLAN_ACCEPTANCE_MAX} acceptance criteria, no questions and a size below XL; a reply that is not ready needs 1 to ${PLAN_QUESTIONS_MAX} questions, and with assume the reply must be ready. An invalid reply gets one follow-up turn in the same session naming what is wrong; a second invalid reply leaves the implementation stuck. Lint problems: the public texts (summary, plan, acceptance, verification, risks, which the PR body carries, and the author questions, which are posted on the issue) are checked for a mention of the reference folder or a page file and, for a repo with reference documentation, for a run of ${QUOTE_WORDS} or more consecutive words of the reference pages and for a reference to outside documentation or a vendor (Jev first, Haiku for the rest: lint.reference.jev, lint.reference.haiku). Problems get the same follow-up turn naming them, whose reply holds only the corrected fields and is merged into the first reply; after it a flagged author question goes to a maintainer as a decision instead of being posted, and flagged plan text leaves the implementation stuck. On the maintainer workflow, parts and recommendation are kept when well formed and otherwise left out (a part without a title is dropped); they never make a reply invalid, and their texts are linted with the public texts.`,
   limits: { perCall: 1, attempts: 2, timeoutSeconds: PLAN_TIMEOUT_SEC },
   extra: [{ label: "Where", value: "A workspace pod of the repository at the default branch head, run on the Task Runner of the person who queued the issue in one of its normal slots; the fixed text is the system prompt and the task, issue and guidance are on stdin. After the reply AutoCraft resets the tree (git checkout and git clean in /work/src); the build directory is kept" }],
 };
@@ -1604,13 +1624,33 @@ export function withoutRepoDir<T>(input: T): T {
 /** An item for the area prompts: the classifier's view plus, for pull requests, the changed paths. */
 export const areaItemInput = (i: AreaItem): Record<string, unknown> => ({ ...itemInput(i), ...(i.kind === "pr" && i.paths && { paths: i.paths.slice(0, AREA_PATHS_MAX) }) });
 
-/** The request body for areas.jev: the registered request with the repo's list as the question's criteria. */
-export function renderAreaJev(item: AreaItem, areas: Area[]): string {
-  const req = JEV_PROMPTS["areas.jev"].request;
+/** The area question of areas.jev with the repo's list as its criteria. */
+function areaQuestion(areas: Area[]): JevQuestion {
   const criteria: Record<string, string> = {};
   for (const a of areas) criteria[a.name] = a.description;
   criteria[NONE_OF_THESE] = "No area of the list fits the item well.";
-  return JSON.stringify({ ...req, state: JSON.stringify(areaItemInput(item)), questions: { area: { ...req.questions.area!, criteria } } });
+  return { ...JEV_PROMPTS["areas.jev"].request.questions.area!, criteria };
+}
+
+/** The request body for areas.jev: the registered request with the repo's list as the question's criteria. */
+export function renderAreaJev(item: AreaItem, areas: Area[]): string {
+  const req = JEV_PROMPTS["areas.jev"].request;
+  return JSON.stringify({ ...req, state: JSON.stringify(areaItemInput(item)), questions: { area: areaQuestion(areas) } });
+}
+
+/** The other per-item questions a classify.jev request carries: priority.jev's impact, and areas.jev's area against the repo's list. */
+export type ClassifyExtras = { impact?: boolean; areas?: Area[] };
+
+/**
+ * The request body of classify.jev, with the questions of priority.jev and areas.jev added when they are due for the same item:
+ * Jev answers independent questions over one state in one request. The state is classify's (itemInput); an area question rides
+ * along only where areaItemInput gives the same state, which is every issue (a pull request's area state adds its paths).
+ */
+export function renderClassifyJev(item: Item, extras: ClassifyExtras = {}): string {
+  const req = JEV_PROMPTS["classify.jev"].request;
+  if (extras.areas && item.kind !== "issue") throw new Error("an area question rides along only on an issue, whose area state is the classify state");
+  const questions = { ...req.questions, ...(extras.impact && JEV_PROMPTS["priority.jev"].request.questions), ...(extras.areas && { area: areaQuestion(extras.areas) }) };
+  return JSON.stringify({ ...req, state: JSON.stringify(itemInput(item)), questions });
 }
 
 const itemValues = (items: Item[]) => ({ items: untrustedJson(items.map(itemInput)) });
@@ -1653,8 +1693,9 @@ const VALUES: { [K in ClaudePromptId]: (input: ClaudeInput[K]) => Record<string,
     return { pr: untrustedJson(rest), repo_access: repoAccess(repo_dir, "the pull request's head commit, for callers and conventions around the files") + quietRule(quiet) };
   },
   "review.opus": ([pr]) => {
-    const { repo_dir, reference, discussion, statements, ...rest } = pr!;
+    const { repo_dir, reference, discussion, statements, workflow, ...rest } = pr!;
     return {
+      workflow: workflow ? REVIEW_WORKFLOW_RULE : "",
       pr: untrustedJson({ ...rest, body: (rest.body ?? "").slice(0, REVIEW_BODY_LIMIT) }),
       discussion: untrustedJson(discussion ?? []),
       owner_statements: statementsList(statements),
@@ -1662,7 +1703,7 @@ const VALUES: { [K in ClaudePromptId]: (input: ClaudeInput[K]) => Record<string,
     };
   },
   "premerge.opus": ([pr]) => {
-    const { repo_dir, reference, discussion: _d, statements, ...rest } = pr!;
+    const { repo_dir, reference, discussion: _d, statements, workflow: _w, ...rest } = pr!;
     return {
       pr: untrustedJson({ ...rest, body: (rest.body ?? "").slice(0, REVIEW_BODY_LIMIT) }),
       owner_statements: statementsList(statements),
@@ -1730,6 +1771,7 @@ const VALUES: { [K in ClaudePromptId]: (input: ClaudeInput[K]) => Record<string,
   },
   "implement.plan": ([p]) => ({
     task: untrustedJson({ ref: p!.ref, repo: p!.repo, sha: p!.sha, assume: p!.assume }), issue: untrustedJson(p!.issue), guidance: untrustedJson({ guidance: p!.guidance, asked: p!.asked }),
+    workflow: p!.workflow ? IMPLEMENT_WORKFLOW_RULE : "",
   }),
   "implement.session": ([t]) => {
     const { fetch_dependencies: fetch, ...task } = t!;

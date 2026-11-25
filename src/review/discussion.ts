@@ -375,8 +375,9 @@ export function changedSince(state: { newest: string; hash: string } | undefined
 const day = (nowMs: number) => new Date(nowMs).toISOString().slice(0, 10);
 export const nextUtcMidnight = (ms: number): number => { const d = new Date(ms); return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1); };
 const rerunKey = (repo: string, number: number, nowMs: number = Date.now()) => `${RERUN_KEY}${repo}#${number}:${day(nowMs)}`;
-const reruns = async (db: Db, repo: string, number: number, nowMs: number): Promise<number> =>
-  Number(await setting(db, rerunKey(repo, number, nowMs)) ?? 0);
+/** Today's rerun counters of every PR in one read, by setting key. */
+const rerunsToday = async (db: Db, nowMs: number): Promise<Map<string, string>> =>
+  new Map((await db.all(db.k.selectFrom("main.settings").select(["key", "value"]).where((eb) => kx.like(db, "key", eb.val(`${kx.likeEscape(RERUN_KEY)}%:${day(nowMs)}`), "\\")))).flatMap((m) => m.value === null ? [] : [[m.key, m.value] as const]));
 
 /** Whether an operator request or the merge-time discussion check marked the PR stale after `since` (such re-reviews are not counted). */
 export async function markedStaleSince(db: Db, repo: string, number: number, since: string): Promise<boolean> {
@@ -439,11 +440,10 @@ export async function staleReviews(db: Db, repo?: string, respectCap = false, op
   await primeHashes(state, rows.filter((r) => maintNewer(state.get(`${r.repo}#${r.number}`), r.seen_at ?? r.at)).map((r) => `${r.repo}#${r.number}`));
   const marks = new Map((await db.all(db.k.selectFrom("main.settings").select(["key", "value"]).where((eb) => kx.like(db, "key", eb.val(`${STALE_KEY}%`))))).map((m) => [m.key.slice(STALE_KEY.length), m.value]));
   const out = new Set<string>();
-  const todays = new Map<string, number>();
+  let todays: Map<string, string> | undefined;
   const capped = async (r: { repo: string; number: number }) => {
-    const k = `${r.repo}#${r.number}`;
-    if (!todays.has(k)) todays.set(k, await reruns(db, r.repo, r.number, now));
-    return todays.get(k)! >= MAX_RERUNS_PER_DAY;
+    todays ??= await rerunsToday(db, now);
+    return Number(todays.get(rerunKey(r.repo, r.number, now)) ?? 0) >= MAX_RERUNS_PER_DAY;
   };
   let loaded: ReturnType<typeof blockersLoader> | undefined;
   const blockers = () => (loaded ??= blockersLoader(db));

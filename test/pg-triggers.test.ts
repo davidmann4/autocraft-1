@@ -155,10 +155,12 @@ test("counters move once per transaction, at commit, and not for a rolled-back s
   const { t, db } = await appDb("postgres");
   const a = await client(t);
   try {
+    // The full-pass cause of a new PR, named after its planner input.
+    const source = planTriggers("postgres").flatMap((p) => ("full" in p && p.table === "items" && p.op === "INSERT" ? [p.full] : []))[0]!;
     const seqs = async () => {
       const s = await readSeqs(db);
       const gen = (await db.get(db.k.selectFrom("plan_full").select("seq")))!.seq;
-      const n = (await db.get(db.k.selectFrom("plan_full_causes").select("n").where("source", "=", "plan_items_full_i")))?.n ?? 0;
+      const n = (await db.get(db.k.selectFrom("plan_full_causes").select("n").where("source", "=", source)))?.n ?? 0;
       return { items: s.items!, fasttrack: s.fasttrack!, gen, n };
     };
     const before = await seqs();

@@ -21,6 +21,7 @@ import { pipelineAccount, setPipelineLogin } from "../github/pipeline-account.ts
 import { ghComment, ghOpenPr, pushOwnBranch, type Writer } from "../github/write.ts";
 import { Client, ONE_QUERY, writeItemNode, type Querier } from "../mirror.ts";
 import { ownerOf, slugOf } from "../owners.ts";
+import { liveWorkflow, repoWorkflow } from "../workflow/store.ts";
 import { preapproveMerge, PreapprovalRefused } from "../preapproval/index.ts";
 import {
   MAX_BINARY_BYTES, MAX_IMPLEMENTATION_LINES, validateImplementation,
@@ -352,9 +353,14 @@ export async function openImplementationPr(db: Db, input: OpenPrInput, d: PrDeps
     let notPreapproved: string | null = null;
     if (pushed.compileTime.length) notPreapproved = `a maintainer decides on its compile-time changes: ${pushed.compileTime.map((c) => `${c.path} ${c.what}`).join("; ")}`;
     else if (isDraft) notPreapproved = "a draft is not pre-approved";
-    else {
+    else if (await repoWorkflow(db, repo) === "new" && !(await liveWorkflow(db, repo, number))?.approvedBy) {
+      // On the maintainer workflow the PR merges only when its issue's workflow is approved; otherwise its review ends in a recommendation.
+      notPreapproved = "the merge is not approved: the review ends in a recommendation";
+    } else {
+      // On the maintainer workflow the approver's merge leg belongs to the issue's workflow (src/workflow/advance.ts).
+      const wf = await repoWorkflow(db, repo) === "new" ? await liveWorkflow(db, repo, number) : null;
       try {
-        await preapproveMerge(db, { repo, number: prNumber, by: im.queuedBy, via: "implement", head: pushed.commit });
+        await preapproveMerge(db, { repo, number: prNumber, by: wf?.approvedBy ?? im.queuedBy, via: "implement", head: pushed.commit, ...(wf ? { workflowId: wf.id } : {}) });
       } catch (e) {
         const why = oneLine(String((e as Error).message ?? e));
         if (!(e instanceof PreapprovalRefused)) return fail(`#${prNumber} could not be pre-approved: ${why}`, true);

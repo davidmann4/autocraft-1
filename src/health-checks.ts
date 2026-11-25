@@ -3,6 +3,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { accountListOrNull } from "./agents/account-actions.ts";
 import { deadlineStops } from "./runner/autopilot.ts";
+import { RUNNER_STOPPED } from "./runner/jobs.ts";
 import { stepTitle } from "./dash/api/trace.ts";
 import { repoErrors } from "./sync-errors.ts";
 import { slugOf } from "./owners.ts";
@@ -70,7 +71,7 @@ export type Check = {
   /** The repo a check is about; viewers who cannot see the repo do not see the check. */
   repo?: string;
   /** Checks of one kind that /healthz/checks reports as one entry with counts, so no repo or environment name leaves the server. */
-  group?: "workers" | "sync-repos" | "deadlines";
+  group?: "workers" | "sync-repos" | "deadlines" | "steps";
   /** Set on a job stopped for running past its step's limit: the step an operator acknowledges to clear it. */
   ackStep?: string;
   /** Set on a warning an operator clears by acknowledging it (other than deadline stops). */
@@ -265,6 +266,46 @@ async function deadlineChecks({ db }: CheckCtx): Promise<Check[]> {
   }));
 }
 
+/** Rows read per pass: the jobs table is large, so only the newest ids are looked at. */
+const STEP_WINDOW = 20_000;
+const STEP_DAYS = 7;
+const STEP_FAILED_RUNS = 3;
+const STEP_MIN_STALL_MS = 6 * 3_600_000;
+
+/**
+ * One check per pipeline step (jobs the autopilot started) whose last three finished runs all failed. It fails when the last
+ * success is older than max(6 h, 4 x the step's median gap between successes over the last week), else it warns.
+ */
+async function stepStalledChecks({ db, nowMs }: CheckCtx): Promise<Check[]> {
+  const floor = Number((await db.get(db.k.selectFrom("jobs").select((eb) => eb.fn.max<number | null>("id").as("m"))))!.m ?? 0) - STEP_WINDOW;
+  const since = new Date(nowMs - STEP_DAYS * 86_400_000).toISOString();
+  const rows = await db.all(db.k.selectFrom("jobs").select(["step", "state", "error", "ended_at as endedAt"])
+    .where("id", ">", floor).where("requested_by", "=", "pipeline").where("state", "in", ["done", "failed"]).where("ended_at", ">", since)
+    .where((eb) => eb.or([eb("error", "is", null), eb("error", "<>", RUNNER_STOPPED)])).orderBy("id", "desc"));
+  const bySteps = new Map<string, typeof rows>();
+  for (const r of rows) bySteps.set(r.step, [...(bySteps.get(r.step) ?? []), r]);
+  const out: Check[] = [];
+  for (const [step, runs] of bySteps) {
+    const last = runs.slice(0, STEP_FAILED_RUNS);
+    if (last.length < STEP_FAILED_RUNS || last.some((r) => r.state !== "failed")) continue;
+    const times = runs.filter((r) => r.state === "done" && r.endedAt).map((r) => Date.parse(r.endedAt!)).filter((t) => !Number.isNaN(t));
+    const lastOk = times[0] ?? null;
+    const gaps = times.slice(0, -1).map((t, i) => t - times[i + 1]!).sort((a, b) => a - b);
+    const usual = gaps.length ? gaps[Math.floor(gaps.length / 2)]! : 0;
+    const limit = Math.max(STEP_MIN_STALL_MS, 4 * usual);
+    const label = stepTitle(step);
+    const errors = last.map((r) => (r.error ?? "failed").replace(/\s+/g, " ").trim()).sort((a, b) => a.length - b.length);
+    const since7 = lastOk === null ? `in ${STEP_DAYS} days` : `since ${new Date(lastOk).toISOString().slice(0, 16).replace("T", " ")} UTC`;
+    out.push({
+      id: `step-stalled:${step}`, state: lastOk === null || nowMs - lastOk > limit ? "fail" : "warn", group: "steps", to: "/pipeline",
+      since: last[last.length - 1]!.endedAt,
+      text: `${label} has not completed a run ${since7}; its last ${last.length} runs failed (${clip(errors[0]!, 120)})`,
+      brief: `${label} is failing`,
+    });
+  }
+  return out;
+}
+
 /** Open items that nothing will move and nobody is asked about (fail), or that have not changed for days (warn). Read from the result the runner stores after planner passes. */
 async function livenessCheck({ db }: CheckCtx): Promise<Check[]> {
   const l = await storedLiveness(db);
@@ -291,6 +332,16 @@ async function appIdentityChecks({ db, probe }: CheckCtx): Promise<Check[]> {
   if (!uncovered.length) return [ok("app-keys", "/admin/github-app"), ok("app-coverage", "/admin/github-app")];
   const text = `The GitHub App does not cover ${uncovered.length} tracked repo${uncovered.length === 1 ? "" : "s"}: ${clip(uncovered.join(", "), 120)}`;
   return [ok("app-keys", "/admin/github-app"), { id: "app-coverage", state: "warn", text, brief: "The GitHub App does not cover every tracked repo", since: null, count: uncovered.length, to: "/admin/github-app" }];
+}
+
+/** Operators and maintainers whose stored GitHub App user token can no longer be refreshed: AutoCraft cannot act as them until they authorize again. Viewers approve nothing, so their tokens are left out. */
+async function userTokensCheck({ db }: CheckCtx): Promise<Check[]> {
+  const rows = await db.all(db.k.selectFrom("user_tokens").innerJoin("access", "access.login", "user_tokens.login")
+    .select(["user_tokens.login", "user_tokens.updated_at"]).where("user_tokens.status", "=", "refresh-failed")
+    .where("access.role", "in", ["operator", "maintainer"]).orderBy("user_tokens.updated_at"));
+  if (!rows.length) return [ok("user-tokens", "/admin/github-app")];
+  const text = `AutoCraft can no longer act on GitHub as ${clip(rows.map((r) => r.login).join(", "), 120)} until ${rows.length === 1 ? "they authorize" : "each authorizes"} it again`;
+  return [{ id: "user-tokens", state: "warn", text, brief: "AutoCraft can no longer act as some people on GitHub", since: rows[0]!.updated_at, count: rows.length, to: "/admin/github-app" }];
 }
 
 /** The GitHub App was uninstalled from an account that is not an allowed owner (src/github/allowed-owners.ts): a warning for 24 hours, or until an operator acknowledges it. */
@@ -444,7 +495,7 @@ async function interactiveNoTakerCheck({ db, nowMs, mode }: CheckCtx): Promise<C
 }
 
 /** Every check, in the order the lists show them. */
-const SOURCES: ((ctx: CheckCtx) => Promise<Check[]>)[] = [runnerCheck, leaderChecks, workerChecks, queueCheck, confidentialCheck, syncCheck, syncRepoChecks, accountsCheck, rateCheck, deadlineChecks, livenessCheck, appIdentityChecks, foreignInstallCheck, authorIdsCheck, outsideSurgeCheck, remoteCallsCheck, remoteStarvedCheck, remoteManualCheck, remoteNoTakerCheck, interactiveNoTakerCheck];
+const SOURCES: ((ctx: CheckCtx) => Promise<Check[]>)[] = [runnerCheck, leaderChecks, workerChecks, queueCheck, confidentialCheck, syncCheck, syncRepoChecks, accountsCheck, rateCheck, deadlineChecks, stepStalledChecks, livenessCheck, appIdentityChecks, userTokensCheck, foreignInstallCheck, authorIdsCheck, outsideSurgeCheck, remoteCallsCheck, remoteStarvedCheck, remoteManualCheck, remoteNoTakerCheck, interactiveNoTakerCheck];
 
 export async function computeChecks(db: Db, nowMs: number = Date.now(), probe = false): Promise<Check[]> {
   const mode = await inferenceMode(db);

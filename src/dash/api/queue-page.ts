@@ -360,7 +360,7 @@ async function markFast(db: Db, by: string, repo: string, number: number, w: num
  * when an ended one was queued again after it ended: issue-facts.ts requeuedAfterEnd). With no implementation under way the
  * person queueing it becomes its queuer, whose Task Runner runs its model calls.
  */
-async function queueIssue(db: Db, by: string, repo: string, number: number, w: number | null, via?: string): Promise<void> {
+export async function queueIssue(db: Db, by: string, repo: string, number: number, w: number | null, via?: string): Promise<void> {
   const had = await db.get(db.k.selectFrom("main.fast_track").select("added_by").where("repo", "=", repo).where("number", "=", number));
   await markFast(db, by, repo, number, w, via);
   if (!had) return;

@@ -6,7 +6,7 @@ import { mergeDecisionId } from "../core/rules.ts";
 import { PERM_READ_TTL } from "../dash/server/sessions.ts";
 import { WRITE_PERMISSIONS } from "../dash/server/provider.ts";
 import { appPermission, type AppPermission } from "../remote/permission.ts";
-import { maintainersSettle, settleKey, settlesNow } from "../settlers.ts";
+import { maintainersSettle, maintainersSettleOn, settleKey, settlesNow } from "../settlers.ts";
 import type { Db } from "../db/index.ts";
 import { rowid } from "../db/kx.ts";
 
@@ -62,10 +62,16 @@ async function pipelineMaintainers(db: Db): Promise<{ login: string; repo: strin
  */
 export async function refreshSettlers(db: Db, log: (line: string) => void = () => {}, deps: RefreshDeps = {}, wake: (at: number) => void = () => {}): Promise<Set<string>> {
   const held = new Set<string>();
-  if (!await maintainersSettle(db)) return held;
+  const all = await maintainersSettle(db);
   const read = deps.permission ?? ((d, login, repo) => appPermission(d, login, repo));
   const now = Date.now();
+  const settlesOn = new Map<string, boolean>();
   for (const { login, repo } of await pipelineMaintainers(db)) {
+    if (!all) {
+      // A repo on the maintainer workflow lets its maintainers settle without `maintainer_writes`.
+      if (!settlesOn.has(repo)) settlesOn.set(repo, await maintainersSettleOn(db, repo));
+      if (!settlesOn.get(repo)) continue;
+    }
     const row = await db.get(db.k.selectFrom("main.repo_permissions").select(["permission", "checked_at"]).where("login", "=", login).where("repo", "=", repo));
     const age = row ? now - Date.parse(row.checked_at) : NaN;
     if (row && WRITE_PERMISSIONS.has(row.permission) && age < REFRESH_AFTER) wake(Date.parse(row.checked_at) + REFRESH_AFTER);
@@ -95,7 +101,7 @@ export async function refreshSettlers(db: Db, log: (line: string) => void = () =
  */
 export async function settlesLive(db: Db, login: string, repo: string, read: RefreshDeps["permission"] = (d, l, r) => appPermission(d, l, r)): Promise<"yes" | "no" | "unknown"> {
   const role = (await db.get(db.k.selectFrom("main.access").select("role").where("login", "=", login)))?.role;
-  if (role !== "maintainer" || !await maintainersSettle(db)) return await settlesNow(db, login, [repo]) ? "yes" : "no";
+  if (role !== "maintainer" || !await maintainersSettleOn(db, repo)) return await settlesNow(db, login, [repo]) ? "yes" : "no";
   const age = async (): Promise<number> => {
     const row = await db.get(db.k.selectFrom("main.repo_permissions").select(["permission", "checked_at"]).where("login", "=", login).where("repo", "=", repo));
     return row && WRITE_PERMISSIONS.has(row.permission) ? Date.now() - Date.parse(row.checked_at) : NaN;

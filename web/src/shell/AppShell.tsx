@@ -28,6 +28,7 @@ import type { MainCiState } from "../api/types";
 import { zoneName } from "../lib/format";
 import { UnlinkDiscordDialog } from "./UnlinkDiscord";
 import { LinkDiscordDialog } from "./LinkDiscord";
+import { UiV2Item } from "./UiV2Item";
 
 // Mockup builds only; a normal build drops this branch and the fixture data with it.
 const MockRoleMenu = import.meta.env.VITE_MOCK === "1" ? lazy(() => import("../api/mock/MockRoleMenu")) : null;
@@ -165,7 +166,7 @@ export function AppShell() {
   );
 }
 
-function RouteView({ route }: { route: RouteDef }) {
+export function RouteView({ route }: { route: RouteDef }) {
   const params = useParams();
   const user = useUser();
   if (route.permission && !can(user, route.permission)) return <div className="p-8 text-ink/60">You can't open this page.</div>;
@@ -178,7 +179,7 @@ function ProjectList({ children }: { children: ReactNode }) {
   return children;
 }
 
-function Wordmark() {
+export function Wordmark() {
   return (
     <NavLink to="/" className="flex items-center gap-2" aria-label="AutoCraft home">
       <Logo size={20} />
@@ -338,14 +339,14 @@ function OldFlowLink({ route }: { route: RouteDef }) {
 }
 
 /** The old two-panel item page path opens the item page. */
-function ItemRedirect() {
+export function ItemRedirect() {
   const { repo, number } = useParams();
   const loc = useLocation();
   return <Navigate to={`/items/${repo}/${number}${loc.search}`} replace />;
 }
 
 /** Sends an old path to its new place. `from` is the prefix to swap, so `/decisions/a/1` becomes `/needs/decisions/a/1`; `search` replaces the query. */
-function RedirectTo({ to, from, search }: { to: string; from?: string; search?: string }) {
+export function RedirectTo({ to, from, search }: { to: string; from?: string; search?: string }) {
   const loc = useLocation();
   const tail = from ? loc.pathname.slice(from.length) : "";
   return <Navigate to={`${to}${tail}${search ?? loc.search}`} replace />;
@@ -361,7 +362,7 @@ const menuCls = "z-50 min-w-[220px] rounded-md border border-line-strong bg-rais
 const itemCls = "flex h-8 cursor-default items-center gap-2.5 rounded px-2 text-sm outline-none data-[highlighted]:bg-ink/[0.07]";
 const labelCls = "px-2 pb-1 pt-2 text-2xs font-medium text-ink/45";
 
-function UserMenu({ theme, setTheme, onHelp }: { theme: ThemePref; setTheme: (t: ThemePref) => void; onHelp?: () => void }) {
+export function UserMenu({ theme, setTheme, onHelp }: { theme: ThemePref; setTheme: (t: ThemePref) => void; onHelp?: () => void }) {
   const user = useUser();
   const api = useApi();
   const navigate = useNavigate();
@@ -408,6 +409,7 @@ function UserMenu({ theme, setTheme, onHelp }: { theme: ThemePref; setTheme: (t:
             </Suspense>
           )}
           <DropdownMenu.Separator className="-mx-1 my-1 h-px bg-line" />
+          <UiV2Item className={itemCls} />
           <DropdownMenu.Item onSelect={() => navigate("/about")} className={itemCls}>
             <InfoIcon className="text-ink/55" /> How it works
           </DropdownMenu.Item>
@@ -434,7 +436,7 @@ function UserMenu({ theme, setTheme, onHelp }: { theme: ThemePref; setTheme: (t:
   );
 }
 
-function ShortcutSheet({ open, onOpenChange }: { open: boolean; onOpenChange: (o: boolean) => void }) {
+export function ShortcutSheet({ open, onOpenChange }: { open: boolean; onOpenChange: (o: boolean) => void }) {
   const local = useActiveShortcuts();
   const global = modules.flatMap((m) => m.commands ?? []);
   const all = [
@@ -478,7 +480,7 @@ function ShortcutSheet({ open, onOpenChange }: { open: boolean; onOpenChange: (o
 }
 
 /** A page this reader's role doesn't open says so; anything else is unknown. */
-function NoRoute({ hidden }: { hidden: { path: string; permission: Permission }[] }) {
+export function NoRoute({ hidden }: { hidden: { path: string; permission: Permission }[] }) {
   const { pathname } = useLocation();
   const found = hidden.find((h) => matchPath({ path: `/${h.path}`, end: false }, pathname));
   const text = !found ? "Nothing here." : found.permission === "staff" ? "Operators and maintainers only." : "Operators only.";
@@ -493,7 +495,7 @@ const LIVE: Record<LiveStatus, [label: string, icon: typeof CloudIcon, color: st
 };
 
 /** The state of the server's event stream, as an icon and a tooltip. */
-function LiveDot() {
+export function LiveDot() {
   const [label, Icon, color] = LIVE[useLiveStatus()];
   return <Icon role="img" aria-label={label} className={cn("mx-1 shrink-0 text-[17px]", color)}><title>{label}</title></Icon>;
 }
@@ -501,7 +503,7 @@ function LiveDot() {
 const CI_ORDER: MainCiState[] = ["green", "red", "running", "optional"];
 
 /** Main CI of every repo at a glance: one dot and count per state, linking to the Main CI page. */
-function MainCiDots() {
+export function MainCiDots() {
   const { data } = useQuery("progress", (api) => api.progress());
   const summary = data?.mainCi;
   if (!summary) return null;
@@ -519,7 +521,7 @@ function MainCiDots() {
   );
 }
 
-function FootLink({ to, icon: Icon, label, open, tall }: { to: string; icon: typeof GearSixIcon; label: string; open: boolean; tall?: boolean }) {
+export function FootLink({ to, icon: Icon, label, open, tall }: { to: string; icon: typeof GearSixIcon; label: string; open: boolean; tall?: boolean }) {
   return (
     <NavLink to={to} title={open ? undefined : label} className={({ isActive }) => cn("flex items-center gap-2 rounded px-2 text-sm text-ink/60", tall ? "h-11" : "h-7", " hover:bg-ink/[0.06] hover:text-ink", isActive && "bg-ink/[0.08] font-medium text-ink", !open && "justify-center px-0")}>
       <Icon className="text-[15px] opacity-80" />

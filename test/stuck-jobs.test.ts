@@ -60,6 +60,20 @@ test("a job past its step's deadline is stopped and failed, and warns until ackn
   assert.deepEqual((await deadlineStops(db)).map((d) => d.step), ["test-other"]);
 });
 
+test("a job that works in slices ends as a success before its deadline, with work left", async () => {
+  const job = await enqueue(db, "test-slices", { units: 10_000 }, "boss");
+  // Its clock is the job's start: once it has done some work, the start moves back past its whole deadline (999 min here). The runner
+  // keeps its own start in memory, so only the job sees the time as up.
+  for (const end = Date.now() + 20_000; Number((await db.get(db.k.selectFrom("jobs").select("items").where("id", "=", job.id)))?.items ?? 0) < 1 && Date.now() < end; await new Promise((r) => setTimeout(r, 50))) await runner.tick();
+  await db.run(db.k.updateTable("jobs").set({ started_at: new Date(Date.now() - 1000 * 60_000).toISOString() }).where("id", "=", job.id));
+  for (const end = Date.now() + 20_000; !["done", "failed"].includes((await getJob(db, job.id)).state) && Date.now() < end; await new Promise((r) => setTimeout(r, 50))) await runner.tick();
+  const j = await getJob(db, job.id);
+  assert.equal(j.state, "done");
+  assert.equal(j.error, null);
+  const [, done, left] = /^(\d+) of \d+ units, (\d+) left$/.exec(j.summary ?? "")!.map(Number);
+  assert.ok(done! > 0 && left! > 0, j.summary ?? "");
+});
+
 test("draining keeps a running job's writes and starts nothing; off blocks the writes", async () => {
   const pipe = (await (await (await (await world()).repo(["comment"])).pr(1)).pipeline(false)).db;
   await setCommentApproval(pipe, "op", "app", true);

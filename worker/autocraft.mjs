@@ -4878,6 +4878,10 @@ const answerWhy = (has) => (has.has("set_weight")
   : "only operators, and maintainers who answer decisions (an answering Task Runner while maintainer writes are on), approve merges");
 /** Withdrawing an approved merge stays with operators, also where a maintainer may approve one. @param {Set<string>} has */
 const cancelWhy = (has) => (has.has("set_weight") ? answerWhy(has) : "only operators withdraw an approved merge");
+/** @param {Set<string>} has */
+const commandWhy = (has) => (has.has("my_items")
+  ? "this Task Runner cannot send commands: tick \"Can answer decisions and approve merges\" for it on the Connect page (the server must offer answering), and use a maintainer or operator login"
+  : "the server did not offer it");
 const LOCAL_WHY = "model calls run on the server's accounts here: the server is not in the user-local inference mode";
 /** @param {Set<string>} has */
 const pickWhy = (has) => (has.has("list_model_calls") ? "only maintainers and operators pick model calls" : LOCAL_WHY);
@@ -4902,10 +4906,14 @@ export const CLI_COMMANDS = [
   { path: ["calls", "mine"], tool: "my_work", usage: "", summary: "today's calls on your machine, and your Task Runners", why: () => "needs one of your Task Runners reporting in, while the server is in the user-local inference mode" },
   { path: ["settings"], tool: "my_settings", usage: "", summary: "your reserve, repos, calls at once and interactive slots", why: () => "only maintainers and operators have settings" },
   { path: ["settings", "set"], tool: "set_my_settings", usage: "[--reserve <5h> <weekly>] [--max-calls N | --no-max-calls] [--repos <a,b>|all] [--interactive-slots N]", summary: "change them, as the Connect page does", why: () => "only maintainers and operators have settings" },
+  { path: ["do"], tool: "command", args: ["item", "text"], usage: "<item> \"<command>\"", summary: "send AutoCraft a command on an item, as on GitHub: \"fix-up and merge\", \"yes\", \"stop\"", why: commandWhy },
+  { path: ["item"], tool: "get_item", args: ["item"], usage: "<item>", summary: "an item's workflow: state, open recommendation, who started and approved it" },
+  { path: ["items"], tool: "my_items", usage: "", summary: "items waiting for your answer, and the ones you started or approved" },
+  { path: ["commands"], tool: "help", usage: "", summary: "the commands AutoCraft takes, what each does and when it comes back to you" },
   { path: ["repos"], tool: "list_repos", usage: "", summary: "tracked repositories with their open decisions and fix-ups" },
   { path: ["fixups"], tool: "list_fixups", usage: "[--repo R] [--limit N]", summary: "PRs whose review fixes the pipeline could not apply" },
-  { path: ["items"], tool: "search_items", usage: "[--query Q] [--repo R] [--kind K] [--state S] [--author A] [--since D] [--limit N] [--cursor C]", summary: "issues and PRs from AutoCraft's copy of GitHub" },
-  { path: ["items", "show"], tool: "get_item", args: ["item"], usage: "<item>", summary: "one issue or PR from AutoCraft's copy of GitHub" },
+  { path: ["items", "search"], tool: "search_items", usage: "[--query Q] [--repo R] [--kind K] [--state S] [--author A] [--since D] [--limit N] [--cursor C]", summary: "issues and PRs from AutoCraft's copy of GitHub" },
+  { path: ["items", "show"], tool: "read_item", args: ["item"], usage: "<item>", summary: "one issue or PR from AutoCraft's copy of GitHub" },
 ];
 
 /**
@@ -5275,6 +5283,9 @@ const TASK_HELP = [
 
 const GROUP_TITLES = /** @type {const} */ ({ inbox: "Inbox", queue: "Merge queue", calls: "Model calls", settings: "Settings" });
 
+/** The workflow commands: send a command, read an item, list your items, list the commands. */
+const ITEM_GROUPS = ["do", "item", "items", "commands"];
+
 /** @param {string} group @returns {HelpLine[]} */
 const serverHelp = (group) => CLI_COMMANDS.filter((c) => c.path[0] === group).map((c) => [`autocraft ${[...c.path, c.usage].filter(Boolean).join(" ")}`, c.summary]);
 
@@ -5282,6 +5293,7 @@ const serverHelp = (group) => CLI_COMMANDS.filter((c) => c.path[0] === group).ma
 const helpSections = (all) => [
   ["Setup", SETUP_HELP], ["Runner", RUNNER_HELP],
   ...Object.entries(GROUP_TITLES).map(([g, title]) => /** @type {[string, HelpLine[]]} */ ([title, serverHelp(g)])),
+  ["Items", ITEM_GROUPS.flatMap(serverHelp)],
   ["Other", [...serverHelp("repos"), ...serverHelp("fixups"), ...CALL_HELP]],
   ...(all ? [/** @type {[string, HelpLine[]]} */ (["Task commands (used by the service and by agents)", TASK_HELP])] : []),
 ];
@@ -5326,6 +5338,7 @@ Config: ${"$XDG_CONFIG_HOME"}/autocraft-runner/config.json, the credential in cr
 function groupHelp(group) {
   if (group === "runner") return section("Runner", RUNNER_HELP);
   if (group in GROUP_TITLES) return `${section(GROUP_TITLES[/** @type {keyof typeof GROUP_TITLES} */ (group)], serverHelp(group))}\n\n${SERVER_NOTE}`;
+  if (ITEM_GROUPS.includes(group)) return `${section("Items", ITEM_GROUPS.flatMap(serverHelp))}\n\n${SERVER_NOTE}`;
   if (group === "repos" || group === "fixups" || group === "call") return `${section("Other", [...serverHelp("repos"), ...serverHelp("fixups"), ...CALL_HELP])}\n\n${SERVER_NOTE}`;
   return helpText(false);
 }

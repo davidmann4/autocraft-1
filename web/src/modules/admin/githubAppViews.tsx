@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import { CheckIcon, CopyIcon } from "@phosphor-icons/react";
 import { useApi, useQuery } from "../../api/client";
 import type { GithubAppStatus, GithubSetupLink } from "../../api/types";
@@ -101,6 +101,7 @@ function AppBlock({ s, onChange }: { s: GithubAppStatus; onChange: () => void })
               rows={[
                 ["Name", s.app.name],
                 ["Slug", <code key="slug">{s.app.slug}</code>],
+                ...(s.app.mention ? [["Mention name", <code key="mention">{s.app.mention}</code>] as [string, ReactNode]] : []),
                 ["App id", <code key="id">{s.app.id}</code>],
                 ["Acts as you", s.authorized ? "Authorized" : "Not authorized"],
               ]}

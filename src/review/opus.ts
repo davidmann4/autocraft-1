@@ -1,6 +1,7 @@
 // Stage 5, Review: Opus reviews every wanted PR, one PR per call, and its verdict is the
 // one every later stage reads (the `final_reviews` view). After a new push Opus reads only
 // the delta since the head it reviewed before. Reads GitHub (diffs); never writes to it.
+import { repoWorkflow } from "../workflow/store.ts";
 import { CLAUDE_PROMPTS } from "../prompts/index.ts";
 import { currentJobId, poolRoom, takersCut } from "../agents/call.ts";
 import { pool } from "../classify/run.ts";
@@ -125,9 +126,9 @@ export async function saveOpus(db: Db, runId: string | null, c: { repo: string; 
     trigger: again ? (await markedStaleSince(db, c.repo, c.number, again.at) ? "operator" : rebased ? "base" : "discussion") : "new-head", job_id: currentJobId() }));
   await db.run(db.k.insertInto("opus_reviews").values({ repo: c.repo, number: c.number, head_oid: c.head_oid, run_id: runId, at, model: s.model, mode: s.mode, base_head: s.base,
       verdict: r.verdict, sure: r.sure ? 1 : 0, reason: r.reason, fixes, risks, public_review: pub, seen_at: s.snap?.seen ?? at, disc_hash: s.snap?.hash ?? null, summary: r.summary,
-      why: r.why, conflicts: r.conflicts.length ? JSON.stringify(r.conflicts) : null, claims, blocked_by: blockedBy, base_ref: baseRef })
+      why: r.why, conflicts: r.conflicts.length ? JSON.stringify(r.conflicts) : null, claims, blocked_by: blockedBy, base_ref: baseRef, workflow: r.workflow ? JSON.stringify(r.workflow) : null })
     .onConflict((oc) => oc.columns(["repo", "number", "head_oid"]).doUpdateSet(kx.excluded(["run_id", "at", "model", "mode", "base_head", "verdict", "sure", "reason", "fixes", "risks", "public_review",
-      "seen_at", "disc_hash", "summary", "why", "conflicts", "claims", "blocked_by", "base_ref"]))));
+      "seen_at", "disc_hash", "summary", "why", "conflicts", "claims", "blocked_by", "base_ref", "workflow"]))));
   await db.run(db.k.deleteFrom("main.settings").where("key", "=", `review_fail:${c.repo}#${c.number}@${c.head_oid}`));
   await db.run(db.k.deleteFrom("opus_carried_fixes").where("repo", "=", c.repo).where("number", "=", c.number).where("head_oid", "=", c.head_oid));
   for (const u of s.unapplied ?? []) {
@@ -307,6 +308,7 @@ export async function runOpusReview(db: Db, params: OpusParams, log: (line: stri
     const { input, snap, mode, base, baseRef } = p;
     const checkout = (await deps.checkout?.(repo, c.number, c.head_oid)) ?? undefined;
     if (checkout) input.repo_dir = REPO_PATH;
+    if (await repoWorkflow(db, repo) === "new") input.workflow = true;
     const dir = referenceDir(repo);
     const semantic = dir ? deps.semantic ?? defaultSemanticDeps(db, input.ref) : undefined;
     const r = await runModelStep(db, REVIEW_OPUS, input, {

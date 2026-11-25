@@ -76,6 +76,34 @@ export async function dueActions(db: Db, kind: ActionKind, opts: DueOptions = {}
 /** `repo#number` of the items whose Plan holds an action of `kind`. */
 export const dueRefs = async (db: Db, kind: ActionKind, opts: DueOptions = {}): Promise<Set<string>> => new Set((await dueActions(db, kind, opts)).map((d) => `${d.repo}#${d.number}`));
 
+/**
+ * The items whose fresh Plan can hold an action of `kind`, as "repo#number", for a step that decides them again on fresh facts
+ * instead of loading every item. A stored Plan stands for an item until a change to it is logged: the runner's planner deletes
+ * the change-log rows a pass read once that pass's Plans are stored (src/core/plan-engine.ts), so a row left in the log is a
+ * change no stored Plan covers yet. The candidates are the items whose stored Plan holds the action, the items the log names,
+ * and the items without a stored Plan (`pr`: open PRs and merged ones with a take or take-fix review; `item`: open items of the
+ * tracked repos). Null when no Plan is stored.
+ * Missing: items that turned due since the planner's last pass for a reason the log does not name (the clock, a global input,
+ * a bulk write); the next pass decides them. The planner writes the stored Plans before it queues jobs, so a job finds at least
+ * what the pass that queued it saw.
+ */
+export async function dueCandidates(db: Db, kind: ActionKind, side: "item" | "pr", repo?: string): Promise<string[] | null> {
+  if (!await db.get(db.k.selectFrom("main.item_plans").select((eb) => eb.lit(1).as("one")).limit(1))) return null;
+  const ref = (eb: kx.AnyEb, t: string) => eb(eb(eb.ref(`${t}.repo`), "||", eb.val("#")), "||", kx.exprOf(eb, `${t}.number`)).as("ref");
+  // The log before the Plans: a pass stores its Plans before it deletes the rows they cover, so a row read gone was covered by
+  // the Plans read after it.
+  const logged = await db.all(db.k.selectFrom("main.item_changes as c").select((eb) => ref(eb, "c")).distinct().$if(!!repo, (q) => q.where("c.repo", "=", repo!)));
+  const out = await dueRefs(db, kind, repo ? { repo } : {});
+  for (const r of logged) out.add(r.ref);
+  for (const r of await db.all(db.k.selectFrom("main.items as i").innerJoin("main.tracked_repos as t", "t.name", "i.repo").select((eb) => ref(eb, "i"))
+    .$if(side === "item", (q) => q.where("i.state", "=", "OPEN"))
+    .$if(side === "pr", (q) => q.where("i.kind", "=", "pr").where((eb) => eb.or([eb("i.state", "=", "OPEN"), eb.and([eb("i.state", "=", "MERGED"),
+      eb.exists(eb.selectFrom("main.opus_reviews as o").select(eb.lit(1).as("one")).whereRef("o.repo", "=", "i.repo").whereRef("o.number", "=", "i.number").where("o.verdict", "in", ["take", "take-fix"]))])])))
+    .$if(!!repo, (q) => q.where("i.repo", "=", repo!))
+    .where((eb) => eb.not(eb.exists(eb.selectFrom("main.item_plans as p").select(eb.lit(1).as("one")).whereRef("p.repo", "=", "i.repo").whereRef("p.number", "=", "i.number")))))) out.add(r.ref);
+  return [...out];
+}
+
 /** The cached view of every open item with a Plan: `repo#number` to its PlanView. */
 export async function openViews(db: Db): Promise<Map<string, PlanView>> {
   const rows = await db.all(db.k.selectFrom("main.item_plans as p").innerJoin("main.items as i", (j) => j.onRef("i.repo", "=", "p.repo").onRef("i.number", "=", "p.number"))

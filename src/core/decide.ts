@@ -1,20 +1,20 @@
 // decidePr: the review-to-merge rules for one open PR, in one place. Pure: no database, no clock (facts carry `now`).
 // The merge queue's rules (src/merge/queue.ts buildQueue, stateOf, eligible, toAsk) are ported rule by rule, in the same order and with the same reason wording.
 import {
-  BATCHABLE, MAIN_RED_HELD, PREMERGE_DEFECT_REASON, PREMERGE_UNSURE_REASON, PREMERGE_FAILED_REASON, PREMERGE_MAX_TRIES, RETRY_AFTER_MS, REVIEW_LABELS, KEEP_IN_CORE,
+  BATCHABLE, MAIN_RED_HELD, autoEligible, PREMERGE_DEFECT_REASON, PREMERGE_UNSURE_REASON, PREMERGE_FAILED_REASON, PREMERGE_MAX_TRIES, RETRY_AFTER_MS, REVIEW_LABELS, KEEP_IN_CORE,
   RULE_LABELS, RULE_SIZES, RULE_TIERS, UNSURE_REASON, VERIFY_UNAVAILABLE, ciAllows, conflictNote, verifyAllows, verifyOk,
   FIXUP_MAX_ATTEMPTS, CIFIX_FINAL_STATES, CIFIX_MAX_PUSHES_PER_PR, CIFIX_MAX_TRIES, CIFIX_MAX_TRIES_PER_PR, STATE_REFUSAL, TRANSIENT_REFUSAL, UNKNOWN_REREADS,
 } from "./rules.ts";
 import { UNCHECKED_REASON } from "./sensitive.ts";
 import { ENDED_STATES, type ImplementationState } from "../implement/types.ts";
 import { inFlightNow, unassignActions } from "./assignment.ts";
-import type { Action, PassFacts, Plan, PlanState, PrFacts, QueueState, UnsentAsk, WaitKind } from "./plan.ts";
+import type { Action, MergePath, PassFacts, Plan, PlanState, PrFacts, QueueState, UnsentAsk, WaitKind, WorkflowFact } from "./plan.ts";
 
 /** The start of a statement for a reason line: one line, at most 80 characters. */
 const excerpt = (t: string): string => { const s = t.replace(/\s+/g, " ").trim(); return s.length > 80 ? `${s.slice(0, 79).trimEnd()}…` : s; };
 
 type PremergeState = "none" | "clean" | "fix" | "defect" | "unsure" | "failed" | "retry";
-export type Entry = { state: QueueState; path: "rule" | "operator" | null; reasons: string[]; note: string | null; conflictNote: string | null; premerge: PremergeState | null; premergeDefects: number; answer: string | null; noCi: boolean; refusedReason: string | null };
+export type Entry = { state: QueueState; path: MergePath; reasons: string[]; note: string | null; conflictNote: string | null; premerge: PremergeState | null; premergeDefects: number; answer: string | null; noCi: boolean; refusedReason: string | null };
 
 const verifyState = (f: PrFacts): QueueState | null => {
   const s = f.verification?.state;
@@ -22,17 +22,42 @@ const verifyState = (f: PrFacts): QueueState | null => {
   return s === "failed" ? "verify-failed" : s === "error" ? "verify-error" : "waiting-verify";
 };
 
-/** The queue entry of a PR that has a take or take-fix review at its head (or merged at the reviewed head). */
+// ---- the maintainer workflow (src/workflow): every rule below that reads these applies only in a repo switched to it
+
+/** The PR's live maintainer workflow in a repo that runs it; null in a legacy repo. */
+export const workflowOf = (f: Pick<PrFacts, "repoFacts" | "workflow">): WorkflowFact | null => (f.repoFacts.workflow === "new" ? f.workflow ?? null : null);
+/**
+ * An unstarted PR in a repo on the maintainer workflow that the workflow takes up by itself: a small or medium bug fix on the merge rule's criteria.
+ * Not once someone stopped it or sent it to the backlog: that means hands off until someone starts it.
+ */
+export const onAutoPath = (f: PrFacts): boolean => f.repoFacts.workflow === "new" && !workflowOf(f) && f.endedWorkflow !== "stopped" && f.endedWorkflow !== "backlog" && autoEligible(f);
+/** An open PR in a repo on the maintainer workflow that nobody started and that is not on the auto path: it gets no model work. */
+export const notStarted = (f: PrFacts): boolean => f.repoFacts.workflow === "new" && !workflowOf(f) && !onAutoPath(f);
+/** The merge entry: the PR goes to the merge queue with no Opus review; the pre-merge review, Verify, CI and GitHub's gates still apply. */
+export const mergeEntry = (f: PrFacts): boolean => workflowOf(f)?.entry === "merge";
+/** A started PR not approved for merge stops when its steps are done, for a person's answer to the recommendation. */
+export const NOT_APPROVED_REASON = "not approved for merge";
+/** The review's own fix-up runs on the auto path, for the fix-up and implement entries and once merge is approved; a review-entry PR that is not approved waits for its recommendation instead. */
+const fixAllowed = (f: PrFacts): boolean => {
+  if (f.repoFacts.workflow !== "new") return true;
+  const w = workflowOf(f);
+  return w ? w.entry === "fixup" || w.entry === "implement" || w.approved : onAutoPath(f);
+};
+
+/** The queue entry of a PR that has a take or take-fix review at its head (or merged at the reviewed head), or of a merge-entry PR (no review needed). */
 export function queueEntry(f: PrFacts, merged: boolean, open: boolean): Entry {
-  const r = f.review!;
+  const mx = mergeEntry(f);
+  const r = mx ? null : f.review!;
   const noCi = f.ci === "none" && f.repoFacts.noCi;
   const reasons: string[] = [];
-  if (r.verdict !== "take") reasons.push("review asks for fixes");
-  if (r.unsure) reasons.push(UNSURE_REASON);
+  if (r && r.verdict !== "take") reasons.push("review asks for fixes");
+  if (r?.unsure) reasons.push(UNSURE_REASON);
+  const w = workflowOf(f);
+  if (w && !w.approved && !mx) reasons.push(NOT_APPROVED_REASON);
   // Merging a stacked PR lands it in the other PR's branch, not in the default branch: a person decides.
   if (open && f.stackedOn !== null) reasons.push(`targets the branch of open #${f.stackedOn}`);
   if (f.ghState === "OPEN" && f.decision.openQuestion) reasons.push("a Merge? question is still open");
-  if (r.mode === "skipped") reasons.push("the review was skipped");
+  if (r?.mode === "skipped") reasons.push("the review was skipped");
   if (!RULE_SIZES.includes(f.size)) reasons.push(`size ${f.size}`);
   if (!f.label || !RULE_LABELS.includes(f.label)) reasons.push(f.label ? `label ${f.label}` : "no settled label");
   else if (f.labelUnsure) reasons.push("label settled by an unsure referee");
@@ -50,12 +75,12 @@ export function queueEntry(f: PrFacts, merged: boolean, open: boolean): Entry {
   if (stuckUnknown) reasons.push(stuckUnknown);
   // Only a merge answer is set aside at an unsure head; a hold or close still counts.
   const given = f.decision.answer;
-  const answer = given === "merge" && r.unsure && !f.decision.mergeAnswerAfterReview ? null : given;
+  const answer = given === "merge" && r?.unsure && !f.decision.mergeAnswerAfterReview ? null : given;
 
-  // The pre-merge review gates what the rule would merge; its blocking reasons count before the path is decided.
+  // The pre-merge review gates what the rule would merge, and every merge-entry PR; its blocking reasons count before the path is decided.
   let premerge: PremergeState | null = null;
   let defects = 0;
-  if (open && !reasons.length) {
+  if (open && (!reasons.length || mx)) {
     const row = f.premerge;
     defects = row?.defects ?? 0;
     if (!row) premerge = "none";
@@ -91,10 +116,13 @@ function stateOf(f: PrFacts, e: Entry, merged: boolean, held: "backlog" | "dupli
   if (merged) return "merged";
   if (held === "backlog") return "held-backlog";
   if (held) return "held-duplicate";
-  if (f.review!.verdict === "take-fix") return "needs-fix-up";
+  const mx = mergeEntry(f);
+  if (!mx && f.review!.verdict === "take-fix") return "needs-fix-up";
   // An operator's Hold or Close answer declines the PR on every path, also when the rule would merge it.
   if (e.answer && e.answer !== "merge") return "declined";
-  if (!e.reasons.length) e.path = "rule";
+  // A merge-entry PR merges on its approval, as its approver once the merge is handed over (an answered Merge); a blocking pre-merge review stops it.
+  if (mx) e.path = e.answer === "merge" ? "operator" : e.premerge === "defect" || e.premerge === "unsure" || e.premerge === "failed" ? null : "maintainer";
+  else if (!e.reasons.length) e.path = "rule";
   else if (e.answer === "merge") e.path = "operator";
   if (f.mergeable === "CONFLICTING") return "conflict";
   if (f.ci === "failure") return "ci-failed";
@@ -104,7 +132,7 @@ function stateOf(f: PrFacts, e: Entry, merged: boolean, held: "backlog" | "dupli
   if (!ciAllows(e.path, f.ci, e.noCi) || f.mergeable !== "MERGEABLE") return "waiting-ci";
   const v = verifyState(f);
   if (v && !(e.path === "operator" && f.verifyOverride && (v === "verify-failed" || v === "verify-error"))) return v;
-  if (e.path === "rule" && e.premerge) {
+  if ((e.path === "rule" || e.path === "maintainer") && e.premerge) {
     if (e.premerge === "none" || e.premerge === "retry") return "waiting-premerge";
     if (e.premerge === "fix") {
       const n = e.premergeDefects;
@@ -116,15 +144,16 @@ function stateOf(f: PrFacts, e: Entry, merged: boolean, held: "backlog" | "dupli
     e.refusedReason = f.lastMerge.reason;
     return "refused";
   }
-  return e.path === "rule" ? "ready" : "decision-answered-merge";
+  return e.path === "rule" || e.path === "maintainer" ? "ready" : "decision-answered-merge";
 }
 
 /**
  * True when the PR may be merged now (ready, approved, or retried after a refusal). Not while its implementation session
- * revises it: the merge (or a batch) waits for the revision's push and the review of the new head.
+ * revises it: the merge (or a batch) waits for the revision's push and the review of the new head. Not on the maintainer
+ * path, whose merge is handed to its approver first (it then takes the operator path).
  */
 const eligible = (f: PrFacts, e: Entry): boolean =>
-  !f.mergeHeld && ownImplementation(f)?.state !== "revising" && e.path !== null && verifyAllows(e.path, f.verification?.state, f.verifyOverride) && ciAllows(e.path, f.ci, e.noCi) && f.mergeable === "MERGEABLE"
+  !f.mergeHeld && ownImplementation(f)?.state !== "revising" && e.path !== null && e.path !== "maintainer" && verifyAllows(e.path, f.verification?.state, f.verifyOverride) && ciAllows(e.path, f.ci, e.noCi) && f.mergeable === "MERGEABLE"
   && (e.state === "ready" || e.state === "decision-answered-merge" || e.state === "refused");
 
 /** A PR refused at its current head waits until its CI or mergeable state differs from what GitHub reported at the refusal. */
@@ -194,6 +223,7 @@ const notHeld = (f: PrFacts): boolean => f.inScope && !f.integration && !f.heldB
 /** Where a take-fix review at the current head stands with the fix-up: the bucket and whether the step has recorded a final row for the head. */
 export function fixupOf(f: PrFacts): { bucket: FixupBucket; done: boolean } | null {
   const r = f.review, x = f.fixup;
+  if (!fixAllowed(f) || mergeEntry(f)) return null;
   if (ownImplementation(f) || declinedBy(f) || !r || !x || r.verdict !== "take-fix" || r.head !== f.head || r.stale || f.draft || !notHeld(f) || f.ghState !== "OPEN" || f.mergeHeld) return null;
   // A maintainer's changes-requested review is the person's to resolve first.
   if (f.mergeable === "CONFLICTING" || x.fixes === 0 || f.changesRequested) return null;
@@ -246,7 +276,7 @@ export type CifixBucket = "unreviewed" | "comment-wait" | "work" | "unapproved" 
 function unreviewedRed(f: PrFacts): boolean {
   const r = f.review;
   // A take review is repaired by the CI fix itself: at the head (normal path) or at an earlier head (our own breakage or the review gate's red CI).
-  const take = !!r && (r.verdict === "take" || r.verdict === "take-fix") && !(r.head === f.head && r.stale);
+  const take = mergeEntry(f) || (!!r && (r.verdict === "take" || r.verdict === "take-fix") && !(r.head === f.head && r.stale));
   // The checks are read at the current head when it is not the reviewed head (gateRed); otherwise the plan's CI state is.
   const red = f.gateRed === true || f.ci === "failure";
   return f.ghState === "OPEN" && red && f.reviewHold?.kind === "ci" && f.reviewHold.red === true && !take && !declinedBy(f) && !f.draft && notHeld(f)
@@ -264,9 +294,12 @@ export function cifixBucket(f: PrFacts): CifixBucket | null {
     if (CIFIX_FINAL_STATES.some((s) => c.states.includes(s)) || c.unsent === "final") return "done";
     return f.repoFacts.commentApproved && !f.quiet ? (c.unsent ? "comment-wait" : "unreviewed") : "cannot-push";
   }
-  if (declinedBy(f) || !r || !c || (r.verdict !== "take" && r.verdict !== "take-fix") || (r.head !== f.head && !broke) || f.ghState !== "OPEN" || (f.ci !== "failure" && !broke) || f.draft || !notHeld(f)) return null;
-  if (f.mergeable === "CONFLICTING" || (r.stale && !broke) || f.changesRequested || f.mergeHeld) return null;
-  if (r.verdict === "take-fix") {
+  // A merge-entry PR has no review to work from: its CI is fixed against its head. A review-entry PR not approved for merge gets no fix work.
+  const mx = mergeEntry(f);
+  if (!fixAllowed(f) || declinedBy(f) || !c || f.ghState !== "OPEN" || (f.ci !== "failure" && !broke) || f.draft || !notHeld(f)) return null;
+  if (!mx && (!r || (r.verdict !== "take" && r.verdict !== "take-fix") || (r.head !== f.head && !broke) || (r.stale && !broke))) return null;
+  if (f.mergeable === "CONFLICTING" || f.changesRequested || f.mergeHeld) return null;
+  if (!mx && r!.verdict === "take-fix") {
     const fx = fixupOf(f);
     if (fx && ["fix", "unapproved", "ask", "ask-retry"].includes(fx.bucket)) return null;
   }
@@ -370,6 +403,7 @@ function unassignOf(f: PrFacts, state: PlanState, actions: Action[]): Action[] {
 /** Who a PR in needs-fix-up waits on. Null while a fix-up, conflict, CI-fix or lint action of the PR is due (the action is the next step). */
 function fixupWait(f: PrFacts, fx: { bucket: FixupBucket; done: boolean } | null, actions: Action[]): Wait | null {
   if (actions.some((a) => ["fixup", "conflict", "cifix", "lint"].includes(a.kind))) return null;
+  if (!fixAllowed(f)) return person(MAINTAINER_ANSWER_WAIT);
   if (f.mergeable === "CONFLICTING") return f.conflict?.bucket === "unapproved" ? person("push approval for the repo")
     : f.conflict?.bucket === "ask-retry" ? unsentWait("the comment asking the contributor to resolve the conflict", f.conflict.until)
     : contributor("the contributor's merge of the base branch");
@@ -383,6 +417,11 @@ function fixupWait(f: PrFacts, fx: { bucket: FixupBucket; done: boolean } | null
     default: return system("the review's fixes to be applied");
   }
 }
+
+/** What an unstarted PR in a repo on the maintainer workflow waits on. */
+export const NOT_STARTED_WAIT = "a maintainer to start it";
+/** What a started PR waits on when its steps stopped for a person (its recommendation, or a blocker). */
+export const MAINTAINER_ANSWER_WAIT = "a maintainer's answer";
 
 /** PassFacts of a decision that has none to give: no re-read pace holds the next diff re-read. */
 export const NO_PASS: PassFacts = { rereadPaceAt: 0 };
@@ -433,16 +472,28 @@ export function decidePr(f: PrFacts, pass: PassFacts = NO_PASS): Plan {
   if (opFix && f.ghState === "OPEN" && !f.heldBacklog && f.head && !f.draft && f.mergeable !== "CONFLICTING" && !f.lint.some((l) => l.source === "operator")
     && f.pushable && f.repoFacts.pushApproved && opFix.attempts + 1 <= FIXUP_MAX_ATTEMPTS) extra.push(act("fixup", f.head, { bucket: "fix", source: "operator" }));
 
+  // A repo on the maintainer workflow: a PR nobody started and that is off the auto path gets no model work and no question.
+  const newRepo = f.repoFacts.workflow === "new";
+  const wf = workflowOf(f);
+  if (open && notStarted(f)) {
+    return plan(f.heldBacklog ? "backlog" : f.heldDuplicate ? "duplicate" : "not-started", { actions: unassignActions(f.assignment, open, true), wait: NOT_STARTED_WAIT, waitKind: "person" });
+  }
+  const mx = mergeEntry(f);
+
   const mergedByUs = f.lastMerge?.outcome === "merged";
   const takeReview = !!r && (r.verdict === "take" || r.verdict === "take-fix");
   const merged = f.ghState === "MERGED" || mergedByUs;
   // A review older than a comment or review by someone else, or at another head, leaves the PR out of the queue until it is reviewed again.
-  const inQueue = takeReview && (merged || (open && !r.stale && r.head === f.head));
+  // A merge-entry PR is in the queue at its head without one.
+  const inQueue = (takeReview && (merged || (open && !r.stale && r.head === f.head))) || (mx && open);
+  // The head the queue's steps work on: the reviewed head, or a merge-entry PR's own head.
+  const qHead = mx ? f.head : r?.head ?? null;
   // A person's live pre-approved merge lifts the label gate: they said merge it, so the review, pre-merge review and CI it still needs
   // run whatever the label is (or before the classification settles). A scope question or answer still gates it.
-  const labelOk = !!f.operator?.preapproved || (!!f.label && REVIEW_LABELS.includes(f.label));
-  const reviewable = !f.draft && !!f.head && labelOk
-    && (f.scopeAnswer !== null ? KEEP_IN_CORE.includes(f.scopeAnswer) : !f.needsDecisionFlag);
+  // In a repo on the maintainer workflow the person who started the PR chose it (no label or scope gate), and the auto path chose by label; a merge entry is never reviewed.
+  const labelOk = !!f.operator?.preapproved || newRepo || (!!f.label && REVIEW_LABELS.includes(f.label));
+  const reviewable = !f.draft && !!f.head && labelOk && !mx
+    && (wf ? true : f.scopeAnswer !== null ? KEEP_IN_CORE.includes(f.scopeAnswer) : !f.needsDecisionFlag);
 
   const actions: Action[] = [...extra];
   let e: Entry | null = null;
@@ -481,14 +532,15 @@ export function decidePr(f: PrFacts, pass: PassFacts = NO_PASS): Plan {
     if (!(p && p.head === f.head && r.at <= (p.opusAt ?? p.at ?? ""))) actions.push(act("post-review", f.head));
   }
 
-  // Verify: a take at the head, CI not failing, not verified yet (a stale verification does not count).
-  if (!held && !f.draft && r && r.head === f.head && r.verdict === "take" && !r.stale && f.ci !== "failure" && (!f.verification || f.verification.state === "stale")) {
+  // Verify: a take at the head (or a merge entry, which has no review), CI not failing, not verified yet (a stale verification does not count).
+  const verifiable = mx ? !!f.head : !!r && r.head === f.head && r.verdict === "take" && !r.stale;
+  if (!held && !f.draft && verifiable && f.ci !== "failure" && (!f.verification || f.verification.state === "stale")) {
     actions.push(act("verify", f.head, { bucket: f.verifyUnavailable ? "unavailable" : "plan" }));
   }
 
-  // Approve the CI runs GitHub holds for a fork PR's reviewed head.
-  if (!held && r && takeReview && r.head === f.head && f.checksHere && f.checksOpen && f.runs && !f.mergeHeld && !declinedBy(f)
-    && (f.runs.reread || (f.runs.crossRepo && f.runs.approvable > 0))) actions.push(act("approve-ci", r.head));
+  // Approve the CI runs GitHub holds for a fork PR's reviewed head (a merge entry's head).
+  if (!held && qHead && (mx || (r && takeReview && r.head === f.head)) && f.checksHere && f.checksOpen && f.runs && !f.mergeHeld && !declinedBy(f)
+    && (f.runs.reread || (f.runs.crossRepo && f.runs.approvable > 0))) actions.push(act("approve-ci", qHead));
 
   // Fix-up of a take-fix review's fixes, or of the pre-merge review's defect fixes.
   const fx = fixupOf(f);
@@ -501,7 +553,7 @@ export function decidePr(f: PrFacts, pass: PassFacts = NO_PASS): Plan {
   }
 
   // Merge the base branch into a conflicting PR, or ask the contributor.
-  if (f.conflict && f.conflict.baseOk && f.mergeable === "CONFLICTING" && r && takeReview && r.head === f.head && !r.stale && !f.draft && !held && !f.mergeHeld && !f.inActiveBatch && !declinedBy(f)) {
+  if (f.conflict && f.conflict.baseOk && f.mergeable === "CONFLICTING" && fixAllowed(f) && (mx || (r && takeReview && r.head === f.head && !r.stale)) && !f.draft && !held && !f.mergeHeld && !f.inActiveBatch && !declinedBy(f)) {
     if (f.conflict.bucket === "merge" || f.conflict.bucket === "ask") actions.push(act("conflict", f.head, { bucket: f.conflict.bucket }));
   }
 
@@ -533,7 +585,7 @@ export function decidePr(f: PrFacts, pass: PassFacts = NO_PASS): Plan {
     const basic = l.ended && open && !f.draft && !declinedBy(f) && (conflicted ? f.mergeable === "CONFLICTING" && !!f.conflict?.baseOk && !f.inActiveBatch : f.mergeable !== "CONFLICTING") && !f.mergeHeld && !f.heldBacklog && !!f.head;
     // A carry-over needs no review at the head; every other patch needs a take review there that is not stale.
     // A CI fix of our own breakage is reviewed against the head before the push.
-    const reviewed = l.source === "carry" || l.source === "operator" || (l.step === "cifix" && (!!f.brokeByUs || !!f.gateRed) && !!r && takeReview && notHeld(f)) || (!!r && takeReview && r.head === f.head && !r.stale && notHeld(f));
+    const reviewed = l.source === "carry" || l.source === "operator" || (mx && notHeld(f)) || (l.step === "cifix" && (!!f.brokeByUs || !!f.gateRed) && !!r && takeReview && notHeld(f)) || (!!r && takeReview && r.head === f.head && !r.stale && notHeld(f));
     const approved = f.pushable ? f.repoFacts.pushApproved : l.step === "cifix" && f.repoFacts.commentApproved;
     // A CI fix patch whose comment did not reach GitHub is posted again once the backoff ends, and not after the last one.
     const unsentHeld = l.step === "cifix" && !!f.cifix?.unsent;
@@ -541,17 +593,20 @@ export function decidePr(f: PrFacts, pass: PassFacts = NO_PASS): Plan {
   }
 
   if (e) {
-    if (e.state === "waiting-premerge" && f.repoFacts.mergeApproved && premergeRetryDue(f)) actions.push(act("premerge", r!.head));
+    if (e.state === "waiting-premerge" && f.repoFacts.mergeApproved && premergeRetryDue(f)) actions.push(act("premerge", qHead));
     // While the diff's reasons are the conservative ones, the Merge? question waits for the re-read that settles them.
-    if (e.state === "needs-decision" && !f.decision.asked && !f.decision.inOpenGroup && !f.diffPending) actions.push(act("ask-merge", r!.head));
-    if (eligible(f, e) && !refusedAsBefore(f, e)) {
+    if (e.state === "needs-decision" && !f.decision.asked && !f.decision.inOpenGroup && !f.diffPending) actions.push(act("ask-merge", qHead));
+    if (eligible(f, e) && !refusedAsBefore(f, e) && !(e.path === "operator" && f.decision.execWaiting)) {
       const singleOnly = f.verification?.state === VERIFY_UNAVAILABLE || f.verifyOverride || e.noCi || f.mainFix || f.baseOffDefault;
-      actions.push(act("merge", r!.head, { singleOnly, batchable: !singleOnly }));
+      actions.push(act("merge", qHead, { singleOnly, batchable: !singleOnly }));
     }
   }
 
   // A pre-approved merge before its merge answer: the PR is not merged, batched or asked about meanwhile (src/preapproval).
-  if (f.operator?.hold) for (let i = actions.length - 1; i >= 0; i--) if (["merge", "ask-merge", "premerge"].includes(actions[i]!.kind)) actions.splice(i, 1);
+  // A merge entry's pre-merge review is part of its own path, before the hand-over.
+  if (f.operator?.hold) for (let i = actions.length - 1; i >= 0; i--) if (["merge", "ask-merge", ...(mx ? [] : ["premerge"])].includes(actions[i]!.kind)) actions.splice(i, 1);
+  // The maintainer workflow asks no Merge? or Hold question: a person answers its recommendation instead. Setting an old question aside still runs.
+  if (newRepo) for (let i = actions.length - 1; i >= 0; i--) if (actions[i]!.kind === "ask-merge" && !actions[i]!.params?.withdraw) actions.splice(i, 1);
   // Its pre-merge review is the one thing it still needs from the queue: the merge answer is handed over only after a clean one at the head.
   if (f.operator?.premerge && e && r && inQueue && f.repoFacts.mergeApproved && !f.draft && !f.mergeHeld && ciAllows("operator", f.ci, e.noCi) && f.mergeable === "MERGEABLE" && premergeRetryDue(f)) actions.push(act("premerge", r.head));
 
@@ -568,10 +623,13 @@ export function decidePr(f: PrFacts, pass: PassFacts = NO_PASS): Plan {
         : system(`GitHub's merge state, unknown since ${f.unknown.since.slice(11, 16)} (unknown for ${f.unknown.reads} checks reads in a row)`);
     }
     if (st === "refused" && refusalStuck(f)) return person(`a person: the merge was refused (${excerpt(f.lastMerge!.reason!)})`);
+    if (newRepo && st === "needs-decision") return person(MAINTAINER_ANSWER_WAIT);
+    if (st === "ready" && e?.path === "maintainer") return system("the approved merge to be handed over to its approver");
     return WAITS[st] ? { text: WAITS[st]!, kind: PERSON_WAITS.has(st) ? "person" : "system" } : null;
   };
   // The Hold question of a hold review: open, answered Wait, or answered and being carried out.
-  const holdWait: Wait | null = holdState && !hq.asked && (hq.otherOpen || f.decision.inOpenGroup) ? person(f.decision.inOpenGroup ? "the duplicate group's answer; the Hold question follows" : "an answer to the item's open question; the Hold question follows")
+  const holdWait: Wait | null = newRepo && holdState ? person(MAINTAINER_ANSWER_WAIT)
+    : holdState && !hq.asked && (hq.otherOpen || f.decision.inOpenGroup) ? person(f.decision.inOpenGroup ? "the duplicate group's answer; the Hold question follows" : "an answer to the item's open question; the Hold question follows")
     : !holdLive || !hq.asked ? null
     : hq.open ? person("an operator's Hold answer")
     : hq.answer === "wait" ? contributor("the author (the Hold question was answered: wait)")

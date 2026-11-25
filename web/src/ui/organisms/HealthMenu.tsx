@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import { Link } from "react-router-dom";
 import { Popover } from "radix-ui";
 import { WarningCircleIcon, WarningIcon } from "@phosphor-icons/react";
@@ -18,6 +18,13 @@ const TONE: Record<NowProblem["tone"], { Icon: typeof WarningIcon; text: string 
 /** Problems keep one place in the list whatever order they arrive in. */
 const AREAS: NowProblem["area"][] = ["pipeline", "runner", "workers", "sync", "breaker", "limit", "account", "jev", "main-ci", "jobs", "deadline", "liveness"];
 const place = (p: NowProblem) => AREAS.indexOf(p.area);
+
+/** A problem's link: a dashboard page through the router, or a server page (an authorization flow) that comes back to this page. */
+function ProblemLink({ p, onClick, className, children }: { p: NowProblem; onClick: () => void; className: string; children: ReactNode }) {
+  if (!p.fullPage) return <Link to={p.to} onClick={onClick} className={className}>{children}</Link>;
+  const href = `${p.to}?${new URLSearchParams({ return_to: window.location.pathname + window.location.search })}`;
+  return <a href={href} className={className}>{children}</a>;
+}
 
 /** Header indicator: icon and count of what is wrong, coloured by the worst problem; opens the list with a link to each fix. Renders nothing when healthy. */
 export function HealthMenu() {
@@ -47,11 +54,11 @@ export function HealthMenu() {
               const t = TONE[p.tone];
               return (
                 <li key={p.id} className="flex items-start">
-                  <Link to={p.to} onClick={() => setOpen(false)} className="flex min-w-0 flex-1 items-start gap-2 rounded px-2 py-2 text-sm hover:bg-ink/[0.07] max-md:min-h-11">
+                  <ProblemLink p={p} onClick={() => setOpen(false)} className="flex min-w-0 flex-1 items-start gap-2 rounded px-2 py-2 text-sm hover:bg-ink/[0.07] max-md:min-h-11">
                     <t.Icon className={cn("mt-0.5 shrink-0", t.text)} aria-hidden />
                     <span className="min-w-0 flex-1 break-words text-ink [overflow-wrap:anywhere]">{p.text}</span>
                     {p.since && <TimeAgo iso={p.since} className="num ml-1 shrink-0 text-xs text-ink/50" />}
-                  </Link>
+                  </ProblemLink>
                   {operator && (p.ackStep || p.ack) && (
                     <Button loading={write.busy === p.id} onClick={() => void write.run(p.id, () => (p.ackStep ? api.pipeline.ackDeadline(p.ackStep) : api.githubApp.ackForeignInstalls()))} className="m-1 shrink-0 max-md:h-11">
                       Acknowledge

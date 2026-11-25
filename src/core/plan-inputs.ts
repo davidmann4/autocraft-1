@@ -6,6 +6,7 @@
 // SQL fragments name the written row `r` (`r.repo`); the triggers put `new` or `old` in its place. Subqueries must not use the
 // alias `r` themselves.
 import { BOOKKEEPING_SETTINGS } from "../live.ts";
+import { PERM_READ_TTL } from "../dash/server/sessions.ts";
 import { pgExpr, pgJsonArray } from "./pg-expr.ts";
 
 /**
@@ -40,6 +41,9 @@ export type PlanInput = {
   pg?: Partial<Record<"refs" | "when" | "updateWhen" | "full" | "fullUpdate", string>>;
 };
 
+/** Live states of item_workflows (src/workflow/store.ts LIVE_STATES). */
+const WF_LIVE = "('running', 'waiting', 'blocked', 'recommending')";
+
 /** The PR number at the end of a pull request URL (`fastScoreSql` and `pilotSqlFor` link a fix attempt to its PR this way), else NULL. */
 const prOfUrl = (url: string): string => `CASE WHEN instr(${url}, '/pull/') > 0 THEN CAST(substr(${url}, instr(${url}, '/pull/') + 6) AS INTEGER) END`;
 
@@ -72,22 +76,57 @@ const changed = (cols: string[]): string => cols.map((c) => `old.${c} IS NOT new
 const PILOT_LIST_SET = `COALESCE((SELECT json_array_length(CASE WHEN json_valid(ps.value) THEN ps.value ELSE '[]' END) FROM settings ps WHERE ps.key = 'pilot_items'), 0) > 0`;
 const PILOT_LIST_SET_PG = `COALESCE((SELECT json_array_length(${pgJsonArray("ps.value")}) FROM settings ps WHERE ps.key = 'pilot_items'), 0) > 0`;
 
-/** Item columns that change other PRs' facts: issues' open PR (title, body, closing_issues), stacked PRs (head_ref, head_repo), long-lived branches (base_ref, author_association), authors' tiers (state). */
-const PR_CROSS_COLUMNS = ["state", "title", "body", "closing_issues", "head_ref", "head_repo", "base_ref", "author_association"];
+/**
+ * Item columns that change other PRs' facts: stacked PRs (head_ref, head_repo), long-lived branches (base_ref, author_association),
+ * authors' tiers (state). A PR's text and closing links move issues' open PR, which the PR_REFS input logs by issue.
+ */
+const PR_CROSS_COLUMNS = ["state", "head_ref", "head_repo", "base_ref", "author_association"];
+
+/**
+ * A PR's text edit whose earlier references are not stored: the issues it named are not readable, so every item is decided again.
+ * Only sync writes title and body, and it writes text_refs in the same transaction (src/mirror.ts), so the new references are logged.
+ */
+const PR_TEXT_UNKNOWN = "(new.kind = 'pr' AND old.text_refs IS NULL AND (old.title IS NOT new.title OR old.body IS NOT new.body))";
+
+/** The issues a PR's stored text references (text_refs mentions, which include the closing ones) and closing-issue links name. */
+const PR_REFS = `SELECT r.repo AS repo, j.value AS number FROM json_each(CASE WHEN json_valid(r.text_refs) AND json_type(r.text_refs, '$[1]') = 'array' THEN json_extract(r.text_refs, '$[1]') ELSE '[]' END) j WHERE j.type = 'integer'
+      UNION SELECT r.repo, j.value FROM json_each(CASE WHEN json_valid(r.closing_issues) AND json_type(r.closing_issues) = 'array' THEN r.closing_issues ELSE '[]' END) j WHERE j.type = 'integer'`;
+const pgRefsArray = (x: string): string => `COALESCE(CASE WHEN json_valid(${x}) THEN CASE WHEN json_typeof(${x}::json -> 1) = 'array' THEN ${x}::json -> 1 END END, '[]'::json)`;
+const PR_REFS_PG = `SELECT r.repo AS repo, ac_int(j #>> '{}') AS number FROM json_array_elements(${pgRefsArray("r.text_refs")}) j WHERE json_typeof(j) = 'number'
+      UNION SELECT r.repo, ac_int(j #>> '{}') FROM json_array_elements(${pgJsonArray("r.closing_issues")}) j WHERE json_typeof(j) = 'number'`;
 /** Item columns that change duplicate sets, group plans and the canonical pick of the item's group. */
 const DUPE_COLUMNS = ["state", "title", "body", "embed_hash", "comments_count", "created_at", "closing_issues"];
 
 /** An item write that forces a full pass; `no` is the dialect's false (the CASE keeps SQLite from probing the dupe tables on every write). */
 const itemsFullUpdate = (no: string): string => `${changed(["kind", "author", "author_id"])}
-      OR (new.kind = 'pr' AND (${changed(PR_CROSS_COLUMNS)}))
+      OR (new.kind = 'pr' AND (${changed(PR_CROSS_COLUMNS)})) OR ${PR_TEXT_UNKNOWN}
       OR (CASE WHEN ${changed(DUPE_COLUMNS)} THEN ${inDupeSet("new")} ELSE ${no} END)`;
 
-/** Settings rows the runner, sync and planner write for their own use (src/live.ts), less `classify_run`, which picks the run every item's labels come from; and the planner's shadow switch, which no fact reads. */
-export const PLAN_IGNORED_SETTINGS = [...BOOKKEEPING_SETTINGS.filter((k) => k !== "classify_run"), "plan_shadow"];
-const PLAN_IGNORED_SETTING_LIKE = ["%\\_points\\_last\\_run", "pipeline\\_fp:%"];
+/**
+ * Settings rows the runner, sync and planner write for their own use (src/live.ts), less `classify_run`, which picks the run every
+ * item's labels come from; the planner's shadow switch; and the app installation sweep's time. No fact reads these.
+ */
+export const PLAN_IGNORED_SETTINGS = [...BOOKKEEPING_SETTINGS.filter((k) => k !== "classify_run"), "plan_shadow", "app_install_sweep_at"];
+// Leader and standby status rows (src/db/leader.ts) are rewritten every few seconds and warm sizes after every warm build;
+// no fact loader reads them. The build feature switches are read (featureOn), so they stay inputs.
+const PLAN_IGNORED_SETTING_LIKE = ["%\\_points\\_last\\_run", "pipeline\\_fp:%", "leader:%", "warm\\_bytes:%"];
+
+/**
+ * A repo_permissions UPDATE that moves facts: a new login, repo or permission, or a checked_at refresh of a row that was no longer
+ * fresh. Settlers read a write permission as fresh while checked_at is younger than PERM_READ_TTL (src/settlers.ts), and the
+ * pipeline and dashboard sessions refresh it before then (src/preapproval/permissions.ts), so a refresh of a fresh row changes no
+ * fact. The threshold is a minute stricter than PERM_READ_TTL, for clock skew between the database and the planner.
+ */
+const FRESH_S = Math.round(PERM_READ_TTL / 1000) - 60;
+const permissionMoved = (fresh: string): string => `${changed(["login", "repo", "permission"])} OR NOT (old.checked_at > ${fresh})`;
+const PERMISSION_FULL_UPDATE = permissionMoved(`strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-${FRESH_S} seconds')`);
+const PERMISSION_FULL_UPDATE_PG = permissionMoved(`to_char(now() AT TIME ZONE 'UTC' - interval '${FRESH_S} seconds', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')`)
+  .replace(/ IS NOT /g, " IS DISTINCT FROM ");
 
 export const PLAN_INPUTS: PlanInput[] = [
   // ---- item-keyed ----
+  // A bookkeeping column (src/live.ts) that the Plan reads: it is watched here on its own.
+  { table: "items", class: "item", why: "A classify request that gave no valid verdict at the item's input (jev_failed_hash) ends the prioritize hold.", columns: ["jev_failed_hash"] },
   { table: "actions", class: "item", why: "Act's comment-and-close record of one item (answeredClose)." },
   { table: "agent_run_items", class: "item", why: "Links a model run to an item; the review gate counts the item's Opus review runs." },
   { table: "ci_fixes", class: "item", why: "CI fix rows of one PR (cifix facts, push chain, lint)." },
@@ -115,6 +154,8 @@ export const PLAN_INPUTS: PlanInput[] = [
   { table: "item_embeddings", class: "item", why: "One item's embedding hash.", columns: ["repo", "number", "model", "hash"] },
   {
     table: "item_plans", class: "item", why: "The item's own planned review or carry: its open decisions' prepare waits for it (reviewQueuedSql). The planner writes it; an unchanged plan writes nothing.",
+    // Only an item with an open decision reads it; opening a decision logs the item through the decisions input.
+    refs: "SELECT r.repo AS repo, r.number AS number WHERE EXISTS (SELECT 1 FROM decisions d WHERE d.repo = r.repo AND d.number = r.number AND d.answer IS NULL)",
     columns: ["actions"],
   },
   { table: "item_priority", class: "item", why: "One item's priority row." },
@@ -151,6 +192,15 @@ export const PLAN_INPUTS: PlanInput[] = [
     updateWhen: changed(["state", "kind", "embed_hash"]),
     refs: `SELECT dp.repo AS repo, dp.b AS number FROM duplicate_pairs dp WHERE dp.repo = r.repo AND dp.a = r.number AND +dp.verdict IS NULL
       UNION SELECT dp.repo, dp.a FROM duplicate_pairs dp WHERE dp.repo = r.repo AND dp.b = r.number AND +dp.verdict IS NULL`,
+  },
+  {
+    // Old and new rows both: the issues the earlier text named and those the new text names. Sync clears text_refs when the text
+    // changes (schema trigger items_text_refs_stale) and writes the new references after the row.
+    table: "items", class: "cross", why: "A PR's text references and closing links: the issues it closes or mentions (issues' open PR).",
+    when: "r.kind = 'pr'",
+    updateWhen: changed(["title", "body", "closing_issues", "text_refs"]),
+    refs: PR_REFS,
+    pg: { refs: PR_REFS_PG, updateWhen: pgExpr(changed(["title", "body", "closing_issues", "text_refs"])) },
   },
   {
     table: "items", class: "cross", why: "An item's state: PRs held for it as a blocking item.",
@@ -244,6 +294,14 @@ export const PLAN_INPUTS: PlanInput[] = [
     refs: "SELECT r.repo AS repo, r.number AS number",
     full: "1", fullUpdate: "(COALESCE(old.overall, 'none') = 'none') IS NOT (COALESCE(new.overall, 'none') = 'none')",
   },
+  {
+    // Commands move a workflow at human pace; its recommendation, plan parts and blocker are not planner facts.
+    table: "item_workflows", class: "cross", why: "A maintainer workflow: its item's entry and approval, the PR of an issue's implement workflow, and, when it starts or ends, the item's scope (duplicate sets, integration PRs).",
+    columns: ["repo", "number", "entry", "state", "approved_by", "started_by", "started_at"],
+    refs: "SELECT r.repo AS repo, r.number AS number UNION SELECT wi.repo, wi.pr_number FROM implementations wi WHERE wi.repo = r.repo AND wi.number = r.number AND wi.pr_number IS NOT NULL",
+    full: `r.state IN ${WF_LIVE}`,
+    fullUpdate: `(old.state IN ${WF_LIVE}) IS NOT (new.state IN ${WF_LIVE})`,
+  },
   { table: "fast_track", class: "cross", why: "Fast track moves an item's scope and score, its fix PR's, and through scope its duplicate sets and integration PRs.", full: "1" },
   { table: "outside_holds", class: "cross", why: "An outside-author hold moves an item's scope, and through it duplicate sets, fix PRs and integration PRs.", full: "1" },
   { table: "postmerge_followups", class: "cross", why: "A follow-up links a merged PR in the pilot list to the fix PR of its issue (scope).", full: "1" },
@@ -259,11 +317,18 @@ export const PLAN_INPUTS: PlanInput[] = [
   { table: "tracked_repos", class: "global", why: "Tracked repos and their pipeline switch (scope of every item)." },
   { table: "repos", class: "global", why: "Visibility and default branch of a repo (every PR there).", columns: ["name", "visibility", "default_branch", "owner"] },
   { table: "access", class: "global", why: "Operator and maintainer roles: who settles a decision, whose comments count." },
-  { table: "repo_permissions", class: "global", why: "Maintainers' write permission per repo: who settles decisions there." },
+  {
+    table: "repo_permissions", class: "global", why: "Maintainers' write permission per repo: who settles decisions there.",
+    fullUpdate: PERMISSION_FULL_UPDATE, pg: { fullUpdate: PERMISSION_FULL_UPDATE_PG },
+  },
   { table: "author_ids", class: "global", why: "Author logins bound to account ids: tiers of every PR of the author." },
   { table: "whitelist_overrides", class: "global", why: "Operator tier overrides of an author." },
   { table: "stage_trips", class: "global", why: "Tripped breakers, per stage and repo (a fact of every item of the repo, like main_ci); trips are rare, so a full pass costs little." },
-  { table: "main_ci", class: "global", why: "Default-branch CI per repo (red main)." },
+  {
+    table: "main_ci", class: "global", why: "Default-branch CI per repo (red main).",
+    // Not `checks`: the full list moves with every check of a running head, and only the dashboard reads it.
+    columns: ["repo", "head_sha", "branch", "state", "failing", "committed_at", "headline", "first_seen_at", "state_changed_at"],
+  },
   { table: "main_fixes", class: "global", why: "Fixes of a red default branch: the repo's main CI state and its own fix PR." },
   { table: "own_commits", class: "global", why: "Commits the pipeline pushed: whether a PR's head is its own work, through any push chain." },
   { table: "owner_statements", class: "global", why: "Owner statements that stored reviews of any PR name as conflicts." },

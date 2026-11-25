@@ -14,7 +14,7 @@ import { envVar } from "./env.ts";
 import { isLockTimeout } from "./db/errors.ts";
 import { NO_CI_SAMPLE, NO_CI_SQL, noCiFrom } from "./merge/no-ci.ts";
 import { fixupEditable } from "./fixup/patch.ts";
-import { SLUGS_KEY, namesOf, parseSlugs } from "./github/slugs.ts";
+import { MENTION_KEY, SLUGS_KEY, namesOf, parseSlugs } from "./github/slugs.ts";
 import { SIM_THRESHOLD } from "./dupes/scan.ts";
 import { splitStageTripsSqlite } from "./db/trip-split.ts";
 import { retireFixAttemptsSqlite } from "./db/fix-retire.ts";
@@ -118,6 +118,8 @@ export const ADDED_COLUMNS: [table: string, column: string, type: string][] = [
   ["items", "embed_hash", "TEXT"],
   ["items", "class_hash", "TEXT"],
   ["items", "class_scheme", "TEXT"],
+  // The classifier input hash (class_hash) at which a classify.jev request gave no valid verdict while Jev was up: the Plan then stops holding the prioritize step for that request.
+  ["items", "jev_failed_hash", "TEXT"],
   ["jobs", "repo", "TEXT"],
   ["build_tasks", "patch", "TEXT"],
   ["build_tasks", "warm_key", "TEXT"],
@@ -334,6 +336,12 @@ export const ADDED_COLUMNS: [table: string, column: string, type: string][] = [
   ["tracked_repos", "workflow", "TEXT NOT NULL DEFAULT 'legacy'"],
   ["github_commands", "parsed", "TEXT"],
   ["preapprovals", "workflow_id", "INTEGER"],
+  // What a review of an item on the maintainer workflow adds (JSON {outside_purpose: {lines, note} | null, recommendation: string | null}).
+  ["opus_reviews", "workflow", "TEXT"],
+  // The step a maintainer workflow is at, recorded by its advance pass (src/workflow/advance.ts).
+  ["item_workflows", "step", "TEXT"],
+  // Why the token endpoint refused the login's refresh token ("<error>: <error_description>"), kept while the row is refresh-failed.
+  ["user_tokens", "refresh_error", "TEXT"],
 ];
 
 // Indexes on added columns: they can only be created once the column exists.
@@ -535,7 +543,7 @@ function migrateValues(db: DatabaseSync): void {
   }
   // The mention flag for the pipeline login and app slugs the comments were last flagged for.
   const settingOf = (key: string) => (db.prepare("SELECT value FROM main.settings WHERE key = ?").get(key) as { value: string } | undefined)?.value;
-  const names = JSON.stringify(namesOf(settingOf("pipeline_login"), parseSlugs(settingOf(SLUGS_KEY))));
+  const names = JSON.stringify(namesOf(settingOf("pipeline_login"), parseSlugs(settingOf(SLUGS_KEY)), null, settingOf(MENTION_KEY) || null));
   const built = (db.prepare("SELECT value FROM main.settings WHERE key = 'mentions_built'").get() as { value: string } | undefined)?.value ?? "";
   if (names !== built) {
     db.exec("BEGIN IMMEDIATE");

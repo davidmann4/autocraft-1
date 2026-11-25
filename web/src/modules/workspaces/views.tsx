@@ -54,14 +54,14 @@ function WorkspaceRow({ w }: { w: WorkspaceSummary }) {
   );
 }
 
-function List() {
+/** The workspace list without its page frame. */
+export function WorkspacesList() {
   const { state: f, update } = useUrlState();
   const which = f.show === "all" ? "all" : "live";
   const q = usePagedQuery(`workspaces:list:${which}`, (api, cursor) => api.workspaces.list({ state: which, cursor }), (p) => p.next);
   const rows = q.pages?.flatMap((p) => p.workspaces) ?? [];
   return (
-    <Page title="Workspaces">
-      <div className="mt-4 space-y-3">
+      <div className="space-y-3">
         <Segmented label="Show" value={which} onChange={(v) => update({ show: v === "all" ? "all" : null })} options={[{ value: "live", label: "Live" }, { value: "all", label: "All" }]} />
         <ErrorLine error={q.error?.message} />
         <Block title="Workspaces" aside="newest first" flush>
@@ -73,6 +73,15 @@ function List() {
             </div>
           )}
         </Block>
+      </div>
+  );
+}
+
+function List() {
+  return (
+    <Page title="Workspaces">
+      <div className="mt-4">
+        <WorkspacesList />
       </div>
     </Page>
   );

@@ -16,6 +16,7 @@ import { ConfirmButton } from "../../ui/molecules/ConfirmButton";
 import { Page } from "../../ui/organisms/Page";
 import { day } from "../../lib/format";
 import { useWrite } from "../../lib/hooks";
+import { t as tr } from "../../../../src/i18n/index.ts";
 import { MySettings } from "./MySettings";
 import { Runners } from "./Runners";
 import { RunnerGuide } from "./Setup";
@@ -72,7 +73,8 @@ export function ConnectView({ user }: ViewProps) {
   );
 }
 
-function Connector({ user }: Pick<ViewProps, "user">) {
+/** `agent`: the Runner page's wording, "Agent tokens", with what each token can do. */
+export function Connector({ user, agent = false }: Pick<ViewProps, "user"> & { agent?: boolean }) {
   const api = useApi();
   const write = useWrite();
   const { data, error } = useQuery("mcp-tokens", (a) => a.mcp.tokens());
@@ -103,7 +105,7 @@ function Connector({ user }: Pick<ViewProps, "user">) {
       dense
       flush
       className="mt-4"
-      title={<SectionTitle icon={PlugsConnectedIcon}>MCP Connector</SectionTitle>}
+      title={<SectionTitle icon={PlugsConnectedIcon}>{agent ? tr("Agent tokens") : "MCP Connector"}</SectionTitle>}
       aside={
         data && (
           <span className="flex items-center gap-3">
@@ -156,7 +158,7 @@ function Connector({ user }: Pick<ViewProps, "user">) {
           <Snippets url={url} token={made.token} />
         </div>
       )}
-      {data && <Tokens tokens={tokens} write={write} fresh={made?.id ?? null} />}
+      {data && <Tokens tokens={tokens} write={write} fresh={made?.id ?? null} agent={agent} />}
       {data && !made && (
         <Fold className="border-t border-line px-3 py-1" title="How to connect">
           <div className="pb-2 pt-1">
@@ -184,7 +186,7 @@ function Snippets({ url, token }: { url: string; token: string }) {
   );
 }
 
-function Tokens({ tokens, write, fresh }: { tokens: McpToken[]; write: ReturnType<typeof useWrite>; fresh: number | null }) {
+function Tokens({ tokens, write, fresh, agent }: { tokens: McpToken[]; write: ReturnType<typeof useWrite>; fresh: number | null; agent: boolean }) {
   const api = useApi();
   if (!tokens.length) return null;
   return (
@@ -194,7 +196,8 @@ function Tokens({ tokens, write, fresh }: { tokens: McpToken[]; write: ReturnTyp
           <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-3 gap-y-0.5">
             <span className="flex items-center gap-2 font-medium">
               {t.label ?? <span className="text-ink/40">no label</span>}
-              {t.canAnswer && <Badge>answers decisions</Badge>}
+              {agent && <Badge>{tr("Read")}</Badge>}
+              {t.canAnswer && <Badge>{agent ? tr("Answer") : "answers decisions"}</Badge>}
               {t.id === fresh && <Badge tone="accent">new</Badge>}
             </span>
             <span className="text-xs text-ink/55">

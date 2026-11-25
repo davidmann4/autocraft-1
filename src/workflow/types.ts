@@ -22,6 +22,12 @@ export type PlanPart = {
   title: string;
   source: "review" | "change" | "implement";
   file?: string;
+  /** An implement part: every file it changes or adds (the implementation PR comes back when it changes a file no planned part names). */
+  files?: string[];
+  /** An implement question's option this part is (its key in the question): naming the part picks it. */
+  option?: string;
+  /** The question (decision id) whose option the part is. */
+  question?: string;
   major?: boolean;
   state: "planned" | "dropped" | "fixed";
 };
@@ -32,6 +38,14 @@ export type Recommendation = {
   /** What a yes runs. */
   parts: { fix: number[]; drop: number[] };
   merges: boolean;
+  /** A yes closes the item (the review says close); no parts are fixed and nothing merges. */
+  close?: boolean;
+  /** A yes runs this step again when it fixes no part: a new review, or a fix-up of the latest review's fixes. */
+  again?: "review" | "fixup";
+  /** A yes answers this question of the legacy machinery as the person (a stuck implementation's Try again). */
+  answer?: { decision: string; option: string; label?: string };
+  /** The open question of the legacy machinery the recommendation stands for: once it is answered or set aside, the recommendation goes. */
+  question?: string;
 };
 
 export type ItemWorkflow = {
@@ -57,6 +71,8 @@ export type ItemWorkflow = {
   recAt: string | null;
   recHead: string | null;
   plan: PlanPart[];
+  /** The step the workflow is at, as the advance pass last recorded it (status.ts StepName); null before its first pass. */
+  step: string | null;
   legacyPreapprovalId: number | null;
   updatedAt: string;
 };
@@ -82,4 +98,4 @@ export type Parsed =
 /** A registered control: a state change a panel needs that is not one of the command words. */
 export type Control = "hold-merge" | "release-merge" | "resume-breaker" | "release-outside" | "set-automatic" | "runner-settings";
 
-export type WorkflowEventKind = "started" | "approved" | "answered" | "ambiguous" | "blocked" | "stopped" | "weighted";
+export type WorkflowEventKind = "started" | "approved" | "answered" | "ambiguous" | "blocked" | "stopped" | "weighted" | "closed" | "backlog" | "set";

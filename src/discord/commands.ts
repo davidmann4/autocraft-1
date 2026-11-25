@@ -5,7 +5,12 @@ import { publicRepoNames, publicStats, publicStatus, type PublicStats, type Publ
 import type { Call, Interactions } from "./interactions.ts";
 import type { DiscordKeys } from "./keys.ts";
 import { forgetReporter } from "./file-issue.ts";
-import { forgetLink, redeemLinkCode } from "./links.ts";
+import { forgetLink, loginOf, redeemLinkCode } from "./links.ts";
+import { PERM_WRITE_TTL, cachedWrite } from "../dash/server/sessions.ts";
+import { t } from "../i18n/index.ts";
+import { parse } from "../workflow/parse.ts";
+import { runCommand } from "../workflow/apply.ts";
+import { COMMANDS, WEIGHT_HELP } from "../workflow/vocab.ts";
 import { plain } from "./reply.ts";
 import type { Db } from "../db/index.ts";
 
@@ -30,11 +35,21 @@ export function formatStatus(s: PublicStatus): string {
   return `${s.ref} ${plain(s.title).slice(0, 100)}\n${s.step}${place}`;
 }
 
+/** The `/autocraft do` lines of Help, generated from the command vocabulary. */
+export function doHelp(): string[] {
+  return [
+    t("`/autocraft do text:<command>` sends a command to AutoCraft as your linked login. Name items as repo#number, with a list after a colon: `merge: photocraft#123 photocraft#456`."),
+    ...COMMANDS.map((c) => `\`${c.usage}\`: ${t(c.short)}`),
+    t("Weight words: {words}.", { words: WEIGHT_HELP.map((w) => `${t(w.word)} (${t(w.weight)})`).join(", ") }),
+  ];
+}
+
 /** Lists what the slash-command picker does not show: pings, the message command and the reaction. */
 export const HELP = [
   "**AutoCraft**",
   "`/autocraft search` opens a form. Pick the app and describe the problem or the idea to see matching issues; if none fits, AutoCraft helps write a new issue and opens it on GitHub, ready to submit.",
   "`/autocraft status item:photocraft#123` shows where an issue or pull request is.",
+  ...doHelp(),
   "`/autocraft stats` shows counts for the public repos.",
   "`/autocraft link` and `unlink` connect this Discord account to your AutoCraft login and remove the link (the code is under Link Discord in the dashboard menu).",
   "`/autocraft alerts on|off` turns on direct messages about decisions you can settle, once linked.",
@@ -68,6 +83,7 @@ export function installAccountCommands(ix: Interactions, deps: { db: Db; keys: D
       { type: 1, name: "alerts", description: "Direct messages about new decisions you can settle", options: [{ type: 3, name: "state", description: "on or off", required: true, choices: [{ name: "on", value: "on" }, { name: "off", value: "off" }] }] },
       { type: 1, name: "stats", description: "Counts for the public repos", options: [{ type: 3, name: "repo", description: "One repo; all public repos when left out", autocomplete: true }] },
       { type: 1, name: "status", description: "Where an issue or pull request is in AutoCraft", options: [{ type: 3, name: "item", description: "For example photocraft#123", required: true, max_length: 100 }] },
+      { type: 1, name: "do", description: "Send a command to AutoCraft, for example: merge: photocraft#123", options: [{ type: 3, name: "text", description: "The command, then a colon and the items: review, urgent: photocraft#123 photocraft#456", required: true, max_length: 1000 }] },
       { type: 1, name: "help", description: "What the AutoCraft bot can do" },
     ],
   };
@@ -94,6 +110,15 @@ export function installAccountCommands(ix: Interactions, deps: { db: Db; keys: D
   ix.autocomplete("autocraft stats", async (call) => {
     const typed = (call.focused()?.value ?? "").toLowerCase();
     return (await publicRepoNames(db)).filter((r) => r.toLowerCase().includes(typed)).map((r) => ({ name: r, value: r }));
+  });
+  ix.command("autocraft do", null, async (call) => {
+    if (!call.userId) return void (await call.edit({ content: "This command needs a Discord user." }));
+    const login = await loginOf(db, keys, call.userId);
+    if (!login) return void (await call.edit({ content: t("Link your account first with /autocraft link.") }));
+    const parsed = parse(call.option("text") ?? "");
+    // Discord has no item the text was written on, so the items come from the list in the text.
+    const result = await runCommand(db, { login, canWrite: (repo) => cachedWrite(db, login, repo, PERM_WRITE_TTL) }, "discord", { parsed, items: [] });
+    await call.edit({ content: result.lines.join("\n").slice(0, 1990) || t("Nothing ran.") });
   });
   ix.command("autocraft help", null, async (call) => {
     await call.edit({ content: HELP });

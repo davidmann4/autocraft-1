@@ -25,6 +25,7 @@ export const OTHER_PR_STATES = [
   "label-not-reviewed", // its settled label is not one that gets a code review, and no pre-approved merge lifts that
   "scope", // waits for a scope answer (or the answer keeps it out of core)
   "not-reviewed", // no review yet: due a review
+  "not-started", // a repo on the maintainer workflow: nobody started it, and it is not a small or medium bug fix the workflow runs by itself
   "closed", // closed or merged on GitHub, outside the merge queue (post-merge review only)
 ] as const;
 
@@ -55,8 +56,8 @@ export type WaitKind = "person" | "contributor" | "system";
 export type Plan = {
   repo: string; number: number; head: string | null;
   state: PlanState;
-  /** How it may merge. */
-  path: "rule" | "operator" | null;
+  /** How it may merge: by the rule, by an operator's answer, or (the maintainer workflow's merge entry) on the approval of the maintainer who queued it. */
+  path: MergePath;
   /** Why it is outside the merge rule, in the queue's wording. */
   reasons: string[];
   note: string | null;
@@ -71,6 +72,26 @@ export type Plan = {
   /** The merge rule or an operator's answer lets it merge now (a refused PR still counts while its retry waits for a change). */
   eligible: boolean;
 };
+
+/** `maintainer`: the merge entry of the maintainer workflow; it runs no Opus review, and the merge itself is handed to the approver. */
+export type MergePath = "rule" | "operator" | "maintainer" | null;
+
+/** Which model a tracked repo runs (tracked_repos.workflow): the decision pipeline, or the maintainer workflow (src/workflow). */
+export type RepoWorkflow = "legacy" | "new";
+
+/** The live maintainer workflow of an item (src/workflow/types.ts ItemWorkflow), as the planner reads it. */
+export type WorkflowFact = {
+  entry: "review" | "fixup" | "implement" | "merge";
+  /** Approved for merge, at the start or later. */
+  approved: boolean;
+  startedBy: string;
+  startedAt: string;
+  /** False on an implementation PR, which carries the workflow of its issue. */
+  own: boolean;
+};
+
+/** The state of an item's latest workflow when none is live (src/workflow/types.ts WorkflowState). Stopped and backlog mean hands off: not even the auto path takes the item up again until someone starts it. */
+export type EndedWorkflow = "done" | "stopped" | "closed" | "backlog";
 
 export const isQueueState = (s: PlanState): s is QueueState => (QUEUE_STATES as readonly string[]).includes(s);
 
@@ -144,10 +165,14 @@ export type PrFacts = {
   scopeAnswer: string | null;
 
   // scope
-  /** In scope: fast-tracked, or its repo's Pipeline switch is on and, with a pilot set, it is a pilot item. */
+  /** In scope: fast-tracked, started in the maintainer workflow, or its repo's Pipeline switch is on and, with a pilot set, it is a pilot item. */
   inScope: boolean;
   /** Held for model work because its author is outside the team and over a limit or in a surge (src/outside.ts); such an item is not in scope. */
   outsideHold?: OutsideHoldInfo;
+  /** The item's live maintainer workflow; only loaded in a repo on it (repoFacts.workflow "new"). */
+  workflow?: WorkflowFact | null;
+  /** Without a live one, how the item's latest workflow ended; loaded like `workflow`. */
+  endedWorkflow?: EndedWorkflow | null;
   /** An integration batch PR the pipeline opened itself. */
   integration: boolean;
   /** Any merge batch's own PR (without the author check). */
@@ -172,6 +197,8 @@ export type PrFacts = {
     fixIssueApproved?: boolean;
     /** The repo's `implement` build feature is on (src/build/features.ts): the switch of an implementation PR's revisions and of the end of its attempt. */
     implementOn: boolean;
+    /** Absent: legacy. */
+    workflow?: RepoWorkflow;
   };
 
   review: ReviewFacts | null;
@@ -216,6 +243,8 @@ export type PrFacts = {
     mergeAnswerAfterReview: boolean;
     /** Member of an open duplicate group (asked after the group is answered). */
     inOpenGroup: boolean;
+    /** The answered decision waits for its person's sign-in or access, or is disputed: the merge step leaves it out, so none is proposed. */
+    execWaiting: boolean;
     /** The Hold question of a review that says hold, at the reviewed head: asked at all, still unanswered, and the answer given. */
     hold: { asked: boolean; open: boolean; answer: string | null; /** Another open question of the item (scope, Merge?, Close?) is asked first. */ otherOpen: boolean };
   };
@@ -340,8 +369,12 @@ export type ItemFacts = {
   /** A live implementation of the issue (src/implement/types.ts LIVE_STATES), or the item is our own fix PR. */
   inFlight?: boolean;
   assignment: AssignFacts;
-  /** The repo's approvals for the writes below. decideItem does not apply them: gates() does. */
-  repoFacts: { labelsApproved: boolean; commentApproved: boolean; fixIssueApproved: boolean };
+  /** The repo's approvals for the writes below (decideItem does not apply them: gates() does), and its model (absent: legacy). */
+  repoFacts: { labelsApproved: boolean; commentApproved: boolean; fixIssueApproved: boolean; workflow?: RepoWorkflow };
+  /** As on PrFacts. */
+  workflow?: WorkflowFact | null;
+  /** As on PrFacts; a workflow ended `closed` lets its person's Close answer through outside the scope. */
+  endedWorkflow?: EndedWorkflow | null;
 
   /** The classification run every step reads (the current run, else the newest verdict run). */
   run: string | null;
@@ -356,6 +389,8 @@ export type ItemFacts = {
     jev: { at: string; changed: boolean; unsure: boolean } | null;
     /** Haiku's verdict in the run; `aloneCurrent`: it classified the item alone at its current input (that settles it without Jev). */
     haiku: { at: string; aloneCurrent: boolean } | null;
+    /** A classify.jev request gave no valid verdict for the item's current input while Jev was up. */
+    jevFailed?: boolean;
   };
 
   /** Hash of the item's embedded text (stored by sync, else computed). */
@@ -420,7 +455,7 @@ export type ItemFacts = {
 
   /** The Implement stage's view of an issue (a PR's has queuedBy null and row null). */
   implement: {
-    /** Who queued the issue for implementation: the `added_by` of its fast_track row; null when it has none. */
+    /** Who queued the issue for implementation: the `added_by` of its fast_track row (in a repo on the maintainer workflow, who started its live implement workflow); null when it has none. */
     queuedBy: string | null;
     /** queuedBy settles decisions on the repo now (an operator, or a maintainer with write access under src/settlers.ts). */
     settles: boolean;

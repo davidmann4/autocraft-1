@@ -4,6 +4,7 @@
 // the Prompts page lists the template through src/act/templates.ts.
 
 import { dropMarkup, outsideCode, scrubMarkdown } from "./public-text.ts";
+import type { MergePath } from "../core/plan.ts";
 
 export { outsideCode };
 
@@ -93,7 +94,7 @@ export function stripLinks(s: string, owner?: string): string {
 export type RecommendInput = {
   verdict: string;
   /** The PR's merge queue entry (take and take-fix reviews only), or null when it has none. */
-  queue: { path: "rule" | "operator" | null; state: string } | null;
+  queue: { path: MergePath; state: string } | null;
   mergeApproved: boolean;
   /** Push approval for the repo and maintainers allow edits on the PR. */
   canPush: boolean;

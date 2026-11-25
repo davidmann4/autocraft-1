@@ -102,6 +102,7 @@ export function createPipelineMock(me: User, changed: () => void): Pick<Api, "pi
   const steps = structuredClone(STEPS);
   let next = 52;
   const judgement = { judgementModel: "opus", judgementModels: ["opus", "sonnet"] };
+  const blockers = { largeFixLines: 400, outsidePurposeMin: 20 };
   const flag = { enabled: !MOCK_DRAIN, draining: MOCK_DRAIN, changedBy: "ochre-fox" as string | null, changedAt: iso(300) as string | null };
   const limits: StageLimit[] = [
     ["classify-new", "Classify new and changed items", 2000, 412], ["embed", "Embed items", null, 0], ["decide", "Ask decisions", 100, 100],
@@ -122,7 +123,7 @@ export function createPipelineMock(me: User, changed: () => void): Pick<Api, "pi
     { key: "merge:deckcraft", repo: "deckcraft", reason: "main CI of deckcraft is red after our merge of #2031", since: iso(80), canResume: true },
   ];
   const pilot: string[] = [];
-  const state = (): PipelineState => ({ ...judgement, ...flag, heartbeat: iso(0), limits, pilot: [...pilot], outside: { ...outside } });
+  const state = (): PipelineState => ({ ...judgement, ...flag, heartbeat: iso(0), limits, pilot: [...pilot], outside: { ...outside }, blockers: { ...blockers } });
   const requireOperator = () => {
     if (me.role !== "operator") throw new Error("only operators run or cancel pipeline steps and change the pipeline switch and limits");
   };
@@ -196,6 +197,13 @@ export function createPipelineMock(me: User, changed: () => void): Pick<Api, "pi
         requireOperator();
         if (!judgement.judgementModels.includes(model)) throw new Error(`not a judgement model: ${model}`);
         judgement.judgementModel = model;
+        changed();
+        return wait(state(), 30);
+      },
+      async setBlockers(input) {
+        requireOperator();
+        for (const [k, v] of Object.entries(input)) if (!Number.isInteger(v) || (v as number) < 1) throw new Error(`${k} must be a whole number from 1 to 1000000`);
+        Object.assign(blockers, input);
         changed();
         return wait(state(), 30);
       },

@@ -49,6 +49,12 @@ export type StepContext = {
   cancelled(): Promise<boolean>;
   /** True when no new item should start: a cancel was requested, the deadline passed, or a pipeline job runs while the pipeline is not on. The current item finishes. */
   stopping(): Promise<boolean>;
+  /**
+   * True once the job has used its slice of the time before its deadline (SLICE_SHARE, src/runner/deadlines.ts). A step that works
+   * through a backlog stops at its next unit boundary and returns what is left as a success; the leftover items make the next job due.
+   * Always false for a run without a runner deadline (a command-line run).
+   */
+  timeUp(): Promise<boolean>;
 };
 
 export type StepDef = {

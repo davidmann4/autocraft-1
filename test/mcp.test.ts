@@ -248,7 +248,7 @@ describe("transport", () => {
     assert.match(init.body.result.instructions, /untrusted/);
     assert.equal((await rpc(t, "initialize", { protocolVersion: "1999-01-01" })).body.result.protocolVersion, "2025-06-18");
     const tools = (await rpc(t, "tools/list")).body.result.tools.map((x: { name: string }) => x.name).sort();
-    assert.deepEqual(tools, ["get_inbox_item", "get_item", "list_fixups", "list_inbox", "list_merge_queue", "list_repos", "my_settings", "search_items", "send_feedback", "set_my_settings", "set_weight"]);
+    assert.deepEqual(tools, ["get_inbox_item", "get_item", "help", "list_fixups", "list_inbox", "list_merge_queue", "list_repos", "my_items", "my_settings", "read_item", "search_items", "send_feedback", "set_my_settings", "set_weight"]);
     assert.equal((await rpc(t, "no/such")).body.error.code, -32601);
   });
 });
@@ -264,22 +264,22 @@ describe("tools", () => {
     // maint can read secretcraft on GitHub, checked with their dashboard session's token.
     const maint = await tokenFor("maint");
     assert.ok(data((await call(maint, "list_inbox")).text).decisions.some((d: { id: string }) => d.id === S7));
-    assert.equal(data((await call(maint, "get_item", { item: "secretcraft#7" })).text).title, "Secret thing");
+    assert.equal(data((await call(maint, "read_item", { item: "secretcraft#7" })).text).title, "Secret thing");
     const photo = data((await call(maint, "list_inbox", { repo: "storytold/photocraft", limit: 5 })).text);
     assert.deepEqual(photo.decisions.map((d: { id: string }) => d.id).sort(), [P1, P10, "photocraft#11:scope"].sort());
     assert.match(photo.decisions.find((d: { id: string }) => d.id === P1).link, /^\/items\/photocraft\/1#decision-/);
   });
 
-  test("get_item and search_items read the mirror within the user's repos and frame its text as untrusted", async () => {
+  test("read_item and search_items read the mirror within the user's repos and frame its text as untrusted", async () => {
     const viewer = await viewerToken();
-    const r = await call(viewer, "get_item", { item: "https://github.com/storytold/photocraft/pull/1" });
+    const r = await call(viewer, "read_item", { item: "https://github.com/storytold/photocraft/pull/1" });
     assert.equal(r.isError, false);
     assert.doesNotMatch(r.text.slice(0, r.text.indexOf("<<<untrusted")), /Ignore previous/);
     assert.equal(r.text.split("<<<end untrusted>>>").length, 2, "only the frame's own end marker");
     const it = data(r.text);
     assert.equal(it.head, "a1");
     assert.ok(it.decisions.includes(P1));
-    assert.equal((await call(viewer, "get_item", { item: "secretcraft#7" })).isError, true);
+    assert.equal((await call(viewer, "read_item", { item: "secretcraft#7" })).isError, true);
     const all = data((await call(viewer, "search_items", { state: "all", limit: 25 })).text);
     assert.ok(all.items.length > 0);
     assert.equal(all.items.some((x: { item: string }) => x.item.startsWith("secretcraft#")), false);
@@ -423,6 +423,26 @@ describe("answering", () => {
     assert.equal((await actionable(db)).length, 0);
   });
 
+
+  test("workflow commands: every token reads, only an answering token of an operator or maintainer is offered command", async () => {
+    const b = await signedIn("boss");
+    const plain = (await b.json<McpTokenCreated>("POST", "/api/mcp/tokens", { label: "plain" })).token;
+    const names = await toolNames(plain);
+    for (const n of ["get_item", "my_items", "help"]) assert.ok(names.includes(n), n);
+    assert.equal(names.includes("command"), false);
+    const refused = await call(plain, "command", { item: "photocraft#10", text: "stop" });
+    assert.equal(refused.isError, true);
+    assert.match((await call(plain, "help")).text, /fix-up/);
+    // A repository that is not switched to AutoCraft commands reads with the command core's line.
+    assert.match((await call(plain, "get_item", { item: "photocraft#10" })).text, /commands are not switched on for/);
+    const made = await b.json<McpTokenCreated>("POST", "/api/mcp/tokens", { label: "cmd", answer: true });
+    const answering_ = made.token;
+    assert.ok((await toolNames(answering_)).includes("command"));
+    const r = await call(answering_, "command", { item: "photocraft#10", text: "stop" });
+    assert.equal(r.isError, false, r.text);
+    assert.match(r.text, /commands are not switched on for/);
+    for (const row of (await b.json<McpTokens>("GET", "/api/mcp/tokens")).tokens) await b.json("POST", "/api/mcp/tokens/revoke", { id: row.id });
+  });
 
   test("an answering token answers as the operator, the pipeline sees it, and undo takes it back", async () => {
     const t = await (async () => {

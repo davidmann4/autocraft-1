@@ -1112,6 +1112,7 @@ export interface ItemWorkflows {
   plan: Generated<string>;
   legacy_preapproval_id: number | null;
   updated_at: string;
+  step: string | null;
 }
 
 export interface Items {
@@ -1152,8 +1153,17 @@ export interface Items {
   embed_hash: string | null;
   class_hash: string | null;
   class_scheme: string | null;
+  jev_failed_hash: string | null;
   text_refs: string | null;
   author_id: number | null;
+}
+
+export interface JevUnsure {
+  prompt_id: string;
+  ref: string;
+  input_hash: string;
+  answer: string;
+  at: string;
 }
 
 export interface JobItems {
@@ -1474,6 +1484,7 @@ export interface OpusReviews {
   conflicts: string | null;
   claims: string | null;
   blocked_by: string | null;
+  workflow: string | null;
 }
 
 export interface OutsideAdmitted {
@@ -2238,6 +2249,7 @@ export interface UserTokens {
   version: Generated<number>;
   updated_at: string;
   status: Generated<string>;
+  refresh_error: string | null;
 }
 
 export interface Verifications {
@@ -2456,6 +2468,7 @@ export interface DB {
   item_stage: ItemStage;
   item_workflows: ItemWorkflows;
   items: Items;
+  jev_unsure: JevUnsure;
   job_items: JobItems;
   job_log_chunks: JobLogChunks;
   jobs: Jobs;
@@ -2647,6 +2660,7 @@ export interface DB {
   "main.item_stage": ItemStage;
   "main.item_workflows": ItemWorkflows;
   "main.items": Items;
+  "main.jev_unsure": JevUnsure;
   "main.job_items": JobItems;
   "main.job_log_chunks": JobLogChunks;
   "main.jobs": Jobs;
@@ -2840,8 +2854,9 @@ export const COLUMNS = {
   item_settled_dirty: ["run_id", "repo", "number", "n"],
   item_settled_runs: ["run", "refreshed_at"],
   item_stage: ["repo", "number", "stage", "at", "reviewed"],
-  item_workflows: ["id", "repo", "number", "kind", "entry", "weight", "state", "started_by", "started_at", "started_via", "base_head", "approved_by", "approved_at", "approved_via", "stopped_by", "stopped_at", "blocker", "blocker_params", "rec", "rec_at", "rec_head", "plan", "legacy_preapproval_id", "updated_at"],
-  items: ["repo", "number", "kind", "state", "title", "body", "url", "author", "author_type", "author_association", "created_at", "updated_at", "closed_at", "merged_at", "merged_by", "state_reason", "is_draft", "labels", "assignees", "comments_count", "reactions_count", "additions", "deletions", "changed_files", "head_ref", "head_oid", "head_repo", "base_ref", "maintainer_can_modify", "mergeable", "review_decision", "ci_state", "closing_issues", "detail_level", "embed_hash", "class_hash", "class_scheme", "text_refs", "author_id"],
+  item_workflows: ["id", "repo", "number", "kind", "entry", "weight", "state", "started_by", "started_at", "started_via", "base_head", "approved_by", "approved_at", "approved_via", "stopped_by", "stopped_at", "blocker", "blocker_params", "rec", "rec_at", "rec_head", "plan", "legacy_preapproval_id", "updated_at", "step"],
+  items: ["repo", "number", "kind", "state", "title", "body", "url", "author", "author_type", "author_association", "created_at", "updated_at", "closed_at", "merged_at", "merged_by", "state_reason", "is_draft", "labels", "assignees", "comments_count", "reactions_count", "additions", "deletions", "changed_files", "head_ref", "head_oid", "head_repo", "base_ref", "maintainer_can_modify", "mergeable", "review_decision", "ci_state", "closing_issues", "detail_level", "embed_hash", "class_hash", "class_scheme", "jev_failed_hash", "text_refs", "author_id"],
+  jev_unsure: ["prompt_id", "ref", "input_hash", "answer", "at"],
   job_items: ["id", "job_id", "repo", "number", "outcome", "at", "ref"],
   job_log_chunks: ["job_id", "seq", "start", "next_start", "chunk", "at"],
   jobs: ["id", "step", "params", "requested_by", "requested_at", "state", "started_at", "ended_at", "progress", "summary", "error", "usage", "log_path", "pid", "cancel_requested_at", "cancel_requested_by", "repo", "items", "acted", "resumes", "crash_resumes", "lease_skips", "lease_skip_keys"],
@@ -2865,7 +2880,7 @@ export const COLUMNS = {
   operator_fixups: ["id", "repo", "number", "from_head", "instructions", "by", "at", "state", "preapproval_id"],
   opus_carried_fixes: ["repo", "number", "head_oid", "from_head", "file", "change", "outcome", "at"],
   opus_review_history: ["repo", "number", "head_oid", "at", "model", "mode", "verdict", "sure", "reason", "risks", "fixes", "summary", "why", "public_review", "claims", "blocked_by", "trigger", "job_id"],
-  opus_reviews: ["repo", "number", "head_oid", "run_id", "at", "model", "mode", "base_head", "verdict", "sure", "reason", "fixes", "risks", "base_ref", "seen_at", "disc_hash", "public_review", "summary", "why", "conflicts", "claims", "blocked_by"],
+  opus_reviews: ["repo", "number", "head_oid", "run_id", "at", "model", "mode", "base_head", "verdict", "sure", "reason", "fixes", "risks", "base_ref", "seen_at", "disc_hash", "public_review", "summary", "why", "conflicts", "claims", "blocked_by", "workflow"],
   outside_admitted: ["repo", "number", "at"],
   outside_holds: ["repo", "number", "author", "kind", "reason"],
   outside_released: ["repo", "number", "by", "at"],
@@ -2930,7 +2945,7 @@ export const COLUMNS = {
   tracked_repos: ["name", "added_by", "added_at", "pipeline", "workflow"],
   user_settings: ["login", "key", "value", "updated_at"],
   user_token_revocations: ["id", "login", "token_enc", "queued_at", "kind", "aad", "attempts"],
-  user_tokens: ["login", "github_id", "token_enc", "version", "updated_at", "status"],
+  user_tokens: ["login", "github_id", "token_enc", "version", "updated_at", "status", "refresh_error"],
   verifications: ["repo", "number", "head_sha", "base_sha", "kind", "reason", "plan", "model", "head_task_id", "base_task_id", "state", "summary", "note", "created_at", "finished_at"],
   whitelist_overrides: ["login", "status", "note", "by", "at", "github_id"],
   work_leases: ["key", "job_id", "step", "taken_at"],

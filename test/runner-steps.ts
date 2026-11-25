@@ -47,6 +47,23 @@ export const steps: StepDef[] = [
     },
   },
   {
+    name: "test-slices",
+    title: "Slices",
+    description: "Test step: works through a backlog in 50 ms units until its time slice is used.",
+    stage: 2,
+    requires: "operator",
+    params: [{ name: "units", label: "Units", kind: "int", min: 0, max: 100000, default: 10 }],
+    run: async (ctx) => {
+      const units = Number(ctx.params.units);
+      let done = 0;
+      while (done < units && !await ctx.timeUp()) {
+        await sleep(50);
+        await ctx.handled(++done);
+      }
+      return `${done} of ${units} units, ${units - done} left`;
+    },
+  },
+  {
     name: "test-other",
     title: "Other group",
     description: "Test step in a second concurrency group.",

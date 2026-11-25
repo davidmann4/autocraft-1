@@ -1,9 +1,9 @@
 // The merge queue as a view of Plans: every PR with a take or take-fix review at its current head commit, with the fields the
 // dashboard, the flow counts and the merge executors show. Nothing here decides: state, path, reasons and notes come from
 // decidePr (src/core/decide.ts); the rest is read from the facts. Reads only local tables; no GitHub calls.
-import { decidePr, queueEntry } from "../core/decide.ts";
+import { decidePr, mergeEntry, queueEntry } from "../core/decide.ts";
 import { loadPass, loadPrFacts } from "../core/facts.ts";
-import { isQueueState, QUEUE_STATES, type PrFacts, type QueueState } from "../core/plan.ts";
+import { isQueueState, QUEUE_STATES, type MergePath, type PrFacts, type QueueState } from "../core/plan.ts";
 import { mergeDecisionId, VERIFY_UNAVAILABLE } from "../core/rules.ts";
 import { claimsOf, findingsOf, premergeAt, type PremergeFinding } from "../premerge/store.ts";
 import type { Claim } from "../review/opus-parse.ts";
@@ -21,13 +21,13 @@ export { countStates } from "../core/plan-read.ts";
 
 export type QueueEntry = {
   repo: string; number: number; title: string; author: string | null; tier: Tier;
-  head: string; size: string; label: string | null; verdict: "take" | "take-fix";
+  head: string; size: string; label: string | null; /** Null for a merge-entry PR, which has no review. */ verdict: "take" | "take-fix" | null;
   reason: string; fixes: number; ci: string; mergeable: string;
   state: QueueState;
   /** The merge rule or an operator's answer lets it merge now (a refused PR still counts while its retry waits for a change). */
   eligible: boolean;
   /** How the PR may merge: by the rule, by an operator's answer, or not yet. */
-  path: "rule" | "operator" | null;
+  path: MergePath;
   /** Why the rule doesn't cover it; empty when it does. */
   outsideRule: string[];
   decisionId: string | null;
@@ -77,23 +77,25 @@ export type QueueOptions = {
 
 /** The queue row of a PR whose Plan is in a queue state. */
 async function entryOf(db: Db, f: PrFacts, plan: ReturnType<typeof decidePr>, title: string): Promise<QueueEntry> {
-  const r = f.review!;
+  // A merge-entry PR is queued at its own head without a review; it joined the queue when its workflow started.
+  const r = mergeEntry(f) ? null : f.review!;
+  const head = r?.head ?? f.head ?? "";
   const merged = plan.state === "merged";
   const x = queueEntry(f, merged, !merged);
   let premerge: QueueEntry["premerge"] = null;
   if (x.premerge) {
-    const row = await premergeAt(db, f.repo, f.number, r.head);
+    const row = await premergeAt(db, f.repo, f.number, head);
     const all = findingsOf(row);
     const defects = all.filter((d) => d.severity === "defect");
     premerge = { state: x.premerge, defects, unknownClaims: claimsOf(row).filter((c) => c.impact === "unknown"), minor: all.length - defects.length, error: row?.error ?? null };
   }
   return {
-    repo: f.repo, number: f.number, title, author: f.author, tier: f.tier, head: r.head, size: f.size, label: f.label,
-    verdict: r.verdict as "take" | "take-fix", reason: r.reason, fixes: r.fixes, ci: f.ci, mergeable: f.mergeable,
+    repo: f.repo, number: f.number, title, author: f.author, tier: f.tier, head, size: f.size, label: f.label,
+    verdict: r ? r.verdict as "take" | "take-fix" : null, reason: r?.reason ?? "", fixes: r?.fixes ?? 0, ci: f.ci, mergeable: f.mergeable,
     state: plan.state as QueueState, eligible: plan.eligible, path: plan.path, outsideRule: plan.reasons,
-    decisionId: f.decision.asked ? mergeDecisionId(f.repo, f.number, r.head) : null,
+    decisionId: f.decision.asked ? mergeDecisionId(f.repo, f.number, head) : null,
     runsWaiting: f.runs?.waiting ?? 0, runsBlocked: f.runs?.blocked ?? null, noCi: x.noCi, answer: x.answer, refusedReason: x.refusedReason,
-    reviewedAt: r.at, held: f.mergeHeld, note: plan.note, blockedLive: plan.state === "changes-requested" && !!f.changesRequested?.live,
+    reviewedAt: r?.at ?? f.workflow?.startedAt ?? "", held: f.mergeHeld, note: plan.note, blockedLive: plan.state === "changes-requested" && !!f.changesRequested?.live,
     verify: f.verification, ...(plan.conflictNote !== null ? { conflictNote: plan.conflictNote } : {}), ...(f.mainFix ? { mainFix: true } : {}), premerge,
   };
 }

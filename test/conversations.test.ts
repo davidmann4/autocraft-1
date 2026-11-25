@@ -432,7 +432,7 @@ describe("maintainers' messages wait and are withdrawn", () => {
     await addMessage(db, "app", 1, { login: "maint", kind: "maintainer" }, "Is this in scope?");
     const { claimPending, withdrawTurn } = await import("../src/conversations/store.ts");
     assert.ok(await claimPending(db, "app", 1));
-    const call = (id: number, forLogin: string, number: number) => ({ id, step: "conversation", stage: 0, max_attempts: 1, timeout_ms: 1, prompt_id: "conversation.turn", prompt_version: "1", tier: "top", effort: "medium", asked_model: "opus", bundle: "{}", state: "leased", items: JSON.stringify([{ repo: "app", number }]), repo: "app", class: "x", level: 0, since: 1, seen_at: 1, for_login: forLogin });
+    const call = (id: number, forLogin: string, number: number) => ({ id, step: "conversation", stage: 0, max_attempts: 1, timeout_ms: 1, prompt_id: "conversation.turn", prompt_version: "1", tier: "top", effort: "medium", asked_model: "opus", bundle: "{}", state: "leased", items: JSON.stringify([{ repo: "app", number }]), repo: "app", class: 0, level: 0, since: 1, seen_at: 1, for_login: forLogin });
     await db.run(db.k.insertInto("main.remote_calls").values([call(901, "Maint", 1), call(902, "other", 1), call(903, "maint", 2)] as never));
     await withdrawTurn(db, "app", 1, { login: "maint", operator: false });
     const state = async (id: number) => (await db.get(db.k.selectFrom("main.remote_calls").select("state").where("id", "=", id)))!.state;

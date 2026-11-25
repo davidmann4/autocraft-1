@@ -6,7 +6,7 @@ import type { Area, AreaItem } from "../areas/types.ts";
 import { parsePairReply, type DupePair, type PairAnswer } from "../dupes/pair.ts";
 import { carryTexts, lintComparison, parseIssueComparison, parsePrComparison, type CompareIssues, type ComparePrs, type IssueComparison, type PrComparison } from "../dupes/group.ts";
 import { jevImpact, parseHaikuImpacts, SURE, type Impact, type JevImpactAnswers } from "../priority/score.ts";
-import { renderAreaJev, renderReferenceJev } from "../prompts/index.ts";
+import { renderAreaJev, renderClassifyJev, renderReferenceJev, type ClassifyExtras } from "../prompts/index.ts";
 import type { ReferenceLintInput } from "../replylint.ts";
 import type { ClaudeStep, JevStep, TieredStep } from "./step.ts";
 import { parseRefereeReply, type Referee } from "../classify/parse.ts";
@@ -42,10 +42,19 @@ export const CLASSIFY_HAIKU: ClaudeStep<Item[], Verdict[]> = {
     return { value: verdicts, rest: leftOf(todo, refOf, missing) };
   },
 };
-export const CLASSIFY_JEV: JevStep<Item, Verdict> = {
+/** A classify.jev request: the item, and the questions of priority.jev and areas.jev due for it (renderClassifyJev). */
+export type ClassifyAsk = { item: Item } & ClassifyExtras;
+/** The verdict, and an answer (null: none valid) for each extra question asked. */
+export type ClassifyAnswer = { verdict: Verdict; impact?: JevImpact | null; area?: AreaAnswer | null };
+export const CLASSIFY_JEV: JevStep<ClassifyAsk, ClassifyAnswer> = {
   provider: "jev", id: "classify.jev",
-  request: (item) => ({ item }),
-  parse: (answers, item) => single(answers ? jevVerdict(refOf(item), answers as JevAnswers) : null),
+  request: (x) => ({ item: x.item, body: renderClassifyJev(x.item, x) }),
+  // The verdict decides whether the reply counts; an extra answer that is not valid is left to its own step.
+  parse: (answers, x, ctx) => {
+    const verdict = answers ? jevVerdict(refOf(x.item), answers as JevAnswers) : null;
+    if (!verdict) return null;
+    return { value: { verdict, ...(x.impact && { impact: jevImpact(answers as JevImpactAnswers) }), ...(x.areas && { area: ctx.code === 0 ? jevAreaChoice(answers, x.areas) : null }) } };
+  },
 };
 
 // Priority: Jev's level, Haiku where Jev is under SURE or gave none.

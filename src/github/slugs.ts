@@ -3,6 +3,29 @@ import { setting, writeSetting } from "../settings-read.ts";
 import type { Db } from "../db/index.ts";
 
 export const SLUGS_KEY = "app_slugs";
+/** The instance setting for the name people type to address the app (no `@`); unset or empty means the app slug. */
+export const MENTION_KEY = "github_mention_name";
+
+/** GitHub's login rules: letters, digits and single hyphens, not starting or ending with one, at most 39 characters. */
+export const validMentionName = (v: string): boolean => v.length <= 39 && /^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9]))*$/.test(v);
+
+/** The configured mention name, or null when unset. */
+export async function mentionName(db: Db): Promise<string | null> {
+  const v = (await setting(db, MENTION_KEY))?.trim();
+  return v && validMentionName(v) ? v : null;
+}
+
+/** What a comment can address the app by: its slug and the mention name (when set), without duplicates. */
+export const addressNames = (slug: string | null | undefined, mention: string | null | undefined): string[] =>
+  [...new Set([slug, mention].filter((x): x is string => !!x))];
+
+/** The name to tell people to type: the mention name when set, otherwise the slug. */
+export const shownMention = (slug: string | null | undefined, mention: string | null | undefined): string | null => mention || slug || null;
+
+/** The names a comment to the app can start with, read from the settings. */
+export async function commentNames(db: Db, slug: string | null | undefined): Promise<string[]> {
+  return addressNames(slug, await mentionName(db));
+}
 
 export const parseSlugs = (v: string | undefined): string[] => {
   try {
@@ -22,12 +45,12 @@ export async function rememberSlug(db: Db, slug: string): Promise<void> {
   await writeSetting(db, SLUGS_KEY, JSON.stringify([...known, slug]));
 }
 
-/** The names a comment can address the pipeline by: the pipeline login (when recorded) and every known app slug. Mentioning `@<slug>` also covers `@<slug>[bot]`. */
+/** The names a comment can address the pipeline by: the pipeline login (when recorded) every known app slug and the mention name. Mentioning `@<slug>` also covers `@<slug>[bot]`. */
 export async function mentionNames(db: Db, extra: string | null = null): Promise<string[]> {
   const box = await setting(db, "pipeline_login");
-  return namesOf(box, await knownSlugs(db), extra);
+  return namesOf(box, await knownSlugs(db), extra, await mentionName(db));
 }
 
 /** mentionNames() from the stored pipeline login and the known slugs. */
-export const namesOf = (box: string | undefined, slugs: string[], extra: string | null = null): string[] =>
-  [...new Set([...(box ? [box] : []), ...slugs, ...(extra ? [extra] : [])])];
+export const namesOf = (box: string | undefined, slugs: string[], extra: string | null = null, mention: string | null = null): string[] =>
+  [...new Set([...(box ? [box] : []), ...slugs, ...(extra ? [extra] : []), ...(mention ? [mention] : [])])];

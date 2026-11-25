@@ -16,13 +16,13 @@ import { startServer } from "../src/dash/server/index.ts";
 import { FakeProvider } from "../src/dash/server/provider.ts";
 import { RateLimiter } from "../src/dash/server/util.ts";
 import type { Embedder } from "../src/embed/model.ts";
-import { writeSnapshot } from "../src/itemtools/snapshot.ts";
 import { awaitCall, claimCall, enqueueCall, submitCall, type Caller } from "../src/remote/calls.ts";
 import { setInferenceMode } from "../src/remote/mode.ts";
 import { PROTOCOL_VERSION, ROUTES, type TaskBundle } from "../src/remote/protocol.ts";
 import { buildReferenceIndex } from "../src/reference-search.ts";
 import { PASSAGES_PER_LEASE, referenceOptions } from "../src/remote/tools.ts";
 import { SCRATCH } from "./scratch.ts";
+import { writeTestSnapshot } from "./test-db.ts";
 import { connectDb } from "../src/db/open.ts";
 import { startWorkerServer } from "../src/build/worker-api.ts";
 
@@ -52,7 +52,7 @@ describe("per-lease tools of remote calls", async () => {
     const now = new Date().toISOString();
     await db.run(db.k.insertInto("repos").values({ name: "photocraft", owner: "storytold", visibility: "public" }));
     await db.run(db.k.insertInto("items").values({ repo: "photocraft", number: 7, kind: "issue", state: "OPEN", title: "Wave filter crashes", body: "b", author: "alice", created_at: now, updated_at: now }));
-    writeSnapshot(dbFile);
+    await writeTestSnapshot(dbFile);
     const ref = join(dir, "reference", "photocraft");
     mkdirSync(ref, { recursive: true });
     writeFileSync(join(ref, "layers.md"), `# Layers\n\n${Array.from({ length: 10 }, (_, i) => `Layer note ${i}. ${"filler ".repeat(100)}`).join("\n\n")}`);

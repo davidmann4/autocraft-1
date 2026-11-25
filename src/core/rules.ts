@@ -9,6 +9,14 @@ export const RULE_SIZES = ["S", "M"];
 export type Tier = "whitelisted" | "not" | "allow" | "deny";
 export const RULE_TIERS: Tier[] = ["whitelisted", "allow"];
 
+/**
+ * In a repo on the maintainer workflow, the PRs that go through review, fix-up and merge with nobody starting them: small and
+ * medium bug fixes (and infra) from whitelisted authors, the merge rule's own criteria, with a label no unsure referee settled
+ * and no needs-decision flag.
+ */
+export const autoEligible = (p: { label: string | null; size: string; tier: string; labelUnsure?: boolean; needsDecisionFlag: boolean }): boolean =>
+  !!p.label && RULE_LABELS.includes(p.label) && RULE_SIZES.includes(p.size) && (RULE_TIERS as string[]).includes(p.tier) && !p.labelUnsure && !p.needsDecisionFlag;
+
 /** Why an unsure Opus take is asked about instead of merged by the rule. */
 export const UNSURE_REASON = "Opus was unsure";
 export const PREMERGE_UNSURE_REASON = "the pre-merge review could not verify a claim of the description";
@@ -21,7 +29,7 @@ export const verifyOk = (state: string | null | undefined): boolean => !!state &
 /** A PR in a repo Verify cannot build is merged only on an operator's answer, which says "not verified". */
 export const VERIFY_UNAVAILABLE = "unavailable";
 /** A failed or errored verification is asked about in the Merge? question; an operator's Merge answer given after the result stands (`override`, src/merge/verify-override.ts). */
-export const verifyAllows = (path: "rule" | "operator" | null, state: string | null | undefined, override = false): boolean =>
+export const verifyAllows = (path: "rule" | "operator" | "maintainer" | null, state: string | null | undefined, override = false): boolean =>
   verifyOk(state) || (path === "operator" && (state === VERIFY_UNAVAILABLE || (override && (state === "failed" || state === "error"))));
 
 /** A PR whose mergeable state stayed unknown for several checks reads is requested once from GitHub's REST endpoint (src/merge/mergeable.ts); a null answer asks a person. */
@@ -32,7 +40,7 @@ export const TRANSIENT_REFUSAL = /\b5\d\d\b|timed? ?out|ETIMEDOUT|ECONN|EAI_AGAI
 
 /** A merge refusal that only reports the state of CI, mergeable or the head: it clears when that state changes. Any other refusal is asked about. */
 export const STATE_REFUSAL = /^(not ready at merge time|head moved|no longer open|GitHub returned no such PR|the operator's merge answer is gone|verification at)/;
-export const ciAllows = (path: "rule" | "operator" | null, ci: string | null | undefined, noCi: boolean): boolean =>
+export const ciAllows = (path: "rule" | "operator" | "maintainer" | null, ci: string | null | undefined, noCi: boolean): boolean =>
   ci === "success" || (path === "operator" && ci === "none" && noCi);
 
 export type Size = "S" | "M" | "L";
