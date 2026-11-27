@@ -7,10 +7,9 @@ import { setJevEnabled } from "../src/agents/jev.ts";
 import { DiscordKeys } from "../src/discord/keys.ts";
 import { SIGNAL_CAP_KEY, Signals, signalCountOf, signalLinks, type Judge } from "../src/discord/signals.ts";
 import { handleDispatch } from "../src/discord/store.ts";
-import { statusList } from "../src/dash/api/items.ts";
 import type { Req } from "../src/dash/types.ts";
 import { SCRATCH } from "./scratch.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb } from "./helpers/raw-db.ts";
 import { excluded } from "../src/db/kx.ts";
 
 mkdirSync(SCRATCH, { recursive: true });
@@ -83,15 +82,6 @@ describe("attention signals", () => {
     assert.equal(await asked(1), 0);
     assert.equal((await signalLinks(db, keys, "photocraft", 1)).length, 0);
     assert.equal((await db.get(db.k.selectFrom("agent_run_texts").select((eb) => eb.fn.countAll<number>().as("n"))))!.n, 0);
-  });
-
-  test("the Items filter returns every mentioned item, asked about or not", async () => {
-    const req = (q: string) => ({ query: new URLSearchParams(q), user: { role: "operator", login: "o", canRead: async () => true } }) as unknown as Req;
-    const rows = async (q: string) => (await statusList(db, req(q))).rows.map((r) => r.number).sort();
-    // m1 (photocraft#1) was deleted; #2 is a plain mention, #3 and #4 were asked about.
-    assert.deepEqual(await rows("discord=1"), [2, 3, 4]);
-    assert.deepEqual(await rows(""), [1, 2, 3, 4]);
-    assert.equal((await statusList(db, req("discord=1"))).total, 3);
   });
 
   test("limits per author and channel, two calls at a time, and a message naming many items is skipped", async () => {

@@ -3,6 +3,7 @@
 // The gateway handler stays free of network calls: it hands the message here and this fires the request without waiting.
 import { RestError, type RestClient } from "./rest.ts";
 import type { Db } from "../db/index.ts";
+import { setting, writeSetting } from "../data/control/index.ts";
 
 type ReactRest = Pick<RestClient, "addReaction">;
 
@@ -17,17 +18,17 @@ export const validReactEmoji = (v: string): boolean => CUSTOM_NAME.test(v) || UN
 
 /** The configured reaction emoji: a custom emoji name or a Unicode emoji. */
 export const reactEmoji = async (db: Db): Promise<string> => {
-  const v = (await db.get(db.k.selectFrom("settings").select("value").where("key", "=", "discord_react_emoji")))?.value;
+  const v = await setting(db, "discord_react_emoji");
   return v && validReactEmoji(v) ? v : DEFAULT_REACT_EMOJI;
 };
 
 export async function setReactEmoji(db: Db, value: string): Promise<void> {
-  await db.run(db.k.insertInto("settings").values({ key: "discord_react_emoji", value }).onConflict((oc) => oc.column("key").doUpdateSet({ value })));
+  await writeSetting(db, "discord_react_emoji", value);
 }
 
 /** The operators' switch on the Discord page; on unless switched off. */
 export const reactOn = async (db: Db): Promise<boolean> =>
-  (await db.get(db.k.selectFrom("settings").select("value").where("key", "=", "discord_react")))?.value !== "off";
+  (await setting(db, "discord_react")) !== "off";
 
 export class Reactor {
   #d: { db: Db; rest: ReactRest; log: (l: string) => void };

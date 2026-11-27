@@ -9,8 +9,7 @@ import { CLIPPY_ARTIFACT, lintPlan, queueLintFor, readLint } from "../src/prepus
 import { lintVerdict, testCrates } from "../src/prepush/tests.ts";
 import type { CratesFetcher } from "../src/verify/crates.ts";
 import { SCRATCH } from "./scratch.ts";
-import type { Db } from "../src/db/index.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb, type Db } from "./helpers/raw-db.ts";
 
 process.env.AUTOCRAFT_DIFF_CACHE = join(SCRATCH, "diffs");
 const HEAD = "a".repeat(40);

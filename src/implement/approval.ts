@@ -1,28 +1,15 @@
-// Per-repo approval for the pipeline to open fix PRs for issues there (push to the pipeline fork, open a PR,
-// Set from the dashboard by an operator or a maintainer with write access to the repo (src/dash/api/admin.ts).
-import { audit } from "../dash/audit.ts";
-import { setting } from "../settings-read.ts";
+// Per-repo approval for the pipeline to open fix PRs for issues there (push to the pipeline fork, open a PR).
+// Set from the dashboard by an operator or a maintainer with write access to the repo (src/dash/api/admin.ts). The rows are
+// control's repo step approvals (step `fixissue`).
 import type { Db } from "../db/index.ts";
+import { repoStepApproval, setStepApproval } from "../data/control/index.ts";
+import type { StepApproval } from "../data/control/index.ts";
 
-export type FixIssueApproval = { by: string; at: string };
-const key = (repo: string) => `fixissue_approved:${repo}`;
+export type FixIssueApproval = StepApproval;
 
-export async function fixIssueApprovalOf(db: Db, repo: string): Promise<FixIssueApproval | null> {
-  const value = await setting(db, key(repo));
-  if (value === undefined) return null;
-  try {
-    return JSON.parse(value) as FixIssueApproval;
-  } catch {
-    return null;
-  }
-}
+export const fixIssueApprovalOf = (db: Db, repo: string): Promise<FixIssueApproval | null> => repoStepApproval(db, repo, "fixissue");
 
-// Returns false when nothing changed.
+/** Returns false when nothing changed; throws for an untracked repo. The change is audited as `fixissue-approve` or `fixissue-revoke`. */
 export async function setFixIssueApproval(db: Db, by: string, repo: string, approved: boolean): Promise<boolean> {
-  if (!await db.get(db.k.selectFrom("main.tracked_repos").select("name").where("name", "=", repo))) throw new Error(`${repo} is not tracked`);
-  if ((await fixIssueApprovalOf(db, repo) !== null) === approved) return false;
-  if (approved) await db.run(db.k.insertInto("main.settings").values({ key: key(repo), value: JSON.stringify({ by, at: new Date().toISOString() }) }));
-  else await db.run(db.k.deleteFrom("main.settings").where("key", "=", key(repo)));
-  await audit(db, by, approved ? "fixissue-approve" : "fixissue-revoke", repo);
-  return true;
+  return await setStepApproval(db, [{ repo, step: "fixissue", on: approved }], by) > 0;
 }

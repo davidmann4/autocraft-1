@@ -1,59 +1,23 @@
-// An operator's answer is final: a pre-approval whose review cannot proceed asks a Merge question, and a sure re-review keeps an answered merge.
+// An approved merge goes on through the pipeline's own fix-ups, and a review that failed for good is tried again once per request.
 import assert from "node:assert/strict";
 import { afterEach, describe, test } from "node:test";
-import { mergeDecisionId } from "../src/core/rules.ts";
-import { advancePreapprovals, preapprovalOf, runPipelineStep } from "../src/preapproval/index.ts";
+import { advancePreapprovals, preapprovalOf } from "../src/preapproval/index.ts";
 import { markReviewsStale } from "../src/review/discussion.ts";
 import { recordReviewFailure, reviewHold } from "../src/review/gate.ts";
 import { saveOpus } from "../src/review/opus.ts";
-import { OPERATOR, T0, world, type World } from "./world-db.ts";
+import { OPERATOR, T0, untilQuiet, world, type World } from "./world-db.ts";
 
 let current: World | null = null;
 const fresh = async (): Promise<World> => (current = await (await world()).repo());
 afterEach(() => current?.close());
 
-const save = async (w: World, n: number, head: string, verdict: "take" | "hold", sure: boolean, blocked: string[] = []) =>
-  await saveOpus(w.db, "rv", { repo: "app", number: n, head_oid: head }, {
-    mode: "full", base: null, model: "m",
-    review: { ref: `app#${n}`, verdict, sure, reason: "r", fixes: [], risks: [], summary: null, why: null, public: null, conflicts: [], claims: [], blocked_by: blocked },
-  });
 const startPushed = async (w: World, n: number, to: string) => {
-  await runPipelineStep(w.db, { repo: "app", number: n, step: { kind: "fixup", instructions: "rename a to b", merge: true }, by: OPERATOR });
+  await w.fixup(n);
   const fix = (await w.rows("SELECT id FROM operator_fixups WHERE number = ? ORDER BY id DESC", n))[0]!.id as number;
   await w.db.run(w.db.k.insertInto("fixups").values({ repo: "app", number: n, from_head: `sha${n}`, to_head: to, state: "pushed", attempt: 1, created_at: T0, source: "operator", operator_fix: fix }));
   await w.synced(n, to);
 };
-const settle = async (w: World) => { for (let i = 0; i < 5; i++) await advancePreapprovals(w.db); };
-
-describe("pre-approval and review holds", () => {
-  test("the fix-up push lifts a blocked hold; a review that failed for good asks a Merge question", async () => {
-    const w = await (await (await (await (await (await fresh()).pr(1)).review(1, { verdict: "take-fix" })).pr(2)).pr(3)).review(3, { verdict: "take-fix" });
-    await w.db.run(w.db.k.updateTable("opus_reviews").set({ verdict: "hold" }).where("number", "=", 1));
-    await save(w, 1, "sha1", "hold", true, ["app#2"]);
-    await startPushed(w, 1, "sha1b");
-    await settle(w);
-    assert.equal((await preapprovalOf(w.db, "app", 1))?.state, "review", String((await preapprovalOf(w.db, "app", 1))?.reason));
-    assert.equal(await reviewHold(w.db, "app", 1, "sha1b"), null);
-
-    await startPushed(w, 3, "sha3b");
-    for (let i = 0; i < 4; i++) await recordReviewFailure(w.db, "app", 3, "sha3b");
-    await settle(w);
-    assert.equal((await preapprovalOf(w.db, "app", 3))?.state, "asked");
-    assert.equal((await w.rows("SELECT 1 FROM decisions WHERE id = ?", mergeDecisionId("app", 3, "sha3b"))).length, 1);
-  });
-});
-
-describe("a re-review at the same head", () => {
-  test("keeps an answered, unapplied merge answer while sure take, and withdraws it with the reason on a hold", async () => {
-    const w = await (await (await (await fresh()).pr(1)).review(1)).answer(1, "merge");
-    const id = mergeDecisionId("app", 1, "sha1");
-    await save(w, 1, "sha1", "take", true);
-    assert.equal((await w.rows("SELECT answer FROM decisions WHERE id = ?", id))[0]?.answer, "merge");
-    await save(w, 1, "sha1", "hold", true);
-    assert.equal((await w.rows("SELECT 1 FROM decisions WHERE id = ?", id)).length, 0);
-    assert.match(String((await w.rows("SELECT answer_note FROM decisions WHERE id LIKE ?", `${id}~replaced-%`))[0]?.answer_note), /new review is a hold/);
-  });
-});
+const settle = (w: World) => untilQuiet(w.db, [() => advancePreapprovals(w.db)], 5);
 
 describe("a review that failed for good", () => {
   test("a request newer than the last failure grants exactly one more try", async () => {
@@ -71,15 +35,34 @@ describe("a review that failed for good", () => {
   });
 });
 
+describe("a fix-up's push and the review of it", () => {
+  test("the push lifts a blocked hold; a review that failed for good fails the approved merge", async () => {
+    const w = await (await (await (await (await (await fresh()).acting()).pr(1)).workflow(1)).review(1, { verdict: "hold" })).pr(2);
+    await (await (await w.pr(3)).workflow(3)).review(3, { verdict: "take-fix" });
+    await saveOpus(w.db, "rv", { repo: "app", number: 1, head_oid: "sha1" }, {
+      mode: "full", base: null, model: "m",
+      review: { ref: "app#1", verdict: "hold", sure: true, reason: "r", fixes: [], risks: [], summary: null, why: null, public: null, conflicts: [], claims: [], blocked_by: ["app#2"] },
+    });
+    await startPushed(w, 1, "sha1b");
+    await settle(w);
+    assert.equal((await preapprovalOf(w.db, "app", 1))?.state, "review", String((await preapprovalOf(w.db, "app", 1))?.reason));
+    assert.equal(await reviewHold(w.db, "app", 1, "sha1b"), null);
+
+    await startPushed(w, 3, "sha3b");
+    for (let i = 0; i < 4; i++) await recordReviewFailure(w.db, "app", 3, "sha3b");
+    await settle(w);
+    assert.equal((await preapprovalOf(w.db, "app", 3))?.state, "failed");
+  });
+});
+
 describe("a sure take-fix review of a pre-approved fix-up", () => {
   test("the pipeline's fix-up runs, its push continues the pre-approval, and a take moves it to ci", async () => {
-    const w = await (await (await fresh()).pr(1)).review(1, { verdict: "take-fix" });
+    const w = await (await (await (await (await fresh()).acting()).pr(1)).workflow(1)).review(1, { verdict: "take-fix" });
     await startPushed(w, 1, "sha1b");
     await settle(w);
     await w.review(1, { verdict: "take-fix", head: "sha1b" });
     await settle(w);
     assert.equal((await preapprovalOf(w.db, "app", 1))?.state, "review");
-    assert.equal((await w.rows("SELECT 1 FROM decisions WHERE id = ?", mergeDecisionId("app", 1, "sha1b"))).length, 0);
     const kinds = (await w.prPlan(1)).actions.map((a) => `${a.kind}:${String(a.params?.source ?? "")}`);
     assert.ok(kinds.includes("fixup:review"), kinds.join());
 

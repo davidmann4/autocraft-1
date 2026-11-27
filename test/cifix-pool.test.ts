@@ -10,16 +10,17 @@ import { setPushApproval } from "../src/fixup/approval.ts";
 import { exec, type Exec } from "../src/fixup/git.ts";
 import type { Querier } from "../src/mirror.ts";
 import { take } from "../src/runner/leases.ts";
+import { acting, appLane } from "./acting.ts";
 import { validating } from "./gql.ts";
+import { reportingTaskRunner } from "./fake-runner.ts";
 import { SCRATCH } from "./scratch.ts";
-import { connectDb } from "../src/db/open.ts";
+import { insertWorkflow } from "../src/workflow/store.ts";
+import { connectDb } from "./helpers/raw-db.ts";
 
 mkdirSync(SCRATCH, { recursive: true });
 const dir = mkdtempSync(join(SCRATCH, "cifix-pool-"));
 process.env.AUTOCRAFT_DIFF_CACHE = join(dir, "diffs");
 process.env.AUTOCRAFT_ARTIFACT_DIR = join(dir, "artifacts");
-writeFileSync(join(dir, "accounts.json"), JSON.stringify([{ id: "a1", configDir: join(dir, "a1") }]));
-process.env.AUTOCRAFT_ACCOUNTS = join(dir, "accounts.json");
 after(() => setCallContext(null));
 
 const T0 = "2026-01-01T00:00:00Z", T1 = "2026-01-02T00:00:00Z";
@@ -51,11 +52,12 @@ async function setup(calls = 2) {
     await db.run(db.k.insertInto("items").values({ repo: "app", number: n, kind: "pr", state: "OPEN", title: "Rename", author: "someone", additions: 5, deletions: 0, head_oid: heads[n]!, created_at: T0, updated_at: T0 }));
     await db.prepare(`INSERT INTO opus_reviews (repo, number, head_oid, run_id, at, model, verdict, reason, fixes, sure, mode) VALUES ('app', ?, ?, 'rv', '${T0}', 'm', 'take', 'ok', '[]', 1, 'full')`).run(n, heads[n]);
     await db.prepare(`INSERT INTO pr_checks (repo, number, head_oid, state, is_draft, overall, checks, mergeable, maintainer_can_modify, fetched_at) VALUES ('app', ?, ?, 'OPEN', 0, 'failure', '[{"name":"gate / test","state":"failure"}]', 'MERGEABLE', 1, '${T1}')`).run(n, heads[n]);
+    await insertWorkflow(db, { repo: "app", number: n, kind: "pr", entry: "fixup", state: "running", startedBy: "op", startedAt: T0, startedVia: "dashboard" });
+    await acting(db, ["op"]);
   }
   await db.run(db.k.insertInto("tracked_repos").values({ name: "app", added_by: "op", added_at: T0, pipeline: 1 }));
   await setPushApproval(db, "op", "app", true);
-  await db.run(db.k.insertInto("claude_accounts").values({ id: "a1", label: "a1" }).onConflict((oc) => oc.doNothing()));
-  await db.run(db.k.updateTable("claude_accounts").set({ enabled: 1, max_concurrent: 8 }).where("id", "=", "a1"));
+  await reportingTaskRunner(db);
   const querier: Querier = validating({
     spent: 0, remaining: 5000,
     async query(_q: string, v: { n: number }) {
@@ -76,7 +78,7 @@ async function setup(calls = 2) {
   let release!: () => void;
   const both = new Promise<void>((r) => (release = r));
   const deps: CifixDeps = {
-    querier, exec: run, now: () => new Date("2026-01-03T00:00:00Z"), root: join(root, "cache"),
+    querier, lane: appLane(querier), exec: run, now: () => new Date("2026-01-03T00:00:00Z"), root: join(root, "cache"),
     fetchDiff: async () => ({ ok: true, text: "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-x\n+fn a() {}\n" }),
     gh: async (args) => {
       if (args[0] === "api" && args[1]!.includes("/pulls/")) return `${"b".repeat(40)}\n`;

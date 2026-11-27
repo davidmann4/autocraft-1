@@ -1,7 +1,8 @@
 // The owner statements a review of a PR gets: the closest ones to the PR's embedding, from the PR's own repo.
 import type { OwnerStatement } from "../review/opus-parse.ts";
 import { STATEMENT_PROMPT_CHARS } from "../review/opus-parse.ts";
-import { quietExprFor } from "../security/quiet.ts";
+import { loadStatementPools } from "../data/conversations/index.ts";
+import { loadEmbeddingVectors } from "../data/triage/index.ts";
 import type { Db } from "../db/index.ts";
 
 /** How many statements a review sees. */
@@ -21,17 +22,14 @@ const asFloats = (b: Uint8Array): Float32Array => new Float32Array(b.buffer.slic
  * operators' words reach a review only for the repo they were said about, and a quiet PR stays unnamed until its advisory.
  */
 export async function relatedStatements(db: Db, repo: string, number: number): Promise<OwnerStatement[]> {
-  const pr = await db.get(db.k.selectFrom("item_embeddings").select(["model", "vec"]).where("repo", "=", repo).where("number", "=", number));
+  const pr = (await loadEmbeddingVectors(db, [{ repo, number }])).get(`${repo}#${number}`);
   if (!pr) return [];
   const q = asFloats(pr.vec);
-  const rows = await db.all(db.k.selectFrom("owner_statements")
-    .select(["id", "source_kind", "repo", "number", "item_title", "text", "at", "embedding"])
-    .where("model", "=", pr.model).where("embedding", "is not", null).where("repo", "=", repo).where("number", "is distinct from", number)
-    .where((eb) => eb.not(eb.and([eb("number", "is not", null), quietExprFor(db, eb, "owner_statements.repo", "owner_statements.number")])))
-    .$narrowType<{ embedding: Uint8Array }>());
+  const rows = (await loadStatementPools(db, [repo], [pr.model])).get(repo) ?? [];
   const hits: (OwnerStatement & { score: number })[] = [];
   for (const r of rows) {
-    const v = asFloats(r.embedding);
+    if (r.number === number) continue;
+    const v = asFloats(r.vec);
     if (v.length !== q.length) continue;
     let dot = 0;
     for (let i = 0; i < q.length; i++) dot += q[i]! * v[i]!;

@@ -7,13 +7,16 @@
 import type { Db } from "../db/index.ts";
 import { envVar } from "../env.ts";
 import type { ExecResult, KPod, KubeApi } from "./kube-api.ts";
-import { MIRROR_WAIT_CONTAINER, PULL_REASONS, settingsOf } from "./pods.ts";
+import { loadEnvs } from "../data/build/index.ts";
+import { envSettings } from "./envs.ts";
+import { MIRROR_WAIT_CONTAINER, PULL_REASONS } from "./pods.ts";
 import { cutMiddle, seconds } from "./workspace-tool-specs.ts";
 import { ciLayoutOf, workspaceImages } from "./workspace-launch.ts";
 import {
   FETCH_CONTAINER, FETCH_DEADLINE_SEC, FETCH_LIMIT_SEC, FETCH_LOG_TAIL, FETCH_START_MS, fetchPodName, fetchSelector, workspaceFetchPodSpec,
 } from "./workspace-pods.ts";
 import { cleanOutput, execInWorkspace, getWorkspace, type WorkspaceRow } from "./workspaces.ts";
+import { effect } from "../db/effects.ts";
 
 /** How long the call may take in all: the pod's start, its deadline and the diff, as the call row's deadline. */
 export const FETCH_CALL_MS = FETCH_START_MS + FETCH_DEADLINE_SEC * 1000 + 60_000;
@@ -36,8 +39,7 @@ export async function fetchDependencies(db: Db, api: KubeApi, workspaceId: numbe
   const now = o.now ?? Date.now;
   const w = await getWorkspace(db, workspaceId);
   if (!w) return refused(`there is no workspace ${workspaceId}`);
-  const env = await db.get(db.k.selectFrom("build_envs").select(["settings"]).where("id", "=", w.env_id));
-  const s = settingsOf(env?.settings ?? null);
+  const s = envSettings((await loadEnvs(db, { ids: [w.env_id] }))[0] ?? { settings: null });
   if (!s.crateMirror) {
     return refused(`the environment ${w.env_id} has no crate mirror (its crateMirror setting is unset), so nothing can be fetched; if the change needs a crate that is not in the workspace, report blocked with "needs dependencies"`);
   }
@@ -51,6 +53,7 @@ export async function fetchDependencies(db: Db, api: KubeApi, workspaceId: numbe
   const prior = (await api.listPods(ns, fetchSelector(w.id))).find((p) => p.metadata.name === name && !p.metadata.deletionTimestamp);
   if (!prior) {
     const ci = ciLayoutOf(w) ?? undefined;
+    effect("build-launch");
     await api.createPod(ns, workspaceFetchPodSpec({ s, envId: w.env_id, id: w.id, ...images, name, pvc: w.pvc, ...(ci ? { ci } : {}), dir }));
   }
   try {

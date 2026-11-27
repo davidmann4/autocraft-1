@@ -1,9 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { settledLookup, settledSet, settledTable } from "../src/classify/settled.ts";
+import { ensureSettled, loadSettled } from "../src/data/triage/index.ts";
 import { connect } from "../src/db.ts";
-import type { Db } from "../src/db/index.ts";
-import { connectDb, dbFor } from "../src/db/open.ts";
+import { connectDb, dbFor, type Db } from "./helpers/raw-db.ts";
 
 const RUN = "r1";
 
@@ -27,23 +26,22 @@ const rows = async (db: Db) => await db.all(db.k.selectFrom("item_settled")
 /** item_settled after a first build and after changes, checked against the per-item rule. */
 async function states(db: Db): Promise<unknown[]> {
   await seed(db);
-  await settledTable(db, RUN);
+  await ensureSettled(db, RUN);
   const first = await rows(db);
   await db.run(db.k.deleteFrom("main.classifications").where("repo", "=", "app").where("number", "=", 2).where("classifier", "=", "haiku"));
   await db.run(db.k.updateTable("main.classifications").set({ probs: '{"top":0.4}' }).where("repo", "=", "app").where("number", "=", 1));
   const jev = (number: number, run_id: string) => ({ repo: "app", number, classifier: "jev", run_id, at: "2026-01-04", type_label: "bugfix", flags: "[]", probs: '{"top":0.92}' });
   await db.run(db.k.insertInto("main.classifications").values([jev(6, RUN), jev(7, "old")]));
-  await settledTable(db, RUN);
+  await ensureSettled(db, RUN);
   const second = await rows(db);
-  const one = settledLookup(db, RUN);
-  const all = await settledSet(db, RUN);
-  const some = await settledSet(db, RUN, ["app#3"]);
-  assert.deepEqual(await some("app", 3), await one("app", 3));
-  assert.equal((await some("app", 1)).status, "unclassified", "an item outside refs reads as unclassified");
+  const keys = (second as { repo: string; number: number }[]).map((r) => ({ repo: r.repo, number: r.number }));
+  const all = await loadSettled(db, keys, RUN);
+  const some = await loadSettled(db, [{ repo: "app", number: 3 }], RUN);
+  assert.deepEqual(some.get("app#3"), all.get("app#3"));
+  assert.equal(some.get("app#1"), undefined, "an item outside the keys is not loaded");
   for (const r of second as { repo: string; number: number; status: string; label: string | null }[]) {
-    const s = await one(r.repo, r.number);
+    const s = all.get(`${r.repo}#${r.number}`)!;
     assert.deepEqual([r.status, r.label], [s.status, s.label], `${r.repo}#${r.number} as the per-item rule settles it`);
-    assert.deepEqual(await all(r.repo, r.number), s, `${r.repo}#${r.number} read in one query`);
   }
   return [first, second];
 }

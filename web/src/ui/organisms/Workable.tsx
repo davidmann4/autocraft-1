@@ -171,7 +171,7 @@ export function WorkableGroup({ title, count, hint, dot, aside, children, id }: 
           {title}
         </span>
         {count !== undefined && <span className="num rounded-full bg-ink/[0.07] px-1.5 text-2xs text-ink/70">{num(count)}</span>}
-        {hint && <span className="text-xs text-ink/50">{hint}</span>}
+        {hint && <span className="min-w-0 flex-1 basis-60 text-xs text-ink/50">{hint}</span>}
         {aside && <span className="ml-auto flex flex-wrap items-center gap-x-3 gap-y-1">{aside}</span>}
       </div>
       {children}

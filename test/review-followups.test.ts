@@ -7,7 +7,7 @@ import { backfillAuthorIds } from "../src/author-ids.ts";
 import { stripLinks } from "../src/review/post-template.ts";
 import { tierKey, tiersOf } from "../src/whitelist.ts";
 import { SCRATCH } from "./scratch.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb } from "./helpers/raw-db.ts";
 
 test("backfill binds logins with merge history, and a different account under the login is not whitelisted", async () => {
   mkdirSync(SCRATCH, { recursive: true });

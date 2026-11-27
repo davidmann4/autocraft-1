@@ -22,6 +22,41 @@ const itemView = (i: PairItem) => ({ ref: `#${i.number}`, kind: i.kind === "pr" 
 /** What the models see of a pair. */
 export const pairView = (p: DupePair): Record<string, unknown> => ({ ref: p.ref, first: itemView(p.a), second: itemView(p.b) });
 
+/** Most candidates one Jev request carries; a longer list is split over several requests. */
+export const MAX_ASK_CANDIDATES = 5;
+
+/** One Jev request: an item and the items its pairs name as candidates. Each answer belongs to the pair `ref`. */
+export type DupeAsk = { ref: string; repo: string; item: PairItem; candidates: { ref: string; other: PairItem }[] };
+
+/** The name of a candidate's question in the request and its answer. */
+export const askKey = (c: { other: PairItem }): string => `same_${c.other.number}`;
+
+/** What Jev sees of a request: the item and its candidates. */
+export const askView = (a: DupeAsk): Record<string, unknown> => ({ ...itemView(a.item), candidates: a.candidates.map((c) => itemView(c.other)) });
+
+/**
+ * Groups pairs into requests, one item each: the item in the most unasked pairs takes up to MAX_ASK_CANDIDATES of them, and so on
+ * until every pair is in one request. Items are told apart by repo and number, so a request's candidates all share its repo and
+ * their numbers name them. The pairs keep their order within a request.
+ */
+export function groupPairs(pairs: readonly DupePair[]): DupeAsk[] {
+  const left = new Set(pairs);
+  const out: DupeAsk[] = [];
+  const key = (repo: string, i: PairItem) => `${repo}#${i.number}`;
+  while (left.size) {
+    const count = new Map<string, number>();
+    for (const p of left) for (const k of [key(p.repo, p.a), key(p.repo, p.b)]) count.set(k, (count.get(k) ?? 0) + 1);
+    const [top] = [...count].sort((x, y) => y[1] - x[1] || (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0))[0]!;
+    const take = [...left].filter((p) => key(p.repo, p.a) === top || key(p.repo, p.b) === top).slice(0, MAX_ASK_CANDIDATES);
+    for (const p of take) left.delete(p);
+    const first = take[0]!;
+    const isTop = (p: DupePair) => key(p.repo, p.a) === top;
+    out.push({ ref: top, repo: first.repo, item: isTop(first) ? first.a : first.b,
+      candidates: take.map((p) => ({ ref: p.ref, other: isTop(p) ? p.b : p.a })) });
+  }
+  return out;
+}
+
 export const pairRef = (repo: string, a: number, b: number): string => `${repo}#${Math.min(a, b)}~${Math.max(a, b)}`;
 
 export type PairAnswer = { ref: string; verdict: PairVerdict; reason: string };

@@ -1,13 +1,11 @@
-// Worker thread of the runner (see offthread.ts): runs the planner's detection and the
-// flowchart refresh on its own database connection, so the runner's loop keeps its heartbeat,
-// cancels and job starts whatever these cost.
+// Worker thread of the runner (see offthread.ts): runs the planner's detection on its own database
+// connection, so the runner's loop keeps its heartbeat, cancels and job starts whatever it costs.
 import { parentPort, workerData } from "node:worker_threads";
-import { refreshSummary } from "../flow/summary.ts";
 import { detectAutopilot } from "./autopilot.ts";
 import { connectDb } from "../db/open.ts";
 import { openAppKeys } from "../github/app-keys.ts";
 
-export type WorkerTask = { id: number; task: "plan"; nowMs?: number } | { id: number; task: "flow"; budgetMs?: number };
+export type WorkerTask = { id: number; task: "plan"; nowMs?: number };
 export type WorkerReply = { id: number; ok: true; result: unknown } | { id: number; ok: false; error: string };
 
 const db = await connectDb((workerData as { dbTarget: string }).dbTarget, { role: "planner" });
@@ -16,7 +14,7 @@ await openAppKeys(db).catch((e: Error) => console.error(`planner: GitHub App key
 
 parentPort!.on("message", async (m: WorkerTask) => {
   try {
-    const result = m.task === "plan" ? await detectAutopilot(db, { incremental: true, ...(m.nowMs === undefined ? {} : { nowMs: m.nowMs }) }) : await refreshSummary(db, m.budgetMs);
+    const result = await detectAutopilot(db, { incremental: true, ...(m.nowMs === undefined ? {} : { nowMs: m.nowMs }) });
     parentPort!.postMessage({ id: m.id, ok: true, result } satisfies WorkerReply);
   } catch (e) {
     parentPort!.postMessage({ id: m.id, ok: false, error: (e as Error).stack ?? String(e) } satisfies WorkerReply);

@@ -9,6 +9,7 @@ import type { AssignFacts } from "../src/core/plan.ts";
 import { claimForWork } from "../src/github/claim.ts";
 import { setFeature } from "../src/build/features.ts";
 import { runUnassign } from "../src/unassign/index.ts";
+import { insertWorkflow } from "../src/workflow/store.ts";
 import { world } from "./world-db.ts";
 import { itemFacts, prFacts } from "./world.ts";
 
@@ -40,8 +41,10 @@ test("a PR on the path to merge keeps the assignment, one that left it loses it"
   assert.equal(unassigns(decidePr(prFacts({ ...held, conflict: { bucket: "merge", base: "main", baseOk: true }, assignment: ours }))), false, "conflict merge due");
 });
 
-test("a fix-up that gave up asks the contributor, then releases the PR, unless it is in a batch", () => {
-  const f = { review: { verdict: "take-fix" }, fixup: spent, assignment: ours };
+test("a fix-up that gave up asks the contributor, then releases the PR, unless it is in a batch; on a PR approved for merge it asks the approver at once", () => {
+  const approved = { review: { verdict: "take-fix" }, fixup: spent, assignment: ours };
+  assert.equal(unassigns(decidePr(prFacts(approved))), true, "approver asked");
+  const f = { ...approved, workflow: { entry: "fixup", approved: false, startedBy: "maint", startedAt: "2026-11-04T09:00:00.000Z", own: true } as const };
   assert.equal(unassigns(decidePr(prFacts(f))), false, "ask due");
   const asked = { ...f, fixup: { ...spent, recorded: ["asked"] } };
   assert.equal(unassigns(decidePr(prFacts(asked))), true, "asked");
@@ -49,33 +52,33 @@ test("a fix-up that gave up asks the contributor, then releases the PR, unless i
   assert.equal(unassigns(decidePr(prFacts({ ...asked, inActiveBatch: true }))), false);
 });
 
-test("a take-fix PR with a conflict give-up, an ended CI fix and a held merge are released; a refused merge is kept", () => {
+test("a take-fix PR with a conflict give-up, an ended CI fix and CI runs a maintainer approves are released; a refused merge is kept", () => {
   const held = { mergeable: "CONFLICTING", conflict: { bucket: "held", base: "main", baseOk: true } };
   assert.equal(unassigns(decidePr(prFacts({ review: { verdict: "take-fix" }, fixup: { fixes: 0, attempts: 0, recorded: [] as string[] }, ...held, assignment: ours }))), true, "conflict held, take-fix");
-  const cifix = (states: string[]) => ({ ci: "failure", cifix: { states, tries: 0, rerunAt: null, infraRuns: null, formattingTask: null, formatterEnded: true, totalPushes: 0, totalTries: 0, checksAt: null }, assignment: ours });
+  // `askedPatch`: the asked row is a posted patch, which ends the CI fix on a PR approved for merge (a plain ask to the contributor does not).
+  const cifix = (states: string[]) => ({ ci: "failure", cifix: { states, tries: 0, rerunAt: null, infraRuns: null, formattingTask: null, formatterEnded: true, totalPushes: 0, totalTries: 0, checksAt: null, askedPatch: true }, assignment: ours });
   assert.equal(unassigns(decidePr(prFacts(cifix(["asked"])))), true, "CI fix ended without a push");
   assert.equal(unassigns(decidePr(prFacts(cifix([])))), false, "CI fix due");
-  assert.equal(unassigns(decidePr(prFacts({ mergeHeld: true, assignment: ours }))), true, "merge held by an operator");
   assert.equal(unassigns(decidePr(prFacts({ runs: { waiting: 1, reread: false, crossRepo: true, approvable: 1 }, repoFacts: { ciApproved: false }, assignment: ours }))), true, "CI runs wait for a maintainer");
   assert.equal(unassigns(decidePr(prFacts({ lastMerge: { outcome: "refused", reason: "x", ci: "pending", mergeable: "MERGEABLE" }, assignment: ours }))), false, "refused merge retried");
 });
 
 test("an issue is unassigned when its implementation waits on a person, kept while it runs, and never assigned by the planner", async () => {
-  const queued = (state: string) => ({ queuedBy: "op", settles: true, featureOn: true, liveInRepo: 0,
+  const queued = (state: string) => ({ queuedBy: "op", standing: "yes" as const, featureOn: true, liveInRepo: 0,
     row: { state, attempt: 1, textChanged: false, newCommentAfterQuestion: false, decisionAnswered: false, requeuedAfterEnd: false, asked: null, prOpen: false } });
   assert.equal(unassigns(decideItem(itemFacts({ assignment: ours, implement: queued("stuck") }))), true);
   assert.equal(unassigns(decideItem(itemFacts({ assignment: ours, implement: queued("implementing") }))), false);
   assert.equal(unassigns(decideItem(itemFacts({ assignment: { login: "bot", assignees: ["bot", "alice"], ours: true }, implement: queued("stuck") }))), false);
-  // An issue queued by an operator is planned for Implement once the repo's switch is on; it is not assigned: only a stage starting work does that.
-  const w = await (await (await world()).repo()).issue(5, { impact: "P2" });
-  await w.db.run(w.db.k.insertInto("fast_track").values({ repo: "app", number: 5, added_by: "op", added_at: "2026-11-04T08:00:00.000Z" }));
+  // An issue whose implement workflow an operator started is planned for Implement once the repo's switch is on; it is not assigned: only a stage starting work does that.
+  const w = await (await (await (await world()).repo()).acting()).issue(5, { impact: "P2" });
+  await insertWorkflow(w.db, { repo: "app", number: 5, kind: "issue", entry: "implement", state: "running", startedBy: "op", startedAt: "2026-11-04T08:00:00.000Z", startedVia: "dashboard" });
   const plan = async () => (await w.plan()).items.find((i) => i.facts.number === 5)!.plan;
   const implement = async () => (await plan()).actions.filter((a) => a.kind === "implement" || a.kind === "unassign").map((a) => [a.kind, a.params?.bucket]);
   assert.deepEqual(await implement(), [], "Implement off: nothing is planned");
   await setFeature(w.db, "implement", true, "op", "app");
   assert.deepEqual(await implement(), [["implement", "plan"]]);
-  // Queued by someone who does not settle on the repo: not queued for Implement.
-  await w.db.run(w.db.k.updateTable("fast_track").set({ added_by: "viewer" }).where("number", "=", 5));
+  // Started by someone who may not act on the repo: nothing is planned for Implement.
+  await w.db.run(w.db.k.updateTable("item_workflows").set({ started_by: "viewer" }).where("number", "=", 5));
   assert.deepEqual(await implement(), []);
 });
 
@@ -100,7 +103,8 @@ test("the unassign step releases what the planner says and only our own assignme
   await mark(2, ["pipeline-bot", "alice"]);
   w.gh.live(1, { assignees: ["pipeline-bot"] });
   w.gh.live(2, { assignees: ["pipeline-bot", "alice"] });
-  await (await w.answer(1, "hold")).answer(2, "hold");
+  // Started with review and done: both wait for a person's answer to the recommendation.
+  for (const n of [1, 2]) await insertWorkflow(w.db, { repo: "app", number: n, kind: "pr", entry: "review", state: "recommending", startedBy: "op", startedAt: "2026-11-04T00:00:00Z", startedVia: "dashboard" });
   const r = await runUnassign(w.db, { repo: "app", by: "pipeline", runId: "t", querier: w.gh.querier, exec: asPipelineBot });
   assert.deepEqual(r.due, 1);
   assert.deepEqual(r.unassigned, ["app#1"]);

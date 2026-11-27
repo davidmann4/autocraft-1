@@ -5,9 +5,10 @@ import { createHash, randomBytes } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { BuildError } from "../build/envs.ts";
-import * as kx from "../db/kx.ts";
 import { queueRound, readRound, requeueRound, type RoundRead } from "../build/rounds.ts";
-import { CONFIDENTIAL_WAIT, confidentialReadyAt } from "../build/tasks.ts";
+import { loadConfidentialReadyAt } from "../data/build/index.ts";
+import { runWatermark } from "../data/inference/index.ts";
+import * as sec from "../data/security/index.ts";
 import { CheckTool, applyCheck, refusal } from "../checktool/index.ts";
 import { runModelStep } from "../agents/step.ts";
 import { textStep } from "../agents/steps.ts";
@@ -31,8 +32,9 @@ import {
   FIX_RUN_BASE, FIX_ROUNDS, fixBranch, giveaway, parseFixReply, patchGiveaway, quietProblem, securityRepo,
   type SecurityFixCheckInput, type SecurityFixInput,
 } from "./rules.ts";
-import { advance, clearRounds, rawFinding, recordFixCall, scanRow, scanTestOf } from "./store.ts";
-import { usageRunId } from "./real.ts";
+import { advance, clearRounds, rawFinding, recordFixCall, scanRow } from "./store.ts";
+import { runsSince, usageRunId } from "./real.ts";
+import type { ScanTestState } from "../../web/src/api/types.ts";
 import type { Db } from "../db/index.ts";
 
 const SHA = /^[0-9a-f]{40}$/;
@@ -61,16 +63,15 @@ export type FixDeps = {
   log: (line: string) => void;
 };
 
-export function defaultFixDeps(db: Db, scanId: number, io: { cancelled: () => Promise<boolean>; log: (l: string) => void }): FixDeps {
+export function defaultFixDeps(db: Db, _scanId: number, io: { cancelled: () => Promise<boolean>; log: (l: string) => void }): FixDeps {
   return {
     exec: realExec, root: fixupDir(), fetchCrates: ghCrates, ...io,
     checkout: (repo, branch, sha) => checkoutForCommit(repo, branch, sha, io.log),
     who: (repo) => commitIdentity(db, repo, () => whoAmI(realExec)),
     ask: async (id, input, o) => {
-      const before = (await db.get(db.k.selectFrom("agent_runs").select((eb) => eb.fn.coalesce(eb.fn.max("id"), eb.lit(0)).as("n"))))!.n;
+      const before = await runWatermark(db);
       const r = await runModelStep(db, textStep<typeof input>(id), input, { checkout: o.checkout, check: o.tool, ...(o.session && { session: o.session }), cancelled: io.cancelled, usage: { run: o.run, agent: o.agent, stage: "security", items: (ok) => (ok ? 1 : 0) } });
-      const spent = (await db.get(db.k.selectFrom("agent_runs as r").innerJoin("agent_run_items as i", "i.run_id", "r.id")
-        .select((eb) => eb.fn.sum<number | null>("r.cost_usd").as("c")).where("i.repo", "=", input.repo).where("i.number", "=", input.number).where("r.id", ">", before)))!.c;
+      const spent = (await runsSince(db, before, input)).cost;
       return { text: r.ok ? r.value : null, cost: spent ?? r.usage.cost, resumed: o.session?.resume !== undefined, ...(o.session?.kept && { kept: o.session.kept }) };
     },
   };
@@ -91,14 +92,15 @@ export function resumeFixMessage(failure: string): string {
   return `The harness checked your diff and the round failed:\n\n${failure.trim()}\n\nFix it. Reply in the same format as before (TITLE line, SUMMARY line, the marker line, then the complete diff): the whole corrected diff, not a change to your earlier diff.`;
 }
 
-type RoundRow = { round: number; patch: string; test_patch: string; title: string; summary: string; head_task: number; base_task: number; retried: number; session: string | null; state: string; failure: string | null; created_at: string };
-const roundRows = async (db: Db, repo: string, n: number): Promise<RoundRow[]> =>
-  await db.all(db.k.selectFrom("security_fix_rounds").select(kx.cols("security_fix_rounds")).where("repo", "=", repo).where("number", "=", n).orderBy("round"));
+type RoundRow = sec.RoundRow;
+const roundRows = async (db: Db, repo: string, n: number): Promise<RoundRow[]> => (await sec.loadRounds(db, [sec.findingKey(repo, n)])).get(sec.findingKey(repo, n)) ?? [];
 
 /** Puts the finding back where an operator can decide again, with the reason on it. */
 async function giveUp(db: Db, repo: string, n: number, why: string, log: (l: string) => void): Promise<string> {
-  await clearRounds(db, repo, n);
-  await advance(db, repo, n, ["fixing"], "new", { note: oneLine(why, 400), last_failure: oneLine(why, 400) });
+  await db.write(async () => {
+    await clearRounds(db, repo, n);
+    await advance(db, repo, n, ["fixing"], "new", { note: oneLine(why, 400), last_failure: oneLine(why, 400) });
+  });
   log(`${repo} finding ${n}: no fix: ${oneLine(why, 200)}`);
   return `finding ${n}: no fix: ${oneLine(why, 120)}`;
 }
@@ -117,16 +119,12 @@ export async function runFix(db: Db, repo: string, n: number, d: FixDeps): Promi
   // The model's checks and the round's builds run only in a confidential build environment: without one ready, the fix
   // waits before any model call, and advanceSecurityFixes queues the next job once one is.
   if (!(await roundRows(db, repo, n)).some((r) => r.state === "building")) {
-    if (await confidentialReadyAt(db) === null) {
-      await db.run(db.k.updateTable("security_findings")
-        .set((eb) => ({ env_wait_at: eb.fn.coalesce("env_wait_at", eb.val(new Date().toISOString())), note: CONFIDENTIAL_WAIT }))
-        .where("repo", "=", repo).where("number", "=", n).where("state", "=", "fixing"));
+    if (await loadConfidentialReadyAt(db) === null) {
+      await sec.setFindingEnvWait(db, sec.findingKey(repo, n), new Date().toISOString());
       log(`${repo} finding ${n}: waiting for a confidential build environment`);
       return `${repo} finding ${n}: waiting for a confidential build environment`;
     }
-    if (row.env_wait_at) await db.run(db.k.updateTable("security_findings")
-      .set((eb) => ({ env_wait_at: null, note: eb.case().when("note", "=", CONFIDENTIAL_WAIT).then(null).else(eb.ref("note")).end() }))
-      .where("repo", "=", repo).where("number", "=", n));
+    if (row.env_wait_at) await sec.setFindingEnvWait(db, sec.findingKey(repo, n), null);
   }
   // The model session of the last fix call, continued by the next round while the prompt cache is warm; its store is deleted when the job ends.
   const ledger = new SessionLedger();
@@ -164,8 +162,8 @@ export async function runFix(db: Db, repo: string, n: number, d: FixDeps): Promi
     const finding = { title: row.title, severity: row.severity, refs, reach: row.reach, impact: row.impact, area: row.area };
     const run = usageRunId(row.scan_id);
     // The scan's own test of the finding, once it has been run (feature scan-tests); no row, no key.
-    const ran = await scanTestOf(db, repo, n);
-    const scanTest = ran && ran.state !== "building" ? { result: ran.state, path: ran.path, source: ran.source } : null;
+    const ran = (await sec.loadScanTests(db, [sec.findingKey(repo, n)])).get(sec.findingKey(repo, n));
+    const scanTest = ran && ran.state !== "building" ? { result: ran.state as Exclude<ScanTestState, "building">, path: ran.test_path, source: ran.test_source } : null;
     /** The rest of a round whose build passed: formatter changes, the fresh Opus review, the local commit. */
     const finalize = async (r: RoundRow, formatDiff: string | null): Promise<{ ok: true; summary: string } | { ok: false; why: string }> => {
       const v = validateFixPatch(r.patch, allowed, testPath, crate.dir, testName, scripts);
@@ -200,10 +198,13 @@ export async function runFix(db: Db, repo: string, n: number, d: FixDeps): Promi
       if (changes.some((c) => !okFiles.has(c[3]!) || (c[2] === "A" ? c[1] !== "100644" : c[2] !== "M" || c[0] !== c[1]))) return { ok: false, why: "the commit would change files or modes outside the validated diff" };
       // A local ref in the bare cache; nothing is pushed before Land.
       await git.must(["update-ref", fixRef(repo, n), commit]);
-      const moved = await advance(db, repo, n, ["fixing"], "ready", {
-        fix_commit: commit, fix_patch: patch, fix_title: r.title, fix_summary: r.summary, fix_branch: fixBranch(r.title, randomBytes(3).toString("hex")), fix_files: JSON.stringify(files), fix_ref: fixRef(repo, n), note: null,
+      const moved = await db.write(async () => {
+        const ok = await advance(db, repo, n, ["fixing"], "ready", {
+          fix_commit: commit, fix_patch: patch, fix_title: r.title, fix_summary: r.summary, fix_branch: fixBranch(r.title, randomBytes(3).toString("hex")), fix_files: JSON.stringify(files), fix_ref: fixRef(repo, n), note: null,
+        });
+        await clearRounds(db, repo, n);
+        return ok;
       });
-      await clearRounds(db, repo, n);
       return { ok: true, summary: moved ? `${repo} finding ${n}: fix ready (${files.length} files, round ${r.round})` : `finding ${n}: left fixing while the fix was written` };
     };
     let previous: SecurityFixInput["previous"];
@@ -217,11 +218,11 @@ export async function runFix(db: Db, repo: string, n: number, d: FixDeps): Promi
     else if (last) {
       const ids: [number, number] = [last.head_task, last.base_task];
       let read: RoundRead = await readRound(db, ids, last.retried === 1);
-      if (read.kind === "pending") return `${repo} finding ${n}: round ${last.round} ${await confidentialReadyAt(db) === null ? "is waiting for a confidential build environment" : "is still building"}`;
+      if (read.kind === "pending") return `${repo} finding ${n}: round ${last.round} ${await loadConfidentialReadyAt(db) === null ? "is waiting for a confidential build environment" : "is still building"}`;
       if (read.kind === "retry-env") {
         try {
           const again = await requeueRound(db, ids);
-          await db.run(db.k.updateTable("security_fix_rounds").set({ head_task: again[0], base_task: again[1], retried: 1 }).where("repo", "=", repo).where("number", "=", n).where("round", "=", last.round));
+          await sec.markRounds(db, [{ repo, number: n, round: last.round, set: { head_task: again[0], base_task: again[1], retried: 1 } }]);
           log(`${repo} finding ${n}: round ${last.round}: build environment error (${read.why}); tasks queued again`);
           return `${repo} finding ${n}: round ${last.round} queued again after a build environment error`;
         } catch (e) {
@@ -232,11 +233,11 @@ export async function runFix(db: Db, repo: string, n: number, d: FixDeps): Promi
       // The round's session is taken over by this job: it continues it, or the end of the job removes it.
       const stored = parseSessions(last.session)[""];
       if (stored) { ledger.hold(stored); kept = { session: stored, at: Date.parse(stored.at) }; }
-      await db.run(db.k.updateTable("security_fix_rounds").set({ session: null }).where("repo", "=", repo).where("number", "=", n).where("round", "=", last.round));
+      await sec.markRounds(db, [{ repo, number: n, round: last.round, set: { session: null } }]);
       if (read.kind === "pass") { passed = { row: last, formatDiff: read.formatDiff }; startRound = last.round; }
       else {
         const why = read.kind === "fail" ? read.reason : "the round did not finish";
-        await db.run(db.k.updateTable("security_fix_rounds").set({ state: "failed", failure: why }).where("repo", "=", repo).where("number", "=", n).where("round", "=", last.round));
+        await sec.markRounds(db, [{ repo, number: n, round: last.round, set: { state: "failed", failure: why } }]);
         previous = { patch: last.patch.slice(0, 60_000), failure: why };
         startRound = last.round + 1;
         log(`${repo} finding ${n}: round ${last.round} failed: ${oneLine(why, 160)}`);
@@ -255,7 +256,7 @@ export async function runFix(db: Db, repo: string, n: number, d: FixDeps): Promi
         passed = null;
         const r = await finalize(done.row, done.formatDiff);
         if (r.ok) return r.summary;
-        await db.run(db.k.updateTable("security_fix_rounds").set({ state: "failed", failure: r.why }).where("repo", "=", repo).where("number", "=", n).where("round", "=", done.row.round));
+        await sec.markRounds(db, [{ repo, number: n, round: done.row.round, set: { state: "failed", failure: r.why } }]);
         failRound(r.why, done.row.patch);
         continue;
       }
@@ -292,11 +293,9 @@ export async function runFix(db: Db, repo: string, n: number, d: FixDeps): Promi
       }
       const keptNow: Kept = reply.kept ? { "": reply.kept } : {};
       // Every column is written: a new round replaces the earlier one's retry flag and failure.
-      await db.run(db.k.insertInto("security_fix_rounds")
-        .values({ repo, number: n, round, patch: v.patch, test_patch: v.testPatch, title: parsed.title, summary: parsed.summary, head_task: ids[0], base_task: ids[1], retried: 0, session: storeSessions(keptNow, new Date()), state: "building", failure: null, created_at: new Date().toISOString() })
-        .onConflict((oc) => oc.columns(["repo", "number", "round"]).doUpdateSet(kx.excluded(["patch", "test_patch", "title", "summary", "head_task", "base_task", "retried", "session", "state", "failure", "created_at"]))));
+      await sec.saveRound(db, { repo, number: n, round, patch: v.patch, test_patch: v.testPatch, title: parsed.title, summary: parsed.summary, head_task: ids[0], base_task: ids[1], retried: 0, session: storeSessions(keptNow, new Date()), state: "building", failure: null, created_at: new Date().toISOString() });
       ledger.stored(keptNow);
-      const queued = `${repo} finding ${n}: round ${round} queued for build${await confidentialReadyAt(db) === null ? "; waiting for a confidential build environment" : ""}`;
+      const queued = `${repo} finding ${n}: round ${round} queued for build${await loadConfidentialReadyAt(db) === null ? "; waiting for a confidential build environment" : ""}`;
       log(queued);
       return queued;
     }

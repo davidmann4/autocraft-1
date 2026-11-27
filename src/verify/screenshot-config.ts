@@ -1,8 +1,7 @@
 // Per-repo setup for before/after UI screenshots. Operators write it (JSON, validated here on every write and
 // read); the planning model only picks command names and argument values, so every command line a task runs comes
 // from this config and from validated arguments, never from model text.
-import { audit } from "../dash/audit.ts";
-import { cols, excluded } from "../db/kx.ts";
+import { loadScreenshotConfigs, removeScreenshotConfig, saveScreenshotConfig, type ScreenshotConfig as StoredConfig } from "../data/merge/index.ts";
 import type { ParamSpec } from "./types.ts";
 import type { Db } from "../db/index.ts";
 
@@ -213,47 +212,40 @@ export function paramValueError(spec: ParamSpec, value: unknown): string | null 
   return charsPattern(spec).test(value) ? null : `must be ${spec.min} to ${spec.max} characters of ${spec.chars}`;
 }
 
-type Row = { repo: string; package: string; example: string; driver: string; commands: string; ui_paths: string; size: string | null; updated_by: string; updated_at: string };
-
-function fromRow(r: Row): ScreenshotConfig | null {
-  const p = parseScreenshotConfig({ package: r.package, example: r.example, driver: r.driver, commands: safeJson(r.commands), ui_paths: safeJson(r.ui_paths), ...(r.size ? { size: r.size } : {}) });
-  return "ok" in p ? { ...p.value, repo: r.repo, updatedBy: r.updated_by, updatedAt: r.updated_at } : null;
+/** The stored config as the validated type; null when it no longer validates. */
+function revalidated(c: StoredConfig): ScreenshotConfig | null {
+  const p = parseScreenshotConfig({ package: c.package, example: c.example, driver: c.driver, commands: c.commands, ui_paths: c.ui_paths, ...(c.size ? { size: c.size } : {}) });
+  return "ok" in p ? { ...p.value, repo: c.repo, updatedBy: c.updatedBy, updatedAt: c.updatedAt } : null;
 }
 
-const safeJson = (s: string): unknown => {
-  try {
-    return JSON.parse(s);
-  } catch {
-    return null;
+/** The repos' configs that are stored and still validate. */
+export async function loadConfigs(db: Db, repos?: string[]): Promise<Map<string, ScreenshotConfig>> {
+  const out = new Map<string, ScreenshotConfig>();
+  for (const [repo, c] of await loadScreenshotConfigs(db, repos)) {
+    const v = revalidated(c);
+    if (v) out.set(repo, v);
   }
-};
+  return out;
+}
 
 /** The repo's config, or null when none is stored (or the stored row no longer validates). */
 export async function getConfig(db: Db, repo: string): Promise<ScreenshotConfig | null> {
-  const r = await db.get(db.k.selectFrom("screenshot_config").select(cols("screenshot_config")).where("repo", "=", repo));
-  return r ? fromRow(r) : null;
+  return (await loadConfigs(db, [repo])).get(repo) ?? null;
 }
 
 export async function listConfigs(db: Db): Promise<ScreenshotConfig[]> {
-  return (await db.all(db.k.selectFrom("screenshot_config").select(cols("screenshot_config")).orderBy("repo"))).map(fromRow).filter((c): c is ScreenshotConfig => c !== null);
+  return [...(await loadConfigs(db)).values()];
 }
 
 /** Validates and stores the repo's config; throws ScreenshotConfigError with the reason. Audited. */
 export async function putConfig(db: Db, by: string, repo: string, raw: unknown): Promise<ScreenshotConfig> {
   const p = parseScreenshotConfig(raw);
   if ("error" in p) throw new ScreenshotConfigError(p.error);
-  const v = p.value;
-  const at = new Date().toISOString();
-  await db.run(db.k.insertInto("screenshot_config")
-    .values({ repo, package: v.package, example: v.example, driver: v.driver, commands: JSON.stringify(v.commands), ui_paths: JSON.stringify(v.ui_paths), size: v.size ?? null, updated_by: by, updated_at: at })
-    .onConflict((oc) => oc.column("repo").doUpdateSet(excluded(["package", "example", "driver", "commands", "ui_paths", "size", "updated_by", "updated_at"]))));
-  await audit(db, by, "screenshot-config", repo, { package: v.package, example: v.example, driver: v.driver, commands: Object.keys(v.commands) });
-  return { ...v, repo, updatedBy: by, updatedAt: at };
+  const saved = await saveScreenshotConfig(db, by, repo, p.value);
+  return { ...p.value, repo, updatedBy: saved.updatedBy, updatedAt: saved.updatedAt };
 }
 
 /** Removes the repo's config; false when there was none. Audited. */
 export async function deleteConfig(db: Db, by: string, repo: string): Promise<boolean> {
-  const gone = (await db.run(db.k.deleteFrom("screenshot_config").where("repo", "=", repo))).changes > 0;
-  if (gone) await audit(db, by, "screenshot-config", repo, { removed: true });
-  return gone;
+  return await removeScreenshotConfig(db, by, repo);
 }

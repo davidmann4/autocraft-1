@@ -25,3 +25,6 @@ export function parseRefs(text: string, repos: TrackedRepo[]): ItemKey[] {
   for (const m of rest.matchAll(SHORT_RE)) add(m[1], m[2]!, m[3]!);
   return [...out.values()];
 }
+
+/** The text with every item URL and `repo#123` replaced by a space, tracked or not. */
+export const withoutRefs = (text: string): string => text.replace(URL_RE, " ").replace(SHORT_RE, " ");

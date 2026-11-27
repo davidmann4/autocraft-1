@@ -1,8 +1,16 @@
 // A post-merge defect holds merges on that repo only, whether or not it is a test repo.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { activeTrips, mergeDefect, resumeStage } from "../src/push-outcomes.ts";
-import { connectDb } from "../src/db/open.ts";
+import { loadTrips, resumeStage, tripMergeBreakers } from "../src/data/control/index.ts";
+import { loadMergedInfo } from "../src/data/merge/index.ts";
+import { connectDb, type Db } from "./helpers/raw-db.ts";
+
+/** A post-merge review of a PR we merged found defects, as the post-merge review records it. */
+async function mergeDefect(db: Db, repo: string, number: number, defects: number, at: string): Promise<void> {
+  const merged = (await loadMergedInfo(db, [{ repo, number }])).get(`${repo}#${number}`);
+  if (defects > 0 && merged) await tripMergeBreakers(db, [{ repo, number, mergedAt: merged.lastAt, reason: `the post-merge review of ${repo}#${number} found ${defects} defects`, evidence: [`${repo}#${number}`] }], at);
+}
+const activeTrips = async (db: Db): Promise<Record<string, string>> => Object.fromEntries([...await loadTrips(db, { active: true })].map(([k, t]) => [k, t.reason]));
 
 test("a post-merge defect trips the merge breaker of its own repo, not the pipeline's", async () => {
   const db = await connectDb(":memory:");

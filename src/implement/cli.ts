@@ -4,8 +4,14 @@
 // question are printed here, never in the job log, which every signed-in user can read.
 // `run --no-pr` runs the build of the issue's current attempt in this process: the session in the attempt's workspace (on
 // the queuer's Task Runner), AutoCraft's checks and the follow-up turns, until the attempt is ready for its PR or stuck.
-// Nothing is written to GitHub; a stuck attempt still asks its decision.
+// Nothing is written to GitHub; a stuck attempt still becomes a blocker of its workflow.
 import type { Db } from "../db/index.ts";
+import { loadTrackedRepos } from "../data/control/index.ts";
+import { loadPlanReplyOfCall } from "../data/implement/index.ts";
+import { loadRun } from "../data/inference/index.ts";
+import { loadJobState } from "../data/jobs/index.ts";
+import { loadCalls, loadCallReply } from "../data/runners/index.ts";
+import { loadSessions } from "../data/build/index.ts";
 import { openDb } from "../db/open.ts";
 import { unpackText } from "../agents/runs.ts";
 import { CLI_QUEUE_BY, enqueue, JobError } from "../runner/jobs.ts";
@@ -13,7 +19,7 @@ import { runBuild } from "./build.ts";
 import { parsePlanReply, planMarkdown, PLAN_PROMPT_ID } from "./plan.ts";
 import { authorComment } from "./questions.ts";
 import { fixIssueApprovalOf } from "./approval.ts";
-import { currentImplementation } from "./store.ts";
+import { currentAttempt } from "./attempt.ts";
 import { BUILD_STATES, type PlanReply } from "./types.ts";
 
 const USAGE = "usage: implement run <repo#n> --plan-only [--no-post] | implement run <repo#n> --no-pr | implement show <repo#n> --call <id>";
@@ -32,13 +38,13 @@ function refOf(s: string | undefined): Ref {
   return m ? { repo: m[1]!, number: Number(m[2]) } : die(USAGE);
 }
 
-/** The plan and its questions as the CLI prints them: the comment an author question posts, the decision a maintainer question asks. */
+/** The plan and its questions as the CLI prints them: the comment an author question posts, the question the maintainers are asked. */
 export function planReport(r: PlanReply): string {
   const out = [planMarkdown(r)];
   const author = r.questions.filter((q) => q.audience === "author");
   if (author.length) out.push(`--- comment to the author ---\n${authorComment(author)}`);
   for (const q of r.questions.filter((x) => x.audience === "maintainer")) {
-    out.push(`--- decision for the maintainers${r.size === "XL" ? " (split)" : ""} ---\n${q.text}\n${q.options.map((o) => `  - ${o.label}${o.label === q.recommended ? " (recommended)" : ""}: ${o.hint}`).join("\n")}\n  - Backlog`);
+    out.push(`--- question for the maintainers${r.size === "XL" ? " (split)" : ""} ---\n${q.text}\n${q.options.map((o) => `  - ${o.label}${o.label === q.recommended ? " (recommended)" : ""}: ${o.hint}`).join("\n")}`);
   }
   return out.join("\n\n");
 }
@@ -50,18 +56,18 @@ export function planReport(r: PlanReply): string {
 async function replyOf(db: Db, callId: number, runId: number | null, raw: string | null): Promise<string | null> {
   if (raw !== null) return raw;
   if (runId !== null) {
-    const t = await db.get(db.k.selectFrom("agent_run_texts").select("output").where("run_id", "=", runId));
-    const out = unpackText(t?.output);
+    // The CLI runs as the operator: every repo is visible and the texts are read.
+    const t = await loadRun(db, runId, { hidden: [], staff: true });
+    const out = unpackText(t?.output ?? null);
     if (out) return out;
   }
-  const round = await db.get(db.k.selectFrom("main.implementation_rounds").select("result").where("kind", "=", "plan").where("call_id", "=", callId).orderBy("id", "desc").limit(1));
-  return round?.result ?? null;
+  return await loadPlanReplyOfCall(db, callId);
 }
 
 async function show(db: Db, ref: Ref, callId: number): Promise<void> {
-  const c = await db.get(db.k.selectFrom("remote_calls").select(["prompt_id", "items", "reply", "state", "run_id"]).where("id", "=", callId));
-  if (!c || c.prompt_id !== PLAN_PROMPT_ID || !(JSON.parse(c.items ?? "[]") as Ref[]).some((r) => r.repo === ref.repo && r.number === ref.number)) die(`call ${callId} is not a plan call of ${ref.repo}#${ref.number}`);
-  const reply = await replyOf(db, callId, c!.run_id, c!.reply);
+  const c = await loadCallReply(db, callId);
+  if (!c || c.promptId !== PLAN_PROMPT_ID || !c.items.some((r) => r.repo === ref.repo && r.number === ref.number)) die(`call ${callId} is not a plan call of ${ref.repo}#${ref.number}`);
+  const reply = await replyOf(db, callId, c!.runId, c!.reply);
   if (reply === null) die(`call ${callId} has no stored reply (${c!.state})`);
   try {
     console.log(planReport(parsePlanReply(reply!)));
@@ -81,7 +87,7 @@ async function planOnly(db: Db, ref: Ref, dry: boolean): Promise<void> {
   }
   console.log(`job ${id} queued${dry ? " (dry run: nothing is stored or posted)" : ""}; waiting for it to end`);
   for (;;) {
-    const j = await db.get(db.k.selectFrom("jobs").select(["state", "summary", "error"]).where("id", "=", id));
+    const j = await loadJobState(db, id);
     if (!j) die(`job ${id} is gone`);
     if (j!.state === "done" || j!.state === "failed" || j!.state === "cancelled") {
       console.log(`job ${id} ${j!.state}: ${j!.summary ?? j!.error ?? ""}`);
@@ -91,14 +97,15 @@ async function planOnly(db: Db, ref: Ref, dry: boolean): Promise<void> {
     await new Promise((r) => setTimeout(r, POLL_MS));
   }
   // The plan call the job ended on: its newest implement.plan call for the issue.
-  const call = await db.get(db.k.selectFrom("workspace_sessions as s").innerJoin("remote_calls as c", "c.id", "s.remote_call_id").select("c.id")
-    .where("s.job_id", "=", id).where("s.kind", "=", "implement").where("c.prompt_id", "=", PLAN_PROMPT_ID).orderBy("c.id", "desc").limit(1));
-  if (call) await show(db, ref, Number(call.id));
+  const ids = ((await loadSessions(db, { jobId: id })).get(id) ?? []).flatMap((s) => (s.kind === "implement" && s.remote_call_id !== null ? [Number(s.remote_call_id)] : []));
+  const calls = await loadCalls(db, ids);
+  const call = Math.max(-1, ...[...calls.values()].filter((c) => c.promptId === PLAN_PROMPT_ID).map((c) => c.id));
+  if (call >= 0) await show(db, ref, call);
 }
 
 /** Runs the build units of the current attempt in this process until it is ready for its PR, stuck or no longer moving. */
 async function buildNoPr(db: Db, ref: Ref): Promise<void> {
-  const cur = await currentImplementation(db, ref.repo, ref.number);
+  const cur = (await currentAttempt(db, ref.repo, ref.number))?.impl;
   if (!cur) return die(`${ref.repo}#${ref.number} has no current implementation attempt`);
   if (!cur.plan) return die(`${ref.repo}#${ref.number}: attempt ${cur.attempt} has no stored plan (state ${cur.state}); plan it first`);
   const run = {
@@ -108,7 +115,7 @@ async function buildNoPr(db: Db, ref: Ref): Promise<void> {
   for (let n = 0; n < UNITS_MAX; n++) {
     const r = await runBuild({ ...run, startedMs: Date.now() }, ref.repo, ref.number);
     console.log(r.summary);
-    const now = await currentImplementation(db, ref.repo, ref.number);
+    const now = (await currentAttempt(db, ref.repo, ref.number))?.impl;
     if (!now || now.state === "opening" || !BUILD_STATES.has(now.state) || !r.moved) {
       process.exitCode = now?.state === "opening" ? 0 : 2;
       return;
@@ -148,7 +155,7 @@ export const commands = {
     async run(args: string[]): Promise<void> {
       const i = args.indexOf("--repo");
       const db = await openDb();
-      const repos = i >= 0 ? [args[i + 1]!] : (await db.all(db.k.selectFrom("tracked_repos").select("name").orderBy("name"))).map((r) => r.name);
+      const repos = i >= 0 ? [args[i + 1]!] : [...(await loadTrackedRepos(db)).keys()].sort();
       for (const r of repos) {
         const a = await fixIssueApprovalOf(db, r);
         console.log(`${r}\t${a ? `approved by ${a.by} at ${a.at}` : "not approved"}`);

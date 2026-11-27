@@ -13,9 +13,8 @@ import { cn } from "../../ui/cn";
 import { num, eventTime } from "../../lib/format";
 import { TimeAgo } from "../../ui/atoms/TimeAgo";
 import { Block, ConfirmButton, ErrorLine, Page, useWrite, when } from "../admin/parts";
-import { JudgementModel, OutsideLimits, PilotPanel, PipelineSwitch, StageLimits } from "./controls";
+import { OutsideLimits, PipelineSwitch, StageLimits } from "./controls";
 import { useNow } from "../../lib/useNow";
-import { decisionPath } from "../../lib/links";
 import { ItemRef } from "../../ui/molecules/ItemRef";
 
 // ---- helpers -------------------------------------------------------------------
@@ -136,10 +135,9 @@ function Jobs({ selected }: { selected?: number }) {
                   <td className="px-3">
                     <span className="code">{j.step}</span>
                     {Object.keys(j.params).length > 0 && <span className="ml-1.5 text-xs text-ink/45">{paramText(j.params)}</span>}
-                    {(j.models.length > 0 || j.accounts.length > 0) && (
+                    {j.models.length > 0 && (
                       <div className="text-xs text-ink/55">
                         {j.models.join(", ")}
-                        {j.accounts.length > 0 && <span className="ml-1.5">on {j.accounts.join(", ")}</span>}
                       </div>
                     )}
                   </td>
@@ -194,8 +192,6 @@ export function PipelineView({ params }: ViewProps) {
     <Page title="Pipeline" sub={o && <RunnerLine o={o} />}>
       <ErrorLine error={q.error?.message} className="mt-3" />
       <PipelineSwitch className="mt-4" />
-      <JudgementModel className="mt-4" />
-      <PilotPanel className="mt-4" />
       <OutsideLimits className="mt-4" />
       <div className="mt-4">
         <StageLimits />
@@ -214,7 +210,7 @@ export function PipelineView({ params }: ViewProps) {
 
 const INLINE_JOB_ITEMS = 5;
 
-/** The items a job handled, one per line with what happened to each and the decision it asked; more than five fold behind "+N more". */
+/** The items a job handled, one per line with what happened to each; more than five fold behind "+N more". */
 function JobItems({ items }: { items: JobItem[] }) {
   const [open, setOpen] = useState(false);
   const shown = open ? items : items.slice(0, INLINE_JOB_ITEMS);
@@ -228,11 +224,6 @@ function JobItems({ items }: { items: JobItem[] }) {
             <ItemRef repo={i.repo} number={i.number} kind={i.kind} state={i.state} title={i.title} size="sm" className="sm:flex-1" />
             <span className="flex flex-wrap items-center gap-x-2 text-xs text-ink/65 sm:max-w-[45%] sm:justify-end">
               {i.outcome}
-              {i.decision && (
-                <Link to={decisionPath({ id: i.decision, repo: i.repo, number: i.number })} className="font-medium text-accent-ink hover:underline max-md:py-2">
-                  Decision
-                </Link>
-              )}
             </span>
           </li>
         ))}

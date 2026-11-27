@@ -1,4 +1,4 @@
-// The live topics (src/live.ts) and the planner's change log (src/core/plan-changes.ts) on Postgres: one plpgsql function per
+// The live topics (src/db/live.ts) and the planner's change log (src/db/plan-triggers.ts) on Postgres: one plpgsql function per
 // table and operation (AFTER ROW) evaluates every topic and change-log trigger SQLite has for that table and operation.
 //
 // Counter rows move once per transaction, at commit. A row trigger only records what it touched in transaction-local settings
@@ -6,13 +6,14 @@
 // insert queues a deferred constraint trigger, which runs at commit: it locks the touched change_seq rows in sorted order, then
 // plan_full, then the plan_full_causes rows in sorted order, and bumps each once. Every transaction locks counters in that one
 // order, so two cannot deadlock on them, and the bump commits with the data (a sequence would show before the commit).
+// A topic in NOTIFY_TOPICS also sends a notification on its channel at that flush, for `Db.listen`.
 // A rolled-back savepoint undoes its settings, its live_flush row and the queued trigger together.
 //
-// item_changes rows are inserted by the row triggers themselves; the planner consumes them by key (src/core/plan-changes.ts).
+// item_changes rows are inserted by the row triggers themselves; the planner consumes them by key (src/data/planner/changes.ts).
 // The bulk marker is the transaction-local setting `ac.bulk` (PG_BULK).
 import { createHash } from "node:crypto";
-import { BOOKKEEPING_COLUMNS, CHANGE_SEQ_TABLE, liveTriggers, TOPICS } from "../live.ts";
-import { blockerFill, blockerSync, PG_BULK, PLAN_TABLES, planTriggers } from "../core/plan-changes.ts";
+import { BOOKKEEPING_COLUMNS, CHANGE_SEQ_TABLE, liveTriggers, NOTIFY_TOPICS, TOPICS } from "./live.ts";
+import { blockerFill, blockerSync, PG_BULK, PLAN_TABLES, planTriggers } from "./plan-triggers.ts";
 import { pgExpr } from "../core/pg-expr.ts";
 import { PIN_SEARCH_PATH, pgSchemaSql, pgSchemaStamp, withMigrationLock, type MigrationOpts, type PgClient } from "./pg-migrate.ts";
 import { translateSqlite } from "./pg-schema.ts";
@@ -20,7 +21,11 @@ import { pgScopeViews, SCOPED_SCHEMA } from "./scoped.ts";
 import { splitStageTripsPg, TRIP_SPLIT_VERSION } from "./trip-split.ts";
 import { featuresRepoOnlyPg, FEATURES_REPO_ONLY_VERSION } from "./feature-repo-only.ts";
 import { retireFixAttemptsPg } from "./fix-retire.ts";
+import { backfillRefusalsPg } from "./refused-runs.ts";
+import { holdsToItemsPg, HOLDS_TO_ITEMS_VERSION } from "./holds-to-items.ts";
+import { chatBackfillPg, CHAT_BACKFILL_VERSION } from "./chat-backfill.ts";
 import { PG_SCHEMA_GENERATION } from "./pg-generation.ts";
+import { builtAfterCopy, copyStatePg, oneActiveLegPg } from "./state-copy.ts";
 
 const OPS = ["INSERT", "UPDATE", "DELETE"] as const;
 type Op = (typeof OPS)[number];
@@ -65,6 +70,7 @@ BEGIN
   IF cardinality(topics) > 0 THEN
     PERFORM 1 FROM change_seq WHERE topic = ANY (topics) ORDER BY topic FOR UPDATE;
     UPDATE change_seq SET seq = seq + 1 WHERE topic = ANY (topics);
+${NOTIFY_TOPICS.map((t) => `    IF '${t}' = ANY (topics) THEN PERFORM pg_notify('${t}', ''); END IF;`).join("\n")}
   END IF;
   IF cardinality(causes) > 0 THEN
     INSERT INTO plan_full (id, seq) VALUES (1, 0) ON CONFLICT (id) DO NOTHING;
@@ -112,7 +118,7 @@ export function pgTriggerParts(columns?: Map<string, string[]>): PgTriggerParts 
   };
   for (const t of liveTriggers(columns)) {
     const g = group(t.table, t.op);
-    g.topics.set(t.topic, [...(g.topics.get(t.topic) ?? []), t.cond ? pgExpr(t.cond) : ""]);
+    g.topics.set(t.topic, [...(g.topics.get(t.topic) ?? []), t.pg ?? (t.cond ? pgExpr(t.cond) : "")]);
   }
   for (const t of planTriggers("postgres", columns)) {
     const body = "full" in t ? `PERFORM ac_mark_full('${t.full}');`
@@ -172,10 +178,12 @@ export function pgColumns(rows: { t: string; c: string }[]): Map<string, string[
   return out;
 }
 
+let stamp: string | undefined;
+
 /** The schema stamp a migrated Postgres database stores in settings: the schema file's stamp and the trigger and view generators. */
 export function pgStamp(): string {
-  return createHash("sha256").update(pgSchemaStamp()).update(pgTriggerSql()).update(JSON.stringify(pgScopeViews("app"))).update(PIN_SEARCH_PATH)
-    .update(JSON.stringify(BOOKKEEPING_COLUMNS)).update(`trip-split ${TRIP_SPLIT_VERSION}`).update(`features-repo-only ${FEATURES_REPO_ONLY_VERSION}`).digest("hex").slice(0, 16);
+  return stamp ??= createHash("sha256").update(pgSchemaStamp()).update(pgTriggerSql()).update(JSON.stringify(pgScopeViews("app"))).update(PIN_SEARCH_PATH)
+    .update(JSON.stringify(BOOKKEEPING_COLUMNS)).update(`trip-split ${TRIP_SPLIT_VERSION}`).update(`features-repo-only ${FEATURES_REPO_ONLY_VERSION}`).update(`holds-to-items ${HOLDS_TO_ITEMS_VERSION}`).update(`chat-backfill ${CHAT_BACKFILL_VERSION}`).digest("hex").slice(0, 16);
 }
 
 export type { PgClient };
@@ -220,8 +228,12 @@ export async function migratePg(client: PgClient, opts: MigrationOpts = {}): Pro
   const rows = async (sql: string) => (await client.query(sql)).rows;
   await withMigrationLock(client, async (m) => {
     if ((await storedPgStamp(rows)) === stamp || (await newerPgSchema(rows))) return;
+    // The schema adds a unique index over the active pre-approved merge legs, which needs one active leg per PR first.
+    await m.step({ label: "preapprovals: one active leg", table: "preapprovals", run: () => oneActiveLegPg(client) });
     // Columns are only ever added, which the views over the tables allow, so the views are replaced after the schema.
-    await m.ddl(pgSchemaSql(), "schema");
+    // Each index of the schema file is one line.
+    const schema = pgSchemaSql().split("\n");
+    await m.ddl(schema.filter((l) => !builtAfterCopy(l)).join("\n"), "schema");
     const parts = pgTriggerParts(pgColumns(await rows(PG_COLUMNS_SQL) as { t: string; c: string }[]));
     await m.ddl(parts.ddl, "live tables");
     await m.step({ label: "trigger functions", sql: [...parts.functions, PIN_SEARCH_PATH] });
@@ -245,6 +257,11 @@ export async function migratePg(client: PgClient, opts: MigrationOpts = {}): Pro
     await m.step({ label: "stage trips", run: () => splitStageTripsPg(client) });
     await m.step({ label: "fix attempts", run: () => retireFixAttemptsPg(client) });
     await m.step({ label: "features", run: () => featuresRepoOnlyPg(client) });
+    await m.step({ label: "holds", run: () => holdsToItemsPg(client) });
+    await m.step({ label: "refused runs", table: "agent_runs", run: () => backfillRefusalsPg(client) });
+    await m.step({ label: "chat", run: () => chatBackfillPg(client) });
+    await copyStatePg(client, m);
+    await m.ddl(schema.filter(builtAfterCopy).join("\n"), "after the copy");
     await m.step({ label: "stamp", run: async () => void (await client.query(`INSERT INTO settings (key, value) VALUES ('schema_stamp', $1), ('schema_generation', $2)
       ON CONFLICT (key) DO UPDATE SET value = excluded.value`, [stamp, String(PG_SCHEMA_GENERATION.generation)])) });
   }, opts);

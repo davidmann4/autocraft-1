@@ -23,6 +23,20 @@ export async function mapLimit<T, U>(xs: readonly T[], limit: number, fn: Cb<T, 
   return out;
 }
 
+/** A wrapper that runs at most `n` of the functions given to it at once; the others wait in call order. */
+export function limiter(n: number): <T>(fn: () => Promise<T>) => Promise<T> {
+  let active = 0;
+  const waiting: (() => void)[] = [];
+  return async <T>(fn: () => Promise<T>): Promise<T> => {
+    if (active >= n) await new Promise<void>((r) => waiting.push(r));
+    else active++;
+    try { return await fn(); } finally {
+      const next = waiting.shift();
+      if (next) next(); else active--;
+    }
+  };
+}
+
 export async function flatMapSeq<T, U>(xs: readonly T[], fn: Cb<T, U | readonly U[]>): Promise<U[]> {
   const out: U[] = [];
   for (let i = 0; i < xs.length; i++) {

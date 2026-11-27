@@ -3,7 +3,7 @@
 // published version's size.
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb } from "./helpers/raw-db.ts";
 import { groupsOf, parseSettings, quantity, stepPod, taskRequest, type Prepared } from "../src/build/pods.ts";
 import { createEnv } from "../src/build/envs.ts";
 import { raiseAfterOom, repoMemory, repoSizing, repoWarmTarget, setWarmTarget } from "../src/build/sizing.ts";

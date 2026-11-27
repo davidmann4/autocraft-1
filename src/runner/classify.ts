@@ -10,21 +10,22 @@
 // existed count as changed when the item was updated after the verdict.
 import { refOf, type Item } from "../classify/parse.ts";
 import { takersFirst } from "../agents/call.ts";
-import { freeSlots } from "../agents/accounts.ts";
 import { jevAvailable } from "../agents/jev.ts";
-import { haikuBatches, jevAgents, runHaiku, runJev, type JevExtraAnswers } from "../classify/run.ts";
+import { haikuBatches, runHaiku, runJev, type JevExtraAnswers } from "../classify/run.ts";
 import { prioritizeAnswered } from "../priority/index.ts";
 import { priorityDue } from "../core/decide-item.ts";
 import type { ClassifyExtras } from "../prompts/index.ts";
 import { AREAS, PRIORITY } from "../agents/steps.ts";
 import { fillClassHashes } from "../itemhash.ts";
+import { byOfJob, CLI_BY, type By } from "../core/gates.ts";
 import { itemPlans, itemsOf, plannedItems, type ItemPlans, type PlannedItem } from "../core/select-items.ts";
-import { startedRefs } from "../pilot.ts";
+import { countItems } from "../data/mirror/index.ts";
+import { keepEarlierUsage } from "../data/inference/index.ts";
+import { classifyRun, countVerdicts, markHaikuAlone, setClassifyRun } from "../data/triage/index.ts";
+import { loadStartedRefs } from "../data/workflow/index.ts";
 import type { StepContext } from "./steps.ts";
-import { latestRun } from "../classify/settled.ts";
 import { areaListsDue, assignAreas, type AskedList, type AssignResult } from "../areas/assign.ts";
 import type { Db } from "../db/index.ts";
-import { batches, excluded } from "../db/kx.ts";
 
 export { inputHash } from "../itemhash.ts";
 
@@ -39,15 +40,9 @@ const JEV_CHUNK = 40, HAIKU_PER_CALL = 25;
  * runJev and runHaiku write one token_usage row per agent name (`jev-<ref>`, and
  * `priority-jev-<ref>` and `areas-jev-<ref>` for the questions a classify request
  * carries for those steps; `haiku-NN`) with INSERT OR REPLACE. Rows from earlier passes with those
- * names are renamed first so their cost stays on record.
+ * names are renamed first so their cost stays on record: for Haiku here, for Jev in runJev's own transaction.
  */
-async function keepUsage(db: Db, run: string, agents: string[]): Promise<void> {
-  for (const slice of batches(agents)) {
-    await db.run(db.k.updateTable("main.token_usage")
-      .set((eb) => ({ agent: eb(eb("agent", "||", eb.val("@")), "||", eb.fn.coalesce("started_at", eb.val(""))) }))
-      .where("run_id", "=", run).where("agent", "in", slice));
-  }
-}
+const keepUsage = async (db: Db, run: string, agents: string[]): Promise<void> => void await keepEarlierUsage(db, run, agents);
 
 /**
  * The job's counts: items sent to a model, and items answered, saved as its handled count. Each pass reports its own running
@@ -79,9 +74,8 @@ export async function jevPass(ctx: StepContext, run: string, todo: Item[], hashe
   const out: JevPassResult = { done: new Set(), impact: new Map(), area: new Map() };
   for (let i = 0; i < todo.length && !await ctx.cancelled() && await jevAvailable(db) && await more(); i += JEV_CHUNK) {
     const chunk = todo.slice(i, i + JEV_CHUNK);
-    await keepUsage(db, run, chunk.flatMap((x) => jevAgents(refOf(x), extras?.get(refOf(x)))));
     t.sent(chunk.length);
-    const r = await runJev(db, run, chunk, undefined, hashes, extras);
+    const r = await runJev(db, run, chunk, undefined, hashes, extras, { keepEarlier: true });
     for (const ref of r.saved) out.done.add(ref);
     for (const [ref, a] of r.impact) out.impact.set(ref, a);
     for (const [ref, a] of r.area) out.area.set(ref, a);
@@ -111,20 +105,20 @@ async function classifyExtras(db: Db, plans: ClassifyPlans, todo: readonly Item[
 }
 
 /**
- * The classify Plans of one job: loaded once, at its start, with the items a maintainer started work on (src/pilot.ts startedExprFor),
+ * The classify Plans of one job: loaded once, at its start, with the items a maintainer started work on (workflow.loadStartedRefs),
  * which go first in both passes.
  */
-export type ClassifyPlans = ItemPlans & { started: Set<string> };
+export type ClassifyPlans = ItemPlans & { started: Set<string>; by: By };
 
-export async function classifyPlans(db: Db, run: string): Promise<ClassifyPlans> {
+export async function classifyPlans(db: Db, run: string, by: By = CLI_BY): Promise<ClassifyPlans> {
   const plans = await itemPlans(db, "classify", { run });
-  return { ...plans, started: await startedRefs(db, plans.items.filter((p) => p.plan.actions.some((a) => a.kind === "classify")).map((p) => p.facts)) };
+  return { ...plans, by, started: await loadStartedRefs(db, { refs: plans.items.filter((p) => p.plan.actions.some((a) => a.kind === "classify")).map((p) => p.facts) }) };
 }
 
 /** The classify actions of `bucket` in the step's order, with started items first (stable). */
 async function bucketItems(db: Db, plans: ClassifyPlans, bucket: "jev" | "haiku"): Promise<PlannedItem[]> {
   const started = (p: PlannedItem) => (plans.started.has(`${p.facts.repo}#${p.facts.number}`) ? 0 : 1);
-  return (await plannedItems(db, "classify", { plans, bucket })).map((p, i) => ({ p, i })).sort((a, b) => started(a.p) - started(b.p) || a.i - b.i).map((x) => x.p);
+  return (await plannedItems(db, "classify", { plans, bucket, by: plans.by })).map((p, i) => ({ p, i })).sort((a, b) => started(a.p) - started(b.p) || a.i - b.i).map((x) => x.p);
 }
 
 /**
@@ -133,7 +127,7 @@ async function bucketItems(db: Db, plans: ClassifyPlans, bucket: "jev" | "haiku"
  */
 async function haikuItems(db: Db, run: string, limit: number, plans: ClassifyPlans, jevDone: ReadonlySet<string>): Promise<Item[]> {
   const fresh = jevDone.size ? (await itemPlans(db, "classify", { run, refs: jevDone })).items : [];
-  const now: ClassifyPlans = { started: plans.started, items: [...plans.items.filter((p) => !jevDone.has(`${p.facts.repo}#${p.facts.number}`)), ...fresh] };
+  const now: ClassifyPlans = { by: plans.by, started: plans.started, items: [...plans.items.filter((p) => !jevDone.has(`${p.facts.repo}#${p.facts.number}`)), ...fresh] };
   const todo = (await takersFirst(db, await bucketItems(db, now, "haiku"), (p) => [p.facts.repo], (p) => [p.facts])).slice(0, limit);
   return await itemsOf(db, todo.map((p) => p.facts));
 }
@@ -141,19 +135,19 @@ async function haikuItems(db: Db, run: string, limit: number, plans: ClassifyPla
 async function haikuPass(ctx: StepContext, run: string, todo: Item[], t: Tally, name: string, more: () => Promise<boolean>): Promise<number> {
   const { db } = ctx;
   const t0 = new Date().toISOString();
-  const answered = async () => (await db.get(db.k.selectFrom("classifications").select((eb) => eb.fn.countAll<number>().as("n"))
-    .where("classifier", "=", "haiku").where("run_id", "=", run).where("at", ">=", t0)))!.n;
-  // A chunk holds one batch for every call the accounts can take at once (at least 4), so the calls fill the free slots.
+  const answered = () => countVerdicts(db, { run, classifier: "haiku", since: t0 });
+  let n = 0;
+  // A chunk holds four batches of calls.
   for (let i = 0, size = 0; i < todo.length && !await ctx.cancelled() && await more(); i += size) {
-    size = HAIKU_PER_CALL * Math.max(4, await freeSlots(db));
+    size = HAIKU_PER_CALL * 4;
     const chunk = todo.slice(i, i + size);
     await keepUsage(db, run, Array.from({ length: (await haikuBatches(db, chunk, HAIKU_PER_CALL)).length }, (_, n) => `haiku-${String(n).padStart(2, "0")}`));
     // The first call of the pass runs alone and writes the prompt cache; the rest read it. Items no Task Runner may take are not sent.
     t.sent(await runHaiku(db, run, chunk, HAIKU_PER_CALL, undefined, { cold: i === 0 }));
-    t.answered(name, await answered());
+    t.answered(name, n = await answered());
     await ctx.progress(`Haiku: ${Math.min(i + size, todo.length)} of ${todo.length} items`);
   }
-  return await answered();
+  return n;
 }
 
 /**
@@ -164,28 +158,16 @@ async function haikuOnlyPass(ctx: StepContext, run: string, items: Item[], hashe
   const { db } = ctx;
   const t0 = new Date().toISOString();
   await haikuPass(ctx, run, items, t, "haiku-alone", more);
-  const setHash = (hash: string, repo: string, number: number) => db.run(db.k.updateTable("main.classifications").set({ input_hash: hash })
-    .where("repo", "=", repo).where("number", "=", number).where("classifier", "=", "haiku").where("run_id", "=", run).where("at", ">=", t0));
   // A Jev row of the item's earlier text goes; one without a hash (older rows) is kept, it is current until the item changes.
-  const dropStale = (repo: string, number: number, hash: string) => db.run(db.k.deleteFrom("main.classifications")
-    .where("repo", "=", repo).where("number", "=", number).where("classifier", "=", "jev").where("run_id", "=", run)
-    .where("input_hash", "is not", null).where("input_hash", "<>", hash));
-  let n = 0;
-  for (const x of items) {
-    if (!(await setHash(hashes.get(refOf(x))!, x.repo, x.number)).changes) continue;
-    await dropStale(x.repo, x.number, hashes.get(refOf(x))!);
-    n++;
-  }
-  return n;
+  return (await markHaikuAlone(db, run, t0, new Map(items.map((x) => [refOf(x), hashes.get(refOf(x))!])))).length;
 }
 
 /**
  * Open items the Plans send to Jev in `run`, with each due item's input hash. "all" takes only items without a verdict.
  * The hashes are stored on the item row (src/itemhash.ts), so no body is read for items that are up to date.
  */
-export async function jevItems(db: Db, run: string, mode: "new" | "all", plans: ClassifyPlans): Promise<{ open: number; due: Item[]; hashes: Map<string, string> }> {
-  const open = (await db.get(db.k.selectFrom("items as i").innerJoin("tracked_repos as t", "t.name", "i.repo")
-    .select((eb) => eb.fn.countAll<number>().as("n")).where("i.state", "=", "OPEN")))!.n;
+export async function jevItems(db: Db, _run: string, mode: "new" | "all", plans: ClassifyPlans): Promise<{ open: number; due: Item[]; hashes: Map<string, string> }> {
+  const open = (await countItems(db, { states: ["OPEN"] })).get("") ?? 0;
   const due: Item[] = [], hashes = new Map<string, string>();
   for (const { classHash, ...x } of await itemsOf(db, (await bucketItems(db, plans, "jev")).filter((p) => mode === "new" || !p.facts.classification.jev).map((p) => p.facts))) {
     due.push(x);
@@ -199,7 +181,7 @@ async function pass(ctx: StepContext, run: string, mode: "new" | "all"): Promise
   ctx.usageRun(run);
   await ctx.progress("Finding items to classify");
   await fillClassHashes(ctx.db);
-  const plans = await classifyPlans(ctx.db, run);
+  const plans = await classifyPlans(ctx.db, run, byOfJob(ctx.job.requestedBy));
   const { open, due, hashes } = await jevItems(ctx.db, run, mode, plans);
   const todo = (await takersFirst(ctx.db, due, (x) => [x.repo], (x) => [x])).slice(0, limit);
   ctx.log(`run ${run}: ${open} open items, ${due.length} due for Jev, taking ${todo.length}`);
@@ -244,7 +226,7 @@ const areaNote = (r: { areas: AssignResult }): string => (r.areas.due ? ` Areas:
 const aloneNote = (r: { haikuAlone: number; aloneDue: number }): string => (r.aloneDue ? `Jev unavailable: Haiku classified ${r.haikuAlone} items. ` : "");
 
 export async function classifyNew(ctx: StepContext): Promise<string> {
-  const run = await latestRun(ctx.db);
+  const run = await classifyRun(ctx.db);
   if (!run) throw new Error("There is no classification run yet; start a classification pass first.");
   const r = await pass(ctx, run, "new");
   failIfUnanswered(r);
@@ -257,7 +239,6 @@ export async function classifyAll(ctx: StepContext): Promise<string> {
   const r = await pass(ctx, run, "all");
   failIfUnanswered(r);
   const complete = r.left === 0 && !await ctx.cancelled();
-  if (complete) await ctx.db.run(ctx.db.k.insertInto("settings").values({ key: "classify_run", value: run })
-    .onConflict((oc) => oc.column("key").doUpdateSet(excluded(["value"]))));
+  if (complete) await setClassifyRun(ctx.db, run, "classify");
   return `Run ${run}: ${aloneNote(r)}Jev classified ${r.jev} of ${r.due} items without a verdict${r.left ? ` (${r.left} left; start it again to continue)` : ""}; Haiku gave a second opinion on ${r.haiku} of ${r.haikuDue}.${areaNote(r)}${complete ? " The run is now the current one." : ""}`;
 }

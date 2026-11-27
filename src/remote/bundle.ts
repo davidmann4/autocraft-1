@@ -8,8 +8,8 @@ import { repoOfCheckout } from "../sandbox/repo-docs.ts";
 import { REPO_DOCS_PATH, REPO_PATH, reposPath } from "../sandbox/command.ts";
 import { tierOfModel } from "./mode.ts";
 import type { Mount, Tier } from "./protocol.ts";
-import { findSeq } from "../async-seq.ts";
 import type { Db } from "../db/index.ts";
+import { loadItems, loadRepos } from "../data/mirror/index.ts";
 
 /** The MCP server of a call's reference documentation in the user-local mode, served per lease; there is no /reference mount. */
 export const REFERENCE_SERVER = "reference";
@@ -23,14 +23,13 @@ export function checkoutCommit(dir: string): { repo: string; sha: string } | nul
   return repo && /^[0-9a-f]{40,64}$/.test(sha) ? { repo, sha } : null;
 }
 
-const repoRow = async (db: Db, repo: string): Promise<{ owner: string; visibility: string | null }> =>
-  (await db.get(db.k.selectFrom("main.repos").select(["owner", "visibility"]).where("name", "=", repo))) ?? { owner: "", visibility: null };
-
 /** A repo at a commit: a git mount for a public repo (with the pull request's head ref when the commit is a head of one of `items`), else a tarball the server serves. */
 async function repoMount(db: Db, path: string, repo: string, sha: string, items: ItemRef[]): Promise<Mount> {
-  const r = await repoRow(db, repo);
-  if (r.visibility !== "public" || !r.owner) return { kind: "tarball", path, repo, sha };
-  const pr = await findSeq(items, async (i) => i.repo === repo && await db.get(db.k.selectFrom("main.items").select("number").where("repo", "=", repo).where("number", "=", i.number).where("kind", "=", "pr").where("head_oid", "=", sha)) !== undefined);
+  const mine = items.filter((i) => i.repo === repo).map((i) => ({ repo: i.repo, number: i.number }));
+  const [repos, prs] = await db.together(() => Promise.all([loadRepos(db, { names: [repo] }), mine.length ? loadItems(db, mine, "pr") : Promise.resolve(new Map())]));
+  const r = repos.get(repo);
+  if (r?.visibility !== "public" || !r.owner) return { kind: "tarball", path, repo, sha };
+  const pr = mine.find((i) => prs.get(`${i.repo}#${i.number}`)?.head_oid === sha);
   return { kind: "git", path, owner: r.owner, repo, sha, ...(pr && { ref: `refs/pull/${pr.number}/head` }) };
 }
 

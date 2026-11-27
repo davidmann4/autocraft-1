@@ -2,7 +2,7 @@ import { Badge, type Tone } from "../atoms/Badge";
 import { Facts } from "../molecules/Facts";
 import { Markdown } from "../molecules/Markdown";
 
-const VERDICT: Record<string, [string, Tone]> = { take: ["Take", "ok"], "take-fix": ["Take with fixes", "ok"], hold: ["Hold", "warn"], close: ["Close", "bad"] };
+const VERDICT: Record<string, [string, Tone]> = { take: ["Take", "ok"], "take-fix": ["Take with fixes", "ok"], hold: ["Not ready", "warn"], close: ["Close", "bad"] };
 
 const str = (v: unknown): string | null => (typeof v === "string" && v ? v : null);
 const list = (v: unknown): unknown[] => (Array.isArray(v) ? v : []);

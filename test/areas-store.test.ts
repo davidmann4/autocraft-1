@@ -3,12 +3,18 @@ import assert from "node:assert/strict";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
-import { acceptProposal, areaCounts, currentList, decideSuggestion, editAreas, itemAreaOf, listVersions, proposalsOf, saveProposal, setItemArea, unassignedCount } from "../src/areas/store.ts";
-import { connectDb } from "../src/db/open.ts";
+import { acceptProposal, decideSuggestion, editAreas, listAreaVersions, loadAreaLists, loadAreaOverview, loadItemAreas, loadProposals, saveItemAreas, saveProposal } from "../src/data/triage/index.ts";
+import { connectDb, type Db } from "./helpers/raw-db.ts";
 import { SCRATCH } from "./scratch.ts";
 
 const T0 = "2026-01-01T00:00:00.000Z";
 const area = (name: string) => ({ name, description: `${name} things` });
+const setItemArea = async (db: Db, repo: string, number: number, a: string | null, source: string, confidence: number | null, version: number) => void await saveItemAreas(db, repo, version, [{ repo, number, area: a, source, confidence }]);
+const itemAreaOf = async (db: Db, repo: string, number: number) => (await loadItemAreas(db, [{ repo, number }])).get(`${repo}#${number}`) ?? null;
+const currentList = async (db: Db, repo: string) => (await loadAreaLists(db, [repo])).get(repo) ?? null;
+const unassignedCount = async (db: Db, repo: string) => (await loadAreaOverview(db, repo)).unassigned;
+const areaCounts = async (db: Db, repo: string) => [...(await loadAreaOverview(db, repo)).counts].map(([a, open]) => ({ area: a, open }));
+const proposalsOf = loadProposals;
 
 async function fresh(name: string) {
   mkdirSync(SCRATCH, { recursive: true });
@@ -34,7 +40,7 @@ test("an edit moves items of a renamed area, drops operator choices of a removed
   assert.equal((await itemAreaOf(db, "app", 3))?.area, null, "a name that is not in the list is unassigned");
   assert.equal((await itemAreaOf(db, "app", 4))?.listVersion, 3, "an assigned item moves to the new version");
   assert.equal((await currentList(db, "app"))?.version, 3);
-  assert.deepEqual((await listVersions(db, "app")).map((v) => v.version), [3, 2, 1]);
+  assert.deepEqual((await listAreaVersions(db, "app")).map((v) => v.version), [3, 2, 1]);
   assert.equal(await unassignedCount(db, "app"), 2);
   await assert.rejects(editAreas(db, "app", { op: "rename", from: "Nope", to: "X" }, "op"), /no area/);
   await assert.rejects(editAreas(db, "other", { op: "add", name: "X", description: "d" }, "op"), /not tracked/);

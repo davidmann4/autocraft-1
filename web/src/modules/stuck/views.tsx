@@ -2,21 +2,12 @@
 import { useQuery } from "../../api/client";
 import type { StuckItem } from "../../api/types";
 import type { ViewProps } from "../../registry/types";
+import { causeText } from "../../lib/stuck";
 import { Chip } from "../../ui/atoms/Chip";
 import { TimeAgo } from "../../ui/atoms/TimeAgo";
 import { ItemRef } from "../../ui/molecules/ItemRef";
 import { Block, ErrorLine, Page, useUrlState } from "../admin/parts";
 
-const CAUSE: Record<string, string> = {
-  "person-wait-without-question": "A person is awaited, nobody is asked",
-  "no-plan": "Nothing due and no wait",
-  "internal-wait": "Waits on a step with no work due",
-  "duplicate-without-question": "Held as a duplicate, no open question",
-  contributor: "Waiting for the contributor",
-  external: "Waiting for CI, GitHub or a sync",
-  planned: "Work is due",
-};
-const causeText = (c: string) => CAUSE[c] ?? c;
 const VERDICT: Record<StuckItem["verdict"], string> = { stuck: "Stuck", long: "Long" };
 
 const Ref = ({ i }: { i: StuckItem }) => <ItemRef repo={i.repo} number={i.number} kind={i.kind} title={i.title ?? undefined} size="sm" />;

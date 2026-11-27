@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { memorySummary, parseResults } from "../src/build/tasks.ts";
 import { SCRATCH } from "./scratch.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb } from "./helpers/raw-db.ts";
 
 const R = { exitCode: 0, durationMs: 5, timedOut: false };
 

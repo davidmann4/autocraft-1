@@ -8,7 +8,7 @@ import { createEnv, hello } from "../src/build/envs.ts";
 import { claim, createTask, warmKeyOf } from "../src/build/tasks.ts";
 import { startWorkerServer } from "../src/build/worker-api.ts";
 import { SCRATCH } from "./scratch.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb } from "./helpers/raw-db.ts";
 
 test("warm keys: distinct repo names never share a key, and every key is valid", () => {
   const names = ["a.b", "a-b", "A.B", "x".repeat(70), "x".repeat(71), "---", "..."];

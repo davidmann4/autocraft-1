@@ -17,8 +17,7 @@ import { SectionTitle } from "./SectionTitle";
 /** A model id as people say it: opus → Opus. */
 const modelName = (m: string) => m.charAt(0).toUpperCase() + m.slice(1);
 
-/** The item choices of My tasks: fast-tracked items are those added with Queue items, the queue command or the fast-track list. */
-const ITEMS_LABEL: Record<TaskItems, string> = { all: "All items", fast: "Fast-tracked", mine: "Fast-tracked by me" };
+const ITEMS_LABEL: Record<TaskItems, string> = { all: "All items", started: "Items someone started", mine: "Items I started" };
 
 /**
  * Saves of one setting run one after another, so the server ends with the latest selection. `confirmed` is the server's last
@@ -367,7 +366,7 @@ export function MySettings({ runner = false }: { runner?: boolean }) {
       <Fold className="mt-1" title="My tasks" summary={`${tasks.length === allTasks.length ? "All tasks" : `${tasks.length} of ${allTasks.length} tasks`}${taskItems === "all" ? "" : `, ${ITEMS_LABEL[taskItems].toLowerCase()}`}`}>
         <div className="mt-1 text-sm text-ink/80">Run my tasks on</div>
         <div role="radiogroup" aria-label="Run my tasks on" className="mt-1 rounded-md border border-line p-1 sm:max-w-md">
-          {(["all", "fast", "mine"] as const).map((v) => (
+          {(["all", "started", "mine"] as const).map((v) => (
             <RadioRow key={v} selected={taskItems === v} onSelect={() => taskItems !== v && saveTaskItems(v)} title={ITEMS_LABEL[v]} />
           ))}
         </div>

@@ -2,20 +2,24 @@
 // read (the CI fix reader) and sorted by Haiku, without tools:
 //   flaky  a timeout, a network error, a cancelled job or a lost runner: the failed jobs are rerun once per head. Red again
 //          at the same head counts as code.
-//   infra  a refused request from a service, a missing secret, a quota or an outage: nothing here can fix it. One operator
-//          decision per (repo, check, red run) asks whether to open an upstream issue; the issue is opened only on that answer.
+//   infra  a refused request from a service, a missing secret, a quota or an outage: nothing here can fix it. One issue per
+//          (repo, check, culprit) is opened under the repo's approval, with the check, the run link and a scrubbed log excerpt: the
+//          row is `issue-opening` before the create, later red heads of the streak reuse its number, and a create whose outcome was
+//          lost is looked up in the audit and on GitHub before another one is made.
 //   code   a compile, test, lint or format failure: recorded as needs-fix for the fix PR step (`onCodeVerdict`).
 // The log is untrusted text: it only reaches a model that has no tools, and what is stored or posted is scrubbed.
 //
 //   autocraft-server main-fix --repo R [--apply]
 //   autocraft-server main-fix-approval [--repo R]
 import { leaseItem } from "../runner/leases.ts";
-import * as kx from "../db/kx.ts";
+import { loadMainFixes, loadMainFixDue, saveMainFixes, type MainFixRow } from "../data/changes/index.ts";
+import { listAudit, loadTrackedRepos, loadStepApprovals } from "../data/control/index.ts";
+import { loadMainCiAt } from "../data/mirror/index.ts";
 import { CLI_BY, type By } from "../core/gates.ts";
 import { guardRepo } from "../core/guard.ts";
-import { actionable, ask, getDecision } from "../decisions.ts";
 import { exec, fixupDir, type Exec } from "../fixup/git.ts";
-import { createIssue, ghRerunMainFailed, IssueError, type Writer } from "../github/write.ts";
+import { byUs, issueMade } from "../github/made.ts";
+import { createIssue, ghRerunMainFailed, IssueError, unclearWrite, type Writer } from "../github/write.ts";
 import { askClaude, saveUsage, type Usage } from "../classify/run.ts";
 import { checkoutForCommit } from "../sandbox/index.ts";
 import { readFailure } from "../cifix/logs.ts";
@@ -26,28 +30,27 @@ import { ghExec, type Gh } from "../merge/safe-merge.ts";
 import { CLAUDE_PROMPTS } from "../prompts/index.ts";
 import { cleanLine } from "../review/post-template.ts";
 import { scrub } from "../runner/scrub.ts";
-import { mainFixApprovalOf } from "./approval.ts";
-import { lintReady, openFixPrs, type FixPrDeps } from "./pr.ts";
+import { approvedRepos, repoApproved } from "../core/repo-approvals.ts";
+import { lintReadyIn, openFixPrs, type FixPrDeps } from "./pr.ts";
 import { REASON_WORDS, VERDICTS, type MainFixInput, type MainFixVerdict } from "./types.ts";
 import { slugOf } from "../owners.ts";
 import { wholeReplyJson } from "../core/reply-json.ts";
 import type { Db } from "../db/index.ts";
 import { openDb } from "../db/open.ts";
+import { filterSeq } from "../async-seq.ts";
 
-export { mainFixApprovalOf, setMainFixApproval } from "./approval.ts";
+export { setMainFixApproval } from "./approval.ts";
 export { autocraftText } from "./status.ts";
 
 export const ACTOR = "main-fix";
 const PROMPT = CLAUDE_PROMPTS["mainfix.classify"];
 const PATCH = CLAUDE_PROMPTS["cifix.patch"];
 const CHECK = CLAUDE_PROMPTS["fixup.check"];
-/** The model named in the note of an issue opened on an operator's answer: it wrote the reason in the decision. */
+/** The model named in the note of an issue opened for an infrastructure failure: it wrote the reason. */
 const NOTE_MODEL = "haiku";
 /** After a rerun the head may stay red this long without a new reading before the rerun counts as failed. */
 const RERUN_WAIT_MS = 10 * 60_000;
 const EXCERPT_CHARS = 1500;
-const OPEN_ISSUE = "open-issue";
-const NOT_NOW = "not-now";
 
 export type Verdict = { check: string; verdict: MainFixVerdict; reason: string };
 export type MainFixDeps = {
@@ -60,18 +63,13 @@ export type MainFixDeps = {
   fix?: FixPrDeps;
 };
 
-export type FixRow = {
-  repo: string; head_sha: string; check: string; verdict: MainFixVerdict; state: string; reason: string | null;
-  run_id: number | null; run_url: string | null; excerpt: string | null; decision_id: string | null; issue_number: number | null; pr_number: number | null; pr_url: string | null;
-  patch: string | null; files: string | null; lint_task: number | null; lint_round: number | null; lint_state: string | null; /** The kept model session that wrote the patch (src/prepush/resume.ts). */ session: string | null;
-  created_at: string; updated_at: string;
-};
+export type FixRow = MainFixRow;
 
-export type MainFixSummary = { repo: string; classified: number; reran: number; asked: number; needsFix: number; issues: number; prs: number; note: string | null };
+export type MainFixSummary = { repo: string; classified: number; reran: number; needsFix: number; issues: number; prs: number; note: string | null };
 
 const oneLine = (s: string, max = 200): string => s.replace(/\s+/g, " ").trim().slice(0, max);
 const words = (s: string): string => s.replace(/\s+/g, " ").trim().split(" ").slice(0, REASON_WORDS).join(" ");
-/** URLs and mentions out of text that goes into a public issue or a decision. */
+/** URLs and mentions out of text that goes into a public issue. */
 const plain = (s: string): string => scrub(s).replace(/\b(?:[a-z][a-z0-9+.-]*:\/\/|www\.)[^\s<>"')]*/gi, "<url>").replace(/(^|[^A-Za-z0-9_])@(?=[A-Za-z0-9_])/g, "$1");
 
 export function defaultDeps(): MainFixDeps {
@@ -109,22 +107,10 @@ export function parseVerdicts(text: string, checks: string[]): Verdict[] | null 
 
 // ---- rows ---------------------------------------------------------------------
 
-const rowsAt = async (db: Db, repo: string, head: string): Promise<FixRow[]> =>
-  await db.all(db.k.selectFrom("main_fixes").select(kx.cols("main_fixes")).$narrowType<{ verdict: MainFixVerdict }>()
-    .where("repo", "=", repo).where("head_sha", "=", head).orderBy("check"));
+const rowsAt = async (db: Db, repo: string, head: string): Promise<FixRow[]> => await loadMainFixes(db, { heads: [{ repo, headSha: head }] });
 
-async function save(db: Db, row: Omit<FixRow, "updated_at"> & { updated_at?: string }, at: string): Promise<void> {
-  const { updated_at: _, ...r } = row;
-  await db.run(db.k.insertInto("main_fixes")
-    .values({
-      repo: r.repo, head_sha: r.head_sha, check: r.check, verdict: r.verdict, state: r.state, reason: r.reason, run_id: r.run_id, run_url: r.run_url, excerpt: r.excerpt,
-      decision_id: r.decision_id, issue_number: r.issue_number, pr_number: r.pr_number, pr_url: r.pr_url, patch: r.patch, files: r.files, lint_task: r.lint_task,
-      lint_round: r.lint_round, lint_state: r.lint_state, session: r.session, created_at: r.created_at, updated_at: at,
-    })
-    .onConflict((oc) => oc.columns(["repo", "head_sha", "check"]).doUpdateSet(kx.excluded([
-      "verdict", "state", "reason", "run_id", "run_url", "excerpt", "decision_id", "issue_number", "pr_number", "pr_url",
-      "patch", "files", "lint_task", "lint_round", "lint_state", "session", "updated_at",
-    ]))));
+async function save(db: Db, row: FixRow, at: string): Promise<void> {
+  await saveMainFixes(db, [row], at);
 }
 
 const setState = async (db: Db, r: FixRow, state: string, reason: string | null, at: string, extra: Partial<FixRow> = {}): Promise<FixRow> => {
@@ -137,45 +123,60 @@ const setState = async (db: Db, r: FixRow, state: string, reason: string | null,
  * Where a code verdict goes. The row records `needs-fix`; the fix PR step takes its rows from here (state needs-fix, verdict code).
  */
 export async function onCodeVerdict(db: Db, row: FixRow, why: string, at: string): Promise<FixRow> {
-  return await setState(db, { ...row, verdict: "code" }, "needs-fix", oneLine(why), at);
+  const c = codeState(why);
+  return await setState(db, { ...row, verdict: c.verdict }, c.state, c.reason, at);
 }
+const codeState = (why: string) => ({ verdict: "code" as const, state: "needs-fix", reason: oneLine(why) });
 
 // ---- the red head ---------------------------------------------------------------
 
-type Current = { headSha: string; branch: string; state: string; culprit: string; culpritPr: number | null; redSince: string; stateChangedAt: string };
+type Current = { headSha: string; branch: string; state: string; culprit: string; culpritPr: number | null; redSince: string; /** When the culprit was first seen: everything recorded about this red streak is from then on. */ culpritAt: string; stateChangedAt: string };
 
-async function currentOf(db: Db, repo: string): Promise<Current | null> {
-  const r = (await mainCiRepos(db)).find((x) => x.repo === repo);
-  if (!r) return null;
-  const changed = await db.get(db.k.selectFrom("main_ci").select("state_changed_at as at").where("repo", "=", repo).where("head_sha", "=", r.headSha));
-  const stateChangedAt = changed?.at ?? "";
-  return { headSha: r.headSha, branch: r.branch, state: r.state, culprit: r.culprit?.sha ?? r.headSha, culpritPr: r.culprit?.pr ?? null, redSince: r.redSince ?? stateChangedAt, stateChangedAt };
+/** The head's CI ended. */
+const known = (c: Current): boolean => c.state === "red" || c.state === "green" || c.state === "optional";
+
+/** The default branch's head of each of `repos` that has one read. */
+async function currentHeads(db: Db, repos: readonly string[]): Promise<Map<string, Current>> {
+  const wanted = new Set(repos);
+  const heads = (await mainCiRepos(db)).filter((x) => wanted.has(x.repo));
+  const at = await loadMainCiAt(db, heads.flatMap((r) => [r.headSha, ...(r.culprit && r.culprit.sha !== r.headSha ? [r.culprit.sha] : [])].map((sha) => ({ repo: r.repo, sha }))));
+  return new Map(heads.map((r) => {
+    const stateChangedAt = at.get(`${r.repo}@${r.headSha}`)?.state_changed_at ?? "";
+    const culprit = r.culprit?.sha ?? r.headSha;
+    return [r.repo, { headSha: r.headSha, branch: r.branch, state: r.state, culprit, culpritPr: r.culprit?.pr ?? null, redSince: r.redSince ?? stateChangedAt, culpritAt: at.get(`${r.repo}@${culprit}`)?.first_seen_at ?? "", stateChangedAt }];
+  }));
 }
 
-export const decisionId = (repo: string, check: string, culprit: string): string => `${repo}:main-fix:${check}@${culprit}`;
-const isMainFixDecision = (repo: string, id: string): boolean => id.startsWith(`${repo}:main-fix:`);
+const currentOf = async (db: Db, repo: string): Promise<Current | null> => (await currentHeads(db, [repo])).get(repo) ?? null;
+
+/** Those of `repos` where a run of the step has something to do. */
+export async function mainFixDueRepos(db: Db, repos: readonly string[]): Promise<string[]> {
+  const approved = await approvedRepos(db, repos, "mainfix");
+  const heads = await currentHeads(db, repos.filter((r) => approved.has(r)));
+  const facts = await loadMainFixDue(db, [...heads].map(([repo, cur]) => ({ repo, headSha: cur.headSha, running: cur.state === "running" })));
+  return await filterSeq([...heads.keys()], async (repo) => {
+    const cur = heads.get(repo)!, due = facts.get(`${repo}@${cur.headSha}`)!;
+    // A stored patch is collected once its lint task ended, or closed when its head is no longer the current one.
+    if (cur.state !== "running" && await lintReadyIn(db, due.lintingHeads, cur.headSha)) return true;
+    // An issue whose create was interrupted or held back is settled once the head's result is known.
+    if (due.opening && known(cur)) return true;
+    if (cur.state === "red") return due.rows.length === 0 || due.rows.some((r) => r.state === "rerun-requested" || r.state === "needs-fix");
+    // A row left at needs-fix by an older head is closed by the next run.
+    return due.rows.some((r) => r.state === "rerun-requested") || due.staleNeedsFix;
+  });
+}
 
 /** Whether a run of the step has something to do for the repo. */
-export async function mainFixDue(db: Db, repo: string): Promise<boolean> {
-  if (!await mainFixApprovalOf(db, repo)) return false;
-  if ((await actionable(db)).some((a) => a.kind === "other" && isMainFixDecision(repo, a.id))) return true;
-  const cur = await currentOf(db, repo);
-  if (!cur) return false;
-  // A stored patch is collected once its lint task ended, or closed when its head is no longer the current one.
-  if (cur.state !== "running" && await lintReady(db, repo, cur.headSha)) return true;
-  const rows = await rowsAt(db, repo, cur.headSha);
-  if (cur.state === "red") return rows.length === 0 || rows.some((r) => r.state === "rerun-requested" || r.state === "needs-fix");
-  // A row left at needs-fix by an older head is closed by the next run.
-  return rows.some((r) => r.state === "rerun-requested") || (cur.state !== "running" && !!await db.get(db.k.selectFrom("main_fixes").select("repo").where("repo", "=", repo).where("state", "=", "needs-fix").limit(1)));
-}
+export const mainFixDue = async (db: Db, repo: string): Promise<boolean> => (await mainFixDueRepos(db, [repo])).length > 0;
 
+const issueTarget = (r: Pick<FixRow, "repo" | "headSha">): string => `${r.repo}:${r.headSha.slice(0, 8)}`;
 const issueTitle = (check: string): string => `Main CI fails: ${cleanLine(check, 100)}`;
 
 /** The issue's text. Fixed layout; the check name, reason and log excerpt are scrubbed, without URLs or mentions. */
-export function issueBody(r: Pick<FixRow, "repo" | "head_sha" | "check" | "reason" | "run_id" | "excerpt">): string {
-  const run = r.run_id ? `\nRun: https://github.com/${slugOf(r.repo)}/actions/runs/${r.run_id}` : "";
+export function issueBody(r: Pick<FixRow, "repo" | "headSha" | "check" | "reason" | "runId" | "excerpt">): string {
+  const run = r.runId ? `\nRun: https://github.com/${slugOf(r.repo)}/actions/runs/${r.runId}` : "";
   const log = (r.excerpt ?? "").replace(/```/g, "'''").trim();
-  return `The CI of the default branch fails at ${r.head_sha.slice(0, 8)}.\n\nFailing check: \`${cleanLine(r.check, 100).replace(/`/g, "'")}\`${run}\n\nThe log reads as a failure outside the code (a refused request, a missing secret, a quota or an outage)${r.reason ? `: ${r.reason}` : "."}${log ? `\n\nLog excerpt:\n\n\`\`\`\n${log}\n\`\`\`` : ""}`;
+  return `The CI of the default branch fails at ${r.headSha.slice(0, 8)}.\n\nFailing check: \`${cleanLine(r.check, 100).replace(/`/g, "'")}\`${run}\n\nThe log reads as a failure outside the code (a refused request, a missing secret, a quota or an outage)${r.reason ? `: ${r.reason}` : "."}${log ? `\n\nLog excerpt:\n\n\`\`\`\n${log}\n\`\`\`` : ""}`;
 }
 
 const excerptOf = (c: CiFailure["checks"][number]): string => {
@@ -188,43 +189,37 @@ const inputOf = (repo: string, f: CiFailure): MainFixInput => ({
   checks: f.checks.map((c) => ({ check: c.name, conclusion: c.conclusion, steps: c.steps.map((s) => ({ job: s.job, step: s.step, log: scrub(s.tail) })) })),
 });
 
-/** A decision's state as the rows show it. */
-async function fromDecision(db: Db, id: string): Promise<{ state: string; issue: number | null }> {
-  const d = await getDecision(db, id);
-  const issue = (await db.get(db.k.selectFrom("main_fixes").select("issue_number as n").where("decision_id", "=", id).where("issue_number", "is not", null).limit(1)))?.n ?? null;
-  if (issue !== null) return { state: "issue-opened", issue };
-  if (d?.answer === NOT_NOW && d.applied_at) return { state: "declined", issue: null };
-  return { state: "asked", issue: null };
-}
-
 async function classifyHead(db: Db, repo: string, cur: Current, deps: MainFixDeps, log: (l: string) => void, s: MainFixSummary, by: By = CLI_BY): Promise<boolean> {
   const at = deps.now().toISOString();
   const reading = await readFailure(deps.gh, repo, cur.headSha, await optionalChecks(db, repo));
-  const base = { repo, head_sha: cur.headSha, run_id: null, run_url: null, excerpt: null, decision_id: null, issue_number: null, pr_number: null, pr_url: null, patch: null, files: null, lint_task: null, lint_round: null, lint_state: null, session: null, created_at: at } as const;
+  const base = { repo, headSha: cur.headSha, runId: null, runUrl: null, excerpt: null, issueNumber: null, prNumber: null, prUrl: null, patch: null, files: null, lintTask: null, lintRound: null, lintState: null, session: null, createdAt: at } as const;
   if (reading.kind === "skip") {
-    await save(db, { ...base, check: "(none)", verdict: "code", state: "nothing-to-do", reason: oneLine(reading.why) }, at);
+    await save(db, { ...base, check: "(none)", verdict: "code", state: "nothing-to-do", reason: oneLine(reading.why), updatedAt: at }, at);
     log(`  ${repo}: nothing to do: ${reading.why}`);
     return false;
   }
+  if (reading.kind === "unread") { log(`  ${repo}: ${reading.why}; read again at the next run`); return false; }
   const failure = reading.failure;
   const verdicts = await deps.classify(db, inputOf(repo, failure));
   if (!verdicts) { log(`  ${repo}: no usable classification; tried again at the next run`); return false; }
   s.classified++;
   const rerunRuns = new Map<number, FixRow[]>();
-  for (const c of failure.checks) {
+  const rows = failure.checks.map((c): FixRow => {
     const v = verdicts.find((x) => x.check === c.name) ?? { check: c.name, verdict: "code" as const, reason: "no verdict" };
     const row: FixRow = {
-      ...base, check: c.name, verdict: v.verdict, state: "nothing-to-do", reason: v.reason || null, run_id: c.runId,
-      run_url: c.runId ? `https://github.com/${slugOf(repo)}/actions/runs/${c.runId}` : null, excerpt: excerptOf(c) || null, updated_at: at,
+      ...base, check: c.name, verdict: v.verdict, state: "nothing-to-do", reason: v.reason || null, runId: c.runId,
+      runUrl: c.runId ? `https://github.com/${slugOf(repo)}/actions/runs/${c.runId}` : null, excerpt: excerptOf(c) || null, updatedAt: at,
     };
-    if (v.verdict === "code") { await onCodeVerdict(db, row, v.reason || "a build, lint or test step failed", at); s.needsFix++; continue; }
-    if (v.verdict === "infra") { await askInfra(db, row, cur, at, s); continue; }
+    if (v.verdict === "code") return { ...row, ...codeState(v.reason || "a build, lint or test step failed") };
+    if (v.verdict === "infra") return { ...row, state: "issue-opening" };
     // flaky
-    if (row.run_id === null) { await setState(db, row, "nothing-to-do", "no Actions run to rerun", at); continue; }
-    // Recorded before the calls: one rerun per head, even if the process dies in the middle of them.
-    const saved = await setState(db, row, "rerun-requested", row.reason, at);
-    (rerunRuns.get(row.run_id) ?? rerunRuns.set(row.run_id, []).get(row.run_id)!).push(saved);
-  }
+    return row.runId === null ? { ...row, reason: "no Actions run to rerun" } : { ...row, state: "rerun-requested" };
+  });
+  // Every row is recorded before the first call to GitHub, so a process that dies in between leaves no check of the head unread:
+  // one rerun per head, and an issue the next run settles.
+  await saveMainFixes(db, rows, at);
+  s.needsFix += rows.filter((r) => r.state === "needs-fix").length;
+  for (const r of rows) if (r.state === "rerun-requested" && r.runId !== null) (rerunRuns.get(r.runId) ?? rerunRuns.set(r.runId, []).get(r.runId)!).push(r);
   const w: Writer = { db, login: ACTOR };
   for (const [runId, rows] of rerunRuns) {
     const g = await guardRepo(db, repo, "main-fix", by);
@@ -235,28 +230,67 @@ async function classifyHead(db: Db, repo: string, cur: Current, deps: MainFixDep
   return true;
 }
 
-async function askInfra(db: Db, row: FixRow, cur: Current, at: string, s: MainFixSummary): Promise<void> {
-  const id = decisionId(row.repo, row.check, cur.culprit);
-  if (!await getDecision(db, id)) {
-    await ask(db, [{
-      id, kind: "other", repo: row.repo, number: 0,
-      question: `Open an upstream issue for the failing check "${cleanLine(row.check, 80)}" on ${row.repo}'s default branch?`,
-      context: "The default branch's CI fails and the log reads as a failure outside the code. AutoCraft can open one issue with the check, the run link and a short log excerpt.",
-      facts: [
-        `check: ${cleanLine(row.check, 100)}`, `head: ${row.head_sha.slice(0, 8)}`, ...(row.run_url ? [`run: ${row.run_url}`] : []),
-        ...(row.reason ? [`reason: ${row.reason}`] : []), ...(row.excerpt ? [`log: ${oneLine(row.excerpt.split("\n").slice(-3).join(" "), 300)}`] : []),
-      ],
-      options: [
-        { key: OPEN_ISSUE, label: "Open issue", hint: "AutoCraft opens one issue on the repo with the check, the run link and the log excerpt." },
-        { key: NOT_NOW, label: "Not now", hint: "Nothing is posted." },
-      ],
-      recommended: OPEN_ISSUE, recommended_reason: "Nothing in the repository's code can fix this; the maintainers need to know.",
-      public_text: issueBody(row), asked_by: ACTOR, asked_at: at,
-    }]);
-    s.asked++;
+/**
+ * The `issue-opening` rows of the repo, check by check: one issue for the check's red streak. Returns what stopped a check whose rows
+ * stay `issue-opening` for the next run: a create without a known outcome, or one the write pacing held back.
+ */
+async function openInfraIssues(db: Db, repo: string, cur: Current, deps: MainFixDeps, log: (l: string) => void, s: MainFixSummary, by: By): Promise<string[]> {
+  const open: string[] = [];
+  const checks = new Set((await loadMainFixes(db, { repo, states: ["issue-opening"] })).map((r) => r.check));
+  for (const check of checks) {
+    const release = await leaseItem(db, `main-issue:${repo}:${check}`, log);
+    if (!release) continue;
+    try {
+      const why = await openInfraIssue(db, repo, check, cur, deps, log, s, by);
+      if (why) open.push(why);
+    } finally { await release(); }
   }
-  const d = await fromDecision(db, id);
-  await setState(db, row, d.state, row.reason, at, { decision_id: id, issue_number: d.issue });
+  return open;
+}
+
+async function openInfraIssue(db: Db, repo: string, check: string, cur: Current, deps: MainFixDeps, log: (l: string) => void, s: MainFixSummary, by: By): Promise<string | null> {
+  const stored = (await loadMainFixes(db, { repo, states: ["issue-opening", "issue-opened", "declined"] })).filter((r) => r.check === check);
+  const rows = stored.filter((r) => r.state === "issue-opening");
+  const newest = rows.at(-1);
+  if (!newest) return null;
+  const end = async (state: string, extra: Partial<FixRow> = {}, reason?: string): Promise<null> => {
+    const at = deps.now().toISOString();
+    await saveMainFixes(db, rows.map((r) => ({ ...r, ...extra, state, reason: reason ?? r.reason })), at);
+    return null;
+  };
+  // The streak's issue, opened (or declined by a person) at an earlier red head.
+  const streak = (r: FixRow): boolean => r.createdAt >= cur.culpritAt;
+  const had = streak(newest) ? stored.find((r) => r.state === "issue-opened" && r.issueNumber !== null && streak(r)) ?? stored.find((r) => r.state === "declined" && streak(r)) : undefined;
+  if (had) return await end(had.state, { issueNumber: had.issueNumber });
+  // A create an earlier run began: its audit row tells the issue, and one that ended without a known outcome is looked up on GitHub.
+  const began = (await listAudit(db, { actions: ["postmerge-file"], targets: rows.map(issueTarget), order: "desc" })).filter((a) => a.details?.check === check && a.at >= rows[0]!.createdAt);
+  const done = began.map((a) => /\/issues\/(\d+)$/.exec(a.details?.state === "done" ? String(a.details.url ?? "") : "")).find((m) => m !== null);
+  if (done) return await end("issue-opened", { issueNumber: Number(done[1]) });
+  // The next result tells whether the streak goes on.
+  if (!known(cur)) return null;
+  for (const a of began.filter((a) => unclearWrite(a.details))) {
+    let made: { number: number; url: string } | null;
+    try {
+      made = await issueMade(deps.gh, { repo, title: String(a.details?.title ?? ""), body: String(a.details?.text ?? ""), since: a.at, mine: await byUs(db) });
+    } catch (e) { return `${repo}: whether the issue for ${check} was opened is not known: ${oneLine(String((e as Error).message ?? e))}`; }
+    if (made) { log(`  ${repo}: the issue for ${check} was opened before: ${made.url}`); return await end("issue-opened", { issueNumber: made.number }); }
+  }
+  if (cur.state !== "red" || !streak(newest)) return await end("nothing-to-do", {}, "main is green again");
+  const g = await guardRepo(db, repo, "main-fix", by);
+  if ("refused" in g) { log(`  ${repo}: issue for ${check} not opened: ${g.refused}`); return await end("issue-failed", {}, oneLine(g.refused, 100)); }
+  try {
+    const made = await createIssue({ db, login: ACTOR }, g, deps.exec, { repo, target: issueTarget(newest), title: issueTitle(check), body: issueBody(newest) }, { by: "model", kind: "issue", model: NOTE_MODEL }, { check });
+    await end("issue-opened", { issueNumber: made.number });
+    s.issues++;
+    log(`  ${repo}: opened ${made.url}`);
+    return null;
+  } catch (e) {
+    const why = oneLine(String((e as Error).message ?? e));
+    log(`  ${repo}: issue for ${check} not opened: ${why}`);
+    if (e instanceof IssueError && e.later) return why;
+    if (!(e instanceof IssueError) || !e.clear) return `${repo}: whether the issue for ${check} was opened is not known: ${why}`;
+    return await end("issue-failed", {}, `issue not opened: ${why}`.slice(0, 200));
+  }
 }
 
 /** Rows waiting on a rerun: green is a pass; red again after a new reading, or after the wait, is a code failure. */
@@ -265,52 +299,22 @@ async function settleReruns(db: Db, repo: string, cur: Current, deps: MainFixDep
   for (const r of (await rowsAt(db, repo, cur.headSha)).filter((x) => x.state === "rerun-requested")) {
     if (cur.state === "green" || cur.state === "optional") { await setState(db, r, "rerun-passed", r.reason, at); continue; }
     if (cur.state !== "red") continue;
-    const changedSince = cur.stateChangedAt > r.updated_at;
-    if (changedSince || deps.now().getTime() - Date.parse(r.updated_at) > RERUN_WAIT_MS) { await onCodeVerdict(db, r, "red again after a rerun", at); s.needsFix++; }
-  }
-}
-
-/** Opens the issues the operator asked for and records the "not now" answers. */
-async function applyAnswers(db: Db, repo: string, deps: MainFixDeps, log: (l: string) => void, s: MainFixSummary, by: By): Promise<void> {
-  for (const a of (await actionable(db)).filter((x) => x.kind === "other" && isMainFixDecision(repo, x.id))) {
-    const at = deps.now().toISOString();
-    const rows = await db.all(db.k.selectFrom("main_fixes").select(kx.cols("main_fixes")).$narrowType<{ verdict: MainFixVerdict }>()
-      .where("decision_id", "=", a.id).orderBy("created_at", "desc").orderBy("head_sha"));
-    const done = async (): Promise<void> => void await db.run(db.k.updateTable("main.decisions").set({ applied_at: at }).where("id", "=", a.id).where("applied_at", "is", null));
-    if (a.answer === NOT_NOW) { for (const r of rows) await setState(db, r, "declined", r.reason, at); await done(); continue; }
-    if (a.answer !== OPEN_ISSUE) continue;
-    const row = rows[0];
-    if (!row) { await done(); continue; }
-    if (rows.some((r) => r.issue_number !== null)) { await done(); continue; }
-    try {
-      const g = await guardRepo(db, repo, "main-fix", by);
-      if ("refused" in g) { log(`  ${repo}: issue for ${row.check} not opened: ${g.refused}`); continue; }
-      const made = await createIssue({ db, login: ACTOR }, g, deps.exec, { repo, target: `${repo}:${row.head_sha.slice(0, 8)}`, title: issueTitle(row.check), body: issueBody(row) }, { by: "operator", model: NOTE_MODEL }, { decision: a.id });
-      for (const r of rows) await setState(db, r, "issue-opened", r.reason, at, { issue_number: made.number });
-      await done();
-      s.issues++;
-      log(`  ${repo}: opened ${made.url}`);
-    } catch (e) {
-      // A refusal leaves the answer unapplied, so the next run tries again; a lost answer from GitHub may have left an issue, so it is not retried.
-      const clear = e instanceof IssueError && e.clear;
-      log(`  ${repo}: issue for ${row.check} not opened: ${oneLine(String((e as Error).message ?? e))}`);
-      if (!clear) { for (const r of rows) await setState(db, r, "asked", `issue outcome unknown: ${oneLine(String((e as Error).message ?? e), 100)}`, at); await done(); }
-    }
+    const changedSince = cur.stateChangedAt > r.updatedAt;
+    if (changedSince || deps.now().getTime() - Date.parse(r.updatedAt) > RERUN_WAIT_MS) { await onCodeVerdict(db, r, "red again after a rerun", at); s.needsFix++; }
   }
 }
 
 /** One repo: nothing without the approval; then answers, rerun results and, for a red head with no rows, the reading and sorting. */
 export async function runMainFix(db: Db, params: { repo: string; onHandled?: (n: number) => void; stopping?: () => Promise<boolean>; by?: By }, log: (line: string) => void = console.log, deps: MainFixDeps = defaultDeps()): Promise<MainFixSummary> {
   const { repo } = params;
-  const s: MainFixSummary = { repo, classified: 0, reran: 0, asked: 0, needsFix: 0, issues: 0, prs: 0, note: null };
-  if (!await mainFixApprovalOf(db, repo)) {
+  const s: MainFixSummary = { repo, classified: 0, reran: 0, needsFix: 0, issues: 0, prs: 0, note: null };
+  if (!await repoApproved(db, repo, "mainfix")) {
     s.note = `fixing a red main in ${repo} is not approved`;
     log(`main-fix ${repo}: ${s.note}; nothing done`);
     return s;
   }
   let handled = 0;
   const bump = (): void => params.onHandled?.(++handled);
-  await applyAnswers(db, repo, deps, log, s, params.by ?? CLI_BY);
   const cur = await currentOf(db, repo);
   if (!cur) return s;
   await settleReruns(db, repo, cur, deps, s);
@@ -326,12 +330,15 @@ export async function runMainFix(db: Db, params: { repo: string; onHandled?: (n:
       } finally { await release(); }
     }
   }
+  const unsettled = await openInfraIssues(db, repo, cur, deps, log, s, params.by ?? CLI_BY);
   if (deps.fix) {
     const asHead = (c: Current | null) => (c ? { headSha: c.headSha, branch: c.branch, state: c.state, redSince: c.redSince, culprit: c.culprit, culpritPr: c.culpritPr } : null);
     const r = await openFixPrs({ db, repo, gh: deps.gh, exec: deps.exec, fix: deps.fix, now: deps.now, log, by: params.by, ...(params.stopping && { stopping: params.stopping }), setState: async (r, state, reason, at, extra) => await setState(db, r, state, reason, at, extra), current: async () => asHead(await currentOf(db, repo)) }, bump);
     s.prs = r.opened;
   }
-  log(`main-fix ${repo}: classified ${s.classified}, reran ${s.reran}, asked ${s.asked}, needs fix ${s.needsFix}, issues ${s.issues}, fix PRs ${s.prs}`);
+  log(`main-fix ${repo}: classified ${s.classified}, reran ${s.reran}, needs fix ${s.needsFix}, issues ${s.issues}, fix PRs ${s.prs}`);
+  // The job fails: the failure backoff spaces the next look (a paced write's message is skipped by it, so the next pass runs it again).
+  if (unsettled.length) throw new Error(unsettled.join("; "));
   return s;
 }
 
@@ -344,8 +351,9 @@ export const commands = {
       const repo = args[i + 1]!;
       const db = await openDb();
       if (args.includes("--apply")) { await runMainFix(db, { repo }); return; }
-      for (const r of await db.all(db.k.selectFrom("main_fixes").select(["head_sha", "check", "verdict", "state", "reason"]).where("repo", "=", repo).orderBy("created_at", "desc").limit(50)))
-        console.log(`${r.head_sha.slice(0, 8)}\t${r.check}\t${r.verdict}\t${r.state}\t${r.reason ?? ""}`);
+      const states = ["needs-fix", "linting", "pr-opened", "fix-failed", "rerun-requested", "rerun-passed", "issue-opening", "issue-opened", "issue-failed", "declined", "nothing-to-do"];
+      for (const r of (await loadMainFixes(db, { repo, states })).sort((a, b) => (a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0)).slice(0, 50))
+        console.log(`${r.headSha.slice(0, 8)}\t${r.check}\t${r.verdict}\t${r.state}\t${r.reason ?? ""}`);
     },
   },
   "main-fix-approval": {
@@ -353,9 +361,10 @@ export const commands = {
     async run(args: string[]): Promise<void> {
       const i = args.indexOf("--repo");
       const db = await openDb();
-      const repos = i >= 0 ? [args[i + 1]!] : (await db.all(db.k.selectFrom("tracked_repos").select("name").orderBy("name"))).map((r) => r.name);
+      const repos = i >= 0 ? [args[i + 1]!] : [...(await loadTrackedRepos(db)).keys()].sort();
+      const approvals = await loadStepApprovals(db, repos, ["mainfix"]);
       for (const r of repos) {
-        const a = await mainFixApprovalOf(db, r);
+        const a = approvals.get(r)?.mainfix;
         console.log(`${r}\t${a ? `approved by ${a.by} at ${a.at}` : "not approved"}`);
       }
     },

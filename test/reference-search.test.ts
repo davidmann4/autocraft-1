@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import type { Embedder } from "../src/embed/model.ts";
-import { buildReferenceIndex, referenceAround, referenceSearch } from "../src/reference-search.ts";
+import { buildReferenceIndex, referenceAround, referenceSearch } from "../src/data/external/index.ts";
 
 // Bag-of-keywords embedder: one axis per topic word, so similarity is deterministic.
 const AXES = ["layer", "blend", "export", "color"];

@@ -5,11 +5,10 @@ import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { after, test } from "node:test";
 import { SCRATCH } from "./scratch.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb } from "./helpers/raw-db.ts";
 import { sqliteOnly } from "./test-db.ts";
 
 const { connect } = await import("../src/db.ts");
-const { batchSizeOf } = await import("../src/merge/batch-store.ts");
 
 mkdirSync(SCRATCH, { recursive: true });
 const dir = mkdtempSync(join(SCRATCH, "ci-first-"));
@@ -43,7 +42,9 @@ test("queued tests verifications become ci-enough where the repo has CI, and sma
     assert.equal(await taskState(ids.get("withci")!), "cancelled");
     assert.equal(await taskState(ids.get("noci")!), "queued");
     // A size chosen after the migration (a failed batch halves it) stays.
-    assert.deepEqual([await batchSizeOf(again, "app"), await batchSizeOf(again, "big"), await batchSizeOf(again, "unset")], [i === 0 ? 20 : 4, 35, 20]);
+    // The migration raises the stored `batch_size:<repo>` values; an unset repo starts at 20.
+    const batchSizeOf = async (repo: string) => Number((await again.prepare("SELECT value FROM settings WHERE key = ?").get(`batch_size:${repo}`) as { value: string } | undefined)?.value ?? 20);
+    assert.deepEqual([await batchSizeOf("app"), await batchSizeOf("big"), await batchSizeOf("unset")], [i === 0 ? 20 : 4, 35, 20]);
     await again.prepare("UPDATE settings SET value = '4' WHERE key = 'batch_size:app'").run();
     await again.close();
   }

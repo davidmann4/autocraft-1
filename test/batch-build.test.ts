@@ -68,6 +68,19 @@ describe("batch-build", () => {
     assert.deepEqual((await batches(t.w)).map((b) => [b.state, b.build_state, b.pr_number]), [["open", "passed", 900]]);
   });
 
+  test("a member that lost its merge approval while the batch is checking is left out, and the others go on", async () => {
+    const t = await setup([1, 2], true);
+    await (await (await t.w.acting()).workflow(2)).handedOver(2);
+    await run(t);
+    assert.deepEqual((await t.w.rows("SELECT number FROM merge_batch_prs ORDER BY number")).map((x) => x.number), [1, 2]);
+    await t.w.db.run(t.w.db.k.updateTable("preapprovals").set({ state: "cancelled" }));
+    await finish(t.w, 1, "pass");
+    await run(t);
+    const [first, second] = await batches(t.w);
+    assert.deepEqual([first!.state, second!.parent_id], ["superseded", first!.id]);
+    assert.deepEqual((await t.w.rows("SELECT number FROM merge_batch_prs WHERE batch_id = ?", second!.id as number)).map((x) => x.number), [1]);
+  });
+
   test("a binary diff, or the switch turned off mid-flight, opens the PR without the build", async () => {
     const bin = await setup([1], true);
     bin.setPatch("diff --git a/x.png b/x.png\nBinary files a/x.png and b/x.png differ\n");
@@ -126,32 +139,5 @@ describe("batch-build", () => {
     await finish(t.w, 3, "env");
     await run(t);
     assert.deepEqual((await batches(t.w)).map((b) => [b.state, b.build_state, b.pr_number]), [["open", "skipped", 900]]);
-  });
-});
-
-describe("a maintainer's Merge answer in a batch", () => {
-  test("is read again before the batch merges: without write access its PR is held and the batch is rebuilt without it", async () => {
-    const t = await setup([1, 2], false);
-    const { w } = t;
-    // Outside the merge rule (a new author), so #3 merges on its Merge answer.
-    await (await (await (await (await w.pr(3, { author: "newcomer" })).review(3)).verified(3)).premerge(3, "clean")).answer(3, "merge");
-    await run(t);
-    const members = async () => (await w.db.all(w.db.k.selectFrom("merge_batch_prs as m").innerJoin("merge_batches as b", "b.id", "m.batch_id").select(["b.state", "m.number"]).orderBy("b.id").orderBy("m.number"))).map((r) => `${r.state}:${r.number}`);
-    assert.deepEqual(await members(), ["open:1", "open:2", "open:3"]);
-    // The answer is a maintainer's, under maintainer writes and the app identity, with a write permission past its cache time.
-    await w.db.run(w.db.k.updateTable("decisions").set({ answered_by: "maint" }).where((eb) => like(w.db, "id", eb.val("app#3:merge@%"))));
-    await w.db.prepare("INSERT OR IGNORE INTO access (login, role) VALUES ('maint', 'maintainer')").run();
-    await w.db.prepare("INSERT INTO settings (key, value) VALUES ('maintainer_writes', '1'), ('github_identity', 'app') ON CONFLICT (key) DO UPDATE SET value = excluded.value").run();
-    const perm = async (permission: string, at: string) =>
-      await w.db.prepare("INSERT INTO repo_permissions (login, repo, permission, checked_at) VALUES ('maint', 'app', ?, ?) ON CONFLICT (login, repo) DO UPDATE SET permission = excluded.permission, checked_at = excluded.checked_at").run(permission, at);
-    await perm("write", new Date(Date.now() - 11 * 60_000).toISOString());
-    const reads: string[] = [];
-    t.deps.permission = async (_db, login) => { reads.push(login); await perm("read", new Date().toISOString()); return { kind: "ok", permission: "read" }; };
-    const s = await run(t);
-    assert.deepEqual(reads, ["maint"]);
-    assert.deepEqual(s.merged, []);
-    assert.equal((await w.rows("SELECT 1 FROM merge_holds WHERE repo = 'app' AND number = 3")).length, 1);
-    assert.match(String((await w.db.get(w.db.k.selectFrom("merge_batches").select("summary").where("id", "=", 1)))!.summary), /app#3 left the batch: maint no longer settles decisions on app/);
-    assert.ok(!(await members()).some((m) => !m.startsWith("superseded") && m.endsWith(":3")), (await members()).join());
   });
 });

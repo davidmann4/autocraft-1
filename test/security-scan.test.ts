@@ -9,14 +9,17 @@ import { addLogin } from "../src/access.ts";
 import { scopeToTracked } from "../src/repos.ts";
 import { apiRoutes } from "../src/dash/api/index.ts";
 import { loadConfig } from "../src/dash/server/config.ts";
+import { live } from "../src/dash/api/live.ts";
+import type { Req } from "../src/dash/types.ts";
 import { startServer } from "../src/dash/server/index.ts";
 import { FakeProvider } from "../src/dash/server/provider.ts";
 import { insertRun } from "../src/agents/runs.ts";
 import { linkRepeatedFindings, runScan, type Ask, type ScanDeps } from "../src/security/scan.ts";
 import { securityRepo } from "../src/security/rules.ts";
 import { autoFixConfirmed } from "../src/security/actions.ts";
+import { checkoutHeld } from "../src/sandbox/checkout.ts";
 import { SCRATCH } from "./scratch.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb } from "./helpers/raw-db.ts";
 import * as kx from "../src/db/kx.ts";
 
 mkdirSync(SCRATCH, { recursive: true });
@@ -123,7 +126,7 @@ function fakeModel(costs = { model: 1, area: 2, verify: 0.5 }, calls: string[] =
   return { ask, checkout: async () => ({ dir: tree, sha: "a".repeat(40) }), cancelled: async () => false, log: () => {} };
 }
 
-const newScan = async (cap: number | null): Promise<number> => (await db.get(db.k.insertInto("security_scans").values({ repo: "photocraft", state: "modeling", cap_usd: cap, started_by: "boss", started_at: "2026-11-05T00:00:00Z" }).returning("id")))!.id;
+const newScan = async (cap: number | null): Promise<number> => (await db.get(db.k.insertInto("security_scans").values({ repo: "photocraft", state: "modeling", cap_usd: cap, started_by: "boss", started_at: new Date().toISOString() }).returning("id")))!.id;
 const scanOf = async (id: number) => (await db.get(db.k.selectFrom("security_scans").select(kx.cols("security_scans")).where("id", "=", id)))!;
 
 describe("security deep scan", () => {
@@ -204,7 +207,7 @@ describe("security deep scan", () => {
     const jobs = (c: Client) => c.get<{ jobs: { step: string }[] }>("/api/pipeline/jobs");
     assert.equal((await jobs(viewer)).jobs.filter((j) => j.step === "security-scan").length, 0);
     assert.equal((await jobs(boss)).jobs.filter((j) => j.step === "security-scan").length, 1);
-    const runId = await insertRun(db, { jobId: null, step: "security-scan", stage: 9, promptId: "security.area", promptVersion: "1", provider: "claude", model: "opus", accountId: null, items: [{ repo: securityRepo("photocraft"), number: 1 }], prompt: "p" });
+    const runId = await insertRun(db, { jobId: null, step: "security-scan", stage: 9, promptId: "security.area", promptVersion: "1", provider: "claude", model: "opus", items: [{ repo: securityRepo("photocraft"), number: 1 }], prompt: "p" });
     const runs = (c: Client) => c.get<{ runs: { id: number }[] }>("/api/agents?limit=200");
     assert.ok(!(await runs(viewer)).runs.some((r) => r.id === runId));
     assert.ok((await runs(maint)).runs.some((r) => r.id === runId));
@@ -225,7 +228,7 @@ describe("security deep scan", () => {
     const id = await newScan(null);
     const model = fakeModel();
     const ask = (async (kind: string, input: unknown) => {
-      const runId = await insertRun(db, { jobId: null, step: "security-scan", stage: 9, promptId: kind, promptVersion: "1", provider: "claude", model: "opus", accountId: null, items: [{ repo: securityRepo("photocraft"), number: id }], prompt: `prompt of ${kind}` });
+      const runId = await insertRun(db, { jobId: null, step: "security-scan", stage: 9, promptId: kind, promptVersion: "1", provider: "claude", model: "opus", items: [{ repo: securityRepo("photocraft"), number: id }], prompt: `prompt of ${kind}` });
       return { ...(await (model.ask as (k: string, i: unknown) => Promise<object>)(kind, input)), runId };
     }) as Ask;
     await runScan(db, id, { ...model, ask });
@@ -326,11 +329,22 @@ describe("security deep scan", () => {
     const steps = (c: Client) => c.get<{ jobs: { step: string; params: { repo?: string } }[] }>("/api/pipeline/jobs").then((r) => r.jobs.filter((j) => j.step === "security-scan" && j.params.repo === "secret").length);
     assert.equal(await steps(boss), 1);
     assert.equal(await steps(maint), 0);
-    const nowJobs = (c: Client) => c.get<{ entries: { kind: string; title: string }[] }>("/api/now").then((r) => r.entries.filter((e) => e.kind === "job" && e.title === "Security deep scan").length);
-    assert.equal(await nowJobs(boss), 1);
-    assert.equal(await nowJobs(maint), 0);
+    const lanes = async (role: "operator" | "maintainer", sees: boolean) => (await live(db, { query: new URLSearchParams(), user: { role, login: role, canRead: async (r: string) => sees || r !== "secret" } } as unknown as Req))
+      .lanes.filter((l) => l.title === "Security deep scan" && l.repo === securityRepo("secret")).length;
+    assert.equal(await lanes("operator", true), 1);
+    assert.equal(await lanes("maintainer", false), 0);
     await maint.get("/api/repos/secret/security", 404);
     const audit = await maint.get<{ entries: { action: string; target: string }[] }>("/api/audit");
     assert.ok(!audit.entries.some((e) => e.target?.startsWith("secret:")));
+  });
+
+  test("the scan's checkout is held against pruning while it runs and released after", async () => {
+    const calls: string[] = [];
+    const deps = fakeModel(undefined, calls);
+    const heldDuring: boolean[] = [];
+    const ask = (async (id: string, input: unknown) => { heldDuring.push(checkoutHeld(tree)); return await (deps.ask as (a: string, b: unknown) => ReturnType<Ask>)(id, input); }) as Ask;
+    await runScan(db, await newScan(null), { ...deps, ask });
+    assert.ok(heldDuring.length > 0 && heldDuring.every(Boolean));
+    assert.equal(checkoutHeld(tree), false);
   });
 });

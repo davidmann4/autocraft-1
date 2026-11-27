@@ -1,12 +1,12 @@
 // The project: one repo the list pages are narrowed to, or null for every repo. The server narrows its list routes to the
 // `x-autocraft-scope` header. The picked project is saved in the browser; a list page's URL names its project first
-// (`/projects/<repo>`, or a `repo` parameter), so a copied link shows the same list, and opening one leaves the pick as it was.
-// Every other page (an item, a decision, settings) has no project and shows every repo.
+// (a `repo` parameter), so a copied link shows the same list, and opening one leaves the pick as it was.
+// Every other page (an item, settings) has no project and shows every repo.
 import { useEffect, useRef, useSyncExternalStore } from "react";
 import { matchPath, useLocation, useSearchParams } from "react-router-dom";
 
 export const SCOPE_HEADER = "x-autocraft-scope";
-/** The project that stands for every repo, as in `/projects/all`. */
+/** The name that stands for every repo in an old `/projects/all` link. */
 export const ALL = "all";
 const KEY = "autocraft:scope";
 
@@ -50,15 +50,10 @@ let listPages: string[] = [];
 export const setListPages = (paths: string[]): void => void (listPages = paths.map((p) => (p.startsWith("/") ? p : `/${p}`)));
 
 /**
- * The project a page shows: a project page's repo; on a list page the one repo its URL names, else the pick; `elsewhere`
+ * The project a page shows: on a list page the one repo its URL names, else the pick; `elsewhere`
  * (none by default) on every other page. A URL naming several repos names no project.
  */
 export function projectOf(pathname: string, search: string, pick: string | null, elsewhere: string | null = null): string | null {
-  const page = /^\/projects\/([^/]+)\/?$/.exec(pathname)?.[1];
-  if (page !== undefined) {
-    const repo = decodeURIComponent(page);
-    return repo === ALL ? null : repo;
-  }
   if (!listPages.some((path) => matchPath(path, pathname))) return elsewhere;
   const repo = new URLSearchParams(search).get("repo");
   if (repo !== null) return repo && !repo.includes(",") ? repo : null;
@@ -113,8 +108,3 @@ export function withProject<T>(project: string | null, start: () => T): T {
 
 /** The project of the request being started (see withProject). */
 export const requestProject = (): string | null => current;
-
-// `/` opens the picked project only on the page the app loads with; afterwards it shows the tiles.
-let firstPage = location.pathname === "/";
-export const isFirstPage = (): boolean => firstPage;
-export const leftFirstPage = (): void => void (firstPage = false);

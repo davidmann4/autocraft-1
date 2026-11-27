@@ -22,7 +22,9 @@ import { HttpError } from "../server/util.ts";
 import type { Req, Res } from "../types.ts";
 import { hiddenRepos, needVisible, visibleRepos } from "./visible.ts";
 import { canSeeInternals } from "./staff.ts";
-import { isHiddenRepo } from "../../hidden-sql.ts";
+import { isHiddenRepo, loadTrackedRepos } from "../../data/control/index.ts";
+import { loadArtifactFiles } from "../../data/build/index.ts";
+import { loadImplementationRepos } from "../../data/implement/index.ts";
 import type { Db } from "../../db/index.ts";
 
 const wrap = async <T>(f: () => Promise<T | Promise<T>>): Promise<T> => {
@@ -84,7 +86,7 @@ export const cancel = async (db: Db, req: Req): Promise<BuildTask> => wrap(async
 export const buildSummary = async (db: Db, req: Req): Promise<BuildSummary> => await summary(db, await hiddenRepos(db, req), canSeeInternals(req));
 
 async function featuresOf(db: Db, req: Req): Promise<BuildFeatures> {
-  const tracked = new Set((await db.all(db.k.selectFrom("main.tracked_repos").select("name"))).map((r) => r.name));
+  const tracked = await loadTrackedRepos(db);
   const repos = (await visibleRepos(db, req)).filter((r) => tracked.has(r)).sort();
   const shown = new Set(repos);
   const visible = await shownFeatures(db);
@@ -152,7 +154,7 @@ async function needRunRepo(req: Req, repo: string | undefined): Promise<void> {
 }
 
 async function trackedRepo(db: Db, repo: string): Promise<string> {
-  if (!await db.get(db.k.selectFrom("main.tracked_repos").select("name").where("name", "=", repo))) throw new HttpError(400, "repo must be a tracked repo");
+  if (!(await loadTrackedRepos(db, [repo])).has(repo)) throw new HttpError(400, "repo must be a tracked repo");
   return repo;
 }
 
@@ -190,8 +192,8 @@ async function artifactBytes(db: Db, taskId: number, name: string, login: string
       throw e;
     }
   }
-  const row = await db.get(db.k.selectFrom("build_artifacts").select("file").where("task_id", "=", taskId).where("name", "=", name));
-  const path = row && absolute(row.file);
+  const file = (await loadArtifactFiles(db, [{ taskId, name }])).get(`${taskId}/${name}`);
+  const path = file && absolute(file);
   if (!path) throw new HttpError(404, "no such artifact");
   try {
     return readFileSync(path);
@@ -206,9 +208,9 @@ export async function implementationShot(db: Db, req: Req): Promise<Res> {
     if (!canSeeInternals(req)) throw new HttpError(403, "only operators and maintainers see implementation screenshots");
     const id = Number(req.params.id), file = req.params.file ?? "";
     if (!Number.isSafeInteger(id) || !SHOT_FILE.test(file)) throw new HttpError(404, "no such screenshot");
-    const row = await db.get(db.k.selectFrom("main.implementations").select("repo").where("id", "=", id));
-    if (!row) throw new HttpError(404, "no such screenshot");
-    await needVisible(db, req, row.repo);
+    const repo = (await loadImplementationRepos(db, [id])).get(id);
+    if (!repo) throw new HttpError(404, "no such screenshot");
+    await needVisible(db, req, repo);
     let data: Buffer;
     const c = runnerClient();
     if (c) {

@@ -18,7 +18,7 @@
 
 **Model.** Jev first, Haiku for the unclear pairs.
 
-**You see.** A "Duplicate?" question on the Needs you page. An open one holds the item out of Review, Verify, Implement and the merge queue.
+**You see.** A duplicate signal on the items. It closes nothing and holds back only a pull request nobody started.
 
 **Can go wrong.** A pair you already ruled on is not asked again.
 
@@ -30,7 +30,7 @@
 
 **Model.** Jev first, Haiku for a second opinion.
 
-**You see.** The type and flags on the item. A disagreement on a scope label becomes a question.
+**You see.** The type and flags on the item. A disagreement on the type goes to a referee model; if it is unsure, the item gets the needs-decision flag and stays off the automatic path.
 
 **Can go wrong.** When Jev is unavailable, Haiku decides alone.
 
@@ -46,17 +46,17 @@
 
 **Can go wrong.** Nothing a person has to fix.
 
-## Decide
+## Starting and answering
 
-**What.** Asks an operator for a scope call, and prepares every open decision with a summary, a recommended choice and drafted answers.
+**What.** A maintainer starts an item with a command (review, fix-up, implement or merge), and answers one recommendation when AutoCraft comes back.
 
-**When.** When an item carries the needs-decision flag, or the classifiers disagree on scope.
+**When.** Whenever someone picks an item. Small bug fixes that pass the merge rule start by themselves.
 
-**Model.** Opus by default; the Pipeline page can switch to Sonnet.
+**Model.** None: commands are read without a model call.
 
-**You see.** The decision card on the item page: question, facts, choices, a note box and Do it.
+**You see.** The recommendation on GitHub, Discord, the item page and in your agent.
 
-**Can go wrong.** If the draft is wrong, change any text or tick before you press Do it.
+**Can go wrong.** Text that is not fully understood runs nothing; AutoCraft answers with what it read.
 
 ## Label
 
@@ -86,13 +86,13 @@
 
 **What.** Implements a queued issue in a workspace: plans it, asks when facts or choices are open, writes the change and its tests, runs the checks and opens a pull request.
 
-**When.** For issues a maintainer queued, in repos with the issue implementations approval and the `implement` feature.
+**When.** For issues a maintainer queued, in repos with the `implement` feature.
 
 **Model.** Opus plans and writes, on the queuer's own Task Runner.
 
-**You see.** A question to the author or a decision, then a new pull request, or a decision when the attempt is stuck.
+**You see.** A question to the author or a maintainer, then a new pull request, or a recommendation when the attempt is stuck.
 
-**Can go wrong.** Checks that still fail after three rounds, a refused diff, a closed issue or a queuer without a ready Task Runner stop the attempt; it becomes a decision with Try again, Open as draft PR, Backlog or Close issue.
+**Can go wrong.** Checks that still fail after three rounds, a refused diff, a closed issue or a queuer without a ready Task Runner stop the attempt; it comes back with its options: try again, open as a draft, backlog or close.
 
 ## Fix-up
 
@@ -116,11 +116,11 @@
 
 **You see.** The verify result on the item and in the merge queue.
 
-**Can go wrong.** A private repo or a non-Rust repo without CI shows "not verified" and goes on to a "Merge?" question.
+**Can go wrong.** A private repo or a non-Rust repo without CI shows "not verified" and waits for an approval.
 
 ## Merge queue
 
-**What.** Merges pull requests that meet the rules in batches, and asks "Merge?" for the rest.
+**What.** Merges pull requests that meet the rules in batches, and the rest once a maintainer approves them.
 
 **When.** Continuously, while the default branch is green.
 
@@ -132,13 +132,13 @@
 
 ## Post-merge review
 
-**What.** A second Opus review of each merged pull request, reading what landed.
+**What.** A second Opus review of a merge, reading what landed.
 
-**When.** Once per merged pull request, oldest first.
+**When.** Once per merge that nobody approved, or whose code AutoCraft changed after the approval, oldest first. A pull request that merged as a person approved it gets none.
 
 **Model.** Opus.
 
-**You see.** Findings on the item, and follow-up issues for defects.
+**You see.** Findings on the item, and follow-up issues for defects; or that the pull request merged as approved and needs no review.
 
 **Can go wrong.** An invalid reply is asked again. After three tries the review is held.
 
@@ -156,9 +156,9 @@
 
 ## Conversations
 
-**What.** A conversation with Opus about one item, shown beside its decision.
+**What.** A conversation with Opus about one item, shown on its page.
 
-**When.** When an operator writes a message.
+**When.** When an operator or a maintainer with write access writes a message.
 
 **Model.** Opus, read-only.
 
@@ -168,24 +168,12 @@
 
 ## What needs a person
 
-**What.** The questions the pipeline cannot settle: scope calls, reference behaviour, merges outside the rules, closing a pull request, label disagreements and duplicates.
+**What.** Starting an item, answering its recommendation, approving a merge, and blockers of an approved item.
 
-**When.** As they come up. Operators settle them. Maintainers with write access settle them when an operator allows it for the repo, and otherwise send feedback.
+**When.** As they come up. Operators and maintainers with write access on the repo answer.
 
-**Model.** Opus prepares each question with a summary and a recommended choice.
+**Model.** The review and the implementation plan write the recommendation.
 
-**You see.** The Needs you page and the item page. Snooze hides a question until the item has new activity.
+**You see.** Home and the item page.
 
-**Can go wrong.** Nobody answers: the question stays open and only that item waits. A push to a pull request withdraws its old Merge? and Close? questions.
-
-## Actions
-
-**What.** What a decision does on GitHub: one main action and optional extras.
-
-**When.** When an operator presses Do it.
-
-**Model.** Opus drafts the texts. Act posts them from fixed templates.
-
-**You see.** The writes listed on the Do it button, then the result on the item.
-
-**Can go wrong.** Undo stays until the pipeline has used the answer.
+**Can go wrong.** Nobody answers: only that item waits. A close that could not be made is listed on Home.

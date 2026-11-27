@@ -11,7 +11,7 @@ import { autoFixConfirmed } from "../src/security/actions.ts";
 import { runScan, type Ask, type ScanDeps } from "../src/security/scan.ts";
 import { advanceScanTests, NOT_SHOWN_NOTE } from "../src/security/scantest.ts";
 import { SCRATCH } from "./scratch.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb } from "./helpers/raw-db.ts";
 import { cols, excluded, jsonNum } from "../src/db/kx.ts";
 
 mkdirSync(SCRATCH, { recursive: true });
@@ -48,7 +48,7 @@ function deps(spy: Spy, withTests: boolean): ScanDeps {
     crates: async () => { spy.crates++; return { ok: true, rust: true, crates: [{ name: "psd", dir: "crates/psd" }] }; },
   };
 }
-const newScan = async (repo: string): Promise<number> => (await db.get(db.k.insertInto("security_scans").values({ repo, state: "modeling", cap_usd: null, started_by: "boss", started_at: "2026-11-05T00:00:00Z" }).returning("id")))!.id;
+const newScan = async (repo: string): Promise<number> => (await db.get(db.k.insertInto("security_scans").values({ repo, state: "modeling", cap_usd: null, started_by: "boss", started_at: new Date().toISOString() }).returning("id")))!.id;
 const findings = async (repo: string) => await db.all(db.k.selectFrom("security_findings").select(["number", "title", "severity", "state", "verification"]).where("repo", "=", repo).orderBy("number"));
 const testRow = async (repo: string, n: number) => await db.get(db.k.selectFrom("security_scan_tests").select(cols("security_scan_tests")).where("repo", "=", repo).where("number", "=", n));
 const result = (step: string, exitCode: number | null, timedOut = false) => ({ step, exitCode, durationMs: 1, timedOut });

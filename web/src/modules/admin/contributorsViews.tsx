@@ -66,7 +66,7 @@ export function ContributorsView({ user }: ViewProps) {
   return (
     <Page
       title="Contributors"
-      sub={data && `${num(all!)} authors${filter.q || filter.repo ? " matching" : ""} · ${num(allowed)} may merge on green CI without a decision`}
+      sub={data && `${num(all!)} authors${filter.q || filter.repo ? " matching" : ""} · ${num(allowed)} may merge on green CI without a maintainer`}
     >
       {data && <RuleBlock rule={data.rule} operator={operator} />}
 
@@ -316,7 +316,7 @@ function RuleBlock({ rule, operator }: { rule: WhitelistRule; operator: boolean 
     };
   }, [operator, changed, next.minMerged, next.minRate, api]);
 
-  const text = `Whitelisted: ${ruleText(rule)}. Their PRs may merge on green CI without a decision. An override always wins.`;
+  const text = `Whitelisted: ${ruleText(rule)}. Their PRs may merge on green CI without a maintainer. An override always wins.`;
   if (!operator)
     return (
       <p className="mt-3 flex items-start gap-2 text-sm text-ink/75">

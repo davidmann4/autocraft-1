@@ -5,6 +5,7 @@
 // are kept, for JOB_LOG_KEEP_MS; the file keeps everything. Chunks are scrubbed before they are stored, and again when read.
 import { closeSync, fstatSync, openSync, readSync } from "node:fs";
 import type { Db } from "../db/index.ts";
+import { addLogChunks, dropLogChunks, loadLogTail, pruneLogChunks, type LogCursor } from "../data/jobs/index.ts";
 import { scrub } from "./scrub.ts";
 
 export const JOB_LOG_KEEP_BYTES = 256 * 1024;
@@ -39,7 +40,7 @@ type Chunk = { job_id: number; seq: number; start: number; next_start: number; c
 /** Log writes of this process, one after another: a copy never reads a file while an earlier copy of it is being written. */
 let queue: Promise<void> = Promise.resolve();
 
-/** Copies one job's log file into job_log_chunks. One per running job, in the process that started it; written by `copyLogs`. */
+/** Copies one job's log file into job_log_chunks. One per running job, in the process that started it; written by `copyLogs`. `cursor` is what the table already holds of the job (loadRunnerTick). */
 export class JobLogCopy {
   readonly job: number;
   #path: string;
@@ -60,10 +61,9 @@ export class JobLogCopy {
    * Starts after what an earlier run of the job (a resumed job) already copied, when the file still holds it; a file shorter
    * than that is another file (a new disk), copied from its start.
    */
-  static async open(db: Db, job: number, path: string): Promise<JobLogCopy> {
-    const rows = await db.all(db.k.selectFrom("job_log_chunks").select(["seq", "start", "chunk", "next_start"]).where("job_id", "=", job).orderBy("seq"));
-    const kept = rows.map((r) => ({ seq: Number(r.seq), bytes: Buffer.byteLength(r.chunk) }));
-    const end = rows.length ? Number(rows.at(-1)!.next_start) : 0;
+  static open(job: number, path: string, cursor?: LogCursor): JobLogCopy {
+    const kept = (cursor?.bytes ?? []).map((bytes, i, all) => ({ seq: cursor!.lastSeq - (all.length - 1 - i), bytes }));
+    const end = cursor?.lastNextStart ?? 0;
     const size = readRange(path, (s) => s)?.size ?? 0;
     return new JobLogCopy(job, path, end <= size ? end : 0, kept);
   }
@@ -115,14 +115,14 @@ export function copyLogs(db: Db, copies: JobLogCopy[], final = false): Promise<v
     if (!chunks.length) return;
     let stored = chunks;
     try {
-      await db.run(db.k.insertInto("job_log_chunks").values(chunks.map(({ n }) => n)));
+      await addLogChunks(db, chunks.map(({ n }) => n));
     } catch (e) {
       // One bad row must not block the others: write each job's chunk on its own.
       if (chunks.length < 2) throw e;
       stored = [];
       for (const c of chunks) {
         try {
-          await db.run(db.k.insertInto("job_log_chunks").values(c.n));
+          await addLogChunks(db, [c.n]);
           stored.push(c);
         } catch (err) {
           console.error(`job log copy failed for job ${c.copy.job}: ${(err as Error).message}`);
@@ -131,7 +131,7 @@ export function copyLogs(db: Db, copies: JobLogCopy[], final = false): Promise<v
       if (!stored.length) throw e;
     }
     const drops = stored.flatMap(({ copy, n }) => { const upTo = copy.wrote(n); return upTo ? [{ job: copy.job, upTo }] : []; });
-    if (drops.length) await db.run(db.k.deleteFrom("job_log_chunks").where((eb) => eb.or(drops.map((d) => eb.and([eb("job_id", "=", d.job), eb("seq", "<=", d.upTo)])))));
+    if (drops.length) await dropLogChunks(db, drops);
   });
   queue = run.catch(() => { /* the caller sees the failure; the next copy reads the lines again */ });
   return run;
@@ -145,27 +145,13 @@ export async function pruneJobLogs(db: Db, nowMs: number = Date.now()): Promise<
   const before = new Date(nowMs - JOB_LOG_KEEP_MS).toISOString();
   let n = 0;
   for (;;) {
-    const rows = await db.all(db.k.selectFrom("job_log_chunks").select(["job_id", "seq"]).where("at", "<", before).limit(500));
-    if (!rows.length) return n;
-    await db.run(db.k.deleteFrom("job_log_chunks").where((eb) => eb.or(rows.map((r) => eb.and([eb("job_id", "=", r.job_id), eb("seq", "=", r.seq)])))));
-    n += rows.length;
+    const done = await pruneLogChunks(db, before, 500);
+    n += done;
+    if (done < 500) return n;
   }
 }
 
 /** The last `bytes` of a job's stored log, from whole lines; truncated when earlier text is not shown. */
 export async function storedLogTail(db: Db, job: number, bytes: number): Promise<{ log: string; logTruncated: boolean } | null> {
-  const parts: string[] = [];
-  let size = 0;
-  let first: number | null = null;
-  for (const c of await db.all(db.k.selectFrom("job_log_chunks").select(["chunk", "start"]).where("job_id", "=", job).orderBy("seq", "desc"))) {
-    parts.push(c.chunk);
-    size += Buffer.byteLength(c.chunk);
-    first = Number(c.start);
-    if (size >= bytes) break;
-  }
-  if (first === null) return null;
-  const joined = parts.reverse().join("");
-  if (size <= bytes) return { log: joined, logTruncated: first > 0 };
-  const cut = Buffer.from(joined).subarray(-bytes).toString("utf8");
-  return { log: cut.slice(cut.indexOf("\n") + 1), logTruncated: true };
+  return await loadLogTail(db, job, bytes);
 }

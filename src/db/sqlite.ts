@@ -52,12 +52,16 @@ export class SqliteAdapter {
   }
 
   #timed<T>(text: string, f: () => T, count: (r: T) => [rows: number, bytes: number]): T {
-    if (!this.#ctx.observed()) return f();
+    const m = this.#ctx.meter();
+    const observed = this.#ctx.observed();
+    if (!m && !observed) return f();
     const t0 = performance.now();
     const r = f();
     const ms = performance.now() - t0;
+    if (m) m.ms += ms;
+    if (!observed) return r;
     const [rows, bytes] = count(r);
-    this.#ctx.emit({ kind: "query", sql: text, rows, bytes, ms, site: callSite(siteError()) });
+    this.#ctx.emit({ kind: "query", sql: text, rows, bytes, ms, site: this.#ctx.site() ?? callSite(siteError()) });
     return r;
   }
 
@@ -79,6 +83,7 @@ export class SqliteAdapter {
       text,
       () => {
         const rows = stmt.all(...(args as [])) as unknown as unknown[][];
+        if (!rows.length) return [];
         const cols = names(stmt);
         return rows.map((v) => rowOf(cols, v));
       }, (r) => [r.length, Buffer.byteLength(JSON.stringify(r))]);

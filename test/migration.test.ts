@@ -6,8 +6,7 @@ import { DatabaseSync } from "node:sqlite";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import { tmpdir } from "./world-db.ts";
-import type { Db } from "../src/db/index.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb, type Db } from "./helpers/raw-db.ts";
 import { sqliteOnly } from "./test-db.ts";
 
 const cols = async (db: Db, table: string): Promise<string[]> => (await db.prepare(`PRAGMA main.table_info(${table})`).all() as { name: string }[]).map((c) => c.name);

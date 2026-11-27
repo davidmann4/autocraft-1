@@ -1,238 +1,167 @@
-// Rows of the security deep scan and their views for the API (web/src/api/types.ts).
+// Rows of the security deep scan and their views for the API (web/src/api/types.ts), composed from the security data module.
 import { dropSessions } from "../prepush/resume.ts";
 import { slugOf } from "../owners.ts";
 import { securityRepo } from "./rules.ts";
-import type { FindingCall, FindingRef, FindingSeverity, FindingState, FindingSummary, FindingVerification, FindingView, ScanArea, ScanCall, ScanDetail, ScanEntryPoint, ScanState, ScanTestState, FindingScanTest, ScanView, SecurityOverview } from "../../web/src/api/types.ts";
-import { mapSeq } from "../async-seq.ts";
+import type { FindingCall, FindingRef, FindingSeverity, FindingState, FindingSummary, FindingVerification, FindingView, ScanArea, ScanCall, ScanDetail, ScanEntryPoint, ScanTestState, FindingScanTest, ScanView, SecurityOverview } from "../../web/src/api/types.ts";
+import * as sec from "../data/security/index.ts";
 import type { Db } from "../db/index.ts";
-import * as kx from "../db/kx.ts";
-import type { ExpressionBuilder } from "kysely";
-import type { DB } from "../db/types.ts";
 
-export const ACTIVE_STATES: ScanState[] = ["modeling", "scanning", "verifying"];
-/** Findings in these states are the scan's own bookkeeping, never listed. */
-export const INTERNAL_FINDING_STATES = ["unverified", "disproved", "duplicate"] as const;
-const now = (): string => new Date().toISOString();
+export { ACTIVE_STATES, INTERNAL_FINDING_STATES, TRANSITIONS, UNCHECKED_RESULT } from "../data/security/index.ts";
+export type ScanRow = sec.ScanListRow;
+export type FindingRow = Omit<sec.FindingRow, "severity" | "state"> & { severity: FindingSeverity; state: FindingState };
 
-type ScanRow = {
-  id: number; repo: string; commit_sha: string | null; state: ScanState; cap_usd: number | null; cost_usd: number; estimate_usd: number | null;
-  areas_total: number; areas_done: number; started_by: string; started_at: string; ended_at: string | null; error: string | null; job_id: number | null; threat_model: string | null;
-};
+const asFinding = (r: sec.FindingRow): FindingRow => r as FindingRow;
 
-const scans = (db: Db) => db.k.selectFrom("security_scans").select(kx.cols("security_scans")).$narrowType<{ state: ScanState }>();
-const findings = (db: Db) => db.k.selectFrom("security_findings").select(kx.cols("security_findings")).$narrowType<{ severity: FindingSeverity; state: FindingState }>();
+export const scanRow = async (db: Db, id: number): Promise<ScanRow | undefined> => (await sec.loadScans(db, [id])).get(id);
 
-export const scanRow = async (db: Db, id: number): Promise<ScanRow | undefined> => await db.get(scans(db).where("id", "=", id));
-
-export async function toScan(db: Db, r: ScanRow): Promise<ScanView> {
-  const n = (await db.get(db.k.selectFrom("security_findings").select((eb) => eb.fn.countAll<number>().as("n")).where("scan_id", "=", r.id).where("state", "not in", INTERNAL_FINDING_STATES)))!.n;
+/** The API view of a scan; `r` carries the count of its listed findings. */
+export function scanView(r: sec.ScanListRow): ScanView {
   return {
-    id: r.id, repo: r.repo, commit: r.commit_sha, state: r.state, capUsd: r.cap_usd, costUsd: r.cost_usd, estimateUsd: r.estimate_usd,
-    areasTotal: r.areas_total, areasDone: r.areas_done, findingCount: n, startedBy: r.started_by, startedAt: r.started_at, endedAt: r.ended_at, error: r.error, canAct: false, canContinue: false,
+    id: r.id, repo: r.repo, commit: r.commit_sha, state: r.state as ScanView["state"], capUsd: r.cap_usd, costUsd: r.cost_usd, estimateUsd: r.estimate_usd,
+    areasTotal: r.areas_total, areasDone: r.areas_done, findingCount: r.finding_count, startedBy: r.started_by, startedAt: r.started_at, endedAt: r.ended_at, error: r.error, canAct: false, canContinue: false,
   };
 }
 
+export async function toScan(db: Db, r: sec.ScanRow): Promise<ScanView> {
+  return scanView((await sec.loadScans(db, [r.id])).get(r.id) ?? { ...r, finding_count: 0 });
+}
+
 /** The active scan of a repo, if any. Scans of one repo never overlap. */
-export async function activeScan(db: Db, repo: string): Promise<ScanRow | undefined> {
-  return await db.get(scans(db).where("repo", "=", repo).where("state", "in", ACTIVE_STATES).orderBy("id", "desc").limit(1));
+export async function activeScan(db: Db, repo: string): Promise<sec.ScanRow | undefined> {
+  return (await sec.loadActiveScans(db, [repo])).get(repo);
 }
 
-/** An active scan whose job has ended without the scan finishing (a killed runner, a cancelled job) is closed: stopped when the job was cancelled, else failed. */
-export async function reconcileScans(db: Db, repo?: string): Promise<void> {
-  const rows = await db.all(db.k.selectFrom("security_scans as s").innerJoin("jobs as j", "j.id", "s.job_id").select(["s.id", "j.state as job_state"])
-    .where("s.state", "in", ACTIVE_STATES).where("j.state", "in", ["done", "failed", "cancelled"]).$if(!!repo, (q) => q.where("s.repo", "=", repo!)));
-  // A scan whose job was never recorded (the request died between the insert and the enqueue) would block its repo for good.
-  const orphans = await db.all(db.k.selectFrom("security_scans").select("id").where("job_id", "is", null).where("started_at", "<", new Date(Date.now() - 60_000).toISOString())
-    .where("state", "in", ACTIVE_STATES).$if(!!repo, (q) => q.where("repo", "=", repo!)));
-  for (const o of orphans) await finishScan(db, o.id, "failed", "The scan was never queued.");
-  for (const r of rows) {
-    const cancelled = r.job_state === "cancelled";
-    await finishScan(db, r.id, cancelled ? "stopped" : "failed", cancelled ? null : "The scan's job ended before the scan finished.");
-  }
+/**
+ * Closes what a dead job left: scans whose job ended or was never recorded, and fixing or landing findings with no job. The
+ * rounds of a cleared fix are logged under the attempt that made them.
+ */
+export async function reconcile(db: Db, repo?: string): Promise<void> {
+  await sec.reconcileSecurity(db, { repo });
 }
-
-export const UNCHECKED_RESULT = "Not verified: the scan ended before this finding was checked.";
-
-/** Findings a capped scan left unchecked, and that nobody has acted on since, go back to the scan's own bookkeeping so a continued scan verifies them. Returns how many. */
-export async function reopenUnchecked(db: Db, scanId: number): Promise<number> {
-  return (await db.run(db.k.updateTable("security_findings").set({ state: "unverified", verification: null, updated_at: now() }).where("scan_id", "=", scanId).where("state", "=", "new")
-    .where((eb) => eb(kx.jsonText(db, "verification", "$.result"), "=", UNCHECKED_RESULT)))).changes;
-}
+export const reconcileScans = reconcile;
+export const reconcileFindings = reconcile;
 
 /** Ends an active scan; a scan that already ended keeps its state. Leftover unverified findings become listed findings that say so. */
-export async function finishScan(db: Db, id: number, state: ScanState, error: string | null = null): Promise<void> {
-  await db.run(db.k.updateTable("security_scans").set({ state, ended_at: now(), error }).where("id", "=", id).where("state", "in", ACTIVE_STATES));
-  const unchecked = JSON.stringify({ kind: "reasoning", result: UNCHECKED_RESULT, notes: "", score: null, proposedTest: null } satisfies FindingVerification);
-  await db.run(db.k.updateTable("security_findings").set({ state: "new", verification: unchecked, updated_at: now() }).where("scan_id", "=", id).where("state", "=", "unverified"));
+export async function finishScan(db: Db, id: number, state: sec.ScanState, error: string | null = null): Promise<void> {
+  await sec.finishScans(db, [{ id, state, error }]);
 }
 
 const parse = <T>(s: string | null, fallback: T): T => {
   try { return s ? JSON.parse(s) as T : fallback; } catch { return fallback; }
 };
 
-export type FindingRow = {
-  repo: string; number: number; scan_id: number; area: string; title: string; severity: FindingSeverity; urgent: number; state: FindingState; refs: string;
-  reach: string; impact: string; verification: string | null; fix_commit: string | null; fix_pr: number | null; ghsa_id: string | null; fork: string | null; fix_patch: string | null; fix_title: string | null; fix_summary: string | null; fix_branch: string | null; fix_files: string | null; fix_ref: string | null; note: string | null; env_wait_at: string | null; reason: string | null; decided_by: string | null; created_at: string; updated_at: string; fix_attempts: number; last_failure: string | null;
-};
-
 export const findingKey = (repo: string, n: number): string => `${repo}:finding:${n}`;
 
-const summary = (r: FindingRow): FindingSummary => ({
-  repo: r.repo, number: r.number, key: findingKey(r.repo, r.number), scanId: r.scan_id, title: r.title, severity: r.severity, urgent: r.urgent === 1, area: r.area,
-  state: r.state, createdAt: r.created_at, updatedAt: r.updated_at,
+const summary = (r: sec.FindingBriefRow): FindingSummary => ({
+  repo: r.repo, number: r.number, key: findingKey(r.repo, r.number), scanId: r.scan_id, title: r.title, severity: r.severity as FindingSeverity, urgent: r.urgent === 1, area: r.area,
+  state: r.state as FindingState, createdAt: r.created_at, updatedAt: r.updated_at,
 });
 
-/** The finding's scan test, or null when it has none. */
-export async function scanTestOf(db: Db, repo: string, n: number): Promise<FindingScanTest | null> {
-  const r = await db.get(db.k.selectFrom("security_scan_tests").select(["state", "detail", "test_path", "test_source"]).$narrowType<{ state: ScanTestState }>().where("repo", "=", repo).where("number", "=", n));
-  return r ? { state: r.state, detail: r.detail, path: r.test_path, source: r.test_source } : null;
+/** Brief rows with the state of their scan test; findings without a scan test keep no key. */
+const withScanTest = (rows: (sec.FindingBriefRow & { scan_test_state?: string | null })[]): FindingSummary[] =>
+  rows.map((r) => (r.scan_test_state ? { ...summary(r), scanTest: r.scan_test_state as ScanTestState } : summary(r)));
+
+/** Drops the stored sessions of cleared rounds once the surrounding transaction (if any) has committed. */
+export function dropRoundSessions(db: Db, sessions: string[]): void {
+  const drop = (): void => { for (const s of sessions) dropSessions(s); };
+  if (db.inTransaction()) db.afterCommit(drop);
+  else drop();
 }
 
-/** Adds each finding's scan-test state; findings without a scan test (every finding while the switch is off) keep no key. */
-async function withScanTests(db: Db, rows: FindingSummary[]): Promise<FindingSummary[]> {
-  if (!rows.length) return rows;
-  const states = new Map((await db.all(db.k.selectFrom("security_scan_tests").select(["repo", "number", "state"]).$narrowType<{ state: ScanTestState }>())).map((t) => [`${t.repo}#${t.number}`, t.state]));
-  return states.size ? rows.map((r) => (states.has(`${r.repo}#${r.number}`) ? { ...r, scanTest: states.get(`${r.repo}#${r.number}`)! } : r)) : rows;
-}
-
-const severityOrder = (eb: ExpressionBuilder<DB, "security_findings">) => eb.case("severity").when("critical").then(0).when("high").then(1).when("medium").then(2).else(3).end();
-
-/** Forgets the rounds of a finding's fix (it ended, ready or not) and removes the sessions they still keep. The rounds stay in security_fix_log, without patches. */
+/** Forgets the rounds of a finding's fix (it ended, ready or not) and removes the sessions they still keep. The rounds stay in the fix log, without patches. */
 export async function clearRounds(db: Db, repo: string, n: number): Promise<void> {
-  const f = await db.get(db.k.selectFrom("security_findings").select(["fix_attempts", "state"]).where("repo", "=", repo).where("number", "=", n));
-  const attempt = f?.fix_attempts ?? 0;
-  const ended = new Date().toISOString();
-  for (const r of await db.all(db.k.selectFrom("security_fix_rounds").select(kx.cols("security_fix_rounds")).where("repo", "=", repo).where("number", "=", n).orderBy("round"))) {
-    dropSessions(r.session);
-    await db.run(db.k.insertInto("security_fix_log")
-      .values({ repo, number: n, attempt, round: r.round, state: r.state === "building" && f?.state === "ready" ? "passed" : r.state, failure: r.failure, title: r.title, created_at: r.created_at, ended_at: ended })
-      .onConflict((oc) => oc.columns(["repo", "number", "attempt", "round"]).doUpdateSet(kx.excluded(["state", "failure", "title", "created_at", "ended_at"]))));
-  }
-  await db.run(db.k.deleteFrom("security_fix_rounds").where("repo", "=", repo).where("number", "=", n));
-}
-
-/**
- * A finding that is `fixing`, or `landing` without a pull request, while no step job of it is queued or running (the job was
- * killed or cancelled) goes back to where an operator can act again. A fixing finding with a round in the build, or one
- * waiting for a confidential build environment, has no job on purpose: advanceSecurityFixes queues one when the round's
- * tasks end or the environment is ready.
- */
-export async function reconcileFindings(db: Db, repo: string): Promise<void> {
-  const grace = new Date(Date.now() - 60_000).toISOString();
-  const rows = await db.all(db.k.selectFrom("security_findings").select(["number", "state"]).$narrowType<{ state: FindingState }>().where("repo", "=", repo).where("updated_at", "<", grace)
-    .where((eb) => eb.or([eb("state", "=", "fixing"), eb.and([eb("state", "=", "landing"), eb("fix_pr", "is", null)])]))
-    .where((eb) => eb.not(eb.exists(eb.selectFrom("jobs as j").select(eb.lit(1).as("one")).where("j.step", "in", ["security-fix", "security-land", "security-advisory"]).where("j.state", "in", ["queued", "running"])
-      .where((e) => e.and([e(kx.jsonText(db, "j.params", "$.repo"), "=", e.ref("security_findings.repo")), e(kx.jsonNum(db, "j.params", "$.number"), "=", e.ref("security_findings.number"))])))))
-    .where((eb) => eb.not(eb.exists(eb.selectFrom("security_fix_rounds as r").select(eb.lit(1).as("one")).whereRef("r.repo", "=", "security_findings.repo").whereRef("r.number", "=", "security_findings.number").where("r.state", "=", "building"))))
-    .where((eb) => eb.not(eb.and([eb("state", "=", "fixing"), eb("env_wait_at", "is not", null)]))));
-  for (const r of rows) {
-    const note = "The job ended before it finished. Try again.";
-    // The rounds a dead fix job left are logged under the attempt that made them, before the next Fix counts a new one.
-    if (r.state === "fixing") await clearRounds(db, repo, r.number);
-    await advance(db, repo, r.number, [r.state], r.state === "fixing" ? "new" : "ready", r.state === "fixing" ? { note, last_failure: note } : { note });
-  }
+  dropRoundSessions(db, (await sec.clearRounds(db, [sec.findingKey(repo, n)])).sessions);
 }
 
 export async function overview(db: Db, repo: string): Promise<SecurityOverview> {
-  await reconcileScans(db, repo);
-  await reconcileFindings(db, repo);
-  const scanList = await mapSeq(await db.all(scans(db).where("repo", "=", repo).orderBy("id", "desc").limit(20)), async (r) => await toScan(db, r));
-  const listed = (await db.all(findings(db).where("repo", "=", repo).where("state", "not in", INTERNAL_FINDING_STATES).orderBy(severityOrder).orderBy("number").limit(500))).map(summary);
-  return { canStart: false, scans: scanList, findings: await withScanTests(db, listed) };
+  await reconcile(db, repo);
+  const o = await sec.loadOverview(db, repo);
+  return { canStart: false, scans: o.scans.map(scanView), findings: withScanTest(o.findings as never) };
 }
 
-export const findingRow = async (db: Db, repo: string, n: number): Promise<FindingRow | undefined> =>
-  await db.get(findings(db).where("repo", "=", repo).where("number", "=", n).where("state", "not in", INTERNAL_FINDING_STATES));
+export const findingRow = async (db: Db, repo: string, n: number): Promise<FindingRow | undefined> => {
+  const r = (await sec.loadFindings(db, [sec.findingKey(repo, n)])).get(sec.findingKey(repo, n));
+  return r && asFinding(r);
+};
 
-export async function toFinding(db: Db, r: FindingRow): Promise<FindingView> {
-  const area = await db.get(db.k.selectFrom("security_areas").select("idx").where("scan_id", "=", r.scan_id).where("name", "=", r.area));
-  const calls = await db.all(db.k.selectFrom("security_calls").select(["kind", "started_at", "ended_at", "ok", "cost_usd"]).$narrowType<{ kind: FindingCall["kind"] }>().where("scan_id", "=", r.scan_id)
-    .where((eb) => eb.or([eb("kind", "=", "model"), eb.and([eb("kind", "=", "area"), eb("area_idx", "=", area?.idx ?? -1)]), eb.and([eb("kind", "in", ["verify", "test", "fix", "review"]), eb("finding_number", "=", r.number)])]))
-    .orderBy("id"));
-  const repeats = await db.all(db.k.selectFrom("security_findings").select("created_at").where("repo", "=", r.repo).where("duplicate_of", "=", r.number).orderBy("created_at"));
+/** The finding's row whatever its state, for the steps that work on it. */
+export const rawFinding = async (db: Db, repo: string, n: number): Promise<FindingRow | undefined> => {
+  const r = (await sec.loadFindings(db, [sec.findingKey(repo, n)], { internal: true })).get(sec.findingKey(repo, n));
+  return r && asFinding(r);
+};
+
+export type FindingDetail = { view: FindingView; row: FindingRow; log: sec.LogRound[]; rounds: sec.LiveRound[] };
+
+/** The finding page's data in one wave: the view, the fix log and the live rounds. Undefined for a finding that is not listed. */
+export async function findingDetail(db: Db, repo: string, n: number): Promise<FindingDetail | undefined> {
+  const d = await sec.loadFindingDetail(db, sec.findingKey(repo, n));
+  if (!d) return undefined;
+  const r = asFinding(d.finding);
   const timeline: FindingCall[] = [
-    ...calls.map((c) => ({ kind: c.kind, at: c.started_at, endedAt: c.ended_at, ok: c.ok === 1, costUsd: c.cost_usd })),
-    ...repeats.map((d): FindingCall => ({ kind: "duplicate", at: d.created_at, endedAt: null, ok: true, costUsd: null })),
+    ...d.calls.map((c) => ({ kind: c.kind as FindingCall["kind"], at: c.started_at, endedAt: c.ended_at, ok: c.ok === 1, costUsd: c.cost_usd })),
+    ...d.repeats.map((x): FindingCall => ({ kind: "duplicate", at: x.created_at, endedAt: null, ok: true, costUsd: null })),
   ].sort((a, b) => a.at.localeCompare(b.at));
-  return {
-    ...summary(r), scanTestResult: await scanTestOf(db, r.repo, r.number), refs: parse<FindingRef[]>(r.refs, []), reach: r.reach, impact: r.impact, verification: parse<FindingVerification | null>(r.verification, null),
+  const view: FindingView = {
+    ...summary(r), scanTestResult: d.scanTest ? { state: d.scanTest.state as ScanTestState, detail: d.scanTest.detail, path: d.scanTest.test_path, source: d.scanTest.test_source } satisfies FindingScanTest : null,
+    refs: parse<FindingRef[]>(r.refs, []), reach: r.reach, impact: r.impact, verification: parse<FindingVerification | null>(r.verification, null),
     fixDiff: r.fix_patch, fixPr: r.fix_pr, fixPrUrl: r.fix_pr === null ? null : `https://github.com/${r.fork ?? slugOf(r.repo)}/pull/${r.fix_pr}`,
     ghsaId: r.ghsa_id, advisoryUrl: r.ghsa_id ? `https://github.com/${slugOf(r.repo)}/security/advisories/${r.ghsa_id}` : null, note: r.note,
     reason: r.reason, decidedBy: r.decided_by,
     timeline,
   };
+  return { view, row: r, log: d.log, rounds: d.rounds };
 }
 
-/** The states a finding moves to by each operator action, and from which states. */
-export const TRANSITIONS: Record<"dismiss" | "backlog" | "reopen", { from: FindingState[]; to: FindingState }> = {
-  dismiss: { from: ["new", "backlog", "ready", "awaiting-admin"], to: "dismissed" },
-  backlog: { from: ["new", "dismissed"], to: "backlog" },
-  reopen: { from: ["dismissed", "backlog"], to: "new" },
-};
+export async function toFinding(db: Db, r: sec.FindingRow): Promise<FindingView> {
+  return (await findingDetail(db, r.repo, r.number))!.view;
+}
 
-export async function moveFinding(db: Db, repo: string, n: number, action: keyof typeof TRANSITIONS, by: string, reason: string | null): Promise<FindingState | null> {
-  const t = TRANSITIONS[action];
-  const r = await db.run(db.k.updateTable("security_findings").set({ state: t.to, reason: action === "dismiss" ? reason : null, decided_by: by, updated_at: now() })
-    .where("repo", "=", repo).where("number", "=", n).where("state", "in", t.from));
-  return r.changes ? t.to : null;
+export async function moveFinding(db: Db, repo: string, n: number, action: keyof typeof sec.TRANSITIONS, by: string, reason: string | null): Promise<FindingState | null> {
+  return (await sec.moveFindings(db, [{ repo, number: n, action, by, reason }])).get(sec.findingKey(repo, n)) ?? null;
 }
 
 /**
  * Moves a finding from one of the states `from` to `to` and sets more columns in the same statement. Returns false when the
  * finding is in none of them, so two requests cannot both start the same step.
  */
-export async function advance(db: Db, repo: string, n: number, from: FindingState[], to: FindingState, set: Record<string, string | number | null> = {}, by?: string): Promise<boolean> {
-  const r = await db.run(db.k.updateTable("security_findings").set({ state: to, updated_at: now(), ...(by ? { decided_by: by } : {}), ...set })
-    .where("repo", "=", repo).where("number", "=", n).where(kx.inList(db, "state", from)));
-  return r.changes > 0;
+export async function advance(db: Db, repo: string, n: number, from: FindingState[], to: FindingState, set: sec.FindingPatch = {}, by?: string): Promise<boolean> {
+  return await sec.advanceFinding(db, { repo, number: n, from, to, set, ...(by !== undefined && { by }) });
 }
 
-/** The finding's row whatever its state, for the steps that work on it. */
-export const rawFinding = async (db: Db, repo: string, n: number): Promise<FindingRow | undefined> =>
-  await db.get(findings(db).where("repo", "=", repo).where("number", "=", n));
-
-/** Records one model call of a finding's fix in its timeline and returns nothing; the cost may be unknown. */
+/** Records one model call of a finding's fix in its timeline; the cost may be unknown. */
 export async function recordFixCall(db: Db, scanId: number, n: number, kind: "fix" | "review", startedAt: string, ok: boolean, costUsd: number | null, resumed = false): Promise<void> {
-  await db.run(db.k.insertInto("security_calls").values({ scan_id: scanId, kind, finding_number: n, started_at: startedAt, ended_at: now(), ok: ok ? 1 : 0, cost_usd: costUsd, resumed: resumed ? 1 : 0 }));
+  await sec.addCalls(db, [{ scanId, kind, finding: n, ok, costUsd, startedAt, resumed }]);
 }
 
 /** Scans of one repo or, with none given, of the repos in `repos`, newest first. */
 export async function listScans(db: Db, repos: string[], repo?: string): Promise<ScanView[]> {
   const want = repo ? repos.filter((r) => r === repo) : repos;
   if (!want.length) return [];
-  await reconcileScans(db, repo);
-  const rows = await db.all(scans(db).where("repo", "in", want).orderBy("id", "desc").limit(200));
-  return await mapSeq(rows, async (r) => await toScan(db, r));
+  await reconcile(db, repo);
+  return (await sec.listScans(db, { repos: want, limit: 200 })).map(scanView);
 }
 
 /**
  * The scan with its threat model, calls and findings. A call keeps the agent run it recorded; a call without one (rows from before
  * the link, and a call still running) takes the first run of the scan that started within its time window.
  */
-export async function scanDetail(db: Db, r: ScanRow): Promise<ScanDetail> {
-  await reconcileScans(db, r.repo);
-  r = (await scanRow(db, r.id))!;
-  const model = parse<{ summary?: string; entryPoints?: ScanEntryPoint[] }>(r.threat_model, {});
-  const callRows = await db.all(db.k.selectFrom("security_calls").select(kx.cols("security_calls")).$narrowType<{ kind: FindingCall["kind"] }>().where("scan_id", "=", r.id).orderBy("id"));
-  const runFor = async (pseudo: string, scanId: number, startedAt: string, endedAt: string | null) =>
-    await db.get(db.k.selectFrom("agent_runs as ar").innerJoin("agent_run_items as i", "i.run_id", "ar.id").select(["ar.id", "ar.state", "ar.progress"])
-      .where("i.repo", "=", pseudo).where("i.number", "=", scanId).where("ar.started_at", ">=", startedAt).$if(endedAt !== null, (q) => q.where("ar.started_at", "<=", endedAt!)).orderBy("ar.id").limit(1));
-  const runById = async (id: number) => await db.get(db.k.selectFrom("agent_runs").select(["id", "state", "progress"]).where("id", "=", id));
-  const pseudo = securityRepo(r.repo);
-  const areaName = async (idx: number | null): Promise<string | null> => idx === null ? null : (await db.get(db.k.selectFrom("security_areas").select("name").where("scan_id", "=", r.id).where("idx", "=", idx)))?.name ?? null;
-  const live = ACTIVE_STATES.includes(r.state);
-  const calls: ScanCall[] = await mapSeq(callRows, async (c) => {
-    const run = c.agent_run_id !== null ? await runById(c.agent_run_id) : await runFor(pseudo, r.id, c.started_at, c.ended_at);
+export async function scanDetail(db: Db, r: sec.ScanRow): Promise<ScanDetail> {
+  await reconcile(db, r.repo);
+  const d = (await sec.loadScanDetail(db, r.id, { runs: { pseudoRepo: securityRepo(r.repo), vis: { hidden: [], staff: true } } }))!;
+  const model = parse<{ summary?: string; entryPoints?: ScanEntryPoint[] }>(d.scan.threat_model, {});
+  const live = sec.ACTIVE_STATES.includes(d.scan.state as sec.ScanState);
+  const runById = new Map(d.runs.map((x) => [x.id, x]));
+  const runFor = (startedAt: string, endedAt: string | null) => d.runs.find((x) => x.startedAt >= startedAt && (endedAt === null || x.startedAt <= endedAt));
+  const calls: ScanCall[] = d.calls.map((c) => {
+    const run = c.agent_run_id !== null ? runById.get(c.agent_run_id) : runFor(c.started_at, c.ended_at);
     const running = c.ended_at === null && live;
     return {
-      id: c.id, kind: c.kind, areaName: await areaName(c.area_idx), findingNumber: c.finding_number,
+      id: c.id, kind: c.kind as FindingCall["kind"], areaName: c.area_name, findingNumber: c.finding_number,
       state: running ? "running" : c.ok === 1 ? "done" : "failed", startedAt: c.started_at, endedAt: c.ended_at, costUsd: c.cost_usd,
       runId: run?.id ?? null, progress: running ? run?.progress ?? null : null,
     };
   });
-  const runningAreas = new Set(callRows.filter((c) => c.kind === "area" && c.ended_at === null && live).map((c) => c.area_idx));
-  const areas = (await db.all(db.k.selectFrom("security_areas").select(["idx", "name", "paths", "risk", "why", "state", "cost_usd"]).where("scan_id", "=", r.id).orderBy("idx")))
-    .map((a): ScanArea => ({ idx: a.idx, name: a.name, risk: a.risk, why: a.why, paths: parse<string[]>(a.paths, []), state: a.state === "done" || a.state === "failed" ? a.state : runningAreas.has(a.idx) ? "running" : "pending", costUsd: a.cost_usd }));
-  const listed = await withScanTests(db, (await db.all(findings(db).where("scan_id", "=", r.id).where("state", "not in", INTERNAL_FINDING_STATES).orderBy(severityOrder).orderBy("number"))).map(summary));
-  return { scan: await toScan(db, r), summary: model.summary ?? null, entryPoints: model.entryPoints ?? [], areas, calls, findings: listed };
+  const runningAreas = new Set(d.calls.filter((c) => c.kind === "area" && c.ended_at === null && live).map((c) => c.area_idx));
+  const areas = d.areas.map((a): ScanArea => ({ idx: a.idx, name: a.name, risk: a.risk, why: a.why, paths: parse<string[]>(a.paths, []), state: a.state === "done" || a.state === "failed" ? a.state : runningAreas.has(a.idx) ? "running" : "pending", costUsd: a.cost_usd }));
+  return { scan: scanView(d.scan), summary: model.summary ?? null, entryPoints: model.entryPoints ?? [], areas, calls, findings: withScanTest(d.findings) };
 }

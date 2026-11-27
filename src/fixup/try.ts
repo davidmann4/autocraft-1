@@ -3,7 +3,6 @@
 // It stores no fixups row, records no check or audit row and writes nothing to GitHub; model usage, model_checks and the
 // worker tasks are recorded as for any run. The pipeline setting and the stage's limits do not apply.
 import { mkdirSync } from "node:fs";
-import { getTask, TERMINAL } from "../build/tasks.ts";
 import { CheckTool, applyCheck, refusal } from "../checktool/index.ts";
 import { CHECK_DIFF_CAP, CHECK_PATCH_CAP } from "../patchcheck/types.ts";
 import { CLAUDE_PROMPTS } from "../prompts/index.ts";
@@ -16,9 +15,16 @@ import { DIFF_CAP, FILE_CAP, TOTAL_CAP, defaultDeps, type FixupDeps } from "./in
 import { shownSize, viewFile } from "./excerpt.ts";
 import { Git } from "./git.ts";
 import { buildScriptsAt, fixupEditable, validatePatch, type FixupPr } from "./patch.ts";
+import { TERMINAL, loadTaskStates } from "../data/build/index.ts";
+import { loadModelChecksAfter, maxModelCheckId } from "../data/changes/index.ts";
+import { listRuns } from "../data/inference/index.ts";
+import { loadItems } from "../data/mirror/index.ts";
+import { loadReviewsAt } from "../data/review/index.ts";
 import { ownerOf } from "../owners.ts";
 import type { Db } from "../db/index.ts";
 
+/** The dev command reads every run, hidden repos included. */
+const STAFF = { hidden: [], staff: true };
 const LINT_GIVE_UP_MS = 90 * 60_000;
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 const indent = (s: string) => s.trimEnd().split("\n").map((l) => `  ${l}`).join("\n");
@@ -28,12 +34,13 @@ const BASE_QUERY = `query($owner: String!, $name: String!, $n: Int!) { repositor
 
 export async function runFixupTry(db: Db, repo: string, number: number, d: FixupDeps = defaultDeps(), log: (line: string) => void = console.log): Promise<number> {
   const ref = `${repo}#${number}`;
-  const item = await db.get(db.k.selectFrom("items").select(["head_oid", "title"]).where("repo", "=", repo).where("number", "=", number).where("kind", "=", "pr"));
+  const found = (await loadItems(db, [{ repo, number }], "text")).get(ref);
+  const item = found?.kind === "pr" ? found : undefined;
   if (!item?.head_oid) throw new Error(`${ref} is not a PR in the database`);
-  const review = await db.get(db.k.selectFrom("final_reviews").select(["fixes", "reason", "verdict"]).where("repo", "=", repo).where("number", "=", number).where("head_oid", "=", item.head_oid).orderBy("at", "desc").limit(1));
+  const review = (await loadReviewsAt(db, [{ repo, number, head: item.head_oid }])).get(`${ref}@${item.head_oid}`);
   if (!review) throw new Error(`${ref} has no review at its head ${item.head_oid.slice(0, 7)}`);
   if (review.verdict !== "take-fix") throw new Error(`the latest review of ${ref} at its head is ${review.verdict}, not take-fix`);
-  const fixes = parseFixes(review.fixes);
+  const fixes = parseFixes(JSON.stringify(review.fixes));
   if (!fixes.length) throw new Error(`the take-fix review of ${ref} lists no usable fix`);
   const files = [...new Set(fixes.map((f) => f.file))];
 
@@ -63,8 +70,8 @@ export async function runFixupTry(db: Db, repo: string, number: number, d: Fixup
   }
   log(`${ref} at ${head.slice(0, 7)}: ${fixes.length} fixes in ${files.join(", ")}; ${checkout ? "sandbox checkout ready" : "NO checkout: the model runs without tools"}`);
 
-  const before0 = (await db.get(db.k.selectFrom("agent_runs").select((eb) => eb.fn.coalesce(eb.fn.max<number | null>("id"), eb.lit(0)).as("n"))))!.n;
-  const before = (await db.get(db.k.selectFrom("model_checks").select((eb) => eb.fn.coalesce(eb.fn.max<number | null>("id"), eb.lit(0)).as("n"))))!.n;
+  const [lastRun, before] = await db.together(() => Promise.all([listRuns(db, { limit: 1 }, STAFF), maxModelCheckId(db)]));
+  const before0 = lastRun.rows[0]?.id ?? 0;
   const base = (await d.querier.query(BASE_QUERY, { owner: ownerOf(repo), name: repo, n: number }) as { repository?: { pullRequest?: { baseRefOid?: string } | null } }).repository?.pullRequest?.baseRefOid ?? null;
   const tool = new CheckTool({ db, step: "fixup", repo, number, head, base, applies: applyCheck(git, d.root, head, (p) => refusal(validatePatch(p, files, (x) => fixupEditable(x, scripts)))) });
   const t0 = Date.now();
@@ -73,13 +80,12 @@ export async function runFixupTry(db: Db, repo: string, number: number, d: Fixup
 
   const offered = checkout !== undefined && CLAUDE_PROMPTS["fixup.patch"].sandbox?.check === true;
   log(`\ntools given to the model: ${offered ? `${[...CLAUDE_PROMPTS["fixup.patch"].sandbox!.tools, "Agent", "mcp__build__check"].join(", ")} (check offered; commands that returned a result: ${[...tool.ran].join(", ") || "none"})` : "none (no checkout, so no sandbox and no check tool)"}`);
-  const runs = await db.all(db.k.selectFrom("agent_runs").select(["id", "summary"]).where("prompt_id", "in", ["fixup.patch"]).where("id", ">", before0).orderBy("id"));
+  const runs = (await listRuns(db, { limit: 100 }, STAFF)).rows.filter((r) => r.id > before0 && r.promptId === "fixup.patch").sort((a, b) => a.id - b.id);
   for (const r of runs) log(`model call: agent run ${r.id}: ${r.summary ?? "no summary"}`);
   log("tool calls:");
-  const calls = await db.all(db.k.selectFrom("model_checks").select(["command", "crate", "test_name", "task_id", "outcome", "started_at", "ended_at"])
-    .where("id", ">", before).where("step", "=", "fixup").where("repo", "=", repo).where("number", "=", number).where("head", "=", head).orderBy("id"));
+  const calls = await loadModelChecksAfter(db, before, { step: "fixup", repo, number, head });
   if (!calls.length) log("  none");
-  for (const c of calls) log(`  ${c.command}${c.crate ? ` -p ${c.crate}` : ""}${c.test_name ? ` ${c.test_name}` : ""}: ${c.outcome ?? "unfinished"} (task ${c.task_id ?? "none"}, ${c.ended_at ? Math.round((Date.parse(c.ended_at) - Date.parse(c.started_at)) / 1000) : "?"} s)`);
+  for (const c of calls) log(`  ${c.command}${c.crate ? ` -p ${c.crate}` : ""}${c.testName ? ` ${c.testName}` : ""}: ${c.outcome ?? "unfinished"} (task ${c.taskId ?? "none"}, ${c.endedAt ? Math.round((Date.parse(c.endedAt) - Date.parse(c.startedAt)) / 1000) : "?"} s)`);
 
   if (reply === null) { log("\nthe model gave no answer"); return 1; }
   const v = validatePatch(reply, files, (x) => fixupEditable(x, scripts));
@@ -102,7 +108,7 @@ export async function runFixupTry(db: Db, repo: string, number: number, d: Fixup
   log(`\nlint task ${task} queued`);
   const l0 = Date.now();
   while (Date.now() - l0 < LINT_GIVE_UP_MS) {
-    const t = await getTask(db, task);
+    const t = (await loadTaskStates(db, [task])).get(task);
     if (!t || TERMINAL.includes(t.state)) break;
     await sleep(5000);
   }

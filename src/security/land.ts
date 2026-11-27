@@ -4,7 +4,6 @@
 import { ownPrSelect } from "../github/adopt.ts";
 import { guardRepo } from "../core/guard.ts";
 import type { By } from "../core/gates.ts";
-import { audit } from "../dash/audit.ts";
 import { Git, type Exec } from "../fixup/git.ts";
 import { branchOf, forkOf } from "../github/fork.ts";
 import { slugOf, ownerOf } from "../owners.ts";
@@ -17,14 +16,17 @@ import { crateOf } from "./fix.ts";
 import { cachedCratesOf } from "../verify/crates.ts";
 import { scanRow } from "./store.ts";
 import { findingKey, advance, rawFinding, type FindingRow } from "./store.ts";
-import { rememberQuietPr } from "./quiet.ts";
 import { giveaway, landBody, nameGiveaway } from "./rules.ts";
 import type { ExecResult } from "../fixup/git.ts";
-import { setting } from "../settings-read.ts";
+import { addAudit } from "../data/control/index.ts";
+import { claimMark } from "../data/jobs/index.ts";
+import { listMerges } from "../data/merge/index.ts";
+import { loadItems, type ItemOf } from "../data/mirror/index.ts";
+import * as sec from "../data/security/index.ts";
 import type { Db } from "../db/index.ts";
-import { excluded } from "../db/kx.ts";
 
 const ACTOR = "security";
+const auditAs = (db: Db, action: string, target: string, details: Record<string, unknown>): Promise<void> => addAudit(db, [{ login: ACTOR, action, target, details }]);
 const oneLine = (s: string, max = 300): string => s.replace(/\s+/g, " ").trim().slice(0, max);
 
 export type LandDeps = {
@@ -95,7 +97,7 @@ export async function runLand(db: Db, repo: string, n: number, by: By, d: LandDe
       if (pr.code !== 0 || number === null) return await back(db, repo, n, `the pull request was not opened: ${oneLine(pr.stderr || pr.stdout)}`, d.log);
     }
     await advance(db, repo, n, ["landing"], "landing", { fix_pr: number, fork: null, note: null });
-    await audit(db, ACTOR, "security-land-opened", key, { pr: number });
+    await auditAs(db, "security-land-opened", key, { pr: number });
     d.log(`${repo} finding ${n}: opened pull request ${number}`);
     return `finding ${n}: pull request ${number} opened`;
   } catch (e) {
@@ -225,7 +227,7 @@ export async function runAdvisory(db: Db, repo: string, n: number, by: By, d: La
       set.fix_pr = made;
       await advance(db, repo, n, ["landing"], "landing", { fix_pr: set.fix_pr });
     }
-    await audit(db, ACTOR, "security-advisory-ready", key, { ghsa, fork });
+    await auditAs(db, "security-advisory-ready", key, { ghsa, fork });
     return await wait(ADMIN.merge, set) + ` (${ghsa})`;
   } catch (e) {
     await back(db, repo, n, `the advisory route failed: ${(e as Error).message}`, d.log);
@@ -237,14 +239,11 @@ export async function runAdvisory(db: Db, repo: string, n: number, by: By, d: La
 async function draftAdvisory(db: Db, row: FindingRow, w: Writer, g: Parameters<typeof ghAdvisoryCreate>[1], d: Pick<LandDeps, "exec" | "root">): ReturnType<typeof ghAdvisoryCreate> {
   const key = findingKey(row.repo, row.number);
   // One draft per finding: the empty id claims the creation, so the merge poll and a Publish press never both create one. A claim older than ten minutes is a crashed attempt.
-  const stale = new Date(Date.now() - 600_000).toISOString();
-  const claimed = (await db.run(db.k.updateTable("security_findings").set({ ghsa_id: "", updated_at: new Date().toISOString() })
-    .where("repo", "=", row.repo).where("number", "=", row.number)
-    .where((eb) => eb.or([eb("ghsa_id", "is", null), eb.and([eb("ghsa_id", "=", ""), eb("updated_at", "<", stale)])])))).changes;
+  const claimed = await sec.claimAdvisoryId(db, sec.findingKey(row.repo, row.number));
   if (!claimed) return { ghsa: null, result: { code: 1, stdout: "", stderr: "the advisory is being created" } };
   const text = `${advisoryText(row)}${row.fix_pr ? `\n### Fix\n\nFixed in ${slugOf(row.repo)}#${row.fix_pr}.\n` : ""}`;
   const a = await ghAdvisoryCreate(w, g, d.exec, { repo: row.repo, key, summary: row.title, description: text, severity: row.severity, range: await advisoryRange(db, row, d) });
-  await db.run(db.k.updateTable("security_findings").set({ ghsa_id: a.ghsa }).where("repo", "=", row.repo).where("number", "=", row.number).where("ghsa_id", "=", ""));
+  await sec.setAdvisoryId(db, sec.findingKey(row.repo, row.number), a.ghsa ?? null);
   return a;
 }
 
@@ -257,7 +256,7 @@ export async function runPublish(db: Db, repo: string, n: number, by: By, cve: b
   if (!row || (row.state !== "landed" && row.state !== "advisory")) return `finding ${n}: nothing to publish`;
   const key = findingKey(repo, n);
   const w: Writer = { db, login: ACTOR };
-  const note = async (why: string): Promise<string> => { await db.run(db.k.updateTable("security_findings").set({ note: oneLine(why, 400), updated_at: new Date().toISOString() }).where("repo", "=", repo).where("number", "=", n)); return `finding ${n}: ${oneLine(why, 120)}`; };
+  const note = async (why: string): Promise<string> => { await sec.setFindingNote(db, sec.findingKey(repo, n), oneLine(why, 400)); return `finding ${n}: ${oneLine(why, 120)}`; };
   const g = await guardRepo(db, repo, "security", by);
   if ("refused" in g) return await note(g.refused);
   let ghsa = row.ghsa_id;
@@ -276,7 +275,7 @@ export async function runPublish(db: Db, repo: string, n: number, by: By, cve: b
     tail = c.code === 0 ? "; CVE requested" : `; CVE request failed: ${oneLine(c.stderr || c.stdout, 100)}`;
   }
   await advance(db, repo, n, ["landed", "advisory"], "published", { note: cve && tail.startsWith("; CVE request failed") ? tail.slice(2) : null });
-  await audit(db, ACTOR, "security-published", key, { ghsa, cve });
+  await auditAs(db, "security-published", key, { ghsa, cve });
   return `finding ${n}: published ${ghsa}${tail}`;
 }
 
@@ -299,10 +298,29 @@ export async function fixOnMain(git: Git, fixCommit: string, head: string): Prom
   return !!own && (await patchIds(git, head, 300)).has(own);
 }
 
-async function setNote(db: Db, repo: string, n: number, note: string): Promise<void> {
-  await db.run(db.k.updateTable("security_findings").set({ note, updated_at: new Date().toISOString() })
-    .where("repo", "=", repo).where("number", "=", n).where("state", "=", "landing")
-    .where((eb) => eb(eb.fn.coalesce("note", eb.val("")), "<>", note)));
+type PrFacts = { item: Pick<ItemOf<"pr">, "state" | "is_draft" | "mergeable" | "ci_state"> | undefined; last: { outcome: string; reason: string | null } | undefined };
+
+/** Why a quiet pull request is still open, from its mirror row and its last merge attempt. */
+function stallText({ item, last }: PrFacts): string {
+  if (!item) return "The pull request is open; waiting for the pipeline to read it.";
+  if (item.is_draft) return "The pull request is a draft.";
+  if (item.mergeable === "CONFLICTING") return "The pull request has merge conflicts.";
+  if (item.ci_state === "FAILURE" || item.ci_state === "ERROR") return "The pull request's checks failed.";
+  if (item.ci_state === "PENDING" || item.ci_state === "EXPECTED") return "Waiting for the pull request's checks.";
+  if (last?.outcome === "refused" && last.reason) return `The merge was refused: ${oneLine(last.reason, 200)}`;
+  return "The pull request is open; waiting for the merge step.";
+}
+
+/** The mirror row and last merge attempt of each pull request. Two statements in one wave. */
+async function loadPrFacts(db: Db, prs: { repo: string; number: number }[]): Promise<Map<string, PrFacts>> {
+  const out = new Map<string, PrFacts>();
+  if (!prs.length) return out;
+  const [items, merges] = await db.together(() => Promise.all([loadItems(db, prs, "pr"), listMerges(db, { refs: prs })]));
+  for (const p of prs) {
+    const k = `${p.repo}#${p.number}`;
+    out.set(k, { item: items.get(k), last: merges.find((m) => m.repo === p.repo && m.number === p.number) });
+  }
+  return out;
 }
 
 /**
@@ -310,15 +328,7 @@ async function setNote(db: Db, repo: string, n: number, note: string): Promise<v
  * so it is safe wherever the note is shown.
  */
 export async function stallReason(db: Db, repo: string, number: number): Promise<string> {
-  const it = await db.get(db.k.selectFrom("main.items").select(["is_draft", "ci_state", "mergeable"]).where("repo", "=", repo).where("number", "=", number));
-  const last = await db.get(db.k.selectFrom("main.merges").select(["outcome", "reason"]).where("repo", "=", repo).where("number", "=", number).orderBy("at", "desc").limit(1));
-  if (!it) return "The pull request is open; waiting for the pipeline to read it.";
-  if (it.is_draft) return "The pull request is a draft.";
-  if (it.mergeable === "CONFLICTING") return "The pull request has merge conflicts.";
-  if (it.ci_state === "FAILURE" || it.ci_state === "ERROR") return "The pull request's checks failed.";
-  if (it.ci_state === "PENDING" || it.ci_state === "EXPECTED") return "Waiting for the pull request's checks.";
-  if (last?.outcome === "refused" && last.reason) return `The merge was refused: ${oneLine(last.reason, 200)}`;
-  return "The pull request is open; waiting for the merge step.";
+  return stallText((await loadPrFacts(db, [{ repo, number }])).get(`${repo}#${number}`)!);
 }
 
 /**
@@ -327,61 +337,85 @@ export async function stallReason(db: Db, repo: string, number: number): Promise
  * `advisory`. External wait: it reads GitHub state and never sleeps on a timer. Returns the number of findings moved.
  */
 export async function pollLanding(db: Db, d: Pick<LandDeps, "exec" | "root" | "log">): Promise<number> {
+  at("watch");
+  const { quiet, waiting } = await sec.loadLandingWatch(db);
   let moved = 0;
-  const quiet = await db.all(db.k.selectFrom("security_findings").select(["repo", "number", "fix_pr"])
-    .where("state", "=", "landing").where("fix_pr", "is not", null).where("fork", "is", null).$narrowType<{ fix_pr: number }>());
-  for (const f of quiet) {
-    const pr = await db.get(db.k.selectFrom("main.items").select("state").where("repo", "=", f.repo).where("number", "=", f.fix_pr));
-    if (pr?.state === "MERGED" && await advance(db, f.repo, f.number, ["landing"], "landed", { note: null })) {
-      await audit(db, ACTOR, "security-landed", findingKey(f.repo, f.number), { pr: f.fix_pr });
-      moved++;
-      // The draft advisory records the issue once the fix is public. Best effort: Publish creates it when this could not.
-      try {
-        const row = (await rawFinding(db, f.repo, f.number))!;
-        const g = row.ghsa_id ? null : await guardRepo(db, f.repo, "security", "pipeline");
-        if (g && !("refused" in g)) await draftAdvisory(db, row, { db, login: ACTOR }, g, d);
-      } catch (e) {
-        d.log(`security: ${f.repo}: draft advisory not created: ${oneLine(String((e as Error).message ?? e), 160)}`);
-      }
-    } else if (pr?.state === "CLOSED" && (await rememberQuietPr(db, f.repo, f.number, f.fix_pr), await advance(db, f.repo, f.number, ["landing"], "ready", { fix_pr: null, note: "The pull request was closed without merging." }))) moved++;
-    else if (pr?.state === "OPEN") await setNote(db, f.repo, f.number, await stallReason(db, f.repo, f.fix_pr));
-  }
-  const waiting = await db.all(db.k.selectFrom("security_findings").select(["repo", "number", "fix_commit", "fork", "fix_pr"])
-    .where("state", "=", "awaiting-admin").where("fix_commit", "is not", null).$narrowType<{ fix_commit: string }>());
-  // The admin may merge the pull request in the advisory's fork; the fork exists until the advisory is published.
-  for (const f of waiting) {
-    if (!f.fork || f.fix_pr === null) continue;
-    const view = await d.exec("gh", ["pr", "view", String(f.fix_pr), "--repo", f.fork, "--json", "state", "--jq", ".state"]);
-    if (view.code === 0 && view.stdout.trim() === "MERGED" && await advance(db, f.repo, f.number, ["awaiting-admin"], "advisory", { note: null })) {
-      await audit(db, ACTOR, "security-landed", findingKey(f.repo, f.number), { route: "advisory" });
-      moved++;
+  at(`facts of ${quiet.length} quiet, ${waiting.length} waiting`);
+  const facts = await loadPrFacts(db, quiet.map((f) => ({ repo: f.repo, number: f.fix_pr })));
+  const stateOf = (f: (typeof quiet)[number]) => facts.get(`${f.repo}#${f.fix_pr}`)?.item?.state;
+  const merged = quiet.filter((f) => stateOf(f) === "MERGED");
+  const closed = quiet.filter((f) => stateOf(f) === "CLOSED");
+  const open = quiet.filter((f) => stateOf(f) === "OPEN");
+  at("write");
+  const landed = await db.write(async () => {
+    const landedKeys = await sec.advanceFindings(db, merged.map((f) => ({ repo: f.repo, number: f.number, from: ["landing"], to: "landed", set: { note: null } })));
+    await addAudit(db, merged.filter((f) => landedKeys.has(sec.findingKey(f.repo, f.number))).map((f) => ({ login: ACTOR, action: "security-landed", target: findingKey(f.repo, f.number), details: { pr: f.fix_pr } })));
+    await sec.addQuietPrs(db, closed.map((f) => ({ repo: f.repo, pr: f.fix_pr, finding: f.number })));
+    const reopened = await sec.advanceFindings(db, closed.map((f) => ({ repo: f.repo, number: f.number, from: ["landing"], to: "ready", set: { fix_pr: null, note: "The pull request was closed without merging." } })));
+    await sec.setNotes(db, open.map((f) => ({ repo: f.repo, number: f.number, note: stallText(facts.get(`${f.repo}#${f.fix_pr}`)!) })));
+    moved += landedKeys.size + reopened.size;
+    return merged.filter((f) => landedKeys.has(sec.findingKey(f.repo, f.number)));
+  });
+  // The draft advisory records the issue once the fix is public. Best effort: Publish creates it when this could not.
+  at("landed findings");
+  const rows = await sec.loadFindings(db, landed.map((f) => sec.findingKey(f.repo, f.number)), { internal: true });
+  for (const f of landed) {
+    at(`draft advisory ${f.repo}#${f.number}`);
+    try {
+      const row = rows.get(sec.findingKey(f.repo, f.number)) as FindingRow | undefined;
+      const g = !row || row.ghsa_id ? null : await guardRepo(db, f.repo, "security", "pipeline");
+      if (row && g && !("refused" in g)) await draftAdvisory(db, row, { db, login: ACTOR }, g, d);
+    } catch (e) {
+      d.log(`security: ${f.repo}: draft advisory not created: ${oneLine(String((e as Error).message ?? e), 160)}`);
     }
   }
+  const advisory = async (fs: typeof waiting): Promise<void> => {
+    if (!fs.length) return;
+    at("advisory write");
+    const keys = await db.write(async () => {
+      const hit = await sec.advanceFindings(db, fs.map((f) => ({ repo: f.repo, number: f.number, from: ["awaiting-admin"], to: "advisory", set: { note: null } })));
+      await addAudit(db, fs.filter((f) => hit.has(sec.findingKey(f.repo, f.number))).map((f) => ({ login: ACTOR, action: "security-landed", target: findingKey(f.repo, f.number), details: { route: "advisory" } })));
+      return hit;
+    });
+    moved += keys.size;
+    for (const f of fs) done.add(sec.findingKey(f.repo, f.number));
+  };
+  const done = new Set<string>();
+  // The admin may merge the pull request in the advisory's fork; the fork exists until the advisory is published.
+  const viaFork: typeof waiting = [];
+  for (const f of waiting) {
+    if (!f.fork || f.fix_pr === null) continue;
+    at(`gh pr view ${f.fork}#${f.fix_pr}`);
+    const view = await d.exec("gh", ["pr", "view", String(f.fix_pr), "--repo", f.fork, "--json", "state", "--jq", ".state"]);
+    if (view.code === 0 && view.stdout.trim() === "MERGED") viaFork.push(f);
+  }
+  await advisory(viaFork);
   for (const repo of new Set(waiting.map((f) => f.repo))) {
     try {
+      at(`fetch ${repo}`);
       const git = new Git(d.exec, d.root, repo);
       const head = await git.fetchBase(ownerOf(repo), repo, await branchOf(db, repo));
-      for (const f of waiting.filter((x) => x.repo === repo)) {
-        if (await fixOnMain(git, f.fix_commit, head) && await advance(db, repo, f.number, ["awaiting-admin"], "advisory", { note: null })) {
-          await audit(db, ACTOR, "security-landed", findingKey(repo, f.number), { route: "advisory" });
-          moved++;
-        }
+      const onMain: typeof waiting = [];
+      for (const f of waiting.filter((x) => x.repo === repo && !done.has(sec.findingKey(x.repo, x.number)))) {
+        at(`fix on main ${repo}#${f.number}`);
+        if (await fixOnMain(git, f.fix_commit, head)) onMain.push(f);
       }
+      await advisory(onMain);
     } catch (e) {
       d.log(`security: ${repo}: ${oneLine(String((e as Error).message ?? e), 160)}`);
     }
   }
+  at("done");
   return moved;
 }
 
+let stage = "";
+const at = (s: string): void => { stage = s; };
+/** Where the running landing poll is, for the sync run's report of a poll that does not end. */
+export const landingStage = (): string => stage;
+
 /** Runs `pollLanding` when the last poll is older than a couple of minutes; the sync run calls it. */
 export async function pollLandingIfDue(db: Db, d: Pick<LandDeps, "exec" | "root" | "log">, now = Date.now()): Promise<number> {
-  const open = await db.get(db.k.selectFrom("security_findings").select((eb) => eb.lit(1).as("one"))
-    .where((eb) => eb.or([eb.and([eb("state", "=", "landing"), eb("fix_pr", "is not", null)]), eb("state", "=", "awaiting-admin")])).limit(1));
-  if (!open) return 0;
-  const at = await setting(db, "security_poll_at");
-  if (at && now - Date.parse(at) < 115_000) return 0;
-  await db.run(db.k.insertInto("settings").values({ key: "security_poll_at", value: new Date(now).toISOString() })
-    .onConflict((oc) => oc.column("key").doUpdateSet(excluded(["value"]))));
+  if (!await claimMark(db, "security-poll", now, 115_000)) return 0;
   return pollLanding(db, d);
 }

@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import { setCommentApproval } from "../src/act/approval.ts";
 import { SCRATCH } from "./scratch.ts";
 import { world } from "./world-db.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb } from "./helpers/raw-db.ts";
 
 process.env.AUTOCRAFT_EXTRA_STEPS = fileURLToPath(new URL("./runner-steps.ts", import.meta.url));
 

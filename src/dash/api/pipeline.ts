@@ -6,31 +6,30 @@ import { mayRunRepo } from "../repo-access.ts";
 import type { Job, JobState, PipelineOverview, PipelineStage, PipelineState, PipelineStep, StepParam } from "../../../web/src/api/types.ts";
 import { enqueue, getJob, jobDetail, jobRow, JobError, JOB_STATES, listJobs, requestCancel, toJobs } from "../../runner/jobs.ts";
 import { ackDeadline, LimitError, pipelineState as rawPipelineState, resetLimitCount, setEnabled, setLimit } from "../../runner/autopilot.ts";
-import { HEARTBEAT_KEY } from "../../runner/runner.ts";
+import { HEARTBEAT_MARK } from "../../runner/runner.ts";
+import { loadLaneState } from "../../data/jobs/index.ts";
 import { loadSteps, type StepDef } from "../../runner/steps.ts";
-import { JUDGEMENT_MODELS, judgementModel, setJudgementModel } from "../../decide/judgement.ts";
 import { audit } from "../audit.ts";
 import { outsideState } from "../../outside.ts";
-import { mayResumeTrip, resumeStage, TripError } from "../../push-outcomes.ts";
+import { mayResumeTrip, resumeStage, TripError } from "../../data/control/index.ts";
 import { HttpError } from "../server/util.ts";
 import type { Req } from "../types.ts";
 import { blankIfHidden, hiddenRepos, visibleRepos } from "./visible.ts";
-import { cols, excluded } from "../../db/kx.ts";
-import { filtered, hiddenTestExpr, isHiddenRepo, type HiddenRepos } from "../../hidden-sql.ts";
-import { isQuiet } from "../../security/quiet.ts";
+import { isHiddenRepo, writeSetting, type HiddenRepos } from "../../data/control/index.ts";
+import { loadPipelineOverview } from "../../data/views/pipeline.ts";
+import { loadQuiet } from "../../data/security/index.ts";
 import { canSeeInternals } from "./staff.ts";
 import { SECURITY_PREFIX, SECURITY_STEP } from "../../security/rules.ts";
 import { mapSeq } from "../../async-seq.ts";
 import type { Db } from "../../db/index.ts";
-import { setting } from "../../settings-read.ts";
-import { LARGE_FIX_KEY, OUTSIDE_PURPOSE_KEY, largeFixLines, outsidePurposeMin } from "../../workflow/settings.ts";
+import { OUTSIDE_PURPOSE_KEY, outsidePurposeMin } from "../../workflow/settings.ts";
 
 // Stages of docs/pipeline.md. A stage with registered steps shows them; the
 // mirror also runs on its own timer.
 const STAGES: { n: number; name: string; automatic?: boolean }[] = [
   { n: 1, name: "Mirror", automatic: true },
   { n: 2, name: "Classify" },
-  { n: 3, name: "Decide" },
+  { n: 3, name: "Duplicates and conversations" },
   { n: 4, name: "Label" },
   { n: 5, name: "Review" },
   { n: 6, name: "Integrate" },
@@ -45,12 +44,12 @@ function requireOperator(req: Req, step?: StepDef): void {
 
 /** The pipeline state for the requester: reasons that name a hidden repo and trips on one are left out. */
 async function pipelineState(db: Db, req: Req): Promise<PipelineState> {
-  const [s, hidden] = await Promise.all([rawPipelineState(db), hiddenRepos(db, req)]);
+  const [s, hidden, outside, minLines] = await Promise.all([rawPipelineState(db), hiddenRepos(db, req), hiddenRepos(db, req).then((h) => outsideState(db, h)), outsidePurposeMin(db)]);
   const limits = await mapSeq(s.limits, async ({ trips, ...l }) => {
-    const shown = await mapSeq((trips ?? []).filter((t) => t.repo === null || !isHiddenRepo(hidden, t.repo)), async (t) => ({ ...t, reason: blankIfHidden(t.reason, hidden), canResume: await mayResumeTrip(req.user, t.key) }));
+    const shown = await mapSeq((trips ?? []).filter((t) => t.repo === null || !isHiddenRepo(hidden, t.repo)), async (t) => ({ ...t, reason: blankIfHidden(t.reason, hidden), canResume: await mayResumeTrip(db, req.user, t.key) }));
     return { ...l, pausedReason: blankIfHidden(l.pausedReason, hidden) || null, status: blankIfHidden(l.status, hidden) || null, ...(shown.length ? { trips: shown } : {}) };
   });
-  return { ...s, outside: await outsideState(db, hidden), limits, blockers: { largeFixLines: await largeFixLines(db), outsidePurposeMin: await outsidePurposeMin(db) } };
+  return { ...s, outside, limits, blockers: { outsidePurposeMin: minLines } };
 }
 
 /** Viewers read that a job failed, not why: the error carries log and command text. */
@@ -84,56 +83,48 @@ function wireParams(s: StepDef, repos: string[]): StepParam[] {
   });
 }
 
-const lastJob = async (db: Db, step: string, view: (j: Job) => Job, hidden: HiddenRepos): Promise<Job | null> => {
-  const r = await db.get(db.k.selectFrom("jobs").select(cols("jobs")).$narrowType<{ state: JobState }>().where("step", "=", step)
-    .$if(filtered(hidden), (q) => q.where((eb) => eb.or([eb("repo", "is", null), eb.not(hiddenTestExpr(db, "repo", hidden))])))
-    .orderBy("id", "desc").limit(1));
-  return r ? view((await toJobs(db, [r]))[0]!) : null;
-};
-
-async function stageState(db: Db, steps: string[], syncFailed: boolean | null): Promise<PipelineStage["state"]> {
-  if (steps.length) {
-    const active = await db.get(db.k.selectFrom("jobs").select("state").$narrowType<{ state: JobState }>().where("step", "in", steps).where("state", "in", ["running", "queued"])
-      .orderBy("state", "desc").limit(1)); // "running" sorts after "queued"
-    if (active) return active.state === "running" ? "running" : "queued";
-  }
-  if (syncFailed !== null) return syncFailed ? "failed" : "ok";
-  if (!steps.length) return "idle";
-  const last = await db.get(db.k.selectFrom("jobs").select("state").$narrowType<{ state: JobState }>().where("step", "in", steps).where("state", "in", ["done", "failed"])
-    .orderBy("id", "desc").limit(1));
-  return last?.state === "done" ? "ok" : last?.state === "failed" ? "failed" : "idle";
+/** A running or queued step decides; else a sync result for the automatic stage; else the newest finished job. */
+function stageState(fromJobs: PipelineStage["state"], syncFailed: boolean | null): PipelineStage["state"] {
+  if (fromJobs === "running" || fromJobs === "queued") return fromJobs;
+  return syncFailed !== null ? (syncFailed ? "failed" : "ok") : fromJobs;
 }
 
 export async function overview(db: Db, req: Req): Promise<PipelineOverview> {
   const all = [...(await loadSteps()).values()].filter((s) => s.name !== SECURITY_STEP || canSeeInternals(req));
-  const repos = await visibleRepos(db, req);
-  const hidden = await hiddenRepos(db, req);
-  const steps: PipelineStep[] = await mapSeq(all, async (s) => ({
-    name: s.name, title: s.title, description: s.description, stage: s.stage, requires: s.requires,
-    params: wireParams(s, repos), unavailable: s.available?.() ?? null,
-    lastJob: await lastJob(db, s.name, forViewer(req, hidden), hidden),
-  }));
-  const raw = await db.all(db.k.selectFrom("sync_runs").select(["started_at as startedAt", "ended_at as endedAt", "mode", "items", "error"]).orderBy("started_at", "desc").limit(10));
+  const [repos, hidden] = await Promise.all([visibleRepos(db, req), hiddenRepos(db, req)]);
+  const stageSteps = STAGES.map((st) => ({ n: st.n, steps: all.filter((s) => s.stage === st.n).map((s) => s.name) }));
+  const [facts, marks] = await db.together(() => Promise.all([
+    loadPipelineOverview(db, { steps: all.map((s) => s.name), stages: stageSteps, hidden, syncRuns: 10, settingKeys: ["org_high_water"] }),
+    loadLaneState(db, ["mark"]),
+  ]));
+  const lastRows = [...facts.lastJobs.values()];
+  const lastJobs = new Map(lastRows.map((r, i) => [r.id, i]));
+  const jobsOf = await toJobs(db, lastRows);
+  const view = forViewer(req, hidden);
+  const steps: PipelineStep[] = all.map((s) => {
+    const row = facts.lastJobs.get(s.name);
+    return {
+      name: s.name, title: s.title, description: s.description, stage: s.stage, requires: s.requires,
+      params: wireParams(s, repos), unavailable: s.available?.() ?? null,
+      lastJob: row ? view(jobsOf[lastJobs.get(row.id)!]!) : null,
+    };
+  });
+  const raw = facts.syncRuns.map((r) => ({ startedAt: r.started_at, endedAt: r.ended_at, mode: r.mode, items: r.items, error: r.error }));
   const lastSync = raw.find((r) => r.endedAt);
   // A sync error can quote GitHub's answer about any repo: staff read it unless it names a repo hidden from them, viewers read "failed".
   const runs = raw.map((r) => ({ ...r, error: r.error && (canSeeInternals(req) ? blankIfHidden(r.error, hidden) || "failed" : "failed") }));
-  const high = (await setting(db, "org_high_water")) ?? null;
-  const stages: PipelineStage[] = await mapSeq(STAGES, async (st) => {
+  const high = facts.settings.get("org_high_water") ?? null;
+  const stages: PipelineStage[] = STAGES.map((st) => {
     const names = steps.filter((s) => s.stage === st.n).map((s) => s.name);
     const mode = st.automatic ? "automatic" : names.length ? "steps" : "planned";
-    return {
-      n: st.n, name: st.name, mode, steps: names,
-      state: mode === "planned" ? "planned" : await stageState(db, names, st.automatic ? (lastSync ? lastSync.error !== null : high ? false : null) : null),
-    };
+    return { n: st.n, name: st.name, mode, steps: names, state: mode === "planned" ? "planned" : stageState(facts.stageStates.get(st.n) ?? "idle", st.automatic ? (lastSync ? lastSync.error !== null : high ? false : null) : null) };
   });
-  const beat = (await setting(db, HEARTBEAT_KEY)) ?? null;
-  const count = async (state: string) => (await db.get(db.k.selectFrom("jobs").select((eb) => eb.fn.countAll<number>().as("n")).where("state", "=", state)
-    .$if(filtered(hidden), (q) => q.where((eb) => eb.or([eb("repo", "is", null), eb.not(hiddenTestExpr(db, "repo", hidden))])))))!.n;
+  const beat = marks.get(`mark|${HEARTBEAT_MARK}|`)?.value ?? null;
   return {
     stages, steps,
     runner: { lastSeen: beat, alive: beat !== null && Date.now() - Date.parse(beat) < RUNNER_ALIVE_MS },
     sync: { lastFinishedAt: lastSync?.endedAt ?? high, runs },
-    counts: { queued: await count("queued"), running: await count("running") },
+    counts: { queued: facts.counts.get("queued") ?? 0, running: facts.counts.get("running") ?? 0 },
   };
 }
 
@@ -167,7 +158,7 @@ export const job = async (db: Db, req: Req) => wrap(async () => {
   d.canCancel = req.user.role === "operator" || (!!repo && await mayRunRepo(req.user, repo));
   if (canSeeInternals(req)) return forViewer(req, hidden)(d) as typeof d;
   // An item's outcome reads "failed: <reason>" or carries notes: viewers get the leading state word, and nothing for a quiet pull request.
-  const items = await mapSeq(d.items, async (i) => ({ ...i, outcome: await isQuiet(db, i.repo, i.number) ? null : /^[A-Za-z-]+/.exec(i.outcome ?? "")?.[0] ?? null }));
+  const items = await mapSeq(d.items, async (i) => ({ ...i, outcome: (await loadQuiet(db, [`${i.repo}#${i.number}`])).size > 0 ? null : /^[A-Za-z-]+/.exec(i.outcome ?? "")?.[0] ?? null }));
   return { ...forViewer(req, hidden)(d) as typeof d, items };
 });
 
@@ -219,30 +210,17 @@ export async function putState(db: Db, req: Req) {
   return pipelineState(db, req);
 }
 
-/** The model of the prepare step and the models an operator may pick. */
-export const getJudgementModel = async (db: Db) => ({ judgementModel: await judgementModel(db), judgementModels: [...JUDGEMENT_MODELS] });
-
-export async function putJudgementModel(db: Db, req: Req) {
-  requireOperator(req);
-  const m = body(req).model;
-  if (typeof m !== "string" || !(JUDGEMENT_MODELS as readonly string[]).includes(m)) throw new HttpError(400, `model must be one of ${JUDGEMENT_MODELS.join(", ")}`);
-  const was = await judgementModel(db);
-  await setJudgementModel(db, m);
-  await audit(db, req.user.login, "judgement-model", "pipeline", { model: m, was });
-  return pipelineState(db, req);
-}
-
-/** The two thresholds of the workflow blockers: a fix above `largeFixLines` changed lines, a change of at least `outsidePurposeMin` lines outside the PR's purpose. */
+/** The threshold of the workflow blocker for a change outside the PR's purpose: a change of at least `outsidePurposeMin` lines outside the PR's purpose. */
 export async function putBlockers(db: Db, req: Req) {
   requireOperator(req);
   const b = body(req);
-  const rows: [string, string, number][] = [[LARGE_FIX_KEY, "largeFixLines", await largeFixLines(db)], [OUTSIDE_PURPOSE_KEY, "outsidePurposeMin", await outsidePurposeMin(db)]];
-  const was = { largeFixLines: rows[0]![2], outsidePurposeMin: rows[1]![2] };
+  const rows: [string, string, number][] = [[OUTSIDE_PURPOSE_KEY, "outsidePurposeMin", await outsidePurposeMin(db)]];
+  const was = { outsidePurposeMin: rows[0]![2] };
   for (const [key, field] of rows) {
     const v = b[field];
     if (v === undefined) continue;
     if (typeof v !== "number" || !Number.isInteger(v) || v < 1 || v > 1_000_000) throw new HttpError(400, `${field} must be a whole number from 1 to 1000000`);
-    await db.run(db.k.insertInto("settings").values({ key, value: String(v) }).onConflict((oc) => oc.column("key").doUpdateSet(excluded(["value"]))));
+    await writeSetting(db, key, String(v));
   }
   await audit(db, req.user.login, "blocker-thresholds", "pipeline", { was, ...b });
   return pipelineState(db, req);
@@ -261,7 +239,7 @@ export async function putLimit(db: Db, req: Req) {
 
 /** An operator, or a maintainer with write access to the trip's repo, clears a breaker (`<stage>:<repo>`, or outside-surge). */
 export async function resumeTrip(db: Db, req: Req) {
-  if (!await mayResumeTrip(req.user, req.params.stage!)) throw new HttpError(403, "only an operator, or a maintainer with write access to the breaker's repo, resumes it");
+  if (!await mayResumeTrip(db, req.user, req.params.stage!)) throw new HttpError(403, "only an operator, or a maintainer with write access to the breaker's repo, resumes it");
   try {
     await resumeStage(db, req.params.stage, req.user.login);
   } catch (e) {

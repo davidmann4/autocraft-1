@@ -6,7 +6,8 @@ import { mkdirSync, mkdtempSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
-import type { Db } from "../src/db/index.ts";
+import PgLib from "pg";
+import type { Db } from "./helpers/raw-db.ts";
 import { writeSnapshot, writeSnapshotFromDb } from "../src/itemtools/snapshot.ts";
 import { SCRATCH } from "./scratch.ts";
 import { needsPg, testDatabase } from "./test-db.ts";
@@ -38,7 +39,6 @@ function dump(file: string): Record<string, unknown[]> {
     items: q("SELECT * FROM items ORDER BY repo, number"),
     comments: q("SELECT * FROM comments ORDER BY id"),
     embeddings: q("SELECT repo, number, model, at, hex(vec) AS vec, typeof(vec) AS t FROM item_embeddings ORDER BY repo, number"),
-    outcomes: q("SELECT * FROM decision_outcomes ORDER BY repo, number"),
     schema: q("SELECT value FROM meta WHERE key = 'schema'"),
     found: q("SELECT i.repo, i.number FROM items_fts f JOIN items i ON i.rowid = f.rowid WHERE items_fts MATCH 'ligature'"),
   };
@@ -84,11 +84,10 @@ test("the snapshot built from Postgres has the rows of the one built from SQLite
     // An embed run moves no change counter: only the vectors are compared and rewritten.
     await pdb.prepare("UPDATE item_embeddings SET vec = ?, at = 't1' WHERE repo = 'photocraft' AND number = 8").run(vec(0.5, 0.5));
     assert.deepEqual((await writeSnapshotFromDb(pdb, file, 2)).changed, { items: 0, comments: 0, embeddings: 1 });
-    // A decision answered alone rewrites the outcomes.
+    // A decision answered alone changes nothing in the snapshot.
     await pdb.prepare(`INSERT INTO decisions (id, kind, repo, number, question, options, asked_at, answer, answered_by, answered_at)
       VALUES ('d2', 'scope', 'photocraft', 8, 'Take it?', '[{"key":"backlog","label":"Backlog"}]', 't', 'backlog', 'op', '2026-02-02T00:00:00Z')`).run();
-    assert.deepEqual((await writeSnapshotFromDb(pdb, file, 2)).changed, { items: 1, comments: 0, embeddings: 0 });
-    assert.ok(dump(file).outcomes.some((o) => (o as { number: number }).number === 8));
+    assert.deepEqual((await writeSnapshotFromDb(pdb, file, 2)).changed, { items: 0, comments: 0, embeddings: 0 });
 
     // A changed and a deleted item, comment and vector are applied in place, and the file then equals a fresh build.
     await pdb.prepare("UPDATE items SET title = 'Fix kerning now' WHERE repo = 'photocraft' AND number = 7").run();
@@ -105,6 +104,45 @@ test("the snapshot built from Postgres has the rows of the one built from SQLite
     assert.equal((await writeSnapshotFromDb(pdb, fresh, 2)).rebuilt, true);
     assert.deepEqual(dump(file), dump(fresh));
     assert.deepEqual(srcRows(file), srcRows(fresh));
+
+    // Rows written since the last refresh are read alone: an edited comment and a draft review submitted, then the
+    // review back to a draft, which leaves the file.
+    await pdb.prepare("UPDATE comments SET body = 'Seen it twice' WHERE id = 'c1'").run();
+    await pdb.prepare("UPDATE comments SET review_state = 'COMMENTED' WHERE id = 'c2'").run();
+    assert.deepEqual((await writeSnapshotFromDb(pdb, file, 2)).changed, { items: 0, comments: 2, embeddings: 0 });
+    // A transaction of another connection still open at that refresh's mark holds its horizon back, so the next refresh
+    // reads the draft review again: neither the file nor the public rows have it, which is no change.
+    const holder = new PgLib.Client({ connectionString: pg.target });
+    await holder.connect();
+    try {
+      await holder.query("BEGIN");
+      await holder.query("SELECT pg_current_xact_id()");
+      await pdb.prepare("UPDATE comments SET review_state = 'PENDING' WHERE id = 'c2'").run();
+      assert.deepEqual((await writeSnapshotFromDb(pdb, file, 2)).changed, { items: 0, comments: 1, embeddings: 0 });
+      await holder.query("COMMIT");
+    } finally {
+      await holder.end();
+    }
+    const fresh2 = join(dir, "fresh2", "items.db");
+    assert.equal((await writeSnapshotFromDb(pdb, fresh2, 2)).rebuilt, true);
+    assert.deepEqual(dump(file), dump(fresh2));
+    assert.deepEqual(srcRows(file), srcRows(fresh2));
+
+    // An item frozen right after its edit (Postgres freezes eagerly) is still read as written since the last refresh.
+    await pdb.prepare("UPDATE items SET title = 'Fix kerning, frozen' WHERE repo = 'photocraft' AND number = 7").run();
+    await pdb.prepare("VACUUM (FREEZE) items").run();
+    const frozen = await pdb.prepare(`SELECT xmin::text::bigint < (SELECT relfrozenxid::text::bigint FROM pg_class WHERE oid = 'items'::regclass) AS f
+      FROM items WHERE repo = 'photocraft' AND number = 7`).get() as { f: unknown };
+    assert.ok(frozen.f, "the edited row is frozen");
+    assert.deepEqual((await writeSnapshotFromDb(pdb, file, 2)).changed, { items: 1, comments: 0, embeddings: 0 });
+
+    // A repository turned private after its changed items were compared: they are not read again, so they leave the file.
+    await pdb.prepare("UPDATE items SET title = 'Fix kerning again' WHERE repo = 'photocraft' AND number = 7").run();
+    const hidden = await writeSnapshotFromDb(pdb, file, 2, {
+      beforeRefetch: async (t) => void (t === "items" && await pdb.prepare("UPDATE repos SET visibility = 'private' WHERE name = 'photocraft'").run()),
+    });
+    assert.equal(hidden.rebuilt, false);
+    assert.deepEqual(dump(file).items.filter((i) => (i as { number: number }).number === 7), []);
   } finally {
     await pg.close();
     await lite.close();

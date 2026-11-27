@@ -6,31 +6,23 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { AppError } from "../src/github/app.ts";
 import { RepoNotInInstallationError } from "../src/github/install-token.ts";
-import { commitIdentity, identityFor, identityOfDecision, githubIdentity, IdentityRefused, setGithubIdentity, setGithubIdentityChecked } from "../src/github/identity.ts";
+import { commitIdentity, identityFor, githubIdentity, IdentityRefused, setGithubIdentity, setGithubIdentityChecked } from "../src/github/identity.ts";
 import { closeItem } from "../src/github/write.ts";
+import { refreshReadIdentity } from "../src/github/read.ts";
+import type { Db } from "../src/db/index.ts";
 import type { GuardedItem } from "../src/core/guard.ts";
 import type { Querier } from "../src/mirror.ts";
 import { SCRATCH } from "./scratch.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb } from "./helpers/raw-db.ts";
 import * as kx from "../src/db/kx.ts";
 
 const grant = (as: string): GuardedItem => ({ scope: "item", action: { kind: "act" }, repo: "app", number: 7, as }) as unknown as GuardedItem;
 const q: Querier = { query: async () => ({}) } as unknown as Querier;
 
-test("a decision answered by someone maps to that login, anything else to the app", async () => {
-  mkdirSync(SCRATCH, { recursive: true });
-  const db = await connectDb(join(SCRATCH, `identity-${process.pid}.db`));
-  const ins = (id: string, answer: string | null) => db.run(db.k.insertInto("decisions")
-    .values({ id, kind: "close", question: "q", options: "[]", asked_at: "t", answer, answered_by: "example-user" }));
-  await ins("d1", "yes");
-  await ins("d2", null);
-  assert.equal(await identityOfDecision(db, "d1"), "user:example-user");
-  assert.equal(await identityOfDecision(db, "d2"), "app");
-  assert.equal(await identityOfDecision(db, "missing"), "app");
-  assert.equal(await identityOfDecision(db, undefined), "app");
+test("a merge or close goes out as the person of its grant, any other write as the app", () => {
   assert.equal(identityFor(grant("user:example-user"), "close"), "user:example-user");
   assert.equal(identityFor(grant("user:example-user"), "merge"), "user:example-user");
-  assert.equal(identityFor(grant("user:example-user")), "app", "any other write is the app's");
+  assert.equal(identityFor(grant("user:example-user")), "app");
 });
 
 test("the audit row records legacy until the identity is switched, then the grant's identity", async () => {
@@ -57,7 +49,7 @@ test("every audited write in write.ts takes its identity from a grant", () => {
   const src = readFileSync(new URL("../src/github/write.ts", import.meta.url), "utf8");
   const calls = src.split("\n").filter((l) => /\b(recorded|viaGh)\(w, /.test(l) && !/function /.test(l));
   assert.ok(calls.length >= 25, `found ${calls.length} audited calls`);
-  for (const l of calls) assert.match(l, /\b(recorded|viaGh)\(w, (await idOf\(w, g(, "close")?\)|identity|"legacy"|`user:\$\{w\.login\}`), /, l.trim().slice(0, 80));
+  for (const l of calls) assert.match(l, /\b(recorded|viaGh)\(w, (idOf\(w, g(, "close")?\)|identity|"legacy"|`user:\$\{w\.login\}`), /, l.trim().slice(0, 80));
   // The rows started with begin() directly (labels, merge, command-line merge) carry the identity in their details.
   const begins = src.split("\n").filter((l) => /\bbegin\(w, /.test(l) && !/function /.test(l));
   assert.equal(begins.length, 4);
@@ -93,4 +85,21 @@ test("switching to the app is refused with the uncovered repos listed, and a swi
   await db.run(db.k.insertInto("sessions").values({ id_hash: "h", login: "op", csrf: "c", created_at: new Date().toISOString(), last_seen: new Date().toISOString(), expires_at: new Date(Date.now() + 1e6).toISOString() }));
   assert.equal(await setGithubIdentityChecked(db, "op", "app", { registered: () => true, mint }), true);
   assert.equal((await db.get(db.k.selectFrom("sessions").select((eb) => eb.fn.countAll<number>().as("n"))))!.n, 0);
+});
+
+test("a process with several handles keeps one settings listener, however the reads alternate, and moves it when the handle that listens is gone", async () => {
+  const db = await connectDb(join(SCRATCH, `identity-watch-${process.pid}.db`));
+  let on = 0, alive = true;
+  const handle = (): Db => new Proxy(db as unknown as Db, { get: (t, k) => {
+    if (k === "dialect") return "postgres";
+    if (k === "listen") return () => { on++; return { listening: () => alive, off: () => { on--; } }; };
+    const v = Reflect.get(t, k) as unknown;
+    return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(t) : v;
+  } });
+  const a = handle(), b = handle();
+  for (let k = 0; k < 4; k++) for (const h of [a, b]) await refreshReadIdentity(h).catch(() => {});
+  assert.equal(on, 1);
+  alive = false;
+  await refreshReadIdentity(b).catch(() => {});
+  assert.equal(on, 1, "the closed handle's listener is replaced, not added to");
 });

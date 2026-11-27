@@ -6,19 +6,25 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fillHashesSync, fillTextRefs, bulkWritesSync } from "./db/sqlite-backfill.ts";
-import { BOOKKEEPING_COLUMNS, liveSql } from "./live.ts";
-import { planChangesSql } from "./core/plan-changes.ts";
+import "./trigger-sources.ts";
+import { BOOKKEEPING_COLUMNS, liveSql } from "./db/live.ts";
+import { planChangesSql } from "./db/plan-triggers.ts";
 import { JEV_USD_PER_INPUT_TOKEN } from "./prompts/index.ts";
 import { JEV_NEEDS_DECISION_YES, JEV_SECURITY_YES } from "./classify/parse.ts";
 import { envVar } from "./env.ts";
 import { isLockTimeout } from "./db/errors.ts";
-import { NO_CI_SAMPLE, NO_CI_SQL, noCiFrom } from "./merge/no-ci.ts";
+import { newDbSeed } from "./db/role.ts";
+import { NO_CI_SAMPLE, noCiFrom } from "./merge/no-ci.ts";
 import { fixupEditable } from "./fixup/patch.ts";
 import { MENTION_KEY, SLUGS_KEY, namesOf, parseSlugs } from "./github/slugs.ts";
 import { SIM_THRESHOLD } from "./dupes/scan.ts";
 import { splitStageTripsSqlite } from "./db/trip-split.ts";
 import { retireFixAttemptsSqlite } from "./db/fix-retire.ts";
 import { featuresRepoOnlySqlite } from "./db/feature-repo-only.ts";
+import { holdsToItemsSqlite } from "./db/holds-to-items.ts";
+import { backfillRefusalsSqlite } from "./db/refused-runs.ts";
+import { chatBackfillSqlite } from "./db/chat-backfill.ts";
+import { ACTIVE_LEG_INDEX, ACTIVE_LEG_STATES, builtAfterCopy, copyStateSqlite, oneActiveLegSqlite } from "./db/state-copy.ts";
 
 export const DEFAULT_DB = join(homedir(), ".local/share/autocraft/mirror.db");
 
@@ -36,9 +42,8 @@ export function dataDir(env: NodeJS.ProcessEnv = process.env): string {
   return envVar("DATA_DIR", env) || dirname(dbPath(env));
 }
 
-// Columns added to existing tables after their first release. CREATE TABLE IF
-// NOT EXISTS leaves an older table as it was, so these are added here.
-export const ADDED_COLUMNS: [table: string, column: string, type: string][] = [
+// Columns added to existing tables before the module state (ADDED_COLUMNS joins the lists).
+const BASE_COLUMNS: [table: string, column: string, type: string][] = [
   ["opus_reviews", "base_ref", "TEXT"],
   ["fast_track", "weight", "INTEGER NOT NULL DEFAULT 5"],
   ["items", "reactions_count", "INTEGER"],
@@ -205,6 +210,10 @@ export const ADDED_COLUMNS: [table: string, column: string, type: string][] = [
   ["agent_runs", "user_login", "TEXT"],
   ["agent_runs", "harness", "TEXT"],
   ["agent_runs", "reported_model", "TEXT"],
+  // The remote call a Task Runner's lease ran (one call has a run per lease), and, for a lease the model's safety filter declined,
+  // what became of the call: `retried` (sent to another Task Runner or tier) or `failed` (nothing else could take it).
+  ["agent_runs", "call_id", "INTEGER"],
+  ["agent_runs", "refusal", "TEXT"],
   ["mcp_tokens", "can_run", "INTEGER NOT NULL DEFAULT 0"],
   ["mcp_tokens", "idle_claim_at", "INTEGER"],
   ["mcp_tokens", "idle_tiers", "TEXT"],
@@ -315,6 +324,13 @@ export const ADDED_COLUMNS: [table: string, column: string, type: string][] = [
   // A call a model's safety filter declined: its retry elsewhere, and the runner token it is not offered to again.
   ["remote_calls", "refusals", "INTEGER NOT NULL DEFAULT 0"],
   ["remote_calls", "refused_token", "INTEGER"],
+  // A give-back after a local setup failure: the short wait before the same login may take it again, and how many got it.
+  ["remote_calls", "release_wait_ms", "INTEGER"],
+  ["remote_calls", "setup_retries", "INTEGER NOT NULL DEFAULT 0"],
+  // A lease whose time limit is cut to the room its Task Runner's harness login had before its refresh (src/remote/calls.ts LOGIN_CUT_MIN_MS); null: the call's own timeout_ms.
+  ["remote_calls", "lease_timeout_ms", "INTEGER"],
+  // When a Task Runner's harness login renews, as its latest claim that left calls for want of that login's room told it; null after a claim with room.
+  ["remote_helpers", "login_renews_at", "INTEGER"],
   // The login whose conversation message the reply that wrote the choices answered.
   ["decision_choices", "asked_by", "TEXT"],
   // Build pod placement and capacity (src/build/pods.ts, src/build/sizing.ts).
@@ -340,14 +356,37 @@ export const ADDED_COLUMNS: [table: string, column: string, type: string][] = [
   ["opus_reviews", "workflow", "TEXT"],
   // The step a maintainer workflow is at, recorded by its advance pass (src/workflow/advance.ts).
   ["item_workflows", "step", "TEXT"],
+  // The PR an implement workflow works on, written by linkWorkflows (src/data/workflow/link.ts).
+  ["item_workflows", "pr_number", "INTEGER"],
+  // How often a workflow row was written, and the PR head a person accepted (src/core/evidence.ts acceptedHeads).
+  ["item_workflows", "version", "INTEGER NOT NULL DEFAULT 0"],
+  ["item_workflows", "accepted_head", "TEXT"],
+  // Why a merge leg ended, as a code with what it names (src/core/codes.ts StopCode).
+  ["preapprovals", "reason_code", "TEXT"],
+  ["preapprovals", "reason_params", "TEXT"],
+  // A review a person asked for of a PR that merges without one, and when the question an answer is for was asked.
+  ["item_workflows", "review_asked_at", "TEXT"],
+  // A row the automatic merge rule started: the person whose answer last ran on it (src/workflow/asked.ts).
+  ["item_workflows", "taken_by", "TEXT"],
+  ["workflow_events", "seen_at", "TEXT"],
   // Why the token endpoint refused the login's refresh token ("<error>: <error_description>"), kept while the row is refresh-failed.
   ["user_tokens", "refresh_error", "TEXT"],
+  // The workflow a held follow-up issue belongs to and its merge approval when it was held (src/data/conversations/held.ts).
+  ["held_followups", "workflow_id", "INTEGER"],
+  ["held_followups", "approved_at", "TEXT"],
+  // How a person's close ends the item: completed | not-planned | duplicate <repo>#<n>; null: no reason given (src/act/index.ts).
+  ["workflow_actions", "close_as", "TEXT"],
+  // The chat conversation a turn belongs to: its item's main conversation (src/data/chat).
+  ["conversation_turns", "conversation_id", "INTEGER"],
 ];
 
 // Indexes on added columns: they can only be created once the column exists.
 // Covering indexes on the hash columns let the planner compare stored hashes without reading item rows.
 // The trigger clears the hashes of an item whose hashed fields were edited without bringing its own (sync does).
-export const ADDED_INDEXES = [
+const BASE_INDEXES = [
+  // The refused runs newest first (the Agents page's Refused filter), and the later leases of a refused run's call.
+  "CREATE INDEX IF NOT EXISTS main.agent_runs_refused ON agent_runs(id) WHERE refusal IS NOT NULL",
+  "CREATE INDEX IF NOT EXISTS main.agent_runs_call ON agent_runs(call_id, id) WHERE call_id IS NOT NULL",
   "CREATE INDEX IF NOT EXISTS main.workspaces_call ON workspaces(remote_call_id) WHERE remote_call_id IS NOT NULL",
   // Covers the claims' read of the queued remote calls (src/remote/calls.ts queuedCalls) and the room count, so neither walks the overflow pages of each row's bundle.
   // remote_calls_queued, the same index without the pick columns, stays while the previous release may still read it
@@ -366,6 +405,9 @@ export const ADDED_INDEXES = [
   "CREATE TRIGGER IF NOT EXISTS main.decisions_answered_role AFTER UPDATE OF answered_by ON decisions BEGIN UPDATE decisions SET answered_role = (SELECT role FROM access WHERE login = NEW.answered_by) WHERE id = NEW.id; END",
   "CREATE INDEX IF NOT EXISTS main.comments_mention ON comments(created_at) WHERE mentions_pipeline = 1",
   "CREATE INDEX IF NOT EXISTS main.comments_author_item ON comments(author, repo, number)",
+  // Operators' comments and conversation turns by login without letter case: the owner-statement candidates (src/data/conversations/statements.ts).
+  "CREATE INDEX IF NOT EXISTS main.comments_author_nocase ON comments(author COLLATE NOCASE)",
+  "CREATE INDEX IF NOT EXISTS main.conversation_turns_operator ON conversation_turns(login COLLATE NOCASE) WHERE kind = 'operator'",
   "CREATE INDEX IF NOT EXISTS main.dupe_carries_item ON dupe_carries(repo, number)",
   "CREATE INDEX IF NOT EXISTS main.classifications_alone ON classifications(at) WHERE classifier = 'haiku' AND input_hash IS NOT NULL",
   "CREATE INDEX IF NOT EXISTS main.jobs_step_repo ON jobs(step, repo, id)",
@@ -389,6 +431,70 @@ export const ADDED_INDEXES = [
     END`,
 ];
 
+// Columns of the module state that moved out of settings and of the set-based loaders (src/data/<module>). Old keys stay
+// next to the new ones: a re-keyed table keeps its old key columns until the code that reads them is gone.
+const STATE_COLUMNS: [table: string, column: string, type: string][] = [
+  // Webhook-first sync: delivery health, the backstop poll and GitHub's delivery list (src/mirror.ts pollReason).
+  ["sync_state", "webhook_at", "TEXT"],
+  ["sync_state", "webhook_started_at", "TEXT"],
+  ["sync_state", "polled_at", "TEXT"],
+  ["sync_state", "poll_missed_at", "TEXT"],
+  ["sync_state", "poll_missed", "TEXT"],
+  ["sync_state", "deliveries_checked_at", "TEXT"],
+  // How a Discord link was made: code (dashboard link code) or verify (the public /verify pages).
+  ["discord_links", "source", "TEXT NOT NULL DEFAULT 'code'"],
+  // Statements, round trips and database time of a job, and the effects (GitHub writes, model calls, builds) it made.
+  ["jobs", "db_statements", "INTEGER"],
+  ["jobs", "db_round_trips", "INTEGER"],
+  ["jobs", "db_ms", "INTEGER"],
+  ["jobs", "effects", "INTEGER"],
+  // A step's daily-limit reset (copied from limit_reset_at:<step>); limit_set 0: the row only records a reset and the step's default limit applies.
+  ["stage_limits", "reset_at", "TEXT"],
+  ["stage_limits", "limit_set", "INTEGER NOT NULL DEFAULT 1"],
+  // Duplicate groups keyed by their own id (`<repo>:dupegroup:<lowest member>`, the value decision_id holds), not by a decision.
+  ["dupe_groups", "id", "TEXT"],
+  ["dupe_group_items", "group_id", "TEXT"],
+  // The repo of a batch member, from its batch.
+  ["merge_batch_prs", "repo", "TEXT"],
+  // The lowest (repo, number) of a model call's items.
+  ["agent_runs", "first_repo", "TEXT"],
+  ["agent_runs", "first_number", "INTEGER"],
+  // A Task Runner's idle claim and machine, kept with its status row (copied from mcp_tokens).
+  ["remote_helpers", "idle_claim_at", "INTEGER"],
+  ["remote_helpers", "idle_tiers", "TEXT"],
+  ["remote_helpers", "idle_repos", "TEXT"],
+  ["remote_helpers", "machine", "TEXT"],
+  // A statement that is never a memory candidate: AutoCraft's own post.
+  ["owner_statements", "ignored", "INTEGER NOT NULL DEFAULT 0"],
+  // A workflow alert's workflow and recommendation time (decision_id `wf:<workflow_id>:<rec_at>`).
+  ["discord_alert_msgs", "workflow_id", "INTEGER"],
+  ["discord_alert_msgs", "rec_at", "TEXT"],
+];
+
+const STATE_INDEXES = [
+  "CREATE UNIQUE INDEX IF NOT EXISTS main.dupe_groups_id ON dupe_groups(id)",
+  "CREATE UNIQUE INDEX IF NOT EXISTS main.dupe_group_items_group ON dupe_group_items(group_id, number)",
+  "CREATE INDEX IF NOT EXISTS main.merge_batch_prs_item ON merge_batch_prs(repo, number, head_oid)",
+  "CREATE UNIQUE INDEX IF NOT EXISTS main.discord_alert_msgs_workflow ON discord_alert_msgs(user_hash, workflow_id, rec_at)",
+  "CREATE INDEX IF NOT EXISTS main.fixups_operator_fix ON fixups(operator_fix) WHERE operator_fix IS NOT NULL",
+  "CREATE INDEX IF NOT EXISTS main.ci_fixes_lint_task ON ci_fixes(lint_task) WHERE lint_task IS NOT NULL",
+  "CREATE INDEX IF NOT EXISTS main.conflict_merges_lint_task ON conflict_merges(lint_task) WHERE lint_task IS NOT NULL",
+  // The calls that ended lately (the live board's workers), and a repo's newest calls (the activity feed of one repo).
+  "CREATE INDEX IF NOT EXISTS main.agent_runs_ended ON agent_runs(ended_at)",
+  "CREATE INDEX IF NOT EXISTS main.agent_runs_first ON agent_runs(first_repo, started_at)",
+  // The implementation a PR belongs to.
+  "CREATE INDEX IF NOT EXISTS main.implementations_pr ON implementations(repo, pr_number) WHERE pr_number IS NOT NULL",
+  // The implement workflows linked to a PR.
+  "CREATE INDEX IF NOT EXISTS main.item_workflows_pr ON item_workflows(repo, pr_number) WHERE pr_number IS NOT NULL",
+  // One active pre-approved merge leg per PR: a second one is refused by the insert. Built after oneActiveLeg (src/db/state-copy.ts).
+  `CREATE UNIQUE INDEX IF NOT EXISTS main.${ACTIVE_LEG_INDEX} ON preapprovals(repo, number) WHERE state IN (${ACTIVE_LEG_STATES.map((s) => `'${s}'`).join(", ")})`,
+];
+
+// Columns added to existing tables after their first release. CREATE TABLE IF NOT EXISTS leaves an older table as it was, so these are added here.
+export const ADDED_COLUMNS: [table: string, column: string, type: string][] = [...BASE_COLUMNS, ...STATE_COLUMNS];
+// Indexes on added columns: they can only be created once the column exists.
+export const ADDED_INDEXES: string[] = [...BASE_INDEXES, ...STATE_INDEXES];
+
 // Columns removed after their first release.
 export const DROPPED_COLUMNS: [table: string, column: string][] = [["classifications", "topics"], ["classifications", "area"], ["mcp_tokens", "cooloff_until"]];
 
@@ -398,7 +504,7 @@ export const HISTORY_COPY_SQL = `INSERT INTO main.opus_review_history (repo, num
   WHERE NOT EXISTS (SELECT 1 FROM main.opus_review_history h WHERE h.repo = o.repo AND h.number = o.number AND h.head_oid = o.head_oid AND h.at = o.at)`;
 
 // Bump when migrateValues() or backfill() change what they do.
-const MIGRATION_VERSION = 21;
+const MIGRATION_VERSION = 23;
 
 // Rows written before their column existed.
 function backfill(db: DatabaseSync): void {
@@ -441,6 +547,9 @@ function backfill(db: DatabaseSync): void {
   splitRunnerTokens(db);
   retireFixAttemptsSqlite(db);
   featuresRepoOnlySqlite(db);
+  holdsToItemsSqlite(db);
+  backfillRefusalsSqlite(db);
+  chatBackfillSqlite(db);
   // Reviews made before snapshots existed count as having read everything up to now: no wave of re-reviews.
   const now = new Date().toISOString();
   db.prepare("UPDATE main.opus_reviews SET seen_at = ? WHERE seen_at IS NULL").run(now);
@@ -663,9 +772,11 @@ function ciFirst(db: DatabaseSync): void {
         reason = 'Upstream CI runs the full gate; the merge waits for it to be green.', summary = 'Upstream CI runs the full gate; the merge waits for it to be green.', finished_at = ?
         WHERE repo = ? AND number = ? AND head_sha = ?`);
       const stage = db.prepare("INSERT INTO main.stages (repo, number, stage, at, actor, note) VALUES (?, ?, 'verify-ci-enough', ?, 'verify', ?)");
+      // The latest checks of one repo, newest first: repoHasNoCi's reading (src/merge/no-ci.ts).
+      const latestChecks = db.prepare("SELECT overall FROM main.pr_checks WHERE repo = ? ORDER BY fetched_at DESC LIMIT ?");
       for (const v of db.prepare("SELECT repo, number, head_sha, head_task_id, base_task_id FROM main.verifications WHERE kind = 'tests' AND state IN ('planned', 'running')").all() as
         { repo: string; number: number; head_sha: string; head_task_id: number | null; base_task_id: number | null }[]) {
-        if (noCiFrom(db.prepare(NO_CI_SQL).all(v.repo, NO_CI_SAMPLE) as { overall: string | null }[])) continue;
+        if (noCiFrom(latestChecks.all(v.repo, NO_CI_SAMPLE) as { overall: string | null }[])) continue;
         for (const t of [v.head_task_id, v.base_task_id]) if (t !== null) cancel.run(at, at, t);
         settle.run(at, v.repo, v.number, v.head_sha);
         stage.run(v.repo, v.number, at, `ci-enough at ${v.head_sha.slice(0, 7)}: upstream CI is the check`);
@@ -803,24 +914,18 @@ export function connect(path: string = dbPath(), opts: { busyTimeoutMs?: number 
 /** Whether `e` is a lock wait that ran out (SQLITE_BUSY or Postgres 55P03): another connection held the write lock past the timeout. */
 export const isBusy = isLockTimeout;
 
-let newDbSeed: (() => string | undefined) | undefined;
-
-/**
- * Test hook: a SQLite file that does not exist yet starts as a copy of the file `seed()` names (a database migrated to
- * the current schema), so opening it takes the up-to-date path instead of migrating from nothing. Files that exist,
- * and `:memory:`, open as they are.
- */
-export function setNewDbSeed(seed: (() => string | undefined) | undefined): void {
-  newDbSeed = seed;
-}
-
 function open(path: string): DatabaseSync {
   mkdirSync(dirname(path), { recursive: true });
-  if (newDbSeed && path !== ":memory:" && !existsSync(path)) {
-    const from = newDbSeed();
+  const seed = newDbSeed();
+  if (seed && path !== ":memory:" && !existsSync(path)) {
+    const from = seed.file();
     if (from) copyFileSync(from, path);
   }
   const db = new DatabaseSync(path, { timeout: 30_000 });
+  if (seed && path === ":memory:") {
+    const bytes = seed.bytes();
+    if (bytes) db.deserialize(bytes);
+  }
   // WAL so the dashboard can read while a sync writes
   db.exec("PRAGMA journal_mode=WAL");
   // WAL needs no fsync per commit for consistency; a power cut can lose the last commits, not corrupt the file
@@ -838,7 +943,8 @@ function open(path: string): DatabaseSync {
   db.exec(schema);
   addColumns(db);
   dropColumns(db);
-  for (const ix of ADDED_INDEXES) db.exec(ix);
+  oneActiveLegSqlite(db);
+  for (const ix of ADDED_INDEXES) if (!builtAfterCopy(ix)) db.exec(ix);
   // The triggers are dropped and created again in one transaction: no write lands between, and a second process that
   // finished migrating first leaves them as they are.
   db.exec("BEGIN IMMEDIATE");
@@ -854,6 +960,8 @@ function open(path: string): DatabaseSync {
   }
   migrateValues(db);
   backfill(db);
+  copyStateSqlite(db);
+  for (const ix of ADDED_INDEXES) if (builtAfterCopy(ix)) db.exec(ix);
   buildSearchIndex(db);
   buildHashes(db);
   buildTextRefs(db);

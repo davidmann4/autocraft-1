@@ -22,11 +22,13 @@ const FAKE = resolve(dirname(fileURLToPath(import.meta.url)), "fake-runtime.mjs"
 
 let coord: FakeCoordinator;
 let n = 0;
+const loops: AbortController[] = [];
 before(async () => {
   coord = await startFakeCoordinator();
   coord.tarballs.set("/src/a.tgz", makeTarGz([{ name: "r-a/" }, { name: "r-a/f", data: "x" }]));
 });
 after(async () => {
+  for (const ac of loops) ac.abort();   // a failed test leaves its loop polling, which would keep the process alive
   await coord.close();
   rmSync(root, { recursive: true, force: true });
 });
@@ -39,6 +41,7 @@ function harness(over: Partial<ServeDeps> = {}, slots = 2) {
   const lines: string[] = [];
   const delays: number[] = [];
   const ac = new AbortController();
+  loops.push(ac);
   const deps: ServeDeps = {
     cfg,
     api: new WorkerApi(coord.url, coord.key),

@@ -7,8 +7,7 @@ import { trace, traceDetail } from "../src/dash/api/trace.ts";
 import { itemPage } from "../src/dash/api/item-page.ts";
 import type { Req } from "../src/dash/types.ts";
 import type { ItemTrace } from "../web/src/api/types.ts";
-import type { Db } from "../src/db/index.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb, type Db } from "./helpers/raw-db.ts";
 import { rowid } from "../src/db/kx.ts";
 
 const req = (n: number, query: Record<string, string> = {}, extra: Record<string, string> = {}): Req => ({
@@ -24,7 +23,7 @@ test("the trace lists every source of an item oldest first, with heads, a cursor
   await db.run(db.k.insertInto("settings").values({ key: "pipeline_login", value: "bot" }));
   await db.run(db.k.insertInto("comments").values({ repo: "photocraft", number: 7, id: "c1", kind: "comment", author: "dev", created_at: "2026-01-01T01:00:00Z", body: "please look", commit_oid: null }));
   await db.run(db.k.insertInto("plan_history").values({ repo: "photocraft", number: 7, head: H1, old_state: "reviewing", new_state: "verifying", wait: "CI", reasons: "[]", at: "2026-01-01T02:00:00Z" }));
-  const run = await insertRun(db, { jobId: null, step: "opus-review", stage: 5, promptId: "p", promptVersion: "1", provider: "claude", model: "opus", accountId: null, items: [{ repo: "photocraft", number: 7 }], prompt: "secret prompt" });
+  const run = await insertRun(db, { jobId: null, step: "opus-review", stage: 5, promptId: "p", promptVersion: "1", provider: "claude", model: "opus", items: [{ repo: "photocraft", number: 7 }], prompt: "secret prompt" });
   await db.run(db.k.updateTable("agent_runs").set({ started_at: "2026-01-01T03:00:00Z" }));
   await saveTools(db, run, [{ type: "assistant", message: { content: [{ type: "tool_use", id: "a", name: "Read", input: { file_path: "x" } }] } }]);
   await finishRun(db, run, { state: "done", output: "o", costUsd: 0.5 });
@@ -99,13 +98,16 @@ test("a viewer gets no staff-only post-merge fields and only the GitHub writes o
   assert.deepEqual(v.map((e) => [e.summary, e.actor.name]), [["Posted review", "AutoCraft"]]);
   assert.equal((await writesOf("maintainer")).length, 2, "a maintainer also sees the dashboard answer, not the operator-only access change");
   assert.equal((await writesOf("operator")).length, 3);
-  await db.run(db.k.insertInto("decisions").values({ id: "b1", kind: "merge", repo: null, number: null, items: JSON.stringify([{ repo: "photocraft", number: 7 }]), question: "Merge the batch?", options: "[]", asked_at: "2026-01-03T00:00:00Z" }));
-  assert.deepEqual(((await trace(db, req(7, { kinds: "decision" }))) as ItemTrace).events.map((e) => e.summary), ["Asked: Merge the batch?"], "a batch decision is found through decision_items");
-  await db.run(db.k.insertInto("decisions").values({ id: "b2", kind: "merge", repo: null, number: null, items: JSON.stringify([{ repo: "photocraft", number: 7 }, { repo: "pdfcraft", number: 1 }]), question: "Hidden batch?", options: "[]", asked_at: "2026-01-04T00:00:00Z" }));
-  const viewer = { ...req(7, { kinds: "decision" }), user: { login: "u", role: "viewer" as const, canWrite: async () => true, canRead: async (r: string) => r !== "pdfcraft" } };
-  await db.run(db.k.insertInto("repos").values({ name: "pdfcraft", visibility: "private" }).onConflict((oc) => oc.column("name").doUpdateSet({ visibility: "private" })));
-  assert.deepEqual(((await trace(db, viewer)) as ItemTrace).events.map((e) => e.summary), ["Asked: Merge the batch?"], "a batch touching a repo hidden from the viewer is left out");
-  assert.equal(((await trace(db, req(7, { kinds: "decision" }))) as ItemTrace).events.length, 2, "an operator sees both");
+  await db.run(db.k.insertInto("workflow_events").values([
+    { repo: "photocraft", number: 7, login: "admin", via: "dashboard", kind: "answered", line: "Merging when CI is green.", at: "2026-01-03T00:00:00Z" },
+    { repo: "pdfcraft", number: 7, login: "admin", via: "dashboard", kind: "answered", line: "another item", at: "2026-01-04T00:00:00Z" },
+  ]));
+  const answers = async (role: "viewer" | "maintainer") => ((await trace(db, { ...as(role), query: new URLSearchParams({ kinds: "decision" }) })) as ItemTrace).events.map((e) => e.summary);
+  assert.deepEqual(await answers("maintainer"), ["Merging when CI is green."]);
+  assert.deepEqual(await answers("viewer"), ["Answered"], "a viewer sees that it was answered, not the text");
+  await db.run(db.k.insertInto("workflow_events").values({ repo: "photocraft", number: 7, login: "admin", via: "cli", kind: "archived", line: "Merge? Answer: Take it.", at: "2026-01-02T00:00:00Z" }));
+  assert.deepEqual(await answers("maintainer"), ["Merge? Answer: Take it.", "Merging when CI is green."], "an archived answer shows at its own time");
+  assert.deepEqual(await answers("viewer"), ["Answered: Take it", "Answered"], "a viewer reads which answer it was, not the question");
   const f = (await trace(db, { ...as("viewer"), query: new URLSearchParams({ kinds: "review" }) })) as ItemTrace;
   assert.equal(f.events[0]!.head, "c".repeat(40));
 });
@@ -135,6 +137,23 @@ test("the activity pass skips a missing item, retries a failed one later and goe
   assert.deepEqual(state, { error: null, retry_at: null }, "a successful read clears the earlier failure");
 });
 
+test("an item whose activity cannot be stored is a failed attempt and the others of the pass are stored", async () => {
+  const db = await connectDb(":memory:");
+  await db.run(db.k.insertInto("items").values([1, 2, 3].map((n) => ({
+    repo: "photocraft", number: n, kind: "issue", state: "OPEN", author: "dev", created_at: "2026-01-01T00:00:00Z", updated_at: `2026-01-0${n}T00:00:00Z`, head_oid: null,
+  }))));
+  const client = { spent: 0, remaining: 5000, async query(_q: string, v: { number: number }) {
+    // Item 2's event has no time, which the table refuses.
+    return { repository: { issueOrPullRequest: { __typename: "Issue", issueTimeline: { nodes: [{ __typename: "LabeledEvent", id: `E${v.number}`, createdAt: v.number === 2 ? null : "2026-01-01T00:00:00Z" }] } } } };
+  } };
+  const now = new Date("2026-01-10T00:00:00Z");
+  assert.equal(await syncActivity(db, client, now), 3);
+  assert.deepEqual((await db.all(db.k.selectFrom("item_activity").select("id").orderBy("id"))).map((r) => r.id), ["E1", "E3"]);
+  const synced = await db.all(db.k.selectFrom("activity_sync").select(["number", "error", "retry_at"]).orderBy("number"));
+  assert.deepEqual(synced.map((r) => [Number(r.number), r.error !== null, r.retry_at !== null]), [[1, false, false], [2, true, true], [3, false, false]]);
+  assert.equal(await syncActivity(db, client, now), 0, "it waits for its retry time");
+});
+
 test("decision_items follows a decision that changes or goes away", async () => {
   const db = await connectDb(":memory:");
   await db.run(db.k.insertInto("decisions").values({ id: "d", kind: "merge", repo: "photocraft", number: null, items: null, question: "q", options: "[]", asked_at: "2026-01-01T00:00:00Z" }));
@@ -160,7 +179,7 @@ test("item history discloses only the reader's own-item calls and preserves unkn
     await db.prepare("INSERT INTO items (repo, number, kind, state, title, created_at, head_oid) VALUES ('photocraft', 7, 'pr', 'OPEN', 'Own item', '2026-01-01T00:00:00Z', ?)").run("a".repeat(40));
     await db.prepare("INSERT INTO repos (name, visibility) VALUES ('photocraft', 'public'), ('pdfcraft', 'private') ON CONFLICT (name) DO UPDATE SET visibility = excluded.visibility").run();
     const make = async (promptId: string, items: { repo: string; number: number }[], at: string, costUsd: number | null) => {
-      const id = await insertRun(db, { jobId: null, step: "opus-review", stage: 5, promptId, promptVersion: "1", provider: "claude", model: "opus", accountId: null, items, prompt: "private prompt" });
+      const id = await insertRun(db, { jobId: null, step: "opus-review", stage: 5, promptId, promptVersion: "1", provider: "claude", model: "opus", items, prompt: "private prompt" });
       await finishRun(db, id, { state: "done", output: "private output", costUsd });
       await db.prepare("UPDATE agent_runs SET started_at = ?, ended_at = ? WHERE id = ?").run(at, at, id);
       return id;

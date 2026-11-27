@@ -5,11 +5,11 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { after, describe, test } from "node:test";
-import { SCRATCH } from "./scratch.ts";
-import { connectDb } from "../src/db/open.ts";
 
 // Every user-local window, the hold included, at a fifth: a 25 s hold is 5 s, the full retry every second. Read on import.
 process.env.AUTOCRAFT_REMOTE_TIME_SCALE = "0.2";
+const { SCRATCH } = await import("./scratch.ts");
+const { connectDb } = await import("./helpers/raw-db.ts");
 const { addLogin } = await import("../src/access.ts");
 const { apiRoutes } = await import("../src/dash/api/index.ts");
 const { createToken } = await import("../src/dash/mcp/tokens.ts");
@@ -21,7 +21,6 @@ const { connect } = await import("../src/db.ts");
 const { CLAIM_RETRY_S, enqueueCall } = await import("../src/remote/calls.ts");
 const { ClaimWaits, Ticket } = await import("../src/remote/claim-wait.ts");
 const { setUserMaxCalls } = await import("../src/remote/max-calls.ts");
-const { setInferenceMode } = await import("../src/remote/mode.ts");
 const { ROUTES } = await import("../src/remote/protocol.ts");
 
 mkdirSync(SCRATCH, { recursive: true });
@@ -32,7 +31,6 @@ describe("long-polling claims", async () => {
   const file = join(dir, "t.db"), perms = join(dir, "perms.json");
   writeFileSync(perms, "{}");
   const db = await connectDb(file), remoteDb = await connectDb(file, { busyTimeoutMs: 100 }), other = await connectDb(file);
-  await setInferenceMode(db, "user-local", "test");
   const tokens: Record<string, { token: string; id: number }> = {};
   for (const login of ["bob", "carol", "dave", "erin", "frank"]) {
     await addLogin(db, "cli", login, "maintainer", null);
@@ -42,7 +40,7 @@ describe("long-polling claims", async () => {
   }
   const config = loadConfig({ AUTOCRAFT_DEV_AUTH: "1", AUTOCRAFT_LISTEN: "127.0.0.1:0", AUTOCRAFT_DB: file, AUTOCRAFT_DEV_PERMS: perms });
   const limiter = new RateLimiter(60, 3600_000);
-  const s = await startServer({ config, db, remoteDb, provider: new FakeProvider(perms), feedbackLimiter: limiter, routes: apiRoutes({ limiter }) });
+  const s = await startServer({ config, db, remoteDb, provider: new FakeProvider(perms), routes: apiRoutes() });
   let closed = false;
   after(async () => { if (!closed) await s.close(); for (const c of [other, remoteDb, db]) await c.close(); });
 
@@ -80,12 +78,12 @@ describe("long-polling claims", async () => {
   test("a held claim with nothing to take answers empty at its deadline and records its helper as idle", async () => {
     const r = claim("bob", { wait: 2 });
     await sleep(100);
-    await db.prepare("UPDATE mcp_tokens SET idle_claim_at = NULL WHERE id = ?").run(tokens.bob!.id);
+    await db.prepare("UPDATE remote_helpers SET idle_claim_at = NULL WHERE token_id = ?").run(tokens.bob!.id);
     const { reply, held } = await r;
     assert.equal(reply.lease, null);
     assert.equal(reply.retryAfter, 0.2);
     assert.ok(held >= 350 && held < 1500, `held ${held} ms of a 400 ms hold`);
-    assert.ok((await db.prepare("SELECT idle_claim_at FROM mcp_tokens WHERE id = ?").get(tokens.bob!.id) as { idle_claim_at: number | null }).idle_claim_at !== null);
+    assert.ok((await db.prepare("SELECT idle_claim_at FROM remote_helpers WHERE token_id = ?").get(tokens.bob!.id) as { idle_claim_at: number | null }).idle_claim_at !== null);
   });
 
   test("a protocol 3 claim is answered at once, whatever it sends as wait", async () => {

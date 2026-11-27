@@ -1,22 +1,19 @@
-// The item's history, oldest first: what people told AutoCraft (workflow events) beside the trace. By default the trace shows
-// people, reviews, questions and GitHub writes; "Every step" adds each model call, tool run, job and plan change. Each trace row
-// opens to its detail (TraceEventBody).
-import { useMemo, useState } from "react";
+// The item's Events tab, oldest first: what people told AutoCraft (workflow events) beside every trace event: GitHub activity,
+// model calls, tool runs, jobs, plan changes, reviews, questions and writes. Each trace row opens to its detail (TraceEventBody);
+// `focus` opens one row and scrolls to it.
+import { useEffect, useMemo, useState } from "react";
 import { ChatTextIcon } from "@phosphor-icons/react";
 import { t } from "../../../../../src/i18n/index.ts";
 import { useQuery } from "../../../api/client";
-import type { ItemKind, MaintainEvent, TraceEvent, TraceKind } from "../../../api/types";
+import type { ItemKind, MaintainEvent } from "../../../api/types";
+import { historyRows } from "../../../lib/history";
 import { TRACE_KIND, eventCost } from "../../../lib/trace";
 import { ErrorLine } from "../../../ui/atoms/ErrorLine";
 import { TimeAgo } from "../../../ui/atoms/TimeAgo";
-import { Segmented } from "../../../ui/molecules/Segmented";
 import { TimelineEvent } from "../../../ui/molecules/TimelineEvent";
-import { TraceEventBody } from "../../item/TraceEventBody";
+import { TraceEventBody } from "../../activity/TraceEventBody";
 
-const MAIN: ReadonlySet<TraceKind> = new Set(["github", "review", "decision", "write", "conversation"]);
 const VIA: Record<MaintainEvent["via"], string> = { github: "GitHub", discord: "Discord", agent: "agent", dashboard: "AutoCraft", cli: "CLI" };
-
-type Row = { t: "said"; at: string; e: MaintainEvent } | { t: "trace"; at: string; e: TraceEvent };
 
 function Said({ e }: { e: MaintainEvent }) {
   return (
@@ -36,19 +33,24 @@ function Said({ e }: { e: MaintainEvent }) {
   );
 }
 
-export function History({ repo, number, kind, said }: { repo: string; number: number; kind: ItemKind; said: MaintainEvent[] }) {
-  const [all, setAll] = useState<"main" | "all">("main");
-  const [open, setOpen] = useState<Set<string>>(new Set());
+/** `focusKey` changes on every request to show `focus`, so asking for the same event again scrolls to it again. */
+export function History({ repo, number, kind, said, focus, focusKey }: { repo: string; number: number; kind: ItemKind; said: MaintainEvent[]; focus?: string | null; focusKey?: number }) {
+  const [open, setOpen] = useState<Set<string>>(new Set(focus ? [focus] : []));
   const { data, error } = useQuery(`item-trace:v2:${repo}#${number}`, async (a) => {
     const r = await a.itemTrace(repo, number, { limit: 300 });
     if ("unchanged" in r) throw new Error("unexpected empty answer");
     return r;
   });
-  const rows = useMemo(() => {
-    const trace = (data?.events ?? []).filter((e) => all === "all" || MAIN.has(e.kind) || e.actor.type === "person");
-    const out: Row[] = [...said.map((e) => ({ t: "said" as const, at: e.at, e })), ...trace.map((e) => ({ t: "trace" as const, at: e.at, e }))];
-    return out.sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0));
-  }, [data, said, all]);
+  const rows = useMemo(() => historyRows(said, data?.events ?? []), [data, said]);
+  const loaded = !!data;
+  // Live refetches leave the reader where they are: only a new request (or the first load) scrolls.
+  useEffect(() => {
+    if (!focus || !loaded) return;
+    setOpen((s) => new Set(s).add(focus));
+    const row = document.getElementById(`event-${focus}`);
+    row?.scrollIntoView({ block: "center" });
+    row?.querySelector("button")?.focus({ preventScroll: true });
+  }, [focus, focusKey, loaded]);
   const toggle = (id: string) => setOpen((s) => {
     const n = new Set(s);
     if (n.has(id)) n.delete(id);
@@ -56,19 +58,12 @@ export function History({ repo, number, kind, said }: { repo: string; number: nu
     return n;
   });
   return (
-    <div className="flex flex-col gap-2 px-4 pb-4">
-      <Segmented
-        label={t("History shows")}
-        value={all}
-        onChange={setAll}
-        className="w-fit max-md:[&>button]:h-11"
-        options={[{ value: "main", label: t("Main events") }, { value: "all", label: t("Every step") }]}
-      />
+    <div className="flex flex-col gap-2">
       <ErrorLine error={error?.message} />
       {!data && !error && <p className="text-sm text-ink/70" role="status">{t("Loading…")}</p>}
       {data && rows.length === 0 && <p className="text-sm text-ink/70">{t("Nothing yet.")}</p>}
       {rows.length > 0 && (
-        <ol aria-label={t("History, oldest first")} className="rounded-lg border border-line bg-panel">
+        <ol aria-label={t("Events, oldest first")} className="rounded-lg border border-line bg-panel">
           {rows.map((r) =>
             r.t === "said" ? (
               <Said key={`w${r.e.id}`} e={r.e} />

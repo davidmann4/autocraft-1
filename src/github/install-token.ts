@@ -4,7 +4,6 @@
 // The private key is read here, in the process that mints, and goes no further:
 // children get only the 1 h installation token, through their environment.
 import type { AppSecrets } from "../dash/server/config.ts";
-import { envVar } from "../env.ts";
 import { openAppKeys, processAppKeys } from "./app-keys.ts";
 import { AppError, appJwt, call, GITHUB_API, type AppDeps } from "./app.ts";
 

@@ -23,12 +23,14 @@
 // while seeding also copies in the gate's craft-fonts / craft-i18n checkouts and sets the checkout's mtimes.
 import { spawn } from "node:child_process";
 import type { Db } from "../db/index.ts";
-import * as kx from "../db/kx.ts";
 import { exec, fixupDir, GIT_ENV, gitDirEnv, Git, HARDENING } from "../fixup/git.ts";
 import { ownerOf } from "../owners.ts";
+import { failStuckCalls, loadEnvPass, loadWorkspaces, loadWorkspacePass, patchWorkspaces } from "../data/build/index.ts";
+import type { WorkspacePass } from "../data/build/index.ts";
+import { envSettings } from "./envs.ts";
 import { KubeError, type KPod, type KubeApi } from "./kube-api.ts";
 import type { LauncherDeps } from "./launcher.ts";
-import { CREATE_TRIES, ciCheckout, LIST_GRACE_MS, PENDING_LIMIT_MS, PULL_LIMIT_MS, PULL_REASONS, quantity, settingsOf, STUCK_MS, type KubeSettings } from "./pods.ts";
+import { CREATE_TRIES, ciCheckout, LIST_GRACE_MS, PENDING_LIMIT_MS, PULL_LIMIT_MS, PULL_REASONS, quantity, STUCK_MS, type KubeSettings } from "./pods.ts";
 import { repoWarmTarget } from "./sizing.ts";
 import { warmKeyOf } from "./tasks.ts";
 import { COPY_MARK_FILE, type WarmTarget } from "./warm-mount.ts";
@@ -39,7 +41,8 @@ import { fetchPodKept, workspaceEnvSelector, workspaceName, workspacePodSpec, wo
 import { resolveGate, resolveI18nRev } from "../worker/gate.ts";
 import { EXT_ARCHIVE_MAX_BYTES, gateStepEnv } from "../worker/environment.ts";
 import { changedFrom, parseLsTree, type CopyMark } from "../worker/warm-copy.ts";
-import { describeHeader, execInWorkspace, execWs, getCheckpoint, getWorkspace, limitsOf, LIVE_STATES, moveWorkspace, POD_STATES, RESUME_TRIES, resumeWorkspace, WORKSPACE_COLUMNS, type WorkspaceRow, type WorkspaceStateName, type WsCallResult } from "./workspaces.ts";
+import { describeHeader, execInWorkspace, execWs, getCheckpoint, getWorkspace, limitsOf, LIVE_STATES, moveWorkspace, POD_STATES, RESUME_TRIES, resumeWorkspace, type WorkspaceRow, type WorkspaceStateName, type WsCallResult } from "./workspaces.ts";
+import { effect } from "../db/effects.ts";
 
 export const SEED_LIMIT_MS = 10 * 60_000;
 export const IDLE_PARK_MS = 30 * 60_000;
@@ -115,15 +118,11 @@ export class WorkspaceState {
  * session relay's own, taken over when its job resumes. Returns the rows failed.
  */
 export async function sweepStuckCalls(db: Db, now: number): Promise<number> {
-  const at = new Date(now).toISOString();
-  const rows = await db.all(db.k.updateTable("workspace_calls")
-    .set({ state: "failed", result: JSON.stringify({ text: "failed: the process running this call ended before it finished, so its outcome is unknown; check the workspace and call it again", isError: true }), finished_at: at })
-    .where("state", "=", "running").where("deadline_at", "is not", null).where("deadline_at", "<", at).returning("id"));
-  return rows.length;
+  return await failStuckCalls(db, new Date(now).toISOString());
 }
 
-type EnvRow = { id: string; enabled: number; settings: string | null };
-type Ctx = { d: LauncherDeps; state: WorkspaceState; api: KubeApi; env: EnvRow; s: KubeSettings; now: () => number };
+type EnvRow = { id: string; enabled: boolean };
+type Ctx = { d: LauncherDeps; state: WorkspaceState; api: KubeApi; env: EnvRow; s: KubeSettings; now: () => number; pass: WorkspacePass };
 
 const clean = (s: string | undefined): string => (s ?? "").replace(/[\u0000-\u001f\u007f]+/g, " ").trim().slice(0, 300);
 const errText = (e: unknown): string => clean(e instanceof Error ? e.message : String(e));
@@ -143,26 +142,32 @@ export async function workspacePass(d: LauncherDeps, state: WorkspaceState): Pro
   }
   const api = d.api;
   if (!api) return;
-  const envs = await d.db.all(d.db.k.selectFrom("build_envs").select(["id", "enabled", "settings"]).where("kind", "=", "kubernetes").orderBy("id"));
+  const envs = (await loadEnvPass(d.db, "workspace")).envs;
   for (const env of envs) {
-    const s = settingsOf(env.settings);
+    const s = envSettings(env);
     if (s.warmWriter) continue;
     try {
-      await envPass({ d, state, api, env, s, now: d.now ?? Date.now });
+      await envPass({ d, state, api, env, s, now: d.now ?? Date.now, pass: { rows: [], calls: new Map(), bound: new Map() } });
     } catch (e) {
       d.log(`workspace launcher: ${env.id}: ${(e as Error).stack ?? e}`);
     }
   }
 }
 
-const liveRows = async (c: Ctx) =>
-  await c.d.db.all(c.d.db.k.selectFrom("workspaces").select(WORKSPACE_COLUMNS).where("env_id", "=", c.env.id).where("state", "in", LIVE_STATES).orderBy("id"));
+const liveRows = async (c: Ctx): Promise<WorkspaceRow[]> =>
+  [...(await loadWorkspaces(c.d.db, { env: c.env.id, states: LIVE_STATES })).values()].sort((a, b) => a.id - b.id);
+
+/** Patches a row only while columns of it still hold what the pass read. */
+async function patchIf(c: Ctx, w: WorkspaceRow, whereState: WorkspaceStateName[], where: Partial<Pick<WorkspaceRow, "pvc" | "pod" | "checkpoint_error">>, set: Partial<Omit<WorkspaceRow, "id">>): Promise<boolean> {
+  return await patchWorkspaces(c.d.db, [{ id: w.id, whereState, where, set }]) > 0;
+}
 
 async function envPass(c: Ctx): Promise<void> {
   const { api, s } = c;
   const ns = s.namespace;
   const [pods, pvcs] = await Promise.all([api.listPods(ns, workspaceEnvSelector(c.env.id)), api.listPvcs(ns, workspaceEnvSelector(c.env.id))]);
-  for (const w of await liveRows(c)) if (!c.state.busy.has(w.id)) await advance(c, w, pods);
+  c.pass = await loadWorkspacePass(c.d.db, c.env.id, c.now());
+  for (const w of c.pass.rows) if (!c.state.busy.has(w.id)) await advance(c, w, pods);
 
   const back = c.state.backoff.get(c.env.id);
   if (c.env.enabled && !(back && back > c.now())) {
@@ -306,8 +311,7 @@ async function prepare(c: Ctx, id: number): Promise<void> {
       env: gate ? gateStepEnv(gate, rev) : {}, craftFontsRef: gate?.craftFontsRef ?? null, craftI18nRev: rev, cacheVersion: gate?.cacheVersion ?? null,
       cargoLock: lock.code === 0 ? sha256(lock.stdout) : null,
     };
-    await db.run(db.k.updateTable("workspaces").set({ prepared: JSON.stringify(p), error: null, updated_at: new Date(c.now()).toISOString() })
-      .where("id", "=", id).where("state", "=", "requested").where("prepared", "is", null));
+    await patchWorkspaces(db, [{ id, whereState: ["requested"], set: { prepared: JSON.stringify(p), error: null, updated_at: new Date(c.now()).toISOString() } }]);
     c.state.prepareTries.delete(id);
   } catch (e) {
     const tries = (c.state.prepareTries.get(id)?.tries ?? 0) + 1;
@@ -353,9 +357,7 @@ async function coldInstead(c: Ctx, w: WorkspaceRow, warm: WorkspaceWarm, why: st
   const name = workspaceName(w.id, c.now().toString(36));
   const next: WorkspaceWarm = { ...warm, use: null, why: `node ${warm.use?.node} had no room for it (${why})` };
   const at = new Date(c.now()).toISOString();
-  const r = await c.d.db.run(c.d.db.k.updateTable("workspaces").set({ pod: name, warm: JSON.stringify(next), warm_commit: null, create_tries: 0, pod_created_at: null, state_at: at, updated_at: at })
-    .where("id", "=", w.id).where("state", "=", "starting").where("pod", "=", w.pod));
-  if (!r.changes) return;
+  if (!await patchIf(c, w, ["starting"], { pod: w.pod }, { pod: name, warm: JSON.stringify(next), warm_commit: null, create_tries: 0, pod_created_at: null, state_at: at, updated_at: at })) return;
   c.d.log(`workspace launcher: workspace ${w.id}: ${next.why}; starting cold on another node`);
   if (w.pod) await c.api.deletePod(c.s.namespace, w.pod).catch(() => {});
 }
@@ -379,7 +381,7 @@ async function create(c: Ctx, row: WorkspaceRow, images: Images): Promise<boolea
   const ns = c.s.namespace;
   const tries = w.create_tries + 1;
   const at = new Date(c.now()).toISOString();
-  await db.run(db.k.updateTable("workspaces").set({ create_tries: tries, pod_created_at: at, updated_at: at }).where("id", "=", w.id).where("state", "=", "starting"));
+  await patchWorkspaces(db, [{ id: w.id, whereState: ["starting"], set: { create_tries: tries, pod_created_at: at, updated_at: at } }]);
   // A create that answered with an error may still have made the object; the name is the workspace's own.
   const conflict = (e: unknown) => e instanceof KubeError && e.status === 409;
   try {
@@ -392,6 +394,7 @@ async function create(c: Ctx, row: WorkspaceRow, images: Images): Promise<boolea
     await c.api.createPvc(ns, workspacePvcSpec(c.s, c.env.id, w.id, w.pvc ?? undefined, warmOf(w)?.storageBytes)).catch((e: unknown) => {
       if (!conflict(e)) throw e;
     });
+    effect("build-launch");
     await c.api.createPod(ns, workspacePodSpec({ s: c.s, envId: c.env.id, id: w.id, ...images, limits: limitsOf(w), pod: w.pod ?? undefined, pvc: w.pvc ?? undefined, ci: ciLayoutOf(w) ?? undefined })).catch(async (e: unknown) => {
       if (!conflict(e)) throw e;
       const old = (await c.api.listPods(ns, workspaceSelector(w.id))).find((p) => p.metadata.name === w.pod);
@@ -409,7 +412,7 @@ async function create(c: Ctx, row: WorkspaceRow, images: Images): Promise<boolea
     c.state.backoff.set(c.env.id, c.now() + CREATE_BACKOFF_MS);
     c.d.log(`workspace launcher: workspace ${w.id}: ${why} (try ${tries} of ${CREATE_TRIES})`);
     if (tries >= CREATE_TRIES) await giveUp(c, w, why);
-    else await db.run(db.k.updateTable("workspaces").set({ error: why.slice(0, 300) }).where("id", "=", w.id).where("state", "=", "starting"));
+    else await patchWorkspaces(db, [{ id: w.id, whereState: ["starting"], set: { error: why.slice(0, 300) } }]);
     return false;
   }
 }
@@ -423,7 +426,7 @@ async function advance(c: Ctx, w: WorkspaceRow, pods: KPod[]): Promise<void> {
   const now = c.now();
   const age = now - Date.parse(w.state_at);
   if (w.state === "parked") {
-    const bound = w.resume_tries < RESUME_TRIES ? await boundCall(c, w) : null;
+    const bound = w.resume_tries < RESUME_TRIES ? boundCall(c, w) : null;
     if (bound) {
       if (await resumeWorkspace(c.d.db, w.id, now)) c.d.log(`workspace launcher: workspace ${w.id} resuming for call ${w.remote_call_id} (${bound})${w.pvc ? " on its volume" : "; rebuilding from base and checkpoint"}`);
       return;
@@ -432,9 +435,7 @@ async function advance(c: Ctx, w: WorkspaceRow, pods: KPod[]): Promise<void> {
     // A volume whose last checkpoint failed holds the only copy of the latest work, so it stays (the row's error says why).
     if (w.pvc && age > PARKED_VOLUME_MS && w.checkpoint_error === null) {
       // The row lets go of the volume first, so a resume meanwhile starts on a new one instead of taking this one.
-      const r = await c.d.db.run(c.d.db.k.updateTable("workspaces").set({ pvc: null, node: null, updated_at: new Date(now).toISOString() })
-        .where("id", "=", w.id).where("state", "=", "parked").where("pvc", "=", w.pvc).where("checkpoint_error", "is", null));
-      if (!r.changes) return;
+      if (!await patchIf(c, w, ["parked"], { pvc: w.pvc, checkpoint_error: null }, { pvc: null, node: null, updated_at: new Date(now).toISOString() })) return;
       await c.api.deletePvc(c.s.namespace, w.pvc);
       c.d.log(`workspace launcher: workspace ${w.id}: parked volume deleted after ${PARKED_VOLUME_MS / 60_000} min; the checkpoint stays`);
     } else if (!w.pvc && age > PARKED_END_MS) {
@@ -509,56 +510,42 @@ async function advance(c: Ctx, w: WorkspaceRow, pods: KPod[]): Promise<void> {
   }
   // ready
   const lastCall = Math.max(Date.parse(w.state_at), w.last_call_at ? Date.parse(w.last_call_at) : 0);
-  const bound = await boundCall(c, w);
+  const bound = boundCall(c, w);
   if (bound === "leased" && now - lastCall > LEASE_TOUCH_MS) {
     const at = new Date(now).toISOString();
-    await c.d.db.run(c.d.db.k.updateTable("workspaces").set({ last_call_at: at, updated_at: at }).where("id", "=", w.id).where("state", "=", "ready"));
-  } else if (!bound && now - lastCall > IDLE_PARK_MS && !await callRunning(c, w.id, now) && !await backgroundRunning(c, w, now)) return background(c, w.id, () => park(c, w.id));
+    await patchWorkspaces(c.d.db, [{ id: w.id, whereState: ["ready"], set: { last_call_at: at, updated_at: at } }]);
+  } else if (!bound && now - lastCall > IDLE_PARK_MS && !callRunning(c, w.id, now) && !backgroundRunning(c, w, now)) return background(c, w.id, () => park(c, w.id));
   const tried = c.state.checkpointTried.get(w.id) ?? 0;
   const lastCheckpoint = Math.max(Date.parse(w.state_at), w.checkpoint_at ? Date.parse(w.checkpoint_at) : 0, tried);
   // A call back in the queue after its session did work: the next session's prompt states the checkpoint's changes.
   const requeued = bound === "queued" && w.last_call_at !== null && (w.checkpoint_at === null || w.last_call_at > w.checkpoint_at) && now - tried > REQUEUE_CHECKPOINT_MS;
   // A checkpoint waits for a dependency fetch, which rewrites Cargo.lock: the next pass takes it.
-  if ((now - lastCheckpoint > CHECKPOINT_EVERY_MS || requeued) && !await callRunning(c, w.id, now, "fetch_dependencies")) {
+  if ((now - lastCheckpoint > CHECKPOINT_EVERY_MS || requeued) && !callRunning(c, w.id, now, "fetch_dependencies")) {
     c.state.checkpointTried.set(w.id, now);
     background(c, w.id, async () => void await checkpoint(c, w.id));
   }
 }
 
 /** Whether a call (of `tool`, when given) is running in the workspace within its time limit (plus CALL_GRACE_MS); a row past it no longer holds the pod. */
-async function callRunning(c: Ctx, id: number, now: number, tool?: string): Promise<boolean> {
-  const { db } = c.d;
-  let q = db.k.selectFrom("workspace_calls").select(["id"]).where("workspace_id", "=", id).where("state", "=", "running")
-    .where("deadline_at", ">", new Date(now).toISOString());
-  if (tool) q = q.where("tool", "=", tool);
-  return !!await db.get(q.limit(1));
+function callRunning(c: Ctx, id: number, now: number, tool?: string): boolean {
+  const at = new Date(now).toISOString();
+  return !!c.pass.calls.get(id)?.running.some((r) => r.deadlineAt > at && (!tool || r.tool === tool));
 }
 
 /** The state of the remote call bound to the workspace while it is queued or leased (its session may still make tool calls), else null. */
-async function boundCall(c: Ctx, w: WorkspaceRow): Promise<"queued" | "leased" | null> {
-  if (w.remote_call_id === null) return null;
-  const { db } = c.d;
-  const r = await db.get(db.k.selectFrom("remote_calls").select("state").where("id", "=", w.remote_call_id).where("state", "in", ["queued", "leased"]));
-  return r ? (r.state as "queued" | "leased") : null;
+function boundCall(c: Ctx, w: WorkspaceRow): "queued" | "leased" | null {
+  return c.pass.bound.get(w.id) ?? null;
 }
 
 /**
  * Whether a background shell command the session started in the current pod may still run, by the session's bookkeeping
  * on its rows (WorkspaceSession): started, not seen ending by a shell_status or shell_kill, and within its own limit.
  */
-async function backgroundRunning(c: Ctx, w: WorkspaceRow, now: number): Promise<boolean> {
-  const { db } = c.d;
-  const rows = await db.all(db.k.selectFrom("workspace_calls")
-    .select((eb) => {
-      const res = eb.case().when(kx.jsonValid(db, "result")).then(eb.ref("result")).end();
-      return ["id", "tool", "started_at", kx.jsonNum(db, res, "$.acct.bg").as("bg"), kx.jsonNum(db, res, "$.acct.limit").as("lim"),
-        kx.jsonNum(db, res, "$.acct.ref").as("ref"), kx.jsonNum(db, res, "$.acct.ended").as("ended")] as const;
-    })
-    .where("workspace_id", "=", w.id).where("tool", "in", ["shell", "shell_status", "shell_kill"]).where("state", "=", "done")
-    .where("started_at", ">=", w.pod_created_at ?? w.state_at));
-  const ended = new Set(rows.filter((r) => r.tool !== "shell" && Number(r.ended) === 1).map((r) => Number(r.ref)));
-  return rows.some((r) => r.tool === "shell" && Number(r.bg) === 1 && !ended.has(Number(r.id)) && r.started_at !== null
-    && Date.parse(r.started_at) + Number(r.lim ?? 0) * 1000 + BACKGROUND_GRACE_MS > now);
+function backgroundRunning(c: Ctx, w: WorkspaceRow, now: number): boolean {
+  const rows = c.pass.calls.get(w.id)?.background ?? [];
+  const ended = new Set(rows.filter((r) => r.tool !== "shell" && r.ended === 1).map((r) => r.ref));
+  return rows.some((r) => r.tool === "shell" && r.bg === 1 && !ended.has(r.id) && r.startedAt !== null
+    && Date.parse(r.startedAt) + (r.limit ?? 0) * 1000 + BACKGROUND_GRACE_MS > now);
 }
 
 /**
@@ -589,9 +576,7 @@ async function freshVolume(c: Ctx, w: WorkspaceRow, why: string): Promise<Worksp
   const name = workspaceName(w.id, c.now().toString(36));
   const at = new Date(c.now()).toISOString();
   const lost = lostWarm(w, why);
-  const r = await c.d.db.run(c.d.db.k.updateTable("workspaces").set({ pvc: name, node: null, volume_fresh: 1, updated_at: at, ...lost })
-    .where("id", "=", w.id).where("state", "=", "starting").where("pvc", "=", w.pvc));
-  if (!r.changes) throw new Error("the workspace changed while its volume was replaced");
+  if (!await patchIf(c, w, ["starting"], { pvc: w.pvc }, { pvc: name, node: null, volume_fresh: 1, updated_at: at, ...lost })) throw new Error("the workspace changed while its volume was replaced");
   c.d.log(`workspace launcher: workspace ${w.id}: ${why}; starting on a new volume rebuilt from base and ${w.checkpoint_at ? `the checkpoint of ${w.checkpoint_at}` : "no checkpoint"}${w.checkpoint_error ? ` (the last checkpoint failed: ${w.checkpoint_error})` : ""}`);
   return { ...w, pvc: name, node: null, volume_fresh: 1, ...lost };
 }
@@ -600,9 +585,7 @@ async function freshVolume(c: Ctx, w: WorkspaceRow, why: string): Promise<Worksp
 async function dropVolume(c: Ctx, w: WorkspaceRow, why: string): Promise<void> {
   const name = workspaceName(w.id, c.now().toString(36));
   const at = new Date(c.now()).toISOString();
-  const r = await c.d.db.run(c.d.db.k.updateTable("workspaces").set({ pod: name, pvc: name, node: null, volume_fresh: 1, create_tries: 0, pod_created_at: null, updated_at: at, ...lostWarm(w, why) })
-    .where("id", "=", w.id).where("state", "=", "starting").where("pod", "=", w.pod).where("checkpoint_error", "is", null));
-  if (!r.changes) return;
+  if (!await patchIf(c, w, ["starting"], { pod: w.pod, checkpoint_error: null }, { pod: name, pvc: name, node: null, volume_fresh: 1, create_tries: 0, pod_created_at: null, updated_at: at, ...lostWarm(w, why) })) return;
   c.d.log(`workspace launcher: workspace ${w.id}: ${why}; rebuilding on a new volume from base and ${w.checkpoint_at ? `the checkpoint of ${w.checkpoint_at}` : "no checkpoint"}`);
   if (w.pod) await c.api.deletePod(c.s.namespace, w.pod).catch(() => {});
   if (w.pvc) await c.api.deletePvc(c.s.namespace, w.pvc).catch(() => {});
@@ -779,7 +762,6 @@ async function warmDone(c: Ctx, w: WorkspaceRow, warm: WorkspaceWarm, mtimes: bo
   if (mtimes) {
     const ch = mark.trimmed ? await warmChanges(w.repo, use.commit, w.base_sha).catch((e: Error) => ({ error: errText(e) })) : null;
     let list = ch && "files" in ch && ch.files ? { files: ch.files, dirs: ch.dirs ?? [] } : null;
-    let putError: string | null = null;
     if (list) {
       const put = async (file: string, paths: string[]) => {
         const r = await execWs(db, c.api, w.id, ["put", file], { tool: "seed", args: { warm: "changed", paths: paths.length }, stdin: Buffer.from(paths.join("\0")), timeoutMs: 120_000 }, c.now);
@@ -789,7 +771,6 @@ async function warmDone(c: Ctx, w: WorkspaceRow, warm: WorkspaceWarm, mtimes: bo
         await put(WARM_CHANGED_FILES, list.files);
         await put(WARM_CHANGED_DIRS, list.dirs.map((d) => d || "."));
       } catch (e) {
-        putError = errText(e);
         list = null;
       }
     }
@@ -821,11 +802,11 @@ async function applyCheckpoint(c: Ctx, id: number): Promise<boolean> {
 /** Stores the workspace's diff against its base commit. Problems are recorded on the row and never fail the workspace; false then. */
 async function checkpoint(c: Ctx, id: number): Promise<boolean> {
   const { db } = c.d;
-  const w = await db.get(db.k.selectFrom("workspaces").select(["state", "base_commit"]).where("id", "=", id));
+  const w = await getWorkspace(db, id);
   if (w?.state !== "ready" || !w.base_commit) return false;
   // While checkpoint_error is set the volume holds work no checkpoint has, so it is not deleted with time or dropped with a lost node.
   const problem = async (why: string) => {
-    await db.run(db.k.updateTable("workspaces").set({ error: `checkpoint: ${why}`.slice(0, 300), checkpoint_error: why.slice(0, 300), updated_at: new Date(c.now()).toISOString() }).where("id", "=", id));
+    await patchWorkspaces(db, [{ id, set: { error: `checkpoint: ${why}`.slice(0, 300), checkpoint_error: why.slice(0, 300), updated_at: new Date(c.now()).toISOString() } }]);
     c.d.log(`workspace launcher: workspace ${id}: checkpoint: ${why}`);
     return false;
   };
@@ -838,7 +819,7 @@ async function checkpoint(c: Ctx, id: number): Promise<boolean> {
     if (raw.exitCode !== 0) return await problem(`the diff could not be read (${raw.error ?? `exit ${raw.exitCode}`})`);
     if (raw.stdout.length > MAX_CHECKPOINT_BYTES) return await problem(`the diff is over ${MAX_CHECKPOINT_BYTES / 1024 ** 2} MiB; the previous checkpoint is kept`);
     const at = new Date(c.now()).toISOString();
-    await db.run(db.k.updateTable("workspaces").set({ checkpoint: raw.stdout, checkpoint_at: at, checkpoint_error: null, error: null, updated_at: at }).where("id", "=", id).where("state", "=", "ready"));
+    await patchWorkspaces(db, [{ id, whereState: ["ready"], set: { checkpoint: raw.stdout, checkpoint_at: at, checkpoint_error: null, error: null, updated_at: at } }]);
     return true;
   } catch (e) {
     return await problem(errText(e));
@@ -847,8 +828,8 @@ async function checkpoint(c: Ctx, id: number): Promise<boolean> {
 
 async function park(c: Ctx, id: number): Promise<void> {
   if (!await checkpoint(c, id)) c.d.log(`workspace launcher: workspace ${id}: parking without a new checkpoint; its volume is kept until one succeeds`);
-  const w = await c.d.db.get(c.d.db.k.selectFrom("workspaces").select(["pod"]).where("id", "=", id).where("state", "=", "ready"));
-  if (!w) return;
+  const w = await getWorkspace(c.d.db, id);
+  if (w?.state !== "ready") return;
   if (!await moveWorkspace(c.d.db, id, ["ready"], "parked", { pod: null }, c.now())) return;
   if (w.pod) await c.api.deletePod(c.s.namespace, w.pod).catch((e: Error) => c.d.log(`workspace launcher: delete pod ${w.pod}: ${e.message}`));
   c.d.log(`workspace launcher: workspace ${id} parked after ${IDLE_PARK_MS / 60_000} min without a call`);

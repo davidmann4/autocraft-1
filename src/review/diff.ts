@@ -13,7 +13,9 @@ import { mayBeRun, mergeSteps, workflowSteps, type WorkflowSteps } from "../core
 import { lockfileNeedsWhole } from "../core/lockfiles.ts";
 import { sensitiveReasons } from "../core/sensitive.ts";
 import type { Db } from "../db/index.ts";
-import * as kx from "../db/kx.ts";
+import { setting, writeSetting } from "../data/control/index.ts";
+import { loadAllDiffFacts, loadDiffFacts, markDiffRead, removeDiffFacts, saveDiffFacts, setDiffFactsIf, type DiffFactsRow } from "../data/mirror/index.ts";
+import { loadLatestReviews } from "../data/review/index.ts";
 
 // gh picks its account from the working directory, so it runs in this repo.
 const REPO_DIR = fileURLToPath(new URL("../..", import.meta.url));
@@ -191,7 +193,7 @@ export async function cachedDiff(db: Db, repo: string, number: number, head: str
       const text = readFileSync(file, "utf8");
       const extras = cachedDiffExtras(repo, number, head);
       // A diff cached before its facts were stored gets them on its next read.
-      if (!await db.get(db.k.selectFrom("diff_facts").select((eb) => eb.lit(1).as("one")).where("repo", "=", repo).where("number", "=", number).where("head_oid", "=", head))) await recordDiffFacts(db, repo, number, head);
+      if (!(await loadDiffFacts(db, [{ ref: `${repo}#${number}`, head }])).size) await recordDiffFacts(db, repo, number, head);
       // An entry whose extras the rule still waits for is read again only by the re-read (see `rereadDiff`).
       if (!opts.reread) return { ok: true, text, ...(stored !== undefined ? { base: stored } : {}), ...(extras ? { extras } : {}) };
     }
@@ -268,7 +270,7 @@ export async function noteReread(db: Db, repo: string, number: number, head: str
   writeFileSync(f, JSON.stringify({ count: diffRereads(repo, number, head).count + 1, at }));
   // A failed read with no diff cached here (a new runner pod) keeps the stored facts; the time still spaces the next try.
   if (diffFactsOfCache(repo, number, head)) await recordDiffFacts(db, repo, number, head);
-  else await db.run(db.k.updateTable("diff_facts").set({ last_read: at }).where("repo", "=", repo).where("number", "=", number).where("head_oid", "=", head));
+  else await markDiffRead(db, [{ ref: `${repo}#${number}`, head }], at);
 }
 
 /** The re-reads recorded for a diff and the time of the last one. */
@@ -305,7 +307,7 @@ export async function dropCachedDiff(db: Db, repo: string, number: number, head:
   rmSync(`${file}.base`, { force: true });
   rmSync(`${file}.files.json`, { force: true });
   rmSync(`${file}.reread`, { force: true });
-  await db.run(db.k.deleteFrom("diff_facts").where("repo", "=", repo).where("number", "=", number).where("head_oid", "=", head));
+  await removeDiffFacts(db, [{ ref: `${repo}#${number}`, head }]);
 }
 
 /**
@@ -328,13 +330,11 @@ export function diffFactsOfCache(repo: string, number: number, head: string): Di
   };
 }
 
+const rowOf = (repo: string, number: number, head: string, f: DiffFacts): DiffFactsRow =>
+  ({ repo, number, head_oid: head, reasons: JSON.stringify(f.reasons), lines: f.lines, pending: f.pending ? 1 : 0, last_read: f.lastRead });
+
 async function writeFacts(db: Db, repo: string, number: number, head: string, f: DiffFacts): Promise<void> {
-  await db.run(db.k.insertInto("diff_facts").values({ repo, number, head_oid: head, reasons: JSON.stringify(f.reasons), lines: f.lines, pending: f.pending ? 1 : 0, last_read: f.lastRead })
-    .onConflict((oc) => oc.columns(["repo", "number", "head_oid"]).doUpdateSet(kx.excluded(["reasons", "lines", "pending", "last_read"]))
-      .where((eb) => eb.or([
-        eb("diff_facts.reasons", "is distinct from", eb.ref("excluded.reasons")), eb("diff_facts.lines", "is distinct from", eb.ref("excluded.lines")),
-        eb("diff_facts.pending", "is distinct from", eb.ref("excluded.pending")), eb("diff_facts.last_read", "is distinct from", eb.ref("excluded.last_read")),
-      ]))));
+  await saveDiffFacts(db, [rowOf(repo, number, head, f)], "upsert-if-changed");
 }
 
 /**
@@ -365,7 +365,7 @@ export function diffFactsRules(): string {
 /** Rows per write transaction of `buildDiffFacts`: the writer lock is held for one batch, never for the whole rebuild. */
 export const DIFF_FACTS_BATCH = 100;
 
-type StoredFacts = { reasons: string | null; lines: number | null; pending: number | null; last_read: number | null };
+type StoredFacts = DiffFactsRow;
 
 /**
  * Computes the stored facts again when they were computed by other rules than this code's (or never): the facts of every
@@ -379,15 +379,12 @@ type StoredFacts = { reasons: string | null; lines: number | null; pending: numb
  */
 export async function buildDiffFacts(db: Db, opts: { batch?: number } = {}): Promise<{ computed: number; pending: number } | null> {
   const rules = diffFactsRules();
-  if ((await db.get(db.k.selectFrom("settings").select("value").where("key", "=", DIFF_FACTS_KEY)))?.value === rules) return null;
+  if (await setting(db, DIFF_FACTS_KEY) === rules) return null;
   const stored = new Map<string, { repo: string; number: number; head: string; row: StoredFacts | null }>();
-  for (const r of await db.all(db.k.selectFrom("diff_facts").select(["repo", "number", "head_oid", "reasons", "lines", "pending", "last_read"]))) {
+  for (const r of (await loadAllDiffFacts(db)).values()) {
     stored.set(`${r.repo}#${r.number}@${r.head_oid}`, { repo: r.repo, number: r.number, head: r.head_oid, row: r });
   }
-  const reviewed = await db.all(db.k.selectFrom("opus_reviews as r").select(["r.repo", "r.number", "r.head_oid"]).where("r.verdict", "is not", null)
-    .where((eb) => eb(kx.rowid("opus_reviews", "r"), "=", eb.selectFrom("opus_reviews as x").select(kx.rowid("opus_reviews", "x").as("rid"))
-      .whereRef("x.repo", "=", "r.repo").whereRef("x.number", "=", "r.number").where("x.verdict", "is not", null)
-      .orderBy("x.at", "desc").orderBy(kx.rowid("opus_reviews", "x"), "desc").limit(1))));
+  const reviewed = [...(await loadLatestReviews(db, { mode: "full" })).values()].map((r) => ({ repo: r.repo, number: r.number, head_oid: r.head }));
   for (const r of reviewed) {
     const key = `${r.repo}#${r.number}@${r.head_oid}`;
     if (!stored.has(key)) stored.set(key, { repo: r.repo, number: r.number, head: r.head_oid, row: null });
@@ -404,9 +401,9 @@ export async function buildDiffFacts(db: Db, opts: { batch?: number } = {}): Pro
   }
   const size = Math.max(1, opts.batch ?? DIFF_FACTS_BATCH);
   for (let i = 0; i < changes.length; i += size) {
-    await db.write(async () => { for (const c of changes.slice(i, i + size)) await writeFactsIf(db, c.repo, c.number, c.head, c.was, c.to); });
+    await setDiffFactsIf(db, changes.slice(i, i + size).map((c) => ({ key: { ref: `${c.repo}#${c.number}`, head: c.head }, was: c.was, to: rowOf(c.repo, c.number, c.head, c.to) })));
   }
-  await db.run(db.k.insertInto("settings").values({ key: DIFF_FACTS_KEY, value: rules }).onConflict((oc) => oc.column("key").doUpdateSet(kx.excluded(["value"]))));
+  await writeSetting(db, DIFF_FACTS_KEY, rules);
   return { computed, pending };
 }
 
@@ -414,19 +411,12 @@ const parseReasons = (s: string | null): string[] => {
   try { const v = JSON.parse(s ?? "[]") as unknown; return Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : []; } catch { return []; }
 };
 
-/** Writes the facts of a head only while its row still holds `was` (absent when null): a compare-and-write. */
-async function writeFactsIf(db: Db, repo: string, number: number, head: string, was: StoredFacts | null, f: DiffFacts): Promise<void> {
-  const values = { reasons: JSON.stringify(f.reasons), lines: f.lines, pending: f.pending ? 1 : 0, last_read: f.lastRead };
-  if (!was) {
-    await db.run(db.k.insertInto("diff_facts").values({ repo, number, head_oid: head, ...values }).onConflict((oc) => oc.columns(["repo", "number", "head_oid"]).doNothing()));
-    return;
-  }
-  await db.run(db.k.updateTable("diff_facts").set(values).where("repo", "=", repo).where("number", "=", number).where("head_oid", "=", head)
-    .where("reasons", "is not distinct from", was.reasons).where("lines", "is not distinct from", was.lines)
-    .where("pending", "is not distinct from", was.pending).where("last_read", "is not distinct from", was.last_read));
+/** The base branch a cached diff was computed against; null when unknown. */
+/** The diff cached for this head, or null when none is; never fetched. */
+export function cachedDiffText(repo: string, number: number, head: string): string | null {
+  try { return readFileSync(join(diffCacheDir(), repo, `${number}-${head}.diff`), "utf8"); } catch { return null; }
 }
 
-/** The base branch a cached diff was computed against; null when unknown. */
 export function cachedDiffBase(repo: string, number: number, head: string): string | null {
   const f = join(diffCacheDir(), repo, `${number}-${head}.diff.base`);
   try { return existsSync(f) ? readFileSync(f, "utf8") : null; } catch { return null; }

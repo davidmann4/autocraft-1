@@ -10,7 +10,7 @@ import { installations } from "./app.ts";
 import { allowedOwners, AllowedOwnerError, allowOwner, removeOwner, rowFor } from "./allowed-owners.ts";
 import { readAppSecrets } from "./install-token.ts";
 import { MENTION_KEY, mentionName, validMentionName } from "./slugs.ts";
-import { deleteSetting, writeSetting } from "../settings-read.ts";
+import { deleteSetting, writeSetting } from "../data/control/index.ts";
 import { audit } from "../dash/audit.ts";
 
 function registerUrl(): string {

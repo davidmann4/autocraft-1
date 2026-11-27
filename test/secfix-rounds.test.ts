@@ -13,7 +13,7 @@ import { sweepSessions } from "../src/prepush/resume.ts";
 import { regressionName } from "../src/verify/types.ts";
 import { patchFor } from "../src/verify/plan.ts";
 import { SCRATCH } from "./scratch.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb } from "./helpers/raw-db.ts";
 import { jsonNum } from "../src/db/kx.ts";
 
 mkdirSync(SCRATCH, { recursive: true });

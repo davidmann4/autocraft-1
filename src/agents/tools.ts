@@ -1,9 +1,10 @@
 // Tool uses of a model call, read from the `claude -p` event stream (or reported by a remote call's helper) and stored per agent run (agent_run_tools).
 // Arguments are scrubbed and capped; results are never stored, only their size.
 import { scrub } from "../runner/scrub.ts";
-import { forEachSeq } from "../async-seq.ts";
 import type { Db } from "../db/index.ts";
-import { excluded } from "../db/kx.ts";
+import { loadModelChecksOfRun } from "../data/changes/index.ts";
+import { saveTools as saveToolRows, type ToolRow } from "../data/inference/index.ts";
+import { loadRelayedCheckTexts } from "../data/runners/index.ts";
 
 export const TOOL_ARGS_MAX = 4000;
 /** The check tool's name as the model sees it (MCP server `build`, tool `check`). */
@@ -70,14 +71,13 @@ const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/;
 const time = (v: unknown): string | null => (typeof v === "string" && ISO.test(v) ? v : null);
 
 /**
- * Stores the tool uses a remote call's helper reported (src/remote/protocol.ts SubmitTool). The helper's list is the one
- * source: the lease's own tools (items, reference, check) appear in it as MCP tool uses. Whether a check use wrote a
- * model_checks row comes from the relay's reply to it (remote_checks), in request order, not from the helper.
+ * The rows of the tool uses a remote call's helper reported (src/remote/protocol.ts SubmitTool), ready to store with the reply.
+ * The helper's list is the one source: the lease's own tools (items, reference, check) appear in it as MCP tool uses. Whether a
+ * check use wrote a model_checks row comes from the relay's reply to it (remote_checks), in request order, not from the helper.
  */
-export async function saveRemoteTools(db: Db, runId: number, callId: number, raw: unknown): Promise<void> {
-  if (!Array.isArray(raw)) return;
-  const relayed = (await db.all(db.k.selectFrom("main.remote_checks").select("result").where("call_id", "=", callId).where("run_id", "=", runId).orderBy("id")))
-    .map((r) => { try { return textOf((JSON.parse(r.result ?? "null") as { text?: unknown } | null)?.text); } catch { return ""; } });
+export async function remoteToolRows(db: Db, runId: number, callId: number, raw: unknown): Promise<Omit<ToolRow, "runId">[]> {
+  if (!Array.isArray(raw)) return [];
+  const [relayed, checks] = await db.together(() => Promise.all([loadRelayedCheckTexts(db, callId, runId), loadModelChecksOfRun(db, runId)]));
   const clock: ToolClock = { start: new Map(), end: new Map() };
   const uses: ToolUse[] = [];
   for (const t of raw.slice(0, MAX_REMOTE_TOOLS) as Record<string, unknown>[]) {
@@ -93,17 +93,21 @@ export async function saveRemoteTools(db: Db, runId: number, callId: number, raw
     if (s) clock.start.set(id, s);
     if (e) clock.end.set(id, e);
   }
-  await saveUses(db, runId, uses, clock);
+  return rowsOf(uses, checks, clock);
+}
+
+/** Tool rows in order; a check-tool use is linked to the next unlinked check row of the run with the same command. Pure. */
+function rowsOf(uses: ToolUse[], checks: readonly { id: number; command: string }[], clock?: ToolClock): Omit<ToolRow, "runId">[] {
+  const left = [...checks];
+  return uses.map((u, i) => {
+    const k = u.command === null || u.noRow ? -1 : left.findIndex((c) => c.command === u.command);
+    const link = k >= 0 ? left.splice(k, 1)[0]!.id : null;
+    return { seq: i + 1, tool: u.name, args: u.args, resultBytes: u.resultBytes, isError: u.isError, startedAt: clock?.start.get(u.id) ?? null, endedAt: clock?.end.get(u.id) ?? null, checkId: link };
+  });
 }
 
 async function saveUses(db: Db, runId: number, uses: ToolUse[], clock?: ToolClock): Promise<void> {
   if (!uses.length) return;
-  const checks = await db.all(db.k.selectFrom("model_checks").select(["id", "command"]).where("run_id", "=", runId).orderBy("id"));
-  await forEachSeq(uses, async (u, i) => {
-    const k = u.command === null || u.noRow ? -1 : checks.findIndex((c) => c.command === u.command);
-    const link = k >= 0 ? checks.splice(k, 1)[0]!.id : null;
-    await db.run(db.k.insertInto("agent_run_tools")
-      .values({ run_id: runId, seq: i + 1, tool: u.name, args: u.args, result_bytes: u.resultBytes, is_error: u.isError ? 1 : 0, started_at: clock?.start.get(u.id) ?? null, ended_at: clock?.end.get(u.id) ?? null, check_id: link })
-      .onConflict((oc) => oc.columns(["run_id", "seq"]).doUpdateSet(excluded(["tool", "args", "result_bytes", "is_error", "started_at", "ended_at", "check_id"]))));
-  });
+  const checks = await loadModelChecksOfRun(db, runId);
+  await saveToolRows(db, rowsOf(uses, checks, clock).map((r) => ({ ...r, runId })));
 }

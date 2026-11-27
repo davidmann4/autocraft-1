@@ -19,7 +19,7 @@ const FEATURES: Record<BuildFeatureName, { name: string; line: string }> = {
   "push-tests": { name: "Tests before push", line: "Runs the repo's tests before AutoCraft pushes its own fix-up." },
   "batch-build": { name: "Build batches", line: "Builds a merge batch's branch before AutoCraft opens the batch PR." },
   nightly: { name: "Nightly checks", line: "Runs the repo's checks and benchmarks on main each night." },
-  implement: { name: "Implement queued issues", line: "AutoCraft implements fast-tracked issues in a workspace and opens the PR." },
+  implement: { name: "Implement queued issues", line: "AutoCraft implements started issues in a workspace and opens the PR." },
   "pr-builds": { name: "Build pull requests", line: "Builds pull requests in a sandbox." },
   "scan-tests": { name: "Run scan tests", line: "Writes and runs a test for each security finding." },
 };

@@ -17,6 +17,20 @@ export function firstSentence(s: string): string {
   return /^.*?[.!?](?=\s|$)/.exec(t)?.[0] ?? t;
 }
 
+/** The text with its end mark, a full stop when it has none. */
+export const asSentence = (s: string): string => (/[.!?…]$/.test(s) ? s : `${s}.`);
+
+/** The text when it fits in `max` characters, else its start up to a word end with "…". Text without spaces is cut where it stops fitting. */
+export function clipText(s: string, max: number): string {
+  const t = squash(s);
+  if (t.length <= max) return t;
+  const head = t.slice(0, max - 2);
+  // A word is whole when the next character is a space.
+  const end = t[max - 2] === " " ? head.length : head.lastIndexOf(" ");
+  const words = (end > max / 2 ? head.slice(0, end) : head).replace(/[\s,;:(–-]+$/, "");
+  return /[.!?]$/.test(words) ? `${words} …` : `${words}…`;
+}
+
 /**
  * Reads an optional prose field of a reply. Missing or empty: null, valid. Within `max` words: the text.
  * Over `max`: invalid unless `last` (the final attempt), then its first sentence.

@@ -63,24 +63,23 @@ function Discord() {
 
 export function RunnerView({ user }: ViewProps) {
   const [sp] = useSearchParams();
-  const local = user.inference === "user-local";
-  const runners = useQuery("runners", (a) => a.runners.list(), { enabled: local });
-  if (local && !runners.data && !runners.error) return <Page title={t("Runner")}><></></Page>;
+  const runners = useQuery("runners", (a) => a.runners.list());
+  if (!runners.data && !runners.error) return <Page title={t("Runner")}><></></Page>;
   // No Task Runner yet: the setup steps and agent tokens; a login waiting for approval (`?runner=CODE`) still shows its card.
-  const none = local && runners.data?.runners.length === 0 && !sp.get("runner");
+  const none = runners.data?.runners.length === 0 && !sp.get("runner");
   return (
     <Page title={t("Runner")}>
       <div className="mt-4 flex flex-col gap-4">
         {none && <RunnerGuide />}
-        {local && !none && <Status />}
-        {local && !none && (
+        {!none && <Status />}
+        {!none && (
           <Fold title={t("All runners and approval")} open={!!sp.get("runner")}>
             <Runners />
           </Fold>
         )}
       </div>
-      {local && !none && <MySettings runner />}
-      {local && !none && <Discord />}
+      {!none && <MySettings runner />}
+      {!none && <Discord />}
       <Connector user={user} agent />
     </Page>
   );

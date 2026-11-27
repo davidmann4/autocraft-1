@@ -11,7 +11,8 @@ import { runSync } from "../src/mirror.ts";
 import { RepoError, trackRepo, trackRepoChecked } from "../src/repos.ts";
 import { G } from "./guarded.ts";
 import { SCRATCH } from "./scratch.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb } from "./helpers/raw-db.ts";
+import { saveSyncState, loadSyncState } from "../src/data/mirror/index.ts";
 
 test("a tracked repo of another owner is written to under its own owner; storytold repos are unchanged", async () => {
   resetOwners();
@@ -48,9 +49,7 @@ async function syncDb() {
   await db.run(db.k.deleteFrom("tracked_repos"));
   await db.run(db.k.insertInto("tracked_repos").values({ name: "designcraft", added_by: "t", added_at: "x", pipeline: 1 }));
   await db.run(db.k.insertInto("repos").values({ name: "designcraft", synced_at: "2026-11-02T09:00:00Z", high_water: "2026-11-02T09:00:00Z", reconciled_at: "2026-11-02T09:00:00Z" }));
-  await db.run(db.k.insertInto("settings").values([
-    { key: "org_high_water", value: "2026-11-02T09:30:00Z" }, { key: "repos_refreshed_at", value: "2999-01-01T00:00:00Z" }, { key: "search_catchup_at", value: "2999-01-01T00:00:00Z" },
-  ]));
+  await saveSyncState(db, { org_high_water: "2026-11-02T09:30:00Z", repos_refreshed_at: "2999-01-01T00:00:00Z", search_catchup_at: "2999-01-01T00:00:00Z" });
   return db;
 }
 const opts = { only: [], all: false, full: false, perRepo: false };

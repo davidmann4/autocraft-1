@@ -26,6 +26,9 @@ function cleanOutsideCode(t: string): string {
 // Mentions go everywhere, code included (scrubMarkdown, dropMarkup): a mention pings once the text is edited or quoted.
 const cleanBody = (s: string): string => scrubMarkdown(s, cleanOutsideCode).trim();
 
+/** Untrusted model text for a public issue or comment: cleanBody (no mentions, URLs, raw HTML or issue references). */
+export const issueText = cleanBody;
+
 export function issueTitle(title: string): string {
   return cleanLine(settle(title, (t) => dropMarkup(outsideCode(t, cleanOutsideCode))), ISSUE_TITLE_MAX);
 }

@@ -15,7 +15,7 @@ import { queueWorkspaceCall } from "../src/build/workspace-call.ts";
 import { IDLE_PARK_MS, NODE_LOST_MS, PARKED_VOLUME_MS, RESUME_PENDING_MS, workspacePass, WorkspaceState } from "../src/build/workspace-launch.ts";
 import { createWorkspace, getCheckpoint, getWorkspace, RESUME_TRIES, resumeWorkspace } from "../src/build/workspaces.ts";
 import { WS_POD_PATH } from "../src/build/workspace.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb } from "./helpers/raw-db.ts";
 import { SCRATCH } from "./scratch.ts";
 
 mkdirSync(SCRATCH, { recursive: true });

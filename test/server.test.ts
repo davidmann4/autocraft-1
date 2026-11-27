@@ -10,7 +10,7 @@ import { loadConfig } from "../src/dash/server/config.ts";
 import { defaultRoutes, SESSION_COOKIE, startServer } from "../src/dash/server/index.ts";
 import { FakeProvider } from "../src/dash/server/provider.ts";
 import { SCRATCH } from "./scratch.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb } from "./helpers/raw-db.ts";
 
 mkdirSync(SCRATCH, { recursive: true });
 const dir = mkdtempSync(join(SCRATCH, "server-test-"));
@@ -183,6 +183,33 @@ describe("sign-in", () => {
   });
 });
 
+describe("reads ahead of the handler", () => {
+  test("a failed read of the repo lists or permissions changes no answer that does not need them, and a request without a session reads neither", async () => {
+    const c = await signedIn("viewer1");
+    // The session is known from here on, so its requests read ahead.
+    assert.equal((await c.get("/api/test/me", false)).status, 200);
+    const stranger = new Client();
+    stranger.jar.set(SESSION_COOKIE, "no-such-session");
+    let ahead = 0;
+    const stop = db.observe((e) => {
+      if (e.kind !== "query" || !/tracked_repos|repo_permissions/.test(e.sql)) return;
+      ahead++;
+      throw new Error("the read failed");
+    });
+    try {
+      assert.equal((await stranger.get("/api/test/me", false)).status, 401);
+      assert.equal((await new Client().get("/api/test/me", false)).status, 401);
+      assert.equal(ahead, 0);
+      assert.equal((await c.get("/api/access", false)).status, 403);
+      assert.equal(ahead, 0, "a route the role may not use reads nothing ahead");
+      assert.equal((await c.get("/api/test/me", false)).status, 200);
+      assert.ok(ahead > 0);
+    } finally {
+      stop();
+    }
+  });
+});
+
 // Writes that only touch the signed-in user's own record, open to every role.
 const SELF_SERVICE = new Set(["/api/account/discord/unlink"])
 // Open to every role too; refused with 503 here because no Discord key file is configured.
@@ -280,6 +307,21 @@ describe("access changes", () => {
     await setRole(db, "cli", "promoted", "operator");
     assert.match(await (await c.get("/")).text(), /http-equiv="refresh" content="0;url=\/auth\/signin/);
     await removeLogin(db, "cli", "promoted");
+  });
+});
+
+describe("a queued token revocation", () => {
+  test("is swept at the next request, also one without a dashboard session", async () => {
+    const queued = async () => (await db.get(db.k.selectFrom("user_token_revocations").select((eb) => eb.fn.countAll<number>().as("n"))))!.n;
+    // The first request of a process sweeps whatever it is.
+    await fetch(`${base}/auth/signed-out`);
+    await sleep(200);
+    for (const path of ["/api/remote/claim", "/mcp"]) {
+      await db.run(db.k.insertInto("user_token_revocations").values({ login: "gone", token_enc: "unreadable", queued_at: new Date().toISOString() }));
+      await fetch(`${base}${path}`, { method: "POST", body: "{}" });
+      for (let i = 0; i < 40 && await queued(); i++) await sleep(50);
+      assert.equal(await queued(), 0, path);
+    }
   });
 });
 

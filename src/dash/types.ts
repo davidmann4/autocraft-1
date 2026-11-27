@@ -10,7 +10,7 @@ export type User = {
   role: Role;
   // write, maintain or admin on <owner>/<repo>, checked against GitHub
   // (cached; re-checked when older than a minute). Handlers call this
-  // before every decision write.
+  // before every write a person starts.
   canWrite(repo: string): Promise<boolean>;
   // Any permission but none on <owner>/<repo>, from the same cached check.
   canRead(repo: string): Promise<boolean>;
@@ -50,6 +50,8 @@ export type Route = {
   operator?: boolean;               // server returns 403 unless user.role is operator
   /** A GET that aggregates the mirror or runs the embedder: it spends the session's expensive-GET budget (for the given query, when a function). */
   expensive?: true | ((query: URLSearchParams) => boolean);
+  /** A GET whose handler asks GitHub or the runner: it runs outside `db.together`, whose callers wait on the database only. */
+  external?: true;
   /** A GET list narrowed to the web app's picked project (`Req.scope`); every other route sees every repo the requester may see. */
   scoped?: true;
   handler: (db: Db, req: Req) => Promise<Res | Promise<Res>>;

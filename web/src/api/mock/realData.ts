@@ -1,11 +1,11 @@
 // Maps real dashboard payloads (the item API, its trace, review history, plan rows) to the redesign's item page shapes.
 // This is the derivation the server will do once `item_plans.view.status`, review triggers and write records exist;
 // every rule that guesses is marked. Pure TypeScript: it runs in the browser on a JSON export.
-import type { RealDecision } from "./realDecisions";
-import { barFromStatus } from "./redesignData";
+import { barFromStatus } from "./itemPagesData";
 import { withTimeline, type ResultCard, type ResultTone } from "./storyMock";
+import type { PeekRow } from "./itemPagesData";
 import type {
-  FindingPageData, ItemPageHeader, GithubEvent, GithubSide, HistoryCall, HistoryEntry, HistoryKind, ItemPageData, ItemPhase, ItemState, ItemStatus, ItemStatusRow,
+  FindingPageData, ItemPageHeader, GithubEvent, GithubSide, HistoryCall, HistoryEntry, HistoryKind, ItemPageData, ItemPhase, ItemState, ItemStatus,
   OpusReviewEntry, ReviewTrigger, ReviewVerdict, CiState, FindingView,
 } from "../types";
 
@@ -18,7 +18,7 @@ export interface RealItem {
   plan: Json[]; planHistory: Json[]; reviewHistory: Json[]; verifications: Json[];
 }
 export interface RealExport { exportedAt: string; items: RealItem[]; findings: { repo: string; number: number; finding: FindingView }[] }
-export interface RealPages { exportedAt: string; pages: ItemPageData[]; rows: ItemStatusRow[]; findings: Map<string, FindingPageData>; decisionOf: Map<string, RealDecision> }
+export interface RealPages { exportedAt: string; pages: ItemPageData[]; rows: PeekRow[]; findings: Map<string, FindingPageData> }
 
 const short = (s: string | null | undefined) => (s ?? "").slice(0, 7);
 const json = <T,>(s: unknown, fallback: T): T => { if (typeof s !== "string") return (s as T) ?? fallback; try { return JSON.parse(s) as T; } catch { return fallback; } };
@@ -36,7 +36,7 @@ export function phaseOf(planState: string, itemState: string | null, ghState: It
   if (["needs-fix-up", "ci-failed", "conflict"].includes(planState)) return "Fixing";
   if (/^verify/.test(planState)) return "Verifying";
   if (["waiting-ci", "waiting-premerge", "ready", "queued"].includes(planState)) return "In queue";
-  if (["label-not-reviewed", "not-reviewed", "review-stale"].includes(planState)) return "Review";
+  if (["not-reviewed", "review-stale"].includes(planState)) return "Review";
   if (/^Fix:/.test(next ?? "")) return "Fixing";
   return "Triage";
 }
@@ -133,6 +133,7 @@ export function resultsOf(r: RealItem): ResultCard[] {
     const n = p.findings?.length ?? 0;
     out.push({ id: "postmerge", kind: "postmerge", title: "Post-merge review", outcome: p.error ? "failed" : `${n} ${n === 1 ? "finding" : "findings"} on ${short(p.mergeSha)}`, tone: p.error ? "bad" : n ? "warn" : "ok", at: p.at, detail: p.error ?? (n ? String(p.findings[0].title ?? "") : null), earlier: (p.earlier ?? []).map((x: Json) => ({ at: x.at, outcome: `${x.findings?.length ?? 0} findings` })) });
   }
+  else if (it.mergedAsApproved) out.push({ id: "postmerge", kind: "postmerge", title: "Post-merge review", outcome: "not needed, merged as approved", tone: "neutral", at: it.mergedAt, detail: null, earlier: [] });
   const cls: Json[] = it.classifications ?? [];
   if (cls.length) {
     const labels = new Set(cls.map((c) => c.typeLabel));
@@ -230,7 +231,7 @@ function headerOf(r: RealItem): ItemPageHeader {
   const lines = (it.additions ?? 0) + (it.deletions ?? 0);
   return {
     labels: it.labels ?? [], assignees: [], autocraftAssigned: false, pipelineOn: it.pipelineOn ?? true, discord: it.discord ?? null,
-    queue: it.queue ?? null, fastTracked: false, held: false, preapproval: it.preapproval ?? null,
+    queue: it.queue ?? null, held: false, preapproval: it.preapproval ?? null,
     releases: it.releases ?? { reviewAgain: false, verifyAgain: false, batchAgain: false }, tier: it.tier ?? "not",
     size: it.kind !== "pr" ? null : lines < 50 ? "S" : lines < 300 ? "M" : lines < 1000 ? "L" : "XL",
     backlog: { held: false, canSettle: true },
@@ -256,7 +257,7 @@ export function findingPageOf(f: FindingView, now: string): FindingPageData {
   const [phase, w, next] = waiting[f.state] ?? ["Closed", null, null];
   const kinds: Record<string, string> = { area: "Area scan", verify: "Verification", model: "Threat model", fix: "Fix" };
   return {
-    finding: f, decision: null, choices: null, attempts: 0, rounds: [], costUsd: f.timeline.reduce((s, c) => s + (c.costUsd ?? 0), 0),
+    finding: f, question: null, attempts: 0, rounds: [], costUsd: f.timeline.reduce((s, c) => s + (c.costUsd ?? 0), 0),
     status: { phase, waiting: w, next, since: f.updatedAt ?? now },
     history: f.timeline.map((c, i) => ({ id: `t${i}`, at: c.at, step: kinds[c.kind] ?? c.kind, outcome: c.ok ? "done" : "failed", model: "Opus", costUsd: c.costUsd, kind: "model" as const, calls: [], writeId: null })),
   };
@@ -265,14 +266,7 @@ export function findingPageOf(f: FindingView, now: string): FindingPageData {
 export function convertReal(x: RealExport): RealPages {
   const ok = x.items.filter((i) => i.item && !i.item.error);
   const pages = ok.map(pageOf);
-  const rows = pages.map((p, i): ItemStatusRow => ({ repo: p.repo, number: p.number, kind: p.kind, state: p.state, title: p.title, author: p.author ?? null, status: p.status, updatedAt: ok[i]!.item.updatedAt }));
+  const rows = pages.map((p, i): PeekRow => ({ repo: p.repo, number: p.number, kind: p.kind, state: p.state, title: p.title, author: p.author ?? null, status: p.status, updatedAt: ok[i]!.item.updatedAt, closes: [] }));
   const findings = new Map(x.findings.filter((f) => f.finding && !("error" in f.finding)).map((f) => [`${f.repo}#${f.number}`, findingPageOf(f.finding, x.exportedAt)]));
-  // Open questions: the decision (only when it has an id; answered items export an empty object), its choices and the conversation.
-  const decisionOf = new Map<string, RealDecision>();
-  for (const i of ok) {
-    const d = i.decision && i.decision.id ? (i.decision as unknown as RealDecision["decision"]) : null;
-    const turns = (i.conversation?.turns ?? []) as RealDecision["turns"];
-    if (d || i.choices || turns.length) decisionOf.set(`${i.repo}#${i.number}`, { decision: d, choices: (i.choices && !i.choices.error ? i.choices : null) as RealDecision["choices"], turns });
-  }
-  return { exportedAt: x.exportedAt, pages, rows, findings, decisionOf };
+  return { exportedAt: x.exportedAt, pages, rows, findings };
 }

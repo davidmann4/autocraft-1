@@ -8,25 +8,15 @@
  * - `await connectDb(target, { busyTimeoutMs, role })`: a handle of its own (tests, the dashboard's second handle, worker
  *   threads). `target` is a SQLite path or a postgres:// URL.
  * - `await dbFor(sync)`: the handle over a `DatabaseSync` that `connect()` (src/db.ts) returned, memoized per connection.
- *   Code that still holds a `DatabaseSync` reaches the async API this way while the rest of the call graph is converted.
  *
- * Target shape of the sync → async conversion (statement API mirrors node:sqlite's, but every call returns a promise):
- * - `db: DatabaseSync`                         → `db: Db`
- * - `db.prepare(X).get(a)` / `.all` / `.run`   → `await db.prepare(X).get(a)` / ...  (`?` and `:name` parameters as today)
- * - `db.prepare(X).iterate(a)` in `for`        → `for await (... of db.prepare(X).iterate(a))`
- * - `db.exec(X)`                               → `await db.script(X)`
- * - `db.isTransaction`                         → `db.inTransaction()`
- * - `BEGIN IMMEDIATE; ...; COMMIT`             → `await db.write(async () => { ... })`
- * - `BEGIN; ...; COMMIT` (read snapshot)       → `await db.read(async () => { ... })`
- * - `connect(path, opts)`                      → `await connectDb(path, opts)`; the default database → `await openDb()`
- * `db.sync` is the underlying `DatabaseSync` on SQLite, for residue that cannot await yet; it bypasses transaction
- * routing (it runs on the same connection, so inside whatever transaction is open on it) and goes away after the move.
+ * A `Db` carries transactions, waves, locks and notifications and has no query methods: the statements live in the data
+ * modules (src/data/**) and in infrastructure (src/db/**), which take the query surface of a handle with `queryDb`
+ * (src/db/query-db.ts; test/data-layer.test.ts keeps it there).
  *
  * Transactions are routed through AsyncLocalStorage: every call made inside `db.write(fn)` / `db.read(fn)`, at any depth
- * of awaits, runs in that transaction. Read `db.k` at each use; a `Kysely` captured outside a transaction stays outside it.
+ * of awaits, runs in that transaction.
  */
-import type { Compilable, Kysely } from "kysely";
-import type { DatabaseSync, SQLInputValue, SQLOutputValue } from "node:sqlite";
+import type { SQLInputValue, SQLOutputValue } from "node:sqlite";
 
 export type Dialect = "sqlite" | "postgres";
 
@@ -35,7 +25,6 @@ export type DbRole = "dashboard" | "dashboard-remote" | "runner" | "job" | "plan
 
 /** The table types Kysely queries are checked against, generated from the migrated schema (scripts/gen-db-types.ts). */
 export type { DB } from "./types.ts";
-import type { DB } from "./types.ts";
 
 export type Value = SQLOutputValue;
 export type Row = Record<string, Value>;
@@ -80,6 +69,36 @@ export type DbEvent =
   /** A write transaction ended; `holdMs` is how long it held the write lock. */
   | { kind: "write-lock"; holdMs: number; site: string };
 
+/** Options of a QueryDb read. */
+export interface QueryOpts {
+  /**
+   * Runs the statement on its own inside `together`, never fused into a wave: for loaders of blobs (`bytea` comes back
+   * from JSON as hex text), of more than about 10,000 rows, of ids above 2^53, or that can be slow (embedding scans).
+   */
+  alone?: boolean;
+  /** The loader's name: an error of the statement starts with it, and observers see it as the site of a fused statement. */
+  label?: string;
+}
+
+/** What `db.meter` counted. */
+export interface DbStats {
+  /** Logical statements: each Kysely query, raw statement and script, and each member of a fused wave. BEGIN and COMMIT are not statements. */
+  statements: number;
+  /** Postgres round trips (every query sent, BEGIN, locks and COMMIT included); 0 on SQLite, which runs in-process. */
+  roundTrips: number;
+  /** Rows the statements returned (a fused wave counts its members' rows). */
+  rows: number;
+  /** Time spent in the database: Postgres round trips, SQLite statements. */
+  ms: number;
+  /** External effects (`effect()` in src/db/effects.ts): GitHub calls, model calls, build launches. */
+  effects: number;
+}
+
+export interface ListenOptions {
+  /** The subscription does not keep the process alive: a cache that drops entries on a notification, not a wait for one. */
+  background?: boolean;
+}
+
 /** One `Db.listen` registration. */
 export interface Subscription {
   /** Whether the channel's notifications arrive now. */
@@ -89,16 +108,6 @@ export interface Subscription {
 
 export interface Db {
   readonly dialect: Dialect;
-  /** Kysely, routed to the transaction open in the current async context. */
-  readonly k: Kysely<DB>;
-  /** Runs a Kysely query: its first row. */
-  get<O>(q: Compilable<O>): Promise<O | undefined>;
-  /** Runs a Kysely query: all rows. */
-  all<O>(q: Compilable<O>): Promise<O[]>;
-  /** Runs a Kysely write. */
-  run(q: Compilable<unknown>): Promise<RunResult>;
-  /** Transitional raw SQL in the SQLite dialect, with `?` and `:name` parameters. */
-  prepare(text: string): Statement;
   /**
    * Runs `fn` with its Kysely SELECTs outside a transaction shared: one with the same text and parameters as an earlier
    * one in this async context gets that read's rows (fresh copies) instead of another round trip. A write through the
@@ -127,14 +136,31 @@ export interface Db {
    */
   write<T>(fn: () => Promise<T>, opts?: WriteOptions): Promise<T>;
   /**
-   * Runs `fn` so that a statement error inside it leaves the open transaction usable: on Postgres, where a failed
-   * statement aborts the whole transaction, `fn` runs under a savepoint that is rolled back when it throws; on SQLite, and
-   * outside a transaction, it is a plain call. The error still reaches the caller, which catches it and carries on.
-   * Attempts in one transaction run one at a time, like its statements.
+   * Runs `fn` with its Kysely SELECTs gathered into waves: the ones issued in the same event-loop turn go out together.
+   * Postgres sends a wave as one statement, which reads one snapshot (each read a JSON array column of it; top-level
+   * booleans come back as 1/0 as on the plain path); past 40 reads, and for `alone` reads, it sends more statements at
+   * once, each its own snapshot outside a transaction. SQLite runs a wave's reads one after another in one read
+   * transaction. Load with `Promise.all` inside it: each `await` on an earlier result starts another wave. Works
+   * inside `read` and `write` (the wave runs in the transaction). A write inside `fn` first sends the reads issued before
+   * it, then runs at once, so they see the state before it. A failed fused statement fails every read in it. Reads that
+   * shareReads already holds are served from it and join no wave.
    */
-  attempt<T>(fn: () => Promise<T>): Promise<T>;
+  together<T>(fn: () => Promise<T>): Promise<T>;
+  /**
+   * Runs `fn` and counts what it did in the database (statements, round trips, rows, time) and its external effects, in
+   * this async context at any depth of awaits. A meter inside another adds its counts to the outer one when it ends.
+   */
+  meter<T>(fn: () => Promise<T>): Promise<{ value: T; stats: DbStats }>;
+  /**
+   * Inside a write transaction (a joined nested write included): queues `fn` to run once that transaction has committed,
+   * in the order queued, before `db.write` returns; a rollback drops the queue. Anywhere else it runs `fn` at once,
+   * synchronously. An error from `fn`, thrown or rejected, is logged and never reaches the caller.
+   */
+  afterCommit(fn: () => void | Promise<void>): void;
   /** Whether a transaction is open in the current async context; with `mode`, one of that kind (a read snapshot or a write). */
   inTransaction(mode?: "read" | "write"): boolean;
+  /** The open transaction of the current async context, as a key for what belongs to it alone; undefined outside one. */
+  transaction(): object | undefined;
   /**
    * Makes this handle see tracked repos only: views filtered to tracked_repos shadow the mirror and work tables
    * (src/db/scoped.ts), and writes to those tables name them with `main.`. On SQLite they are TEMP views on the
@@ -142,23 +168,25 @@ export interface Db {
    * opening, outside any transaction.
    */
   scope(): Promise<void>;
-  /** Runs several statements with no parameters (schema scripts, PRAGMAs). */
-  script(text: string): Promise<void>;
   /**
    * Postgres: NOTIFY `channel` with `payload` for every process listening; inside a write transaction it is sent when the
    * transaction commits. SQLite: nothing, since its processes poll.
    */
   notify(channel: string, payload: string): Promise<void>;
   /**
+   * The change counters (src/db/live.ts) of `topics`, or of every topic. One statement; inside `together` it joins the wave.
+   * A topic with no row has no entry.
+   */
+  seqs(topics?: readonly string[]): Promise<Record<string, number>>;
+  /**
    * Postgres: calls `fn` with the payload of each notification on `channel` until `off()`, on the handle's one listening
    * connection, which opens in the background; with null after that connection was lost and opened again, when some may
    * have been missed. `listening()` is false until the LISTEN is in effect and while the connection is down: poll at the
    * short interval then. A notification is a hint to look again, never the data. SQLite: null, and the caller polls.
+   * The connection keeps the process alive while a subscription that is not `background` (a cache's invalidation) is on.
    */
-  listen(channel: string, fn: (payload: string | null) => void): Subscription | null;
+  listen(channel: string, fn: (payload: string | null) => void, o?: ListenOptions): Subscription | null;
   /** Calls `fn` for every round trip and write-lock release; returns the function that stops it. */
   observe(fn: (e: DbEvent) => void): () => void;
   close(): Promise<void>;
-  /** The underlying SQLite connection, for code that cannot await yet. Absent on Postgres. */
-  readonly sync?: DatabaseSync;
 }

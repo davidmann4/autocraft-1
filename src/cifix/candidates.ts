@@ -14,10 +14,20 @@ export type CifixCandidate = {
   attempt: number;
   /** branch: the branch accepts our push. comment: it does not, and the repo allows comments. */
   route: "branch" | "comment";
+  /** Our push to the PR is approved (pushPermission). */
+  mayPush: boolean;
+  /** A comment on the PR may go out instead. */
+  mayComment: boolean;
   /** The one rerun of this head was done; the failure is read again as something to fix. */
   rerun: boolean;
   /** When the rerun was requested (ISO), else null. */
   rerunAt: string | null;
+  /** Reads of the head's failure log that found none yet; at CIFIX_UNREAD_DELAYS_MS.length the next such read is a failed try. */
+  unreads?: number;
+  /** The one rerun of the failed jobs may be asked for: the repo approves CI reruns and a review read the head. */
+  mayRerun?: boolean;
+  /** The PR author's login, whom an ask about red CI addresses. */
+  author?: string | null;
   /** A stored model patch whose lint task ended: the collect step pushes it with the format changes folded in, or asks the model again with the findings. */
   lint?: { rowid: number; round: number; task: number | null; state: string; patch: string; files: string[]; /** The kept model session that wrote the patch (src/prepush/resume.ts). */ session: string | null };
 };
@@ -33,6 +43,8 @@ export type CifixSelection = {
   ask: CifixCandidate[];
   /** Stored patches whose lint task ended (the Plan's `lint` action, step cifix). */
   lint: CifixCandidate[];
+  /** The rowids of every stored patch the Plan lists, also those that may not be delivered now: they are kept. */
+  listed: number[];
   /** Infra failures due their one rerun, with the run ids to rerun. */
   rerun: { c: CifixCandidate; runs: number[] }[];
 };

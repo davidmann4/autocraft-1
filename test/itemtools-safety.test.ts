@@ -9,7 +9,7 @@ import { after, describe, test } from "node:test";
 import { buildSnapshot } from "../src/itemtools/snapshot.ts";
 import { callTool, frame, openDb } from "../src/itemtools/server/tools.ts";
 import { SCRATCH } from "./scratch.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb } from "./helpers/raw-db.ts";
 
 mkdirSync(SCRATCH, { recursive: true });
 const dir = mkdtempSync(join(SCRATCH, "itemtools-safety-"));

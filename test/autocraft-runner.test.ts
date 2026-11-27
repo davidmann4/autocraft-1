@@ -60,6 +60,9 @@ test("stream-json output gives the reply, the called model's usage, usage per mo
   const cut = helper.parseClaudeOutput(SAMPLE.split("\n").slice(0, 3).join("\n"), "opus");
   assert.equal(cut.ok, false);
   assert.deepEqual(cut.usage, { inputTokens: 9, outputTokens: 120, cacheReadTokens: 15000, cacheWriteTokens: 4000 });
+  // A refused run: the failure carries the result's stop reason and subtype for the server's record.
+  const refused = helper.parseClaudeOutput(JSON.stringify({ type: "result", subtype: "success", is_error: true, stop_reason: "refusal", result: "API Error: declined", usage: { input_tokens: 5, output_tokens: 70000 } }), "opus");
+  assert.deepEqual({ ok: refused.ok, refused: refused.refused, stopReason: refused.stopReason, subtype: refused.subtype, output: refused.usage?.outputTokens }, { ok: false, refused: true, stopReason: "refusal", subtype: "success", output: 70000 });
   // Tool uses for the run's record, timed by the arrival of their lines; the explorer's included.
   const stamps = SAMPLE.split("\n").map((_, i) => `2026-11-19T10:00:0${i}.000Z`);
   const tools = helper.claudeTools(SAMPLE, stamps);

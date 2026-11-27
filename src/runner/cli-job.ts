@@ -9,9 +9,10 @@ import { closeSync, createWriteStream, mkdirSync, openSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dbEnv, dbTarget } from "../db/open.ts";
 import { cliGate, jobLimit } from "./autopilot.ts";
-import { checkRequest, endJob, JobError, now } from "./jobs.ts";
+import { checkRequest, endJob, JobError } from "./jobs.ts";
 import { logsDir } from "./runner.ts";
 import { loadSteps, type StepDef } from "./steps.ts";
+import { claimCliJob, setPids } from "../data/jobs/index.ts";
 import type { Db } from "../db/index.ts";
 
 /** How a command maps to a step. `apply`: a job only with --apply (a dry run without it stays read-only); `dry-run`: a job unless --dry-run; `always`: always. */
@@ -23,8 +24,8 @@ export const CLI_STEPS: Record<string, CliStep> = {
   "main-fix": { step: "main-fix", when: "apply" },
   fixup: { step: "fixup", when: "apply" },
   verify: { step: "verify", when: "dry-run" }, "verify-collect": { step: "verify-collect", when: "dry-run" }, "opus-review": { step: "opus-review", when: "dry-run" },
-  dupes: { step: "dupes", when: "dry-run" }, "dupe-compare": { step: "dupes-compare", when: "dry-run" }, decide: { step: "decide", when: "dry-run" },
-  prioritize: { step: "prioritize", when: "always" }, rank: { step: "rank", when: "always" }, checks: { step: "checks", when: "always" }, "merge-ask": { step: "merge-ask", when: "always" },
+  dupes: { step: "dupes", when: "dry-run" }, "dupe-compare": { step: "dupes-compare", when: "dry-run" },
+  prioritize: { step: "prioritize", when: "always" }, rank: { step: "rank", when: "always" }, checks: { step: "checks", when: "always" },
 };
 
 export type CliRequest = { step: string; params: Record<string, string | number> };
@@ -52,7 +53,7 @@ export function cliRequest(command: string, args: string[], steps: Map<string, S
 /** Runs the request as an operator job here and returns the exit code. */
 export async function runCliJob(db: Db, req: CliRequest): Promise<number> {
   const steps = await loadSteps();
-  let job: number;
+  let job: { id: number; logPath: string };
   try {
     const { step, params } = await checkRequest(db, req.step, req.params);
     // The gate and the insert are one write transaction, so two CLI runs cannot both pass the gate.
@@ -63,25 +64,22 @@ export async function runCliJob(db: Db, req: CliRequest): Promise<number> {
       if (!lim) throw new JobError(409, `the daily limit of ${step.name} leaves too little for a run`);
       const full: Record<string, unknown> = { ...params, ...lim };
       mkdirSync(logsDir(), { recursive: true });
-      const t = now();
       const repo = typeof full.repo === "string" ? full.repo : null;
-      return Number((await db.get(db.k.insertInto("jobs").values({ step: step.name, params: JSON.stringify(full), repo, requested_by: "cli", requested_at: t, state: "running", started_at: t })
-        .returning("id")))!.id);
+      return await claimCliJob(db, { step: step.name, params: full, repo, logDir: logsDir() });
     });
   } catch (e) {
     if (e instanceof JobError) { console.error(`${req.step}: ${e.message}`); return 1; }
     throw e;
   }
-  const logPath = `${logsDir()}/job-${job}.log`;
+  const { id, logPath } = job;
   closeSync(openSync(logPath, "a"));
-  await db.run(db.k.updateTable("jobs").set({ log_path: logPath }).where("id", "=", job));
   const log = createWriteStream(logPath, { flags: "a" });
-  const logCopy = await JobLogCopy.open(db, job, logPath);
+  const logCopy = JobLogCopy.open(id, logPath);
   const copying = setInterval(() => void copyLogs(db, [logCopy]).catch(() => { /* the next copy reads the lines again */ }), JOB_LOG_FLUSH_MS);
-  const child = spawn(process.execPath, [fileURLToPath(new URL("../cli.ts", import.meta.url)), "runner", "exec", String(job)], {
+  const child = spawn(process.execPath, [fileURLToPath(new URL("../cli.ts", import.meta.url)), "runner", "exec", String(id)], {
     stdio: ["ignore", "pipe", "pipe"], env: dbEnv(dbTarget()),
   });
-  await db.run(db.k.updateTable("jobs").set({ pid: child.pid ?? null }).where("id", "=", job));
+  if (child.pid) await setPids(db, [{ id, pid: child.pid }]);
   child.stdout.on("data", (b: Buffer) => { log.write(b); process.stdout.write(b); });
   child.stderr.on("data", (b: Buffer) => { log.write(b); process.stderr.write(b); });
   for (const sig of ["SIGINT", "SIGTERM"] as const) process.once(sig, () => child.kill(sig));
@@ -90,8 +88,8 @@ export async function runCliJob(db: Db, req: CliRequest): Promise<number> {
   const [code, signal] = await new Promise<[number | null, NodeJS.Signals | null]>((resolve) => child.on("close", (c, s) => resolve([c, s])));
   clearInterval(copying);
   await new Promise<void>((resolve) => log.end(resolve));
-  const r = await endJob(db, job, code, signal, spawnError);
-  await copyLogs(db, [logCopy], true).catch((e: Error) => console.error(`job ${job}: log not stored: ${e.message}`));
-  console.error(`job ${job}: ${r?.state ?? "ended"}${r?.error ? `: ${r.error}` : ""}`);
+  const r = await endJob(db, id, code, signal, spawnError);
+  await copyLogs(db, [logCopy], true).catch((e: Error) => console.error(`job ${id}: log not stored: ${e.message}`));
+  console.error(`job ${id}: ${r?.state ?? "ended"}${r?.error ? `: ${r.error}` : ""}`);
   return r?.state === "done" ? 0 : 1;
 }

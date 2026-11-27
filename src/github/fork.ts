@@ -6,12 +6,13 @@ import type { Exec } from "../fixup/git.ts";
 import type { GuardedRepo } from "../core/guard.ts";
 import { slugOf } from "../owners.ts";
 import type { Db } from "../db/index.ts";
+import { loadRepos } from "../data/mirror/index.ts";
 
 const oneLine = (s: string, max = 200) => s.replace(/\s+/g, " ").trim().slice(0, max);
 const SHA = /^[0-9a-f]{40}$/;
 
 export const branchOf = async (db: Db, repo: string): Promise<string> =>
-  (await db.get(db.k.selectFrom("repos").select("default_branch").where("name", "=", repo)))?.default_branch ?? "main";
+  (await loadRepos(db, { names: [repo] })).get(repo)?.default_branch ?? "main";
 
 /** The pipeline account's fork of the repo as owner/name, created when missing; the base repo itself for a repo on the app identity. */
 export async function forkOf(w: Writer, g: GuardedRepo, run: Exec, login: string, repo: string, details: Record<string, unknown> = {}): Promise<string> {

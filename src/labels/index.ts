@@ -68,8 +68,8 @@ async function apply(args: string[]): Promise<void> {
     const client = new Client(500);
     const r = await applyLabels(await openDb(), client, o.repo, { runId: o.run!, limit: o.limit, apply: o.apply, log: console.log });
     console.log(r.dryRun
-      ? `dry run: ${r.planned} items would be labelled; add --apply to write (needs operator approval)`
-      : `labelled ${r.labeled} of ${r.planned} items in ${r.batches} batches, ${r.skipped} skipped (no longer open), ${r.failed.length} failed${r.failed.length ? ` (${r.failed.join(", ")})` : ""}; points ${client.spent}`);
+      ? `dry run: ${r.planned} items would be labelled${r.held ? `, ${r.held}` : ""}; add --apply to write`
+      : `labelled ${r.labeled} of ${r.planned} items in ${r.batches} batches, ${r.skipped} skipped (no longer open), ${r.failed.length} failed${r.failed.length ? ` (${r.failed.join(", ")})` : ""}; points ${client.spent}${r.held ? `; ${r.held}` : ""}`);
   } catch (e) {
     if (!(e instanceof LabelsError)) throw e;
     console.error(e.message);

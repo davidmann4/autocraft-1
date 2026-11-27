@@ -1,10 +1,9 @@
-// The duplicate-stage queries over real rows: merged PRs that fix an issue, unchecked pair counts, held and counted duplicates, and re-marking stored comparisons.
+// The duplicate-stage queries over real rows: merged PRs that fix an issue, unchecked pair counts and re-marking stored comparisons.
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { canonInfoAll } from "../src/dupes/canonical.ts";
 import { compareAgain } from "../src/dupes/compare.ts";
-import { uncheckedPairCounts, uncheckedPairs } from "../src/dupes/check.ts";
-import { duplicateCount, duplicateHeld, backlogHeld } from "../src/dupes/held.ts";
+import { loadUncheckedPairCounts, loadUncheckedPairs } from "../src/data/triage/index.ts";
 import { fillEmbedHashes } from "../src/itemhash.ts";
 import { T0, world } from "./world-db.ts";
 
@@ -21,16 +20,11 @@ test("canonical info, unchecked pairs, duplicate holds and comparison re-marking
   await fillEmbedHashes(db);
   const hash = async (n: number) => (await db.get(db.k.selectFrom("items").select("embed_hash").where("repo", "=", "app").where("number", "=", n)))!.embed_hash!;
   await db.run(db.k.insertInto("duplicate_pairs").values({ repo: "app", a: 1, b: 2, a_hash: await hash(1), b_hash: await hash(2), similarity: 0.9, created_at: T0 }));
-  assert.equal((await uncheckedPairs(db, -1)).length, 1);
-  assert.equal((await uncheckedPairs(db, 0)).length, 0);
-  assert.deepEqual([...await uncheckedPairCounts(db)].sort(), [["app#1", 1], ["app#2", 1]]);
-  assert.deepEqual([...await uncheckedPairCounts(db, { refs: ["app#1"] })], [["app#1", 1]]);
-  assert.deepEqual([...await uncheckedPairCounts(db, { refs: ["app#3"] })], []);
-  await db.run(db.k.insertInto("decisions").values({ id: "d1", kind: "duplicate", repo: "app", number: 2, question: "q", options: "[]", asked_at: T0, facts: JSON.stringify(["duplicate of app#1"]) }));
-  assert.equal(await duplicateCount(db, "app", 1), 1);
-  assert.equal(await duplicateHeld(db, "app", 2), true);
-  assert.equal(await duplicateHeld(db, "app", 1), false);
-  assert.equal(await backlogHeld(db, "app", 1), false);
+  assert.equal((await loadUncheckedPairs(db)).length, 1);
+  const refs = (...ns: number[]) => ns.map((number) => ({ repo: "app", number }));
+  assert.deepEqual([...await loadUncheckedPairCounts(db, refs(1, 2))].sort(), [["app#1", 1], ["app#2", 1]]);
+  assert.deepEqual([...await loadUncheckedPairCounts(db, refs(1))], [["app#1", 1]]);
+  assert.deepEqual([...await loadUncheckedPairCounts(db, refs(3))], []);
   await db.run(db.k.insertInto("dupe_comparisons").values([
     { repo: "app", key: "k1", kind: "issue", members: "[1,2]", hash: "h", kept: 1, source: "rule", at: T0 },
     { repo: "app", key: "k2", kind: "issue", members: "[3,4]", hash: "h", kept: 3, source: "rule", at: T0 },

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb } from "./helpers/raw-db.ts";
 import { rankOfItem, runRank } from "../src/rank/index.ts";
 
 test("rank writes every open item past one statement's worth of rows, reads the settled label, drops closed items and rewrites nothing unchanged", async () => {

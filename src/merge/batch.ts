@@ -12,24 +12,18 @@
 // split in half and each half retried. A single PR still red goes on hold. When the default branch moves, the batch
 // is rebuilt on the new head. Every GitHub write goes through `exec` / `run`.
 import { ownPrSelect } from "../github/adopt.ts";
-import { baseScopeRepos, scopeRepos } from "../pilot.ts";
-import { isFastTracked, workScores } from "../fasttrack.ts";
-import { mergeHeld } from "./holds.ts";
-import { holdMerge } from "./controls.ts";
-import { settlesLive, type RefreshDeps } from "../preapproval/permissions.ts";
-import { markMerged } from "../mirror.ts";
-import { closeMergedQuestions } from "./withdraw.ts";
+import { standsLive, type RefreshDeps } from "../preapproval/permissions.ts";
 import { mkdirSync } from "node:fs";
-import { audit } from "../dash/audit.ts";
-import { createTask, getTask, MAX_PATCH_BYTES, TERMINAL, warmKeyOf } from "../build/tasks.ts";
+import { cloneTask, createTask, getTask, MAX_PATCH_BYTES, TERMINAL, warmKeyOf } from "../build/tasks.ts";
 import { featureOn } from "../build/features.ts";
 import { failureTail } from "../build/rounds.ts";
-import { cloneTask } from "../verify/tasks.ts";
 import { outcomeOf } from "../verify/results.ts";
 import { scrub } from "../runner/scrub.ts";
 import { rustPlan } from "../worker/rust.ts";
+import type { RefusalCode } from "../core/codes.ts";
 import { CLI_BY, type By } from "../core/gates.ts";
 import { guard, guardBatchMerge, guardRepo, liveOf, type GuardedRepo } from "../core/guard.ts";
+import { repoInScope } from "../core/scope.ts";
 import { claimForWork } from "../github/claim.ts";
 import { ghClosePr, ghOpenPr, ghRerunMainFailed, mergeViaCommand, pushOwnBranch, type Writer } from "../github/write.ts";
 import { readFailure } from "../cifix/logs.ts";
@@ -38,31 +32,41 @@ import { failureLocations, MAX_SUSPECTS, suspects } from "./batch-blame.ts";
 import { type Exec, exec, fixupDir } from "../fixup/git.ts";
 import { whoAmI } from "../fixup/index.ts";
 import { setPipelineLogin } from "../github/pipeline-account.ts";
-import { commitIdentity } from "../github/identity.ts";
+import { commitIdentity, type Identity } from "../github/identity.ts";
 import { branchOf, forkOf, mainHeadOf } from "../github/fork.ts";
 import type { Querier } from "../mirror.ts";
 import { refreshChecks } from "../review/checks.ts";
 import { BatchGit } from "./batch-git.ts";
-import { ACTIVE_BATCH, BLOCKED_BY_REVIEW, CLOSED_BY_PERSON, MAX_PUBLISH_FAILURES, PUBLISH_FAILED, RUNS_WAIT_NOTE, BUILD_MAX_MS, MAX_BUILD_TRIES, activeBatches, admits, batchSizeOf, cancelBuild, retryDelayMs, getBatch, growBatchSize, insertBatch, membersOf, nextBranch, publishDelayMs, shrinkBatchSize, updateBatch, type BatchMember, type BatchRow } from "./batch-store.ts";
-import { mergeApprovalOf } from "./approval.ts";
+import { ACTIVE_BATCH, BLOCKED_BY_REVIEW, CLOSED_BY_PERSON, MAX_PUBLISH_FAILURES, PUBLISH_FAILED, RUNS_WAIT_NOTE, BUILD_MAX_MS, MAX_BUILD_TRIES, admits, cancelBuild, retryDelayMs, getBatch, publishDelayMs, updateBatch, type BatchMember, type BatchView } from "./batch-store.ts";
+import { firstRefusal, mergeVerdicts } from "./approval.ts";
 import { baseRefusal, recordLiveBase } from "./base.ts";
-import { allowFailedArgs, prInfo, mergeRun, DEFAULT_MERGE_COMMAND, type CommandResult } from "./index.ts";
+import { allowFailedArgs, ciNow, prInfo, mergeRun, DEFAULT_MERGE_COMMAND, type CommandResult } from "./index.ts";
 import { liveGateChecked } from "../review/discussion.ts";
 import { redMainRepos } from "../mainci/index.ts";
-import { effectiveCi, optionalChecks } from "../optional-checks.ts";
-import { PIPELINE_LOGIN_KEY, buildQueue, type QueueEntry } from "./queue.ts";
+import { optionalChecks } from "../optional-checks.ts";
+import { buildQueue, type QueueEntry } from "./queue.ts";
 import { planned } from "../core/select.ts";
+import { NO_WORKFLOW_SCORE } from "../core/work-score.ts";
 import { envVar } from "../env.ts";
 import { jobItem } from "../runner/job-items.ts";
 import { leaseItem } from "../runner/leases.ts";
 import { ownerOf, slugOf } from "../owners.ts";
-import { everySeq, filterSeq, someSeq } from "../async-seq.ts";
+import { addAudit } from "../data/control/index.ts";
+import { loadBatchRun, loadBatchSizes, loadRunApprovals, openBatch, recordLanded as saveLanded, updateBatches } from "../data/merge/index.ts";
+import type { StageRow } from "../data/merge/types.ts";
+import { loadItems, loadMainCiAt } from "../data/mirror/index.ts";
+import { addStageEvents } from "../data/planner/index.ts";
+import { loadItemAreas } from "../data/triage/index.ts";
+import { loadPrWorkflows, loadRepoScopes, loadWorkScores } from "../data/workflow/index.ts";
+import { afterBatch } from "./controls.ts";
 import type { Db } from "../db/index.ts";
 import { openDb } from "../db/open.ts";
 
 const ACTOR = "batch";
 /** How long the one rerun of a red batch PR gets to report new results before the batch is split anyway. */
 export const RERUN_WAIT_MS = 45 * 60_000;
+/** Refusals of a member's merge that say nothing about the PR: the batch waits for them, as a single merge does. Any other leaves the member out. */
+const WAITED_FOR: ReadonlySet<RefusalCode> = new Set(["breaker", "actor-unknown"]);
 /** Batches in flight per repo at most; a split or a trace starts no more. */
 const MAX_ACTIVE = 8;
 const PR_URL = /^https:\/\/github\.com\/[A-Za-z0-9-]+\/[A-Za-z0-9._-]+\/pull\/(\d+)$/;
@@ -127,20 +131,27 @@ export async function defaultBatchDeps(): Promise<BatchDeps> {
 export async function runBatches(db: Db, params: BatchParams, log: (line: string) => void = console.log, deps?: BatchDeps): Promise<BatchSummary> {
   const d = deps ?? await defaultBatchDeps();
   const { repo } = params;
-  if (!await mergeApprovalOf(db, repo)) throw new Error(`merging in ${repo} is not approved`);
   const at = () => d.now().toISOString();
   const runId = `batch-${repo}-${at().replace(/[-:]/g, "").slice(0, 15)}`;
   const s: BatchSummary = { runId, repo, started: [], published: [], merged: [], failed: [], split: [], superseded: [], waiting: [] };
-  if (!(await scopeRepos(db)).has(repo)) { log(`batch ${repo}: not in the pipeline scope; nothing done`); return s; }
-  // A repo in scope only through fast track: only batches made of fast-tracked PRs are touched.
-  const fullScope = (await baseScopeRepos(db)).has(repo);
-  const mine = async (b: BatchRow): Promise<boolean> => fullScope || await everySeq((await membersOf(db, b.id)), async (m) => await isFastTracked(db, repo, m.number));
-  const myBatches = async (): Promise<BatchRow[]> => await filterSeq((await activeBatches(db, repo)), mine);
+  const scope = (await loadRepoScopes(db, [repo])).get(repo);
+  if (!repoInScope(scope, "cleanup")) { log(`batch ${repo}: not tracked; nothing done`); return s; }
+  // With the repo's pipeline off only batches made of PRs with a live workflow are worked; the others are closed.
+  const fullScope = repoInScope(scope, "builds");
+  /** The repo's active batches, split into those this run works and those whose PRs left the scope. */
+  const batchesNow = async (): Promise<{ mine: BatchView[]; outside: BatchView[] }> => {
+    const active = (await loadBatchRun(db, repo)).active;
+    if (fullScope) return { mine: active, outside: [] };
+    const refs = active.flatMap((b) => b.members.map((m) => ({ repo, number: m.number })));
+    const live = await loadPrWorkflows(db, refs);
+    const isMine = (b: BatchView) => b.members.every((m) => live.has(`${repo}#${m.number}`));
+    return { mine: active.filter(isMine), outside: active.filter((b) => !isMine(b)) };
+  };
+  const activeCount = async (): Promise<number> => (await loadBatchRun(db, repo)).active.length;
   mkdirSync(d.root, { recursive: true });
   const git = new BatchGit(d.exec, d.root, repo);
-  const stage = async (repo: string, number: number, stage: string, at: string, actor: string, note: string): Promise<void> => {
-    await db.run(db.k.insertInto("main.stages").values({ repo, number, stage, at, actor, note }));
-  };
+  const stageRow = (number: number, stage: StageRow["stage"], note: string): StageRow => ({ repo, number, stage, at: at(), actor: ACTOR, note });
+  const audit = async (action: string, target: string, details: Record<string, unknown>): Promise<void> => await addAudit(db, [{ login: ACTOR, action, target, details }]);
   let landed = 0;
   /** PRs this run may still start or land under the stage's daily limit. */
   const left = () => (params.limit === undefined ? Infinity : params.limit - landed);
@@ -150,13 +161,20 @@ export async function runBatches(db: Db, params: BatchParams, log: (line: string
   const liveRead = liveOf(db, d.querier);
   const refOf = (n: number) => `${repo}#${n}`;
   const branch = await branchOf(db, repo);
-  /** The batch stage's repo-level writes (its branch and PR) need the repo's merge approval. */
-  const grant = async (need: "merge" | null = "merge"): Promise<GuardedRepo | null> => {
-    const g = await guardRepo(db, repo, need, by);
+  /**
+   * The batch's repo-level writes (its branch, its PR, the reruns) need every member's merge to be permitted (mergeVerdicts):
+   * with no repo approval a batch holds only PRs people approved one by one. `members` null: a write
+   * that only ends the batch (closing its PR), which needs the pipeline alone.
+   */
+  const grant = async (members: { number: number; head_oid: string }[] | null): Promise<GuardedRepo | null> => {
+    const verdicts = members ? await mergeVerdicts(db, repo, members.map((m) => ({ number: m.number, head: m.head_oid }))) : null;
+    const why = verdicts && firstRefusal(verdicts, repo);
+    if (why) { log(`  ${why}`); return null; }
+    const g = await guardRepo(db, repo, members ? "merge" : null, by, undefined, { members: verdicts ? [...verdicts.values()] : [] });
     if ("refused" in g) { log(`  ${g.refused}`); return null; }
     return g;
   };
-  const closePr = async (b: BatchRow, why: string) => {
+  const closePr = async (b: BatchView, why: string) => {
     if (b.pr_number === null) return;
     const g = await grant(null);
     if (!g) return;
@@ -165,29 +183,22 @@ export async function runBatches(db: Db, params: BatchParams, log: (line: string
   };
 
   /**
-   * Members that merge on a Merge answer (path operator) whose answerer no longer settles on the repo. The batch PR is merged without the user
-   * lane, so a maintainer's write permission is read now (settlesLive) rather than trusted from the cache. `unsure`: GitHub could not answer for one.
+   * Members whose merge is a person's (`as`) who no longer has write access to the repo. The batch PR is merged without the user lane,
+   * so the permission is read now (standsLive, once per approver) rather than trusted from the cache. `unsure`: GitHub could not answer
+   * for one.
    */
-  async function answersGone(members: { number: number; head: string }[], q: QueueEntry[]): Promise<{ gone: { number: number; why: string }[]; unsure: boolean }> {
+  async function approversGone(members: { number: number; as: Identity }[]): Promise<{ gone: { number: number; why: string }[]; unsure: boolean }> {
+    const byLogin = new Map<string, number[]>();
+    for (const m of members) if (m.as !== "app") { const by = m.as.slice("user:".length); byLogin.set(by, [...(byLogin.get(by) ?? []), m.number]); }
     const gone: { number: number; why: string }[] = [];
     let unsure = false;
-    for (const m of members) {
-      const e = q.find((x) => x.number === m.number && x.head === m.head);
-      if (e?.path !== "operator" || !e.decisionId) continue;
-      const login = (await db.get(db.k.selectFrom("main.decisions").select("answered_by").where("id", "=", e.decisionId).where("answer", "=", "merge")))?.answered_by;
-      if (!login) continue;
-      const v = await settlesLive(db, login, repo, d.permission);
+    for (const [login, numbers] of byLogin) {
+      const v = await standsLive(db, login, repo, d.permission ? { permission: d.permission } : {});
       if (v === "unknown") unsure = true;
-      if (v === "no") gone.push({ number: m.number, why: `${login} no longer settles decisions on ${repo}, so their Merge answer no longer counts` });
+      if (v === "no") for (const number of numbers) gone.push({ number, why: `${login} no longer has write access to ${repo}, so their approval no longer counts` });
     }
     return { gone, unsure };
   }
-  /** Holds a PR whose Merge answer stopped counting, as Remove from batch does, so the next run does not batch it again; an operator releases it. */
-  const holdGone = async (x: { number: number; why: string }, batch: string | null) => {
-    await holdMerge(db, ACTOR, repo, x.number, { ...(batch ? { batch } : {}), reason: x.why });
-    if (batch) await audit(db, ACTOR, "batch-remove", refOf(x.number), { run: runId, batch, reason: x.why });
-    log(`  ${refOf(x.number)}: held: ${x.why}`);
-  };
 
   /**
    * Builds a batch of the candidates, in order, from the current head of the default branch (or `onBase`, a head the caller
@@ -200,7 +211,6 @@ export async function runBatches(db: Db, params: BatchParams, log: (line: string
     await setPipelineLogin(db, who.login);
     const chain: { cand: Cand; commit: string }[] = [];
     let cur = base;
-    const q = await buildQueue(db, { repo, merged: "exclude" });
     for (const c of cands) {
       if (chain.length && !admits(chain.map((x) => x.cand), c, max)) continue;
       const sha = await git.fetchPr(ownerOf(repo), repo, c.number);
@@ -217,9 +227,9 @@ export async function runBatches(db: Db, params: BatchParams, log: (line: string
       if (baseWhy) { log(`  ${refOf(c.number)}: left out: ${baseWhy}`); continue; }
       const g = await guard(db, { repo, number: c.number }, { kind: "merge", head: c.head, batch: true }, by, liveRead);
       if ("refused" in g) { log(`  ${refOf(c.number)}: left out: ${g.refused}`); continue; }
-      const answers = await answersGone([c], q);
-      if (answers.gone.length) { await holdGone(answers.gone[0]!, null); continue; }
-      if (answers.unsure) { log(`  ${refOf(c.number)}: left out: GitHub could not confirm the write permission of who answered Merge`); continue; }
+      const approvers = await approversGone([{ number: c.number, as: g.as }]);
+      if (approvers.gone.length) { log(`  ${refOf(c.number)}: left out: ${approvers.gone[0]!.why}`); continue; }
+      if (approvers.unsure) { log(`  ${refOf(c.number)}: left out: GitHub could not confirm the write permission of who approved it`); continue; }
       const tree = await git.mergeTree(cur, sha);
       if (!tree) { log(`  ${refOf(c.number)}: conflicts with the batch so far; waits for the next one`); continue; }
       cur = await git.mergeCommit(tree, [cur, sha], `Merge pull request #${c.number}`, { name: author.name, email: author.email });
@@ -243,44 +253,43 @@ export async function runBatches(db: Db, params: BatchParams, log: (line: string
         }
       } catch (e) { skipped = `the build could not be queued: ${oneLine(String((e as Error).message ?? e), 120)}`; }
     }
-    const name = await nextBranch(db, repo, d.now());
     const members: BatchMember[] = chain.map((x) => ({ number: x.cand.number, head_oid: x.cand.head }));
-    const id = await insertBatch(db, { repo, branch: name, baseSha: base, commitSha: tip, parentId, taskId, members, at: at() });
-    if (taskId !== null) await updateBatch(db, id, at(), { build_state: "pending", build_tries: 1 });
-    else if (skipped) await skipBuild(await getBatch(db, id), skipped);
-    await audit(db, ACTOR, "batch-start", `${repo}:${name}`, { run: runId, base, prs: members.map((m) => m.number) });
+    // The batch row, its members and the `batch-start` audit row in one write.
+    const { id, branch: name } = await openBatch(db, {
+      repo, baseSha: base, commitSha: tip, parentId, taskId, members, at: at(), build: taskId !== null ? "pending" : skipped ? "skipped" : null, runId, prs: members.map((m) => m.number),
+    });
+    if (taskId === null && skipped) await skipBuild(await getBatch(db, id), skipped, false);
     s.started.push(name);
-    const ag = await grant();
+    const ag = await grant(members);
     if (ag) for (const m of members) await claimForWork(w, ag, d.querier, repo, m.number, "pr", { id: who.nodeId, login: who.login }, { run: runId, batch: name }, log);
     log(`  ${name}: ${members.length} PR${members.length === 1 ? "" : "s"} (${members.map((m) => `#${m.number}`).join(", ")}) on ${short(base)}; ${taskId === null ? "opening the batch PR" : `building and testing it in task #${taskId} first`}`);
     if (taskId === null) await publish(await getBatch(db, id), members);
     return id;
   }
 
-  /** The batch PR opens without a passed build: records why. */
-  async function skipBuild(b: BatchRow, why: string): Promise<void> {
-    await updateBatch(db, b.id, at(), { build_state: "skipped" });
-    await audit(db, ACTOR, "batch-build-skip", `${repo}:${b.branch}`, { run: runId, reason: oneLine(why, 200) });
+  /** The batch PR opens without a passed build: records why (`set` false: the row already says skipped). */
+  async function skipBuild(b: BatchView, why: string, set = true): Promise<void> {
+    if (set) await updateBatch(db, b.id, at(), { build_state: "skipped" });
+    await audit("batch-build-skip", `${repo}:${b.branch}`, { run: runId, reason: oneLine(why, 200) });
     log(`  ${b.branch}: build skipped: ${why}`);
   }
 
   const asCands = (ms: BatchMember[]): Cand[] => ms.map((m) => ({ number: m.number, head: m.head_oid, size: "S", lines: 0 }));
 
-  /** The batch's PRs are rebuilt on the current default branch head, leaving out `members` that changed. */
-  async function supersede(b: BatchRow, keep: BatchMember[], why: string): Promise<void> {
+  /** Closes the batch; `keep` is rebuilt on the current default branch head. `named`: the members its closing comment speaks of. */
+  async function supersede(b: BatchView, keep: BatchMember[], why: string, named = keep): Promise<void> {
     // A control may have ended the batch while the caller's GitHub calls ran.
     if (!ACTIVE_BATCH.includes((await getBatch(db, b.id)).state)) return;
     await cancelBuild(db, b, ACTOR);
     await updateBatch(db, b.id, at(), { state: "superseded", summary: why });
-    await closePr(b, `Closing: ${why}. The PRs are rebuilt in a new batch.`);
+    await closePr(b, `Closing: ${why}.${await afterBatch(db, repo, named.map((m) => m.number), named.length < b.members.length)}`);
     s.superseded.push(b.branch);
     log(`  ${b.branch}: ${why}`);
-    const rebuild = await filterSeq(keep, async (m) => !await mergeHeld(db, repo, m.number));
-    if (rebuild.length && left() > 0) await startBatch(asCands(rebuild), left(), b.id);
+    if (keep.length && left() > 0) await startBatch(asCands(keep), left(), b.id);
   }
 
   /** Why the batch must be rebuilt because the default branch moved, or null: a move that merges cleanly with the batch tip does not matter (GitHub and upstream CI re-check the batch PR). */
-  async function movedAway(b: BatchRow): Promise<string | null> {
+  async function movedAway(b: BatchView): Promise<string | null> {
     const head = await d.mainHead(repo, branch);
     if (!head || head === b.base_sha) return null;
     try {
@@ -291,26 +300,28 @@ export async function runBatches(db: Db, params: BatchParams, log: (line: string
   }
 
   /** A failed batch: several PRs split in half and each half retried; one PR goes on hold. */
-  async function fail(b: BatchRow, why: string): Promise<void> {
-    const members = await membersOf(db, b.id);
-    await shrinkBatchSize(db, repo);
+  async function fail(b: BatchView, why: string): Promise<void> {
+    const members = b.members;
     await closePr(b, "Closing: the batch failed. Its PRs are retried in smaller batches or held.");
     if (members.length === 1) {
       const m = members[0]!;
       const summary = why;
-      await updateBatch(db, b.id, at(), { state: "failed", summary: oneLine(summary, 400) });
-      await stage(repo, m.number, "hold", at(), ACTOR, `batch failed at ${short(m.head_oid)}: ${oneLine(summary, 200)}`);
-      await audit(db, ACTOR, "batch-hold", refOf(m.number), { run: runId, batch: b.branch, summary: oneLine(summary, 200) });
+      // The batch row, the repo's smaller batch size, the hold stage row and the audit row in one write.
+      await db.write(async () => {
+        await updateBatches(db, [{ id: b.id, at: at(), set: { state: "failed", summary: oneLine(summary, 400) }, size: "shrink" }]);
+        await addStageEvents(db, [stageRow(m.number, "hold", `batch failed at ${short(m.head_oid)}: ${oneLine(summary, 200)}`)]);
+        await audit("batch-hold", refOf(m.number), { run: runId, batch: b.branch, summary: oneLine(summary, 200) });
+      });
       s.failed.push(m.number);
       log(`  ${b.branch}: ${refOf(m.number)} failed alone; on hold: ${oneLine(summary, 120)}`);
       return;
     }
-    await updateBatch(db, b.id, at(), { state: "split", summary: oneLine(why, 400) });
+    await updateBatches(db, [{ id: b.id, at: at(), set: { state: "split", summary: oneLine(why, 400) }, size: "shrink" }]);
     s.split.push(b.branch);
     log(`  ${b.branch}: ${why}; splitting ${members.length} PRs in half`);
     const mid = Math.ceil(members.length / 2);
     for (const half of [members.slice(0, mid), members.slice(mid)]) {
-      if ((await activeBatches(db, repo)).length >= MAX_ACTIVE) break;
+      if (await activeCount() >= MAX_ACTIVE) break;
       if (left() <= 0) break;
       await startBatch(asCands(half), left(), b.id);
     }
@@ -321,30 +332,30 @@ export async function runBatches(db: Db, params: BatchParams, log: (line: string
    * holds it only if it is red there too, and the others are rebuilt without them. The batch size stays: the batch
    * was not too big, one PR broke it.
    */
-  async function drop(b: BatchRow, members: BatchMember[], traced: Map<number, string>, why: string): Promise<void> {
+  async function drop(b: BatchView, members: BatchMember[], traced: Map<number, string>, why: string): Promise<void> {
     // A control may have ended the batch while the caller's GitHub calls ran.
     if (!ACTIVE_BATCH.includes((await getBatch(db, b.id)).state)) return;
     await cancelBuild(db, b, ACTOR);
     const list = [...traced].map(([n, w]) => `#${n} (${w})`).join("; ");
     await updateBatch(db, b.id, at(), { state: "split", summary: oneLine(`${why}; traced to ${list}: tested alone, the rest rebuilt without`, 400) });
     await closePr(b, `Closing: the batch failed and its failure points at ${[...traced.keys()].map((n) => `#${n}`).join(", ")}. Those are tested alone; the other PRs are rebuilt without them.`);
-    for (const [n, w] of traced) await audit(db, ACTOR, "batch-blame", refOf(n), { run: runId, batch: b.branch, reason: oneLine(w, 200) });
+    await addAudit(db, [...traced].map(([n, w]) => ({ login: ACTOR, action: "batch-blame", target: refOf(n), details: { run: runId, batch: b.branch, reason: oneLine(w, 200) } })));
     s.split.push(b.branch);
     log(`  ${b.branch}: ${why}; traced to ${list}`);
     // Every batch started here is built on one head, so a suspect alone is never red from a change the others did not have.
     const base = await git.fetchMain(ownerOf(repo), repo, branch);
     // The suspects go first: their tests alone are what the trace asks for. A rest that finds no room returns to the queue
     // and is batched again later; nothing of it is lost.
-    for (const m of await filterSeq(members, async (x) => traced.has(x.number) && !await mergeHeld(db, repo, x.number))) {
-      if (left() <= 0 || (await activeBatches(db, repo)).length >= MAX_ACTIVE) break;
+    for (const m of members.filter((x) => traced.has(x.number))) {
+      if (left() <= 0 || await activeCount() >= MAX_ACTIVE) break;
       await startBatch(asCands([m]), 1, b.id, base);
     }
-    const rest = await filterSeq(members, async (m) => !traced.has(m.number) && !await mergeHeld(db, repo, m.number));
-    if (rest.length && left() > 0 && (await activeBatches(db, repo)).length < MAX_ACTIVE) await startBatch(asCands(rest), left(), b.id, base);
+    const rest = members.filter((m) => !traced.has(m.number));
+    if (rest.length && left() > 0 && await activeCount() < MAX_ACTIVE) await startBatch(asCands(rest), left(), b.id, base);
   }
 
   /** The members a failure's log text points at, when that is a trace worth following (some, not all, and few). */
-  async function traceOf(b: BatchRow, members: BatchMember[], text: string): Promise<Map<number, string> | null> {
+  async function traceOf(b: BatchView, members: BatchMember[], text: string): Promise<Map<number, string> | null> {
     if (members.length < 2) return null;
     try {
       const found = await suspects(git, b, members, failureLocations(text));
@@ -356,7 +367,7 @@ export async function runBatches(db: Db, params: BatchParams, log: (line: string
   }
 
   /** The failed checks of the batch tip with their log tails, or null when they cannot be read. Read-only. */
-  async function readBatchFailure(b: BatchRow): Promise<CiFailure | null> {
+  async function readBatchFailure(b: BatchView): Promise<CiFailure | null> {
     const gh = async (args: string[]): Promise<string> => {
       const r = await d.exec("gh", args);
       if (r.code !== 0) throw new Error(oneLine(r.stderr || r.stdout || `gh exited ${r.code}`));
@@ -364,7 +375,8 @@ export async function runBatches(db: Db, params: BatchParams, log: (line: string
     };
     try {
       const r = await readFailure(gh, repo, b.commit_sha, await optionalChecks(db, repo));
-      return r.kind === "failure" ? r.failure : null;
+      // A log not readable yet still names the failed checks and their runs: the batch traces nothing in it and reruns or waits.
+      return r.kind === "skip" ? null : r.failure;
     } catch {
       return null;
     }
@@ -372,7 +384,7 @@ export async function runBatches(db: Db, params: BatchParams, log: (line: string
 
   /** The gate checks that failed on the default branch at `sha`, from the main CI poll; null when that head was not polled. */
   async function redOnMainAt(sha: string): Promise<Set<string> | null> {
-    const row = await db.get(db.k.selectFrom("main.main_ci").select("failing").where("repo", "=", repo).where("head_sha", "=", sha));
+    const row = (await loadMainCiAt(db, [{ repo, sha }])).get(`${repo}@${sha}`);
     if (!row) return null;
     try {
       return new Set((JSON.parse(row.failing) as { name?: string }[]).map((f) => f.name ?? "").filter(Boolean));
@@ -385,7 +397,7 @@ export async function runBatches(db: Db, params: BatchParams, log: (line: string
    * Upstream CI failed on the batch PR. In order: checks red on the default branch at the base too blame no PR; a
    * failure the log traces drops those PRs (tested alone); otherwise the failed runs are rerun once; then the batch fails.
    */
-  async function red(b: BatchRow, members: BatchMember[], names: string[]): Promise<void> {
+  async function red(b: BatchView, members: BatchMember[], names: string[]): Promise<void> {
     const optional = new Set(await optionalChecks(db, repo));
     const failing = names.filter((n) => !optional.has(n));
     const why = `upstream CI failed on the batch PR${failing.length ? `: ${failing.join(", ")}` : ""}`;
@@ -412,7 +424,7 @@ export async function runBatches(db: Db, params: BatchParams, log: (line: string
     if (traced) return drop(b, members, traced, why);
     if (!b.ci_reruns) {
       const runs = [...new Set((failure?.checks ?? []).filter((c) => c.conclusion === "failure" && c.runId !== null).map((c) => c.runId!))];
-      const g = runs.length ? await grant() : null;
+      const g = runs.length ? await grant(members) : null;
       if (g) {
         // GitHub's rollup is red as soon as one job fails, while the run's other jobs go on, and it refuses to rerun the
         // failed jobs of a run in progress: the one rerun waits until every failed check's run is completed.
@@ -428,7 +440,7 @@ export async function runBatches(db: Db, params: BatchParams, log: (line: string
         await updateBatch(db, b.id, at(), { ci_reruns: 1, ci_rerun_at: at(), summary: oneLine(`${why}; no PR traced, rerunning the failed runs once`, 400) });
         let refused = 0;
         for (const id of runs) if ((await ghRerunMainFailed(w, g, d.exec, { repo, head: b.commit_sha, runId: id }, { batch: b.branch })).code !== 0) refused++;
-        await audit(db, ACTOR, "batch-rerun", `${repo}:${b.branch}`, { run: runId, runs, refused });
+        await audit("batch-rerun", `${repo}:${b.branch}`, { run: runId, runs, refused });
         log(`  ${b.branch}: ${why}; no PR traced, reran ${runs.length} failed run${runs.length === 1 ? "" : "s"} once${refused ? ` (${refused} refused)` : ""}`);
         // Every call refused: no rerun is under way, so there is nothing to wait for.
         if (runs.length && refused === runs.length) return await active() ? fail(b, why) : undefined;
@@ -454,29 +466,49 @@ export async function runBatches(db: Db, params: BatchParams, log: (line: string
   }
 
   /** A push or PR creation failed: the error is kept on the batch, the next try waits longer, and the fifth failure ends the batch so its PRs go back to the queue. */
-  async function publishFailed(b: BatchRow, error: string): Promise<void> {
+  async function publishFailed(b: BatchView, error: string): Promise<void> {
     const failures = b.retries + 1;
     log(`  ${b.branch}: ${error}`);
     if (failures >= MAX_PUBLISH_FAILURES) {
       await updateBatch(db, b.id, at(), { state: "failed", retries: failures, summary: oneLine(`${PUBLISH_FAILED} after ${failures} tries: ${error}`, 400) });
-      s.failed.push(...(await membersOf(db, b.id)).map((m) => m.number));
+      s.failed.push(...b.members.map((m) => m.number));
       return;
     }
     await updateBatch(db, b.id, at(), { retries: failures, summary: oneLine(error, 400) });
     s.waiting.push(b.branch);
   }
 
-  async function publish(b: BatchRow, members: BatchMember[]): Promise<void> {
+  /**
+   * The members with who each one's merge is made as, when every member may merge now. Null: the batch was rebuilt without the members
+   * that may not, or it waits.
+   */
+  async function mayLand(b: BatchView, members: BatchMember[]): Promise<{ number: number; as: Identity }[] | null> {
+    const verdicts = await mergeVerdicts(db, repo, members.map((m) => ({ number: m.number, head: m.head_oid })), { batch: true });
+    const ok: { number: number; as: Identity }[] = [], out: string[] = [];
+    let why = "", waits = "";
+    for (const m of members) {
+      const v = verdicts.get(m.number)!;
+      if (v.ok) ok.push({ number: m.number, as: v.as });
+      else if (WAITED_FOR.has(v.why.code)) waits ||= `${refOf(m.number)}: ${v.why.text}`;
+      else { out.push(refOf(m.number)); why ||= v.why.text; }
+    }
+    if (out.length) { await supersede(b, members.filter((m) => !out.includes(refOf(m.number))), `${out.join(", ")} left the batch: ${why}`); return null; }
+    if (waits) { log(`  ${b.branch}: waits: ${waits}`); s.waiting.push(b.branch); return null; }
+    return ok;
+  }
+
+  async function publish(b: BatchView, members: BatchMember[]): Promise<void> {
     const moved = await movedAway(b);
     if (moved) return supersede(b, members, moved);
     // Time passes between building and pushing (and between retries of a failed push): the members must still be open at the batched heads.
     const checks = await refreshChecks(db, d.querier, repo, members.map((m) => m.number));
-    const live = members.filter((m) => checks.some((c) => c.number === m.number && c.state === "OPEN" && c.head_oid === m.head_oid));
-    if (live.length < members.length) return supersede(b, live, "a PR in the batch was closed, merged or pushed to");
+    const live = members.filter((m) => checks.some((c) => c.number === m.number && c.state === "OPEN" && !c.is_draft && c.head_oid === m.head_oid));
+    if (live.length < members.length) return supersede(b, live, "a PR in the batch was closed, merged, pushed to or turned into a draft");
     // An operator may have stopped the batch while the checks were read.
     if ((await getBatch(db, b.id)).state !== "checking") return;
+    if (!await mayLand(b, members)) return;
     const who = await whoAmI(d.exec);
-    const g = await grant();
+    const g = await grant(members);
     if (!g) return publishFailed(b, "not approved or the pipeline is off");
     const fork = await forkOf(w, g, d.exec, who.login, repo, { run: runId });
     const push = await pushOwnBranch(w, g, git, "batch-push", { repo, remote: fork, branch: b.branch, sha: b.commit_sha }, { run: runId, fork });
@@ -511,35 +543,31 @@ export async function runBatches(db: Db, params: BatchParams, log: (line: string
     log(`  ${b.branch}: opened ${url}`);
   }
 
-  /** Bookkeeping once the batch PR is merged, whoever merged it. */
-  async function recordLanded(b: BatchRow, members: BatchMember[], q: QueueEntry[], mergeSha: string | null = null): Promise<void> {
+  /** Bookkeeping once the batch PR is merged, whoever merged it: one write records the batch, its members' attempts, the mirror, stage and audit rows. */
+  async function bookLanded(b: BatchView, members: BatchMember[], q: QueueEntry[], mergeSha: string | null = null): Promise<void> {
     // A control may have ended the batch while the merge ran: the merge still happened, so the row says so and the audit shows the order of events.
-    const was = (await getBatch(db, b.id)).state;
-    if (was !== "open" && was !== "checking") await audit(db, ACTOR, "batch-merged-after-end", `${repo}:${b.branch}`, { run: runId, was, prs: members.map((m) => m.number) });
-    await updateBatch(db, b.id, at(), { state: "merged", summary: null, ...(mergeSha ? { merge_sha: mergeSha } : {}) });
+    await saveLanded(db, {
+      batchId: b.id, runId, at: at(), mergeSha: mergeSha ?? "", by: ACTOR,
+      members: members.map((m) => {
+        const e = q.find((x) => x.number === m.number);
+        return { number: m.number, head: m.head_oid, path: e?.path === "rule" || !e ? "rule" : "maintainer", ci: e?.ci ?? null, mergeable: e?.mergeable ?? null };
+      }),
+    });
     for (const m of members) {
-      const e = q.find((x) => x.number === m.number);
-      await db.run(db.k.insertInto("merges").values({ repo, number: m.number, head_oid: m.head_oid, run_id: runId, at: at(), path: e?.path ?? "rule", method: "merge", outcome: "merged", reason: null, ci: e?.ci ?? "success", mergeable: e?.mergeable ?? "MERGEABLE" }));
-      await stage(repo, m.number, "merged", at(), ACTOR, `merge in ${b.branch} at ${short(m.head_oid)}`);
       await jobItem(db, repo, m.number, `merged in batch ${b.branch}`, log);
-      await markMerged(db, repo, m.number, at());
-      await closeMergedQuestions(db, repo, m.number, at());
-      await audit(db, ACTOR, "merge", refOf(m.number), { run: runId, head: m.head_oid, method: "merge", batch: b.branch });
-      if (e?.path === "operator" && e.decisionId) await db.run(db.k.updateTable("main.decisions").set({ applied_at: at() }).where("id", "=", e.decisionId).where("applied_at", "is", null));
       s.merged.push(m.number);
     }
-    await growBatchSize(db, repo);
     landed += members.length;
     params.onMerged?.(landed);
     log(`  ${b.branch}: merged ${members.length} PR${members.length === 1 ? "" : "s"}`);
   }
 
-  async function land(b: BatchRow, members: BatchMember[], q: QueueEntry[]): Promise<void> {
+  async function land(b: BatchView, members: BatchMember[], q: QueueEntry[]): Promise<void> {
     // One query for the batch PR and its members: the members must still be open at the head that was batched.
     const checks = await refreshChecks(db, d.querier, repo, [b.pr_number!, ...members.map((m) => m.number)]);
     const ch = checks.find((c) => c.number === b.pr_number);
     if (!ch) { s.waiting.push(b.branch); return; }
-    if (ch.state === "MERGED") return await recordLanded(b, members, q);
+    if (ch.state === "MERGED") return await bookLanded(b, members, q);
     // Main is red: the batch keeps its checks but does not merge until main is green. Main-fix PRs never join a batch (a plan merge action with singleOnly).
     if ((await redMainRepos(db)).has(repo)) {
       log(`  ${b.branch}: main CI is red in ${repo}; not merged`);
@@ -550,15 +578,17 @@ export async function runBatches(db: Db, params: BatchParams, log: (line: string
     if ((await getBatch(db, b.id)).state !== "open") { log(`  ${b.branch}: ended meanwhile; left alone`); return; }
     if (ch.state === "CLOSED") {
       // Our own closes mark the batch first, so a closed active batch was closed by a person: hold its PRs for their current heads.
-      await updateBatch(db, b.id, at(), { state: "failed", summary: CLOSED_BY_PERSON });
-      for (const m of members) await stage(repo, m.number, "hold", at(), ACTOR, `the batch PR ${b.branch} was closed; held at ${short(m.head_oid)}`);
+      await db.write(async () => {
+        await updateBatch(db, b.id, at(), { state: "failed", summary: CLOSED_BY_PERSON });
+        await addStageEvents(db, members.map((m) => stageRow(m.number, "hold", `the batch PR ${b.branch} was closed; held at ${short(m.head_oid)}`)));
+      });
       s.failed.push(...members.map((m) => m.number));
       log(`  ${b.branch}: the batch PR was closed; its PRs are held until they change`);
       return;
     }
-    const live = members.filter((m) => checks.some((c) => c.number === m.number && c.state === "OPEN" && c.head_oid === m.head_oid));
-    if (live.length < members.length) return supersede(b, live, "a PR in the batch was closed, merged or pushed to");
-    const ci = await effectiveCi(db, repo, ch.overall, ch.checks);
+    const live = members.filter((m) => checks.some((c) => c.number === m.number && c.state === "OPEN" && !c.is_draft && c.head_oid === m.head_oid));
+    if (live.length < members.length) return supersede(b, live, "a PR in the batch was closed, merged, pushed to or turned into a draft");
+    const ci = await ciNow(db, repo, ch);
     if (ci === "failure") return red(b, members, ch.checks.filter((c) => c.state === "failure").map((c) => c.name));
     if (ch.mergeable === "CONFLICTING") return supersede(b, members, `the batch PR conflicts with ${branch}`);
     const moved = await movedAway(b);
@@ -566,8 +596,8 @@ export async function runBatches(db: Db, params: BatchParams, log: (line: string
     if (members.length > left()) { log(`  ${b.branch}: ${members.length} PRs exceed the ${Math.max(left(), 0)} left of the daily limit; waits`); s.waiting.push(b.branch); return; }
     if (ci !== "success" || ch.mergeable !== "MERGEABLE") {
       // A fork's runs wait for a maintainer's approval; the ci-approve step does it where the repo allows, and the note says so until the runs started.
-      const waiting = await db.get(db.k.selectFrom("ci_run_approvals").select(["runs", "reread"]).where("repo", "=", repo).where("number", "=", b.pr_number!).where("head_oid", "=", b.commit_sha));
-      const note = waiting && (JSON.parse(waiting.runs).length || waiting.reread) ? RUNS_WAIT_NOTE : null;
+      const waiting = (await loadRunApprovals(db, [{ repo, number: b.pr_number! }])).get(`${repo}#${b.pr_number}@${b.commit_sha}`);
+      const note = waiting && (waiting.runs.length || waiting.reread) ? RUNS_WAIT_NOTE : null;
       if ((b.summary ?? null) !== note) await updateBatch(db, b.id, at(), { summary: note });
       s.waiting.push(b.branch);
       return;
@@ -582,16 +612,19 @@ export async function runBatches(db: Db, params: BatchParams, log: (line: string
     if (own.blocked) {
       if ((await getBatch(db, b.id)).state !== "open") { log(`  ${b.branch}: ended meanwhile; left alone`); return; }
       // Rebuilding would only open a new PR around the review: the batch fails and its PRs wait for a new head.
-      await updateBatch(db, b.id, at(), { state: "failed", summary: BLOCKED_BY_REVIEW });
+      await db.write(async () => {
+        await updateBatch(db, b.id, at(), { state: "failed", summary: BLOCKED_BY_REVIEW });
+        await addStageEvents(db, members.map((m) => stageRow(m.number, "hold", `the batch PR ${b.branch} has changes requested; held at ${short(m.head_oid)}`)));
+      });
       await closePr(b, `Closing: ${own.blocked}. The PRs in it are held until they change.`);
-      for (const m of members) await stage(repo, m.number, "hold", at(), ACTOR, `the batch PR ${b.branch} has changes requested; held at ${short(m.head_oid)}`);
       s.failed.push(...members.map((m) => m.number));
       log(`  ${b.branch}: ${own.blocked}; its PRs are held until they change`);
       return;
     }
+    const mirror = await loadItems(db, members.map((m) => ({ repo, number: m.number })), "pr");
     for (const m of members) {
       // A member retargeted or reviewed again against another base since the batch was built: what lands is no longer what its review read.
-      const mirrored = (await db.get(db.k.selectFrom("items").select("base_ref").where("repo", "=", repo).where("number", "=", m.number)))?.base_ref ?? branch;
+      const mirrored = mirror.get(refOf(m.number))?.base_ref ?? branch;
       const baseWhy = mirrored !== branch ? `its base branch is ${mirrored}, not ${branch}` : await baseRefusal(db, repo, m.head_oid, m.number, branch);
       if (baseWhy) return supersede(b, members.filter((x) => x !== m), `${refOf(m.number)} left the batch: ${baseWhy}`);
       const gate = await liveGateChecked(db, d.querier, repo, m.number, m.head_oid, log);
@@ -599,17 +632,18 @@ export async function runBatches(db: Db, params: BatchParams, log: (line: string
       if (gate.blocked) return supersede(b, members.filter((x) => x !== m), `a PR in the batch has a review: ${gate.blocked}`);
       if (gate.moved) return supersede(b, members.filter((x) => x !== m), "a PR in the batch has new comments or reviews to be reviewed first");
     }
-    // A member merging on a maintainer's Merge answer: that maintainer must still have write access, read now.
-    const answers = await answersGone(members.map((m) => ({ number: m.number, head: m.head_oid })), q);
-    if (answers.gone.length) {
+    const mays = await mayLand(b, members);
+    if (!mays) return;
+    // A member a person approved needs that person's write access, read now.
+    const approvers = await approversGone(mays);
+    if (approvers.gone.length) {
       if ((await getBatch(db, b.id)).state !== "open") { log(`  ${b.branch}: ended meanwhile; left alone`); return; }
-      for (const x of answers.gone) await holdGone(x, b.branch);
-      return supersede(b, members.filter((m) => !answers.gone.some((x) => x.number === m.number)), `${answers.gone.map((x) => refOf(x.number)).join(", ")} left the batch: ${answers.gone[0]!.why}`);
+      await addAudit(db, approvers.gone.map((x) => ({ login: ACTOR, action: "batch-remove", target: refOf(x.number), details: { run: runId, batch: b.branch, reason: x.why } })));
+      return supersede(b, members.filter((m) => !approvers.gone.some((x) => x.number === m.number)), `${approvers.gone.map((x) => refOf(x.number)).join(", ")} left the batch: ${approvers.gone[0]!.why}`);
     }
-    if (answers.unsure) { log(`  ${b.branch}: GitHub could not confirm the write permission of who answered Merge for a PR in it; not merged this pass`); s.waiting.push(b.branch); return; }
-    // Holds and controls may have changed during the calls above: look again right before merging.
+    if (approvers.unsure) { log(`  ${b.branch}: GitHub could not confirm the write permission of who approved a PR in it; not merged this pass`); s.waiting.push(b.branch); return; }
+    // A control may have ended the batch during the calls above: look again right before merging.
     if ((await getBatch(db, b.id)).state !== "open") { log(`  ${b.branch}: ended meanwhile; not merged`); return; }
-    if (await someSeq(members, async (m) => await mergeHeld(db, repo, m.number))) { log(`  ${b.branch}: a PR in the batch was held meanwhile; not merged`); s.waiting.push(b.branch); return; }
     // A fix-up or CI fix pushing to a member would move its head under the merge: hold the members' leases until it ends.
     const leases: (() => Promise<void>)[] = [];
     for (const m of members) {
@@ -628,7 +662,7 @@ export async function runBatches(db: Db, params: BatchParams, log: (line: string
       });
       if (r.code !== 0) {
         // The merge may have gone through although the command failed afterwards.
-        if (after?.state === "MERGED") return await recordLanded(b, members, q);
+        if (after?.state === "MERGED") return await bookLanded(b, members, q);
         const why = oneLine(r.stderr) || oneLine(r.stdout) || `exit code ${r.code}`;
         await updateBatch(db, b.id, at(), { summary: `${d.mergeCommand}: ${why}`.slice(0, 400) });
         log(`  ${b.branch}: refused: ${why}`);
@@ -636,7 +670,7 @@ export async function runBatches(db: Db, params: BatchParams, log: (line: string
         return;
       }
       // The merge command prints `<repo>#<pr> MERGED <merge commit>`.
-      await recordLanded(b, members, q, /\bMERGED ([0-9a-f]{7,40})\b/.exec(r.stdout)?.[1] ?? null);
+      await bookLanded(b, members, q, /\bMERGED ([0-9a-f]{7,40})\b/.exec(r.stdout)?.[1] ?? null);
 
     } finally {
       for (const f of leases) await f();
@@ -644,7 +678,7 @@ export async function runBatches(db: Db, params: BatchParams, log: (line: string
   }
 
   /** Reads the build task of a batch that has no PR yet: opens the PR when it passed, fails the batch when the tree is red, waits or fails open otherwise. */
-  async function readBuild(b: BatchRow, members: BatchMember[]): Promise<void> {
+  async function readBuild(b: BatchView, members: BatchMember[]): Promise<void> {
     const open = async (why?: string) => { if (why) await skipBuild(b, why); return publish(await getBatch(db, b.id), members); };
     const task = b.task_id === null ? null : await getTask(db, b.task_id);
     if (!task) return open("the build task is gone");
@@ -682,13 +716,12 @@ export async function runBatches(db: Db, params: BatchParams, log: (line: string
     s.waiting.push(b.branch);
   }
 
-  async function advance(id: number): Promise<void> {
+  async function advance(id: number, q: QueueEntry[]): Promise<void> {
     const b = await getBatch(db, id);
     if (!ACTIVE_BATCH.includes(b.state)) return;
-    const members = await membersOf(db, b.id);
-    const q = await buildQueue(db, { repo, merged: "exclude" });
+    const members = b.members;
     // The batch state overrides a PR's own only while it would still be mergeable (see BATCHABLE), and its merge path must still exist.
-    const keep = members.filter((m) => q.some((e) => e.number === m.number && e.head === m.head_oid && e.path !== null && !e.held && (e.state === "batch-checking" || e.state === "in-batch")));
+    const keep = members.filter((m) => q.some((e) => e.number === m.number && e.head === m.head_oid && e.path !== null && (e.state === "batch-checking" || e.state === "in-batch")));
     if (keep.length < members.length) return supersede(b, keep, "a PR in the batch changed or is no longer ready");
     if (b.state === "open") return land(b, members, q);
     if (b.state === "checking" && b.build_state === "pending") {
@@ -703,21 +736,27 @@ export async function runBatches(db: Db, params: BatchParams, log: (line: string
     return publish(b, members);
   }
 
-  for (const b of await myBatches()) await advance(b.id);
-  // A batch in a repo that is off only through fast track loses its place when a mark is removed: it is only closed, never advanced.
-  for (const b of await filterSeq((await activeBatches(db, repo)), async (x) => !await mine(x))) await supersede(b, [], "a PR in the batch is no longer fast-tracked and the repo's pipeline is off");
+  const first = await batchesNow();
+  // One queue read for the run: each batch's effects re-read its own row before they write.
+  if (first.mine.length) {
+    const q = await buildQueue(db, { repo, merged: "exclude" });
+    for (const b of first.mine) await advance(b.id, q);
+  }
+  // A batch in a repo whose pipeline is off loses its place when a PR in it has no live workflow any more: it is only closed, never advanced, also in a repo with no work left.
+  for (const b of first.outside) await supersede(b, [], "a PR in the batch has no live workflow and the repo's pipeline is off", b.members);
 
-  if (!(await myBatches()).length && (params.limit === undefined || params.limit > 0)) {
-    const scores = await workScores(db, repo);
-    // PRs in a repo Verify cannot build, or with no CI for a batch PR to wait on, are left to the single-PR merge (the plan's merge action is not batchable).
-    const ranked = (await planned(db, "merge", { repo })).filter((p) => p.action.params?.batchable)
-      .sort((a, b) => (scores.get(b.facts.number) ?? -1) - (scores.get(a.facts.number) ?? -1) || a.facts.number - b.facts.number)
-      .map((p): Cand => ({ number: p.facts.number, head: p.action.head!, size: p.facts.size, lines: p.facts.lines }));
-    if (ranked.length) {
-      const max = Math.min(await batchSizeOf(db, repo), params.limit ?? Infinity);
-      const areas = new Map((await db.all(db.k.selectFrom("item_areas").select(["number", "area"]).where("repo", "=", repo))).map((r) => [r.number, r.area]));
+  if (repoInScope(scope, "work") && !(await batchesNow()).mine.length && (params.limit === undefined || params.limit > 0)) {
+    // PRs in a repo Verify cannot build are left to the single-PR merge (the plan's merge action is not batchable).
+    const due = (await planned(db, "merge", { repo, by })).filter((p) => p.action.params?.batchable);
+    if (due.length) {
+      const keys = due.map((p) => ({ repo, number: p.facts.number }));
+      const [scores, sizes, areas] = await db.together(() => Promise.all([loadWorkScores(db, keys), loadBatchSizes(db, [repo]), loadItemAreas(db, keys)]));
+      const score = (n: number) => scores.get(refOf(n)) ?? NO_WORKFLOW_SCORE;
+      const ranked = due.sort((a, b) => score(b.facts.number) - score(a.facts.number) || a.facts.number - b.facts.number)
+        .map((p): Cand => ({ number: p.facts.number, head: p.action.head!, size: p.facts.size, lines: p.facts.lines }));
+      const max = Math.min(sizes.get(repo)!, params.limit ?? Infinity);
       log(`merge ${repo}: ${ranked.length} PRs may merge; batch of up to ${max}`);
-      await startBatch(areaFirst(ranked, (n) => areas.get(n) ?? null), max, null);
+      await startBatch(areaFirst(ranked, (n) => areas.get(refOf(n))?.area ?? null), max, null);
     }
   }
   log(`merge ${repo}: ${s.merged.length} merged, ${s.started.length} batches started, ${s.published.length} opened, ${s.split.length} split, ${s.superseded.length} rebuilt, ${s.waiting.length} waiting; run ${runId}`);
@@ -726,11 +765,10 @@ export async function runBatches(db: Db, params: BatchParams, log: (line: string
 
 export const commands = {
   "merge-batches": {
-    summary: "merge-batches --repo R [--limit N]: advance the repo's integration batches and start the next one (needs merge approval)",
+    summary: "merge-batches --repo R [--limit N]: advance the repo's integration batches and start the next one (each PR needs merge approval)",
     async run(args: string[]): Promise<void> {
       const i = args.indexOf("--repo"), l = args.indexOf("--limit");
       if (i < 0 || !args[i + 1]) throw new Error("missing --repo");
-      const { connect } = await import("../db.ts");
       await runBatches(await openDb(), { repo: args[i + 1]!, ...(l >= 0 ? { limit: Number(args[l + 1]) } : {}) });
     },
   },

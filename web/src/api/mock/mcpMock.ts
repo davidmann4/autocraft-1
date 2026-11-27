@@ -1,5 +1,5 @@
 import type { Api } from "../client";
-import type { InferenceSettings, McpToken, ModelQueue, ModelQueueCall, MySettings, PendingRunnerLogin, RunnerInfo, User } from "../types";
+import type { InferenceSettings, JevStatus, McpToken, ModelQueue, ModelQueueCall, MySettings, PendingRunnerLogin, RunnerInfo, User } from "../types";
 import { NOW } from "./fixtures";
 
 const DAY = 86_400_000;
@@ -11,19 +11,20 @@ const TASKS = [
   { id: "dupes", title: "Duplicates", about: "Finds items that describe the same bug or request as another open item, or one closed in the last year, and compares each group.", models: ["opus", "sonnet", "haiku"] },
   { id: "classify", title: "Classify", about: "Gives each open item one type label and two flags (security, needs decision).", models: ["opus", "sonnet", "haiku"] },
   { id: "priority", title: "Priority", about: "Gives each open item a level from P0 to P4, then orders the candidates of later stages by a work rank.", models: ["haiku"] },
-  { id: "decide", title: "Decide", about: "Asks an operator for scope calls, prepares every open decision with a summary, a pick and drafted answers, and answers questions about an item in its conversation.", models: ["opus", "haiku"] },
+  { id: "decide", title: "Conversations", about: "Answers questions about an item in its conversation.", models: ["opus", "haiku"] },
   { id: "review", title: "Review", about: "Opus reviews every wanted PR at its current head, reading the repo, and gives a verdict with the complete fix list.", models: ["opus"] },
   { id: "fix", title: "Fix", about: "Writes a patch for a bugfix issue where the fix is clear, tests it in the sandbox and opens a PR.", models: ["opus", "sonnet", "haiku"] },
   { id: "fixup", title: "Fix-up", about: "For a take-with-fixes review, applies the listed small fixes to the contributor's branch, or posts them as a comment when the branch cannot be pushed to.", models: ["opus", "sonnet", "haiku"] },
   { id: "verify", title: "Verify", about: "Records upstream CI as the verification of taken PRs in repos that have it.", models: ["opus", "sonnet", "haiku"] },
-  { id: "merge", title: "Merge queue", about: "Merges PRs that pass the rules in integration batches (up to 50 PRs, checked by upstream CI on the batch PR) through safe-merge, and asks for a Merge? decision on PRs outside the rules. It also covers the Opus review of a PR's head commit before the PR goes into a batch or a pre-approved merge is handed to the queue.", models: ["opus"] },
-  { id: "postmerge", title: "Post-merge review", about: "Opus reviews each PR the pipeline merged a second time, reading what landed with the pipeline's own commits and reviews of the PR, and lists defects and minor findings.", models: ["opus"] },
+  { id: "merge", title: "Merge queue", about: "Merges PRs that pass the rules in integration batches (up to 50 PRs, checked by upstream CI on the batch PR) through safe-merge. It also covers the Opus review of a PR's head commit before the PR goes into a batch or a pre-approved merge is handed to the queue.", models: ["opus"] },
+  { id: "postmerge", title: "Post-merge review", about: "Opus reviews what landed with a merge nobody approved, or whose code the pipeline changed after the approval, reading it with the pipeline's own commits and reviews of the PR, and lists defects and minor findings; a PR that merged as a person approved it gets no such review.", models: ["opus"] },
   { id: "other", title: "Other", about: "Calls of steps outside the stages above: the security scan's checks and private fixes, Discord mentions, searches and issue drafts, and any call whose step is not known.", models: ["opus", "haiku"] },
 ];
 
 export function createMcpMock(me: User, changed: () => void): Pick<Api, "mcp" | "inference" | "runners" | "modelQueue"> & { meSettings: Api["me"]["settings"] } {
-  let inference: InferenceSettings = { mode: me.inference, models: { top: ["opus", "astra"], mid: ["sonnet"], small: ["haiku"] }, minEffort: { top: "high" } };
-  let settings: MySettings = { reserve: { fiveHour: 20, weekly: 10 }, maxCalls: null, interactiveSlots: 1, manualOnly: false, tasks: TASKS.map((t) => t.id), taskChoices: TASKS, taskItems: "all", runnerPrivate: false, uiV2: false, repos: ["designcraft", "photocraft", "textcraft"], repoChoices: ["designcraft", "fontcraft", "gridcraft", "iconcraft", "pdfcraft", "photocraft", "Sheetcraft", "wordcraft"] };
+  let jev: JevStatus = { enabled: true, unavailable: null };
+  let inference: InferenceSettings = { models: { top: ["opus", "astra"], mid: ["sonnet"], small: ["haiku"] }, minEffort: { top: "high" } };
+  let settings: MySettings = { reserve: { fiveHour: 20, weekly: 10 }, maxCalls: null, interactiveSlots: 1, manualOnly: false, tasks: TASKS.map((t) => t.id), taskChoices: TASKS, taskItems: "all", runnerPrivate: false, repos: ["designcraft", "photocraft", "textcraft"], repoChoices: ["designcraft", "fontcraft", "gridcraft", "iconcraft", "pdfcraft", "photocraft", "Sheetcraft", "wordcraft"] };
   const at = (ms: number) => new Date(NOW + ms).toISOString();
   const wait = <T>(v: T) => new Promise<T>((r) => setTimeout(() => r(v), 60));
 
@@ -65,7 +66,7 @@ export function createMcpMock(me: User, changed: () => void): Pick<Api, "mcp" | 
   let tokens: McpToken[] = [
     { id: 2, label: "claude code", kind: "connector", canAnswer: false, canRun: false, createdAt: new Date(NOW - 3 * DAY).toISOString(), lastUsedAt: new Date(NOW - 40 * MIN).toISOString(), expiresAt: new Date(NOW + 87 * DAY).toISOString() },
   ];
-  const settles = me.role === "operator" || (me.role === "maintainer" && me.maintainerWrites);
+  const settles = me.role !== "viewer";
   const list = () => ({ tokens: structuredClone(tokens), max: 5, path: "/mcp", answering: true });
 
   const staff = me.role !== "viewer";
@@ -76,7 +77,7 @@ export function createMcpMock(me: User, changed: () => void): Pick<Api, "mcp" | 
     { id: 5102, repo: "designcraft", items: [item("designcraft", 1520, "pr", "Snap guides to the artboard edge on resize")], kind: "Review pull requests", tier: "top", model: "opus", estCostUsd: 0.79, waitedMs: 8 * MIN, why: { code: "picked", text: "Picked by oakmoss" }, pickedBy: "oakmoss", gating: false, followUp: false },
     { id: 5108, repo: "designcraft", forLogin: "kiri-n", items: [item("designcraft", 1484, "pr", "Add Hungarian spellchecking and nonstandard hyphenation")], kind: "Answer conversations", tier: "top", model: "opus", estCostUsd: 0.38, waitedMs: 2 * MIN, why: staff ? { code: "bound", text: "Waiting for kiri-n's Task Runner: it is busy" } : { code: "bound", text: "Waiting for the asker's own Task Runner: it is busy" }, pickedBy: null, gating: false, followUp: false },
     { id: 5103, repo: "pdfcraft", items: [item("pdfcraft", 2210, "pr", "Keep form field order when flattening annotations")], kind: "Push fix-ups", tier: "mid", model: "sonnet", estCostUsd: 0.31, waitedMs: 6 * MIN, why: { code: "session", text: "Waiting for laptop, which holds its session" }, pickedBy: null, gating: false, followUp: true },
-    { id: 5104, repo: "vectorcraft", items: [item("vectorcraft", 873, "issue", "Boolean union drops the last subpath of compound shapes"), item("vectorcraft", 880, "issue", "Union of overlapping circles leaves a sliver")], kind: "Ask decisions", tier: "top", model: "opus", estCostUsd: 0.42, waitedMs: 19 * MIN, why: { code: "manual-only", text: "Every ready Task Runner is Manual only" }, pickedBy: null, gating: false, followUp: false, lastError: "the harness exited with code 1: rate limited" },
+    { id: 5104, repo: "vectorcraft", items: [item("vectorcraft", 873, "issue", "Boolean union drops the last subpath of compound shapes"), item("vectorcraft", 880, "issue", "Union of overlapping circles leaves a sliver")], kind: "Implement issues", tier: "top", model: "opus", estCostUsd: 0.42, waitedMs: 19 * MIN, why: { code: "manual-only", text: "Every ready Task Runner is Manual only" }, pickedBy: null, gating: false, followUp: false, lastError: "the harness exited with code 1: rate limited" },
     { id: 5105, repo: "filmcraft", items: [item("filmcraft", 3301, "pr", "Trim clips on the timeline with the keyboard")], kind: "Classify new and changed items", tier: "small", model: "haiku", estCostUsd: 0.004, waitedMs: 3 * MIN, why: { code: "busy", text: "Every Task Runner that may take it is busy" }, pickedBy: null, gating: true, followUp: false },
     { id: 5106, repo: "deckcraft", items: [item("deckcraft", 455, "pr", "Export speaker notes to the PPTX notes pane")], kind: "Review pull requests", tier: "top", model: "opus", estCostUsd: null, waitedMs: 2 * MIN, why: { code: "behind", text: "4 calls ahead" }, pickedBy: null, gating: false, followUp: false },
     { id: 5107, repo: "wordcraft", items: [item("wordcraft", 702, "issue", "Track changes lose author colours after save")], kind: "Fix issues", tier: "top", model: "opus", estCostUsd: 1.92, waitedMs: 34 * MIN, why: { code: "no-repo-access", text: "No ready Task Runner's user can take calls on wordcraft" }, pickedBy: null, gating: false, followUp: false },
@@ -104,16 +105,22 @@ export function createMcpMock(me: User, changed: () => void): Pick<Api, "mcp" | 
     inference: {
       get: () => wait(structuredClone(inference)),
       async put(body) {
-        if (me.role !== "operator") throw new Error("only operators change the inference mode");
+        if (me.role !== "operator") throw new Error("only operators change the accepted models");
         const minEffort = { ...inference.minEffort };
         for (const [t, e] of Object.entries(body.minEffort ?? {})) {
           if (e === null) delete minEffort[t as keyof typeof minEffort];
           else minEffort[t as keyof typeof minEffort] = e;
         }
-        inference = { mode: body.mode ?? inference.mode, models: body.models ?? inference.models, minEffort };
-        me.inference = inference.mode;
+        inference = { models: body.models ?? inference.models, minEffort };
         changed();
         return wait(structuredClone(inference));
+      },
+      jev: () => wait(structuredClone(jev)),
+      async setJev(enabled) {
+        if (me.role !== "operator") throw new Error("only operators switch Jev");
+        jev = { enabled, unavailable: enabled ? null : { reason: "switched off", since: new Date(NOW).toISOString() } };
+        changed();
+        return wait(structuredClone(jev));
       },
     },
     meSettings: {
@@ -132,7 +139,7 @@ export function createMcpMock(me: User, changed: () => void): Pick<Api, "mcp" | 
       pending: (code) => wait(structuredClone(pending.get(norm(code)) ?? null)),
       async approve(code, label, scopes, otherMachine) {
         if (!staff) throw new Error("viewers cannot add Task Runners");
-        if (scopes.answer && !settles) throw new Error("only operators, and maintainers where they may settle decisions, let a Task Runner answer decisions");
+        if (scopes.answer && !settles) throw new Error("only operators and maintainers let a Task Runner send commands");
         const p = pending.get(norm(code));
         if (!p) throw new Error("no pending Task Runner login has this code");
         if (p.ip !== p.yourIp && !otherMachine) throw new Error("this login was started from another address than yours");
@@ -157,7 +164,7 @@ export function createMcpMock(me: User, changed: () => void): Pick<Api, "mcp" | 
       async setScopes(id, scopes) {
         const cur = runners.find((r) => r.tokenId === id);
         if (!cur) throw new Error("you have no such Task Runner");
-        if (scopes.answer && !cur.answer && !settles) throw new Error("only operators, and maintainers where they may settle decisions, let a Task Runner answer decisions");
+        if (scopes.answer && !cur.answer && !settles) throw new Error("only operators and maintainers let a Task Runner send commands");
         runners = runners.map((r) => (r.tokenId === id ? { ...r, ...scopes } : r));
         changed();
         return wait({ ok: true });
@@ -187,7 +194,7 @@ export function createMcpMock(me: User, changed: () => void): Pick<Api, "mcp" | 
       tokens: () => wait(list()),
       async create(label, answer = false) {
         if (me.role === "viewer") throw new Error("viewers cannot make agent tokens");
-        if (answer && !settles) throw new Error("only operators and maintainers who settle make answering tokens");
+        if (answer && !settles) throw new Error("only operators and maintainers make tokens that send commands");
         if (tokens.length >= 5) throw new Error("you have 5 connector tokens; revoke one first");
         const id = next++;
         tokens = [{ id, label: label.trim() || null, kind: "connector", canAnswer: answer, canRun: false, createdAt: new Date(NOW).toISOString(), lastUsedAt: null, expiresAt: new Date(NOW + (answer ? 7 : 90) * DAY).toISOString() }, ...tokens];

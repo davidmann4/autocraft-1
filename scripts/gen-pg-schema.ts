@@ -21,6 +21,7 @@ if (check) {
 } else writeFileSync(file, want);
 
 // Imported after the schema file is written: the stamp covers it.
+await import("../src/trigger-sources.ts");
 const { pgStamp } = await import("../src/db/pg-triggers.ts");
 const { PG_SCHEMA_GENERATION } = await import("../src/db/pg-generation.ts");
 const stamp = pgStamp();

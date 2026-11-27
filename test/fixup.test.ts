@@ -11,10 +11,12 @@ import { runFixup, type FixupDeps } from "../src/fixup/index.ts";
 import { viewFile } from "../src/fixup/excerpt.ts";
 import { validatePatch, type FixupPr } from "../src/fixup/patch.ts";
 import { REPO_PATH } from "../src/sandbox/command.ts";
+import { acting, appLane } from "./acting.ts";
+import { reportingTaskRunner } from "./fake-runner.ts";
 import { SCRATCH } from "./scratch.ts";
 import { validating } from "./gql.ts";
-import type { Db } from "../src/db/index.ts";
-import { connectDb } from "../src/db/open.ts";
+import { insertWorkflow } from "../src/workflow/store.ts";
+import { connectDb, type Db } from "./helpers/raw-db.ts";
 import * as kx from "../src/db/kx.ts";
 
 mkdirSync(SCRATCH, { recursive: true });
@@ -32,7 +34,7 @@ function git(cwd: string, ...args: string[]): string {
 
 type Opts = { canModify?: boolean; approved?: boolean; mergeable?: string; verdict?: string; reviewHead?: string };
 
-/** One take-fix PR (#7) at `head`. */
+/** One take-fix PR (#7) at `head`, started with fix-up. */
 async function fresh(head: string, o: Opts = {}): Promise<Db> {
   const db = await connectDb(join(mkdtempSync(join(dir, "db-")), "t.db"));
   await db.run(db.k.insertInto("items").values({ repo: "app", number: 7, kind: "pr", state: "OPEN", title: "Fix a thing", author: "someone", additions: 5, deletions: 0, head_oid: head, created_at: T0, updated_at: T0 }));
@@ -40,6 +42,9 @@ async function fresh(head: string, o: Opts = {}): Promise<Db> {
   await db.run(db.k.insertInto("pr_checks").values({ repo: "app", number: 7, head_oid: head, state: "OPEN", is_draft: 0, overall: "success", checks: "[]", mergeable: o.mergeable ?? "MERGEABLE", maintainer_can_modify: o.canModify === false ? 0 : 1, fetched_at: T1 }));
   await db.run(db.k.insertInto("tracked_repos").values({ name: "app", added_by: "op", added_at: T0, pipeline: 1 }).onConflict((oc) => oc.doNothing()));
   if (o.approved !== false) await setPushApproval(db, "op", "app", true);
+  await insertWorkflow(db, { repo: "app", number: 7, kind: "pr", entry: "fixup", state: "running", startedBy: "op", startedAt: T0, startedVia: "dashboard" });
+  await acting(db, ["op"]);
+  await reportingTaskRunner(db);
   return db;
 }
 
@@ -106,6 +111,7 @@ function world(opts: { check?: string | null; reply?: string | null; moveBranch?
   writeFileSync(join(work, "src/lib.rs"), opts.lib ?? "fn a() {}\nfn main() { a(); }\n");
   writeFileSync(join(work, "src/other.rs"), "fn z() {}\n");
   writeFileSync(join(work, "ROADMAP.md"), "# Plan\n- one\n");
+  writeFileSync(join(work, "GUIDE.md"), "# Plan\n- one\n");
   git(work, "add", "-A");
   git(work, "commit", "-q", "-m", "contributor");
   const head = git(work, "rev-parse", "HEAD");
@@ -150,7 +156,7 @@ function world(opts: { check?: string | null; reply?: string | null; moveBranch?
     return exec("git", net >= 0 ? sub2 : args, { ...o });
   };
   w.deps = {
-    querier, exec: run, now: () => new Date(T1), root: join(root, "cache"),
+    querier, lane: appLane(querier), exec: run, now: () => new Date(T1), root: join(root, "cache"),
     fetchDiff: async () => ({ ok: true, text: opts.diff ?? "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-x\n+fn a() {}\n" }),
     ask: async (_db, input) => { log.push("model"); w.asked.push(...input); return opts.reply === undefined ? good : opts.reply; },
     check: async (_db, input) => { log.push("check"); assert.match(input[0]!.patch, /^diff --git/); return opts.check === undefined ? APPROVE : opts.check; },
@@ -179,6 +185,16 @@ describe("fixup step", () => {
 
 
 
+
+  test("a push that another one overtook is no try of the fix-up", async () => {
+    const file = "GUIDE.md";
+    const w = world({ pushError: "! [rejected] fix -> fix (stale info)", reply: `diff --git a/${file} b/${file}\n--- a/${file}\n+++ b/${file}\n@@ -1,2 +1,2 @@\n # Plan\n-- one\n+- two\n`, diff: `diff --git a/${file} b/${file}\n--- a/${file}\n+++ b/${file}\n@@ -1,2 +1,2 @@\n # Plan\n-- zero\n+- one\n` });
+    const db = await fresh(w.head);
+    await db.run(db.k.updateTable("opus_reviews").set({ fixes: JSON.stringify([{ file, change: "say two" }]) }));
+    await runFixup(db, { repo: "app", dryRun: false }, () => {}, w.deps);
+    assert.deepEqual((await fixupRows(db)).map((r) => r.state), ["superseded"]);
+    assert.deepEqual(await db.all(db.k.selectFrom("own_pushes").select(["from_oid", "action", "landed_at"])), [{ from_oid: w.head, action: "fixup-push", landed_at: null }]);
+  });
 
   test("a file over the size limit is held without a checkout and listed by path alone with one", async () => {
     const lib = Array.from({ length: 6000 }, (_, i) => `fn f${i}() {}`).join("\n") + "\n";

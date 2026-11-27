@@ -25,7 +25,7 @@ export function withTimeline(p: MockPage): ItemPageData {
   const { results, history, extra, ...rest } = p;
   const reviews = [p.reviews.latest, ...p.reviews.earlier].filter((r) => r !== null);
   const line = (id: string, at: string, kind: TimelineEntry["kind"], actor: string, icon: TimelineEntry["icon"], text: string, o: Partial<TimelineEntry> = {}): TimelineEntry => ({
-    id, at, kind, actor, icon, text, tone: "neutral", costUsd: null, major: false, jobId: null, reviewId: null, githubId: null, commit: null, preapproval: null, calls: [], body: null, markdown: false, lines: [], feedback: null, ...o,
+    id, at, kind, actor, icon, text, tone: "neutral", costUsd: null, major: false, jobId: null, reviewId: null, githubId: null, commit: null, preapproval: null, calls: [], body: null, markdown: false, lines: [], ...o,
   });
   const out = history.map((h): TimelineEntry => {
     const review = /^Opus review/.test(h.step) ? reviews.reduce<(typeof reviews)[number] | null>((b, r) => (!b || Math.abs(Date.parse(r.at) - Date.parse(h.at)) < Math.abs(Date.parse(b.at) - Date.parse(h.at)) ? r : b), null) : null;

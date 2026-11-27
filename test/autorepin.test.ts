@@ -1,19 +1,22 @@
 // Autorepin: `@<app> autorepin <pull request>` on a PR, and the commit that repins its Cargo dependencies once that pull request is merged.
+import { loadOwnPushes } from "../src/data/views/own-pushes.ts";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, test } from "node:test";
 import { storeArtifact, tempPath } from "../src/build/artifacts.ts";
 import { safeEqual } from "../src/dash/server/crypto.ts";
 import { exec, type Exec, type ExecResult } from "../src/fixup/git.ts";
-import { drainCommands, parseCommand } from "../src/github/commands.ts";
+import { drainCommands } from "../src/github/commands.ts";
 import { handleDelivery, signatureOf } from "../src/github/webhooks.ts";
 import type { Querier } from "../src/mirror.ts";
-import { advancePreapprovals, preapprovalOf, preapproveMerge } from "../src/preapproval/index.ts";
+import { advancePreapprovals, preapprovalOf } from "../src/preapproval/index.ts";
 import { anyRepinDue } from "../src/repin/due.ts";
 import { drainRepins, MAX_TRIES, requestRepin, type RepinDeps } from "../src/repin/index.ts";
-import { lockRefusal, repinManifest } from "../src/repin/manifest.ts";
+import { lockRefusal, parseBranch, parsePrRef, repinManifest } from "../src/repin/manifest.ts";
+import { runCommand } from "../src/workflow/apply.ts";
+import { parse, parseComment } from "../src/workflow/parse.ts";
 import { validating } from "./gql.ts";
 import { SCRATCH } from "./scratch.ts";
 import { OPERATOR, world, type World } from "./world-db.ts";
@@ -56,22 +59,32 @@ const lockOf = (rev: string, extra = ""): string =>
   `version = 4\n\n[[package]]\nname = "app"\nversion = "0.1.0"\n\n[[package]]\nname = "craft-ui"\nversion = "0.1.0"\nsource = "git+${LIBS}?rev=${rev}#${rev}"\n\n[[package]]\nname = "serde"\nversion = "1.0.0"\n${CRATES}\nchecksum = "aa"\n${extra}`;
 
 describe("the autorepin command", () => {
+  /** What the comment's autorepin command names: the pull request and branch its argument reads as, or the parse result when it is no command. */
+  const read = (body: string) => {
+    const p = parseComment(body, SLUG, { repo: "app" });
+    if (p?.kind !== "commands" || p.parts.length !== 1 || p.parts[0]!.word !== "autorepin") return p;
+    const args = (p.parts[0] as { args: string }).args;
+    const m = /^(\S+)(?:\s+via\s+(\S+))?$/i.exec(args)!;
+    return { ref: m[1]!.toLowerCase() === "off" ? null : parsePrRef(m[1]!), branch: m[2] === undefined ? null : parseBranch(m[2]) };
+  };
   test("names the pull request by slug, bare repo name or URL; off drops it", () => {
     const ref = { owner: "storytold", name: "libs", number: 12 };
-    assert.deepEqual(parseCommand(`@${SLUG} autorepin storytold/libs#12`, SLUG), { command: "autorepin", ref, branch: null });
-    assert.deepEqual(parseCommand(`thanks!\n@${SLUG} auto-repin ${LIBS}/pull/12`, SLUG), { command: "autorepin", ref, branch: null });
-    assert.deepEqual(parseCommand(`@${SLUG} autorepin libs#12`, SLUG), { command: "autorepin", ref: { ...ref, owner: null }, branch: null });
-    assert.deepEqual(parseCommand(`@${SLUG} autorepin OFF`, SLUG), { command: "autorepin", ref: null, branch: null });
-    assert.deepEqual(parseCommand(`@${SLUG} autorepin libs#12 via release/next-1.2`, SLUG), { command: "autorepin", ref: { ...ref, owner: null }, branch: "release/next-1.2" });
+    assert.deepEqual(read(`@${SLUG} autorepin storytold/libs#12`), { ref, branch: null });
+    assert.deepEqual(read(`thanks!\n@${SLUG} auto-repin ${LIBS}/pull/12`), { ref, branch: null });
+    assert.deepEqual(read(`@${SLUG} autorepin libs#12`), { ref: { ...ref, owner: null }, branch: null });
+    assert.deepEqual(read(`@${SLUG} autorepin OFF`), { ref: null, branch: null });
+    assert.deepEqual(read(`@${SLUG} autorepin libs#12 via release/next-1.2`), { ref: { ...ref, owner: null }, branch: "release/next-1.2" });
   });
-  test("a branch git would refuse, or one that reads as an option or a ref path, is no command", () => {
-    for (const b of ["-x", "..", "a..b", "a.lock", "a/", "/a", "a//b", ".hidden", "a.", "HEAD", "refs/heads/x", "a~1", "a^", "a:b", "@{1}", "x".repeat(101)]) {
-      assert.equal(parseCommand(`@${SLUG} autorepin libs#12 via ${b}`, SLUG), null, b);
+  // A sentence-final period is not part of a branch name, so `via a.` names `a`.
+  test("a branch git would refuse, or one that reads as an option or a ref path, runs nothing", () => {
+    for (const b of ["-x", "..", "a..b", "a.lock", "a/", "/a", "a//b", ".hidden", "HEAD", "refs/heads/x", "a~1", "a^", "a:b", "@{1}", "x".repeat(101)]) {
+      assert.equal(parseComment(`@${SLUG} autorepin libs#12 via ${b}`, SLUG, { repo: "app" })?.kind, "ambiguous", b);
     }
-    assert.equal(parseCommand(`@${SLUG} autorepin off via next`, SLUG), null);
+    assert.equal(parseComment(`@${SLUG} autorepin off via next`, SLUG, { repo: "app" })?.kind, "ambiguous");
   });
-  test("a number alone, a missing target or a quoted line is no command", () => {
-    for (const body of [`@${SLUG} autorepin 12`, `@${SLUG} autorepin #12`, `@${SLUG} autorepin`, `> @${SLUG} autorepin libs#12`, `@${SLUG} autorepin libs#12 please`]) assert.equal(parseCommand(body, SLUG), null, body);
+  test("a number alone, a missing target or a quoted line runs nothing", () => {
+    for (const body of [`@${SLUG} autorepin 12`, `@${SLUG} autorepin #12`, `@${SLUG} autorepin`, `@${SLUG} autorepin libs#12 please`]) assert.equal(parseComment(body, SLUG, { repo: "app" })?.kind, "ambiguous", body);
+    assert.equal(parseComment(`> @${SLUG} autorepin libs#12`, SLUG, { repo: "app" }), null);
   });
 });
 
@@ -149,23 +162,39 @@ type Setup = { w: World; fork: string; head: string; comments: string[]; pushes:
 let current: World | null = null;
 afterEach(() => current?.close());
 
+/** The bare fork contrib/app of each kind of setup, built once and copied for every test. */
+const forks = new Map<boolean, { dir: string; head: string }>();
+function forkTemplate(lock: boolean): { dir: string; head: string } {
+  let made = forks.get(lock);
+  if (!made) {
+    const root = mkdtempSync(join(SCRATCH, "repin-fork-"));
+    const work = join(root, "work");
+    mkdirSync(work);
+    git(work, "init", "-q", "-b", "fix");
+    writeFileSync(join(work, "Cargo.toml"), MANIFEST);
+    if (lock) writeFileSync(join(work, "Cargo.lock"), lockOf(OLD));
+    git(work, "add", "-A");
+    git(work, "commit", "-q", "-m", "contributor");
+    const head = git(work, "rev-parse", "HEAD");
+    const dir = join(root, "fork.git");
+    git(root, "clone", "-q", "--bare", work, dir);
+    git(dir, "update-ref", "refs/pull/1/head", head);
+    forks.set(lock, made = { dir, head });
+  }
+  return made;
+}
+
 /** app#1 from the fork contrib/app (branch `fix`), pinned to libs at OLD; libs#12 is open in the mirror. */
 async function setup(o: { lock?: boolean; off?: Parameters<World["repo"]>[0] } = {}): Promise<Setup> {
   const root = mkdtempSync(join(SCRATCH, "repin-"));
-  const work = join(root, "work");
-  mkdirSync(work);
-  git(work, "init", "-q", "-b", "fix");
-  writeFileSync(join(work, "Cargo.toml"), MANIFEST);
-  if (o.lock !== false) writeFileSync(join(work, "Cargo.lock"), lockOf(OLD));
-  git(work, "add", "-A");
-  git(work, "commit", "-q", "-m", "contributor");
-  const head = git(work, "rev-parse", "HEAD");
+  const { dir, head } = forkTemplate(o.lock !== false);
   const fork = join(root, "fork.git");
-  git(root, "clone", "-q", "--bare", work, fork);
-  git(fork, "update-ref", "refs/pull/1/head", head);
+  cpSync(dir, fork, { recursive: true });
 
   const w = (current = await (await (await world()).repo(o.off)).pr(1, { head }));
   await w.db.run(w.db.k.updateTable("access").set({ github_id: 101 }).where("login", "=", OPERATOR));
+  await w.db.run(w.db.k.updateTable("main.tracked_repos").set({ workflow: "new" }).where("name", "=", "app"));
+  await w.db.run(w.db.k.insertInto("main.settings").values({ key: "github_identity", value: "app" }).onConflict((oc) => oc.column("key").doUpdateSet({ value: "app" })));
   await w.db.run(w.db.k.insertInto("tracked_repos").values({ name: "libs", added_by: OPERATOR, added_at: "2026-01-01T00:00:00Z" }));
   await w.db.run(w.db.k.insertInto("repos").values({ name: "libs", visibility: "public", default_branch: "main" }));
   await w.db.run(w.db.k.insertInto("items").values({ repo: "libs", number: 12, kind: "pr", state: "OPEN", title: "lib change", created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" }));
@@ -195,7 +224,7 @@ async function setup(o: { lock?: boolean; off?: Parameters<World["repo"]>[0] } =
     const local = args.map((a) => (a.startsWith("https://github.com/storytold/libs") ? LIBS_GIT : a.startsWith("https://github.com/") ? fork : a)).filter((a, i, all) => !(a === "-c" && all[i + 1] === "protocol.file.allow=never") && a !== "protocol.file.allow=never");
     return exec("git", net ? local : args, { ...opts });
   };
-  s.deps = { querier, exec: run, root: join(root, "cache"), permission: async () => "ok" };
+  s.deps = { querier, exec: run, root: join(root, "cache"), permission: async () => "ok", mint: async () => "installation-token" };
   return s;
 }
 
@@ -221,7 +250,7 @@ async function comment(s: Setup, body: string, now = body): Promise<void> {
   }));
   await handleDelivery(s.w.db, "secret", { event: "issue_comment", signature: signatureOf("secret", raw) }, raw, safeEqual, SLUG);
   await drainCommands(s.w.db, {
-    querier: s.deps.querier, exec: s.deps.exec, slug: SLUG,
+    querier: s.deps.querier, exec: s.deps.exec, slug: SLUG, mint: s.deps.mint,
     permission: async () => ({ kind: "ok", permission: "write" }),
     comment: async () => ({ kind: "ok", authorId: 101, body: now }),
   });
@@ -232,7 +261,7 @@ describe("autorepin", () => {
     const s = await setup();
     await comment(s, `@${SLUG} autorepin storytold/libs#12`);
     assert.equal(s.comments.length, 1);
-    assert.match(s.comments[0]!, new RegExp(`@${OPERATOR} Autorepin set: once storytold/libs#12 is merged`));
+    assert.match(s.comments[0]!, new RegExp(`@${OPERATOR} Repinning the Cargo dependencies of storytold/libs#12 when this merges`));
     assert.equal((await row(s)).state, "waiting");
     assert.equal(await anyRepinDue(s.w.db), false);
     assert.equal(await drainRepins(s.w.db, s.deps), 0);
@@ -270,7 +299,9 @@ describe("autorepin", () => {
 
   test("a merge pre-approved at the old head goes on at the repinned head, to be reviewed again", async () => {
     const s = await setup({ lock: false });
-    await preapproveMerge(s.w.db, { repo: "app", number: 1, by: OPERATOR });
+    await s.w.acting();
+    const started = await runCommand(s.w.db, { login: OPERATOR, canWrite: async () => true }, "dashboard", { parsed: parse("review and merge"), items: [{ repo: "app", number: 1 }] });
+    assert.equal(started.items[0]!.outcome, "run", started.lines.join("\n"));
     await set(s);
     await merged(s);
     await drainRepins(s.w.db, s.deps);
@@ -279,6 +310,11 @@ describe("autorepin", () => {
     await advancePreapprovals(s.w.db);
     const p = (await preapprovalOf(s.w.db, "app", 1))!;
     assert.deepEqual([p.state, p.head], ["review", to]);
+    // Asked for again for the same dependency, which clears its row: the push made stays known.
+    await set(s);
+    assert.equal((await row(s)).to_head, null);
+    const known = (await loadOwnPushes(s.w.db, [{ repo: "app", number: 1 }])).get("app#1") ?? [];
+    assert.deepEqual(known.map((x) => [x.from, x.to, x.what, x.landed, x.small]), [[s.head, to, "autorepin", true, true]]);
   });
 
   test("without a lockfile the manifest is pushed at once", async () => {
@@ -367,7 +403,7 @@ describe("autorepin", () => {
     const s = await setup();
     nextAt(NEXT_OLD);
     await comment(s, `@${SLUG} autorepin storytold/libs#12 via next`);
-    assert.match(s.comments[0]!, /once storytold\/libs#12 is merged and on `next`/);
+    assert.match(s.comments[0]!, /storytold\/libs#12 via next when this merges/);
     s.comments.length = 0;
     await merged(s);
     const t0 = Date.now();

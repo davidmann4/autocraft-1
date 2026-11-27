@@ -1,30 +1,37 @@
-// Which tracked repos a viewer may see. Public repos are visible to everyone
-// signed in; a repo that is not public (private, internal, or unknown) is
-// visible to operators and to users whose own GitHub token has some
-// permission on it (stored in repo_permissions, refreshed by the server).
-// Every query that spans repos must go through this.
 import type { HiddenRepos } from "../../hidden-sql.ts";
-import { trackedNames } from "../../repos.ts";
 import { DEFAULT_OWNER, ownerOf } from "../../owners.ts";
 import { HttpError } from "../server/util.ts";
 import type { Req, User } from "../types.ts";
 import { securityRepo } from "../../security/rules.ts";
 import { canSeeInternals } from "./staff.ts";
-import type { AliasableExpression, SqlBool } from "kysely";
 import type { Db } from "../../db/index.ts";
-import { inList, type Ex } from "../../db/kx.ts";
+import { knownNames, loadVisibilityInputs } from "../../data/views/visibility.ts";
+import type { VisibilityInputs } from "../../data/views/types.ts";
+
+export { excludeHiddenExpr } from "../../data/views/visibility.ts";
 
 const memo = new WeakMap<Req, Promise<string[]>>();
+const inputsMemo = new WeakMap<Req, Promise<VisibilityInputs>>();
 
-/** The tracked repos `user` may see; also used by the server for image requests. */
-export async function visibleTo(db: Db, user: Pick<User, "role" | "canRead">): Promise<string[]> {
-  const tracked = await trackedNames(db);
+const inputsOf = (db: Db, req: Req): Promise<VisibilityInputs> => {
+  let p = inputsMemo.get(req);
+  if (!p) inputsMemo.set(req, (p = loadVisibilityInputs(db)));
+  return p;
+};
+
+async function visibleFrom(inputs: VisibilityInputs, user: Pick<User, "role" | "canRead">): Promise<string[]> {
+  const tracked = [...inputs.tracked.keys()].sort();
   if (user.role === "operator") return tracked;
-  const pub = new Set((await db.all(db.k.selectFrom("main.repos").select("name").where((eb) => eb(eb.fn<string>("lower", ["visibility"]), "=", "public")))).map((r) => r.name));
+  const pub = new Set(tracked.filter((r) => inputs.repos.get(r)?.visibility?.toLowerCase() === "public"));
   const rest = tracked.filter((r) => !pub.has(r));
   const ok = await Promise.all(rest.map((r) => user.canRead(r).catch(() => false)));
   const allowed = new Set(rest.filter((_, i) => ok[i]));
   return tracked.filter((r) => pub.has(r) || allowed.has(r));
+}
+
+/** The tracked repos `user` may see; also used by the server for image requests. */
+export async function visibleTo(db: Db, user: Pick<User, "role" | "canRead">): Promise<string[]> {
+  return visibleFrom(await loadVisibilityInputs(db), user);
 }
 
 /**
@@ -39,7 +46,7 @@ export async function visibleRepos(db: Db, req: Req): Promise<string[]> {
 /** Tracked repos the requester may see, ignoring the project scope: for the picker itself, write rights and repo checks. */
 export async function allVisibleRepos(db: Db, req: Req): Promise<string[]> {
   let p = memo.get(req);
-  if (!p) memo.set(req, (p = visibleTo(db, req.user)));
+  if (!p) memo.set(req, (p = inputsOf(db, req).then((i) => visibleFrom(i, req.user))));
   return p;
 }
 
@@ -48,11 +55,6 @@ export async function repoOwners(db: Db, req: Req): Promise<Record<string, strin
   const out: Record<string, string> = {};
   for (const r of await allVisibleRepos(db, req)) if (ownerOf(r) !== DEFAULT_OWNER) out[r] = ownerOf(r);
   return out;
-}
-
-/** Every repo name the database knows, tracked or not: the mirror's repos and every repo that was ever tracked (its work rows stay after untracking). */
-async function knownRepos(db: Db): Promise<string[]> {
-  return (await db.all(db.k.selectFrom("main.repos").select("name").union(db.k.selectFrom("main.tracked_repos").select("name")).union(db.k.selectFrom("main.ever_tracked_repos").select("name")).orderBy("name"))).map((r) => r.name);
 }
 
 /**
@@ -66,7 +68,7 @@ export async function hiddenRepos(db: Db, req: Req): Promise<HiddenRepos> {
   if (req.user.role === "operator") return [];
   const visibleList = await visibleRepos(db, req);
   const visible = new Set(visibleList);
-  const known = await knownRepos(db);
+  const known = knownNames(await inputsOf(db, req));
   const staff = canSeeInternals(req);
   const hidden = known.filter((r) => !visible.has(r));
   // The list stays the denylist for text matching; SQL filters use the allow-list attached to it (see excludeHiddenExpr).
@@ -81,22 +83,13 @@ export async function hiddenRepos(db: Db, req: Req): Promise<HiddenRepos> {
 async function scopedHiddenRepos(db: Db, req: Req, repo: string): Promise<HiddenRepos> {
   await needVisible(db, req, repo);
   const staff = canSeeInternals(req);
-  const others = (await knownRepos(db)).filter((r) => r !== repo);
+  const others = knownNames(await inputsOf(db, req)).filter((r) => r !== repo);
   return Object.assign([...others, ...others.map(securityRepo), ...(staff ? [] : [securityRepo(repo)])], { visible: staff ? [repo, securityRepo(repo)] : [repo] });
 }
 
 /** 404 unless the repo is tracked and visible to the requester; the message is the same for both. */
 export async function needVisible(db: Db, req: Req, repo: string): Promise<void> {
   if (!(await allVisibleRepos(db, req)).includes(repo)) throw new HttpError(404, `${repo} is not a tracked repo`);
-}
-
-/**
- * Leaves out the hidden repos, on the repo in `col`; null when nothing is hidden. A list from hiddenRepos carries the repos the
- * requester may see: rows of any other repo, known or not, are left out.
- */
-export function excludeHiddenExpr(db: Db, col: Ex, hidden: string[] & { visible?: string[] }): AliasableExpression<SqlBool> | null {
-  if (hidden.visible) return inList(db, col, hidden.visible);
-  return hidden.length ? inList(db, col, hidden, "text", true) : null;
 }
 
 const namePatterns = new WeakMap<string[], RegExp | null>();

@@ -155,7 +155,7 @@ export class ClaimWaits {
     try {
       let seq: number;
       try {
-        seq = Number((await this.#db.get(this.#db.k.selectFrom("main.change_seq").select("seq").where("topic", "=", "remote-queue")))?.seq ?? 0);
+        seq = (await this.#db.seqs(["remote-queue"]))["remote-queue"] ?? 0;
       } catch (e) {
         if (isBusy(e)) return;
         throw e;

@@ -1,6 +1,6 @@
-// Work queue: running now, waiting with the reason, the merge queue (batches, next merges, hold and release), the model call
+// Work queue: running now, waiting with the reason, the merge queue (batches, next merges, hold), the held items, the model call
 // queue and recently merged. Every list updates in place from the live topics.
-import { createContext, useContext, useMemo, type ReactNode } from "react";
+import { useMemo, type ReactNode } from "react";
 import { Link } from "react-router-dom";
 import { t } from "../../../../../src/i18n/index.ts";
 import { useApi, useQuery } from "../../../api/client";
@@ -17,6 +17,7 @@ import { Button } from "../../../ui/atoms/Button";
 import { ErrorLine } from "../../../ui/atoms/ErrorLine";
 import { Pending } from "../../../ui/atoms/Pending";
 import { ItemRef } from "../../../ui/molecules/ItemRef";
+import { PENDING_STEP } from "../../queue/pendingStep";
 import { BATCH_STATE } from "../../queue/mergeParts";
 import { QueueRow as ModelCallRow } from "../../agents/queue";
 import { WarningIcon } from "@phosphor-icons/react";
@@ -50,29 +51,23 @@ function Row({ item, line, action }: { item: { repo: string; number: number; kin
   );
 }
 
-const MetaContext = createContext<MaintainQueueMeta>({ newRepos: [], approvedBy: {} });
-
 /** Small secondary button; the touch target grows past its box with a transparent overlay, not with its size. */
 const small = "relative h-8 after:absolute after:-inset-x-2 after:-inset-y-2";
 
-/** Items of repos on the new workflow go through the workflow controls; the others through the classic routes. */
-function HoldButton({ m, held }: { m: Pick<NextMerge, "repo" | "number">; held: boolean }) {
+/** Holds an item, or resumes a held one, by the command of that name. */
+function HoldButton({ m, held }: { m: Pick<NextMerge, "repo" | "number">; held?: boolean }) {
   const api = useApi();
   const write = useWrite();
-  const meta = useContext(MetaContext);
   if (!canRun(useUser(), m.repo)) return null;
-  const control = held ? "release-merge" : "hold-merge";
-  const ref = key(m);
+  const word = held ? "resume" : "hold";
   const go = async () => {
-    if (meta.newRepos.includes(m.repo)) {
-      const r = await api.controls.run({ control, item: { repo: m.repo, number: m.number } });
-      if (!r.ok) throw new Error(r.line);
-    } else await (held ? api.queueControl.release(ref) : api.queueControl.hold(ref));
+    const r = await api.maintainItem.command(m.repo, m.number, word);
+    if (!r.ok) throw new Error(r.lines.join(" "));
   };
   return (
     <span className="flex flex-col items-end gap-1">
-      <Button size="sm" className={small} loading={write.busy === control} onClick={() => void write.run(control, go)}>
-        {held ? t("Release") : t("Hold")}
+      <Button size="sm" className={small} aria-label={t("{word} {ref}", { word: held ? t("Resume") : t("Hold"), ref: key(m) })} loading={write.busy === word} onClick={() => void write.run(word, go)}>
+        {held ? t("Resume") : t("Hold")}
       </Button>
       <ErrorLine error={write.error} className="text-2xs" />
     </span>
@@ -109,7 +104,6 @@ function MergeQueue({ project, meta }: { project: string | null; meta: MaintainQ
   const { pages, error } = usePage("merge", project ?? "pipeline", undefined);
   const live = useQuery("live", (a) => a.live()).data;
   const first = pages?.[0];
-  const held = useMemo(() => new Set((pages?.flatMap((p) => p.mergeRows) ?? []).filter((r) => r.held).map(key).concat((first?.batches ?? []).flatMap((b) => b.prs).filter((r) => (r as { held?: boolean }).held).map(key))), [pages, first]);
   if (!first) return <Pending error={error} />;
   const next = first.nextMerges;
   const batchKeys = new Set(first.batches.flatMap((b) => b.prs.map(key)));
@@ -138,7 +132,7 @@ function MergeQueue({ project, meta }: { project: string | null; meta: MaintainQ
             </div>
             <ul className="divide-y divide-line border-t border-line">
               {b.prs.map((r) => (
-                <Row key={key(r)} item={{ ...r, kind: "pr" as const, state: "open" as const }} line={held.has(key(r)) ? t("Held out of the merge") : lineOf(r, t("Merges with the batch when CI is green"))} action={<HoldButton m={r} held={held.has(key(r))} />} />
+                <Row key={key(r)} item={{ ...r, kind: "pr" as const, state: "open" as const }} line={lineOf(r, t("Merges with the batch when CI is green"))} action={<HoldButton m={r} />} />
               ))}
             </ul>
           </div>
@@ -149,7 +143,7 @@ function MergeQueue({ project, meta }: { project: string | null; meta: MaintainQ
         {inLine.length ? (
           <ul className="divide-y divide-line">
             {inLine.map((m, i) => (
-              <Row key={key(m)} item={{ ...m, kind: "pr" as const, state: "open" as const }} line={<><span className="num mr-1.5 text-ink/60">{i + 1}.</span>{lineOf(m, m.label)}</>} action={<HoldButton m={m} held={m.waitsFor === "held" || held.has(key(m))} />} />
+              <Row key={key(m)} item={{ ...m, kind: "pr" as const, state: "open" as const }} line={<><span className="num mr-1.5 text-ink/60">{i + 1}.</span>{lineOf(m, m.label)}</>} action={<HoldButton m={m} />} />
             ))}
           </ul>
         ) : (
@@ -162,7 +156,7 @@ function MergeQueue({ project, meta }: { project: string | null; meta: MaintainQ
             </p>
             <ul className="divide-y divide-line">
               {queued.map((r) => (
-                <Row key={key(r)} item={{ ...r, kind: r.kind, state: "open" as const }} line={lineOf(r, r.implement ? `${r.implement.text}${r.implement.wait ? ` · ${r.implement.wait}` : ""}` : r.next ?? r.step)} action={r.kind === "pr" ? <HoldButton m={r} held={r.held} /> : undefined} />
+                <Row key={key(r)} item={{ ...r, kind: r.kind, state: "open" as const }} line={lineOf(r, r.implement ? `${r.implement.text}${r.implement.wait ? ` · ${r.implement.wait}` : ""}` : r.next ?? (r.step === "next" || r.step === "implement" ? t("In progress") : t(PENDING_STEP[r.step])))} action={<HoldButton m={r} />} />
               ))}
             </ul>
           </>
@@ -174,6 +168,18 @@ function MergeQueue({ project, meta }: { project: string | null; meta: MaintainQ
       </div>
       <ErrorLine error={error?.message} />
     </section>
+  );
+}
+
+function HeldItems({ project, meta }: { project: string | null; meta: MaintainQueueMeta }) {
+  const rows = (meta.held ?? []).filter((r) => !project || r.repo === project);
+  if (!rows.length) return null;
+  return (
+    <Part title={t("Held")} count={rows.length} empty="">
+      {rows.map((r) => (
+        <Row key={key(r)} item={{ ...r, state: "open" as const }} line={r.line} action={<HoldButton m={r} held />} />
+      ))}
+    </Part>
   );
 }
 
@@ -202,12 +208,12 @@ function ModelCalls({ user }: { user: ViewProps["user"] }) {
   );
 }
 
-/** A paused breaker; Resume goes through the workflow control for repos on the new workflow, the classic route for the rest. */
-function TripRow({ trip, meta }: { trip: StageTrip; meta: MaintainQueueMeta }) {
+/** A paused breaker: one repo's resumes through the workflow control, an instance-wide one through the pipeline route. */
+function TripRow({ trip }: { trip: StageTrip }) {
   const api = useApi();
   const write = useWrite();
   const go = async () => {
-    if (trip.repo && meta.newRepos.includes(trip.repo)) {
+    if (trip.repo) {
       const r = await api.controls.run({ control: "resume-breaker", key: trip.key });
       if (!r.ok) throw new Error(r.line);
     } else await api.pipeline.resumeTrip(trip.key);
@@ -235,20 +241,19 @@ export function QueueView({ user }: ViewProps) {
   const project = usePageProject();
   const { data, error } = useQuery("next-page", (a) => a.next());
   const live = useQuery("live", (a) => a.live()).data;
-  const meta = useQuery("maintain-queue", (a) => a.maintain.queue()).data ?? { newRepos: [], approvedBy: {} };
+  const meta = useQuery("maintain-queue", (a) => a.maintain.queue()).data ?? { approvedBy: {}, held: [] };
   const limits = useQuery("pipeline-state", (a) => a.pipeline.state()).data;
-  const now = useQuery("now", (a) => a.now()).data;
+  const health = useQuery("health", (a) => a.health()).data;
   if (!data) return <Pending error={error} />;
   const inScope = (repo: string | null) => !project || !repo || repo === project;
   const trips = (limits?.limits ?? []).flatMap((l) => l.trips ?? []).filter((tr) => inScope(tr.repo));
-  const overdue = (now?.health.problems ?? []).filter((p) => p.area === "deadline");
+  const overdue = (health?.problems ?? []).filter((p) => p.area === "deadline");
   const lanes = (live?.lanes ?? []).filter((l) => l.state === "running" && l.item && !l.key.startsWith("batch:") && inScope(l.repo));
   const running = lanes.length
     ? lanes.map((l) => ({ item: l.item!, line: [l.title, runnerOf(live, l.item!) && t("on {runner}", { runner: runnerOf(live, l.item!)! }), t("since {at}", { at: clock(l.start) })].filter(Boolean).join(" · ") }))
     : data.steps.flatMap((s) => s.items.filter((i) => i.inFlight).map((i) => ({ item: i, line: s.title })));
   const waitCount = trips.length + overdue.length + data.waitingTotal;
   return (
-    <MetaContext.Provider value={meta}>
       <div className="h-full overflow-y-auto">
         <div className="mx-auto flex max-w-[768px] flex-col gap-3 px-4 pb-10 pt-5 md:px-6">
           <h1 className="text-xl font-semibold">{t("Work queue")}</h1>
@@ -259,7 +264,7 @@ export function QueueView({ user }: ViewProps) {
           </Part>
           <Part title={t("Waiting")} count={waitCount} empty={t("Nothing waits.")}>
             {trips.map((tr) => (
-              <TripRow key={tr.key} trip={tr} meta={meta} />
+              <TripRow key={tr.key} trip={tr} />
             ))}
             {overdue.map((p) => (
               <li key={p.id} className="relative flex items-start gap-3 px-3 py-2.5 hover:bg-ink/[0.025]">
@@ -275,9 +280,9 @@ export function QueueView({ user }: ViewProps) {
             ))}
           </Part>
           <MergeQueue project={project} meta={meta} />
+          <HeldItems project={project} meta={meta} />
           <ModelCalls user={user} />
         </div>
       </div>
-    </MetaContext.Provider>
   );
 }

@@ -8,9 +8,9 @@ import { storeArtifact, tempPath } from "../src/build/artifacts.ts";
 import { HARDENING, type Exec } from "../src/fixup/git.ts";
 import { mainFixDue, onCodeVerdict, runMainFix, setMainFixApproval, type FixRow, type MainFixDeps } from "../src/mainfix/index.ts";
 import { CLIPPY_ARTIFACT } from "../src/prepush/index.ts";
+import { reportingTaskRunner } from "./fake-runner.ts";
 import { SCRATCH } from "./scratch.ts";
-import type { Db } from "../src/db/index.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb, type Db } from "./helpers/raw-db.ts";
 
 mkdirSync(SCRATCH, { recursive: true });
 const dir = mkdtempSync(join(SCRATCH, "mainfix-pr-"));
@@ -43,8 +43,9 @@ async function world() {
   const db = await connectDb(join(mkdtempSync(join(dir, "db-")), "t.db"));
   await db.run(db.k.insertInto("tracked_repos").values({ name: "app", added_by: "op", added_at: T0, pipeline: 1 }));
   await setMainFixApproval(db, "op", "app", true);
+  await reportingTaskRunner(db);
   await db.run(db.k.insertInto("main_ci").values({ repo: "app", head_sha: head, branch: "main", state: "red", failing: "[]", checks: "[]", first_seen_at: T0, state_changed_at: T0, updated_at: T0 }));
-  const row: FixRow = { repo: "app", head_sha: head, check: "gate / test", verdict: "code", state: "needs-fix", reason: null, run_id: 11, run_url: null, excerpt: null, decision_id: null, issue_number: null, pr_number: null, pr_url: null, patch: null, files: null, lint_task: null, lint_round: null, lint_state: null, session: null, created_at: T0, updated_at: T0 };
+  const row: FixRow = { repo: "app", headSha: head, check: "gate / test", verdict: "code", state: "needs-fix", reason: null, runId: 11, runUrl: null, excerpt: null, issueNumber: null, prNumber: null, prUrl: null, patch: null, files: null, lintTask: null, lintRound: null, lintState: null, session: null, createdAt: T0, updatedAt: T0 };
   await onCodeVerdict(db, row, "a compile error", T0);
 
   const asked: { previous?: { patch: string; findings: string[] }; files: unknown }[] = [];

@@ -1,6 +1,4 @@
 import type { ComponentType } from "react";
-import type { Icon as PhosphorIcon } from "@phosphor-icons/react";
-import type { Api } from "../api/client";
 import type { User } from "../api/types";
 
 /** `viewer` = anyone signed in; `operator` = the operator role; `write:<repo>` = GitHub write on that repo. */
@@ -36,25 +34,15 @@ export interface ViewDef {
   phone?: ComponentType<ViewProps>;
   /** Extra controls rendered in the view header (filters, tabs). */
   toolbar?: ComponentType<ViewProps>;
-  /** Slot names the view renders. Their contributions load with the view, so the page does not wait on them after its data arrives. */
-  slots?: string[];
 }
 
 export interface RouteDef {
-  /** react-router path, relative to the root (`decisions/:id?`). */
+  /** react-router path, relative to the root (`items/:repo/:number`). */
   path: string;
   view: ViewDef;
   permission?: Permission;
   /** A list page the project picker narrows: it keeps the project in its URL (useProjectInUrl). */
   scoped?: true;
-}
-
-export interface NavEntry {
-  label: string;
-  icon: PhosphorIcon;
-  to: string;
-    /** Live count shown beside the entry. */
-  useBadge?: () => number | undefined;
 }
 
 export interface Command {
@@ -65,22 +53,11 @@ export interface Command {
   group: string;
 }
 
-/** A slot is a named place in another module's view that this module can fill. */
-export interface SlotContribution {
-  slot: string;
-  order: number;
-  component: ComponentType<ViewProps>;
-}
-
 export interface FeatureModule {
   id: string;
   /** Needed to see the module at all; routes may ask for more. */
   permission: Permission;
-  nav?: NavEntry;
   routes: RouteDef[];
   /** Global commands this module documents in the shortcut sheet. View-local keys register at runtime. */
   commands?: Command[];
-  slots?: SlotContribution[];
-  /** Warm the data the module's first screen needs. */
-  prefetch?: (api: Api) => void;
 }

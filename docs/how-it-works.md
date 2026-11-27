@@ -8,19 +8,19 @@ Copies every issue, pull request and comment from GitHub once a minute. It also 
 
 ## Duplicates
 
-Finds items that report the same bug or request as another item. It compares each group and may ask "Duplicate?". While that question is open, the item waits: no review, no fix, no merge.
+Finds items that report the same bug or request as another item. It compares each group and shows the result on the items. A duplicate closes nothing by itself. A pull request nobody started waits for a maintainer while another open or merged one duplicates it, unless the comparison keeps it.
 
 ## Classify
 
-Gives each item one type (bugfix, performance, missing feature, small extra, plugin candidate or infra) and two flags: security and needs decision. Jev answers first. Haiku gives a second opinion when Jev is unsure. If they disagree on a scope label, a person decides.
+Gives each item one type (bugfix, performance, missing feature, small extra, plugin candidate or infra) and two flags: security and needs decision. Jev answers first. Haiku gives a second opinion when Jev is unsure. A referee settles what they disagree on.
 
 ## Priority
 
 Rates each item from P0 (critical) to P4 and orders the work, highest first. Security items rank one level higher. Nothing to do here.
 
-## Decide
+## Starting and answering
 
-Asks for a scope call on items that need one. Opus writes a short summary, a recommended choice and draft answers. You pick a choice, add a note if you want, and press Do it.
+A maintainer starts an item with a command: review, fix-up, implement or merge. Small bug fixes from whitelisted authors start by themselves. When the steps are done, AutoCraft comes back with one recommendation; yes runs it, and any other command runs instead. Once the merge is approved, the item comes back only at a blocker.
 
 ## Label
 
@@ -32,7 +32,7 @@ Opus reads every wanted pull request at its current head, with read access to th
 
 ## Implement
 
-Implements an issue a maintainer queued: Opus plans it in a workspace on the queuer's Task Runner, asks the author or a maintainer when the issue leaves something open, writes the change and its tests, and opens a pull request after AutoCraft's own checks pass. A stuck attempt becomes a decision. It needs the repo's issue implementations approval.
+Implements an issue a maintainer queued: Opus plans it in a workspace on the queuer's Task Runner, asks the author or a maintainer when the issue leaves something open, writes the change and its tests, and opens a pull request after AutoCraft's own checks pass. A stuck attempt comes back with its options. It needs the repo's `implement` feature.
 
 ## Fix-up
 
@@ -44,11 +44,11 @@ Uses the repo's own CI as the check when the repo has CI. A repo without CI gets
 
 ## Merge queue
 
-Lists every taken pull request with one state, such as ready, waiting for CI or conflict. Pull requests that follow the merge rules go into batches of up to 50, which CI checks together. Opus reviews each one a last time, independently, before it merges. A pull request outside the rules asks "Merge?".
+Lists every taken pull request with one state, such as ready, waiting for CI or conflict. Pull requests that follow the merge rules go into batches of up to 50, which CI checks together. Opus reviews each one a last time, independently, before it merges. A pull request outside the rules waits for a maintainer's approval.
 
 ## Post-merge review
 
-Opus reviews each merged pull request a second time and reads what actually landed. Each defect that no open item covers becomes a follow-up issue. Minor findings are only shown.
+Opus reviews what actually landed when a pull request merged without a person's approval, or when AutoCraft changed its code after the approval. A pull request that merged as a person approved it gets no such review. Each defect that no open item covers becomes a follow-up issue. Minor findings are only shown.
 
 ## Security deep scan
 
@@ -56,24 +56,16 @@ An operator starts a scan of one repo's default branch. Opus looks for vulnerabi
 
 ## Conversations
 
-Each item can have a conversation with Opus next to its decision. Everyone with access to the repo can read it. Operators write, and so do maintainers with write access to the repo; a maintainer's messages are answered on their own Task Runner. Opus answers with read-only access to the repo.
+Each item can have a conversation with Opus on its page. Everyone with access to the repo can read it. Operators write, and so do maintainers with write access to the repo; a maintainer's messages are answered on their own Task Runner. Opus answers with read-only access to the repo.
 
 ## What needs a person
 
-Most work runs without anyone. These questions wait on the Needs you page:
+Nothing runs on an item nobody picked, except the small bug fixes above. These wait for a person:
 
-- **Scope:** is this item in scope, a small extra or a plug-in?
-- **Merge?** for a pull request outside the merge rules.
-- **Close this PR?** when the review says to close it.
-- **Duplicate?** for items that look like the same report.
-- **Reference behaviour** that public sources do not settle.
-- **Label** disagreements on scope between the two classifiers.
+- **Starting an item**, or leaving it.
+- **The recommendation** of a started item that is not approved for merge.
+- **A blocker** of an approved item: a major finding, someone else's commits that the review finds beyond what was approved, a step that failed twice, a fix larger than agreed. Someone else's commits are reviewed first; the approval stays.
+- **A merge** outside the merge rules.
+- **A close** that could not be made.
 
-Operators settle every question. Maintainers who have write access to the repo can settle them too, when an operator has switched that on for the repo. Other maintainers send feedback, which operators read. Viewers only read.
-
-When nobody answers, the question stays open and only that item waits. Everything else keeps moving. Snooze hides a question until the item has new activity. A question about an old version of a pull request is withdrawn when the author pushes. A closed or merged item withdraws its questions.
-
-
-## Actions
-
-A decision offers one main action and optional extras. The Do it button names every GitHub write it will make. Act then posts the comments and closes from fixed templates. Undo stays available until the pipeline has used the answer.
+Operators and maintainers with write access on the repo answer, on GitHub, Discord, the dashboard or with their own agent. Viewers only read. When nobody answers, only that item waits.

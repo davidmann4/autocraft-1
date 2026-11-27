@@ -17,11 +17,11 @@ export function esc(s: unknown): string {
 // Minimal page for the server's own responses (sign-in, sign-out, errors), in
 // the dashboard's colours. The inline script applies the theme the reader chose
 // in the dashboard (stored by web/src/shell/theme.ts); without it the page
-// follows the system setting.
-export function plainPage(nonce: string, title: string, body: string, head = ""): string {
+// follows the system setting. `icons` false leaves out the icon links, for pages that may request nothing outside their own path.
+export function plainPage(nonce: string, title: string, body: string, head = "", icons = true): string {
   return `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><title>${esc(title)}</title>
-<link rel="icon" type="image/svg+xml" href="/artcraft-mark.svg"><link rel="apple-touch-icon" href="/artcraft-mark.png">${head}
+${icons ? `<link rel="icon" type="image/svg+xml" href="/artcraft-mark.svg"><link rel="apple-touch-icon" href="/artcraft-mark.png">` : `<link rel="icon" href="data:,">`}${head}
 <script nonce="${nonce}">try{var t=localStorage.getItem("autocraft:theme");if(t==="dark"||t==="light")document.documentElement.dataset.theme=t}catch(e){}</script>
 <style nonce="${nonce}">
 :root{color-scheme:dark;--bg:#101014;--card:#141518;--fg:#f2f1ee;--muted:#9a9aa0;--line:rgba(255,255,255,.1);--link:#74aaff;--accent:#2d81ff}

@@ -19,7 +19,6 @@ export function ModelCallDetail({ call, runId, run, error }: { call: Call; runId
       <Facts
         rows={[
           ["Model", call.model],
-          ["Account", call.via ? null : call.account],
           ["Run by", call.via && <RemoteVia key="via" via={call.via} />],
           ["Tokens", tokens],
           ["Cost", call.costUsd === null ? null : usd(call.costUsd)],

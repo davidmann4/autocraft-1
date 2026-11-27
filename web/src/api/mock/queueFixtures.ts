@@ -1,8 +1,8 @@
 // Fake merge queue: a few PRs in every state, over the mock repos.
-import type { BatchFilter, BatchList, QueueBatch, QueueFilter, QueueList, QueueRow, QueueState, TypeLabel } from "../types";
-import { AUTHORS, DECISIONS, NOW, REPOS, rng, titleFor } from "./fixtures";
+import type { QueueBatch, QueueRow, QueueState, TypeLabel } from "../types";
+import { AUTHORS, NOW, REPOS, rng, titleFor } from "./fixtures";
 
-const STATES: QueueState[] = ["ready", "decision-answered-merge", "refused", "waiting-ci", "waiting-premerge", "ci-failed", "conflict", "needs-fix-up", "waiting-verify", "verify-failed", "verify-error", "needs-decision", "declined", "merged", "held-duplicate", "held-backlog", "batch-checking", "in-batch", "batch-failed", "changes-requested"];
+const STATES: QueueState[] = ["ready", "decision-answered-merge", "refused", "waiting-ci", "waiting-premerge", "ci-failed", "conflict", "needs-fix-up", "waiting-verify", "verify-failed", "verify-error", "needs-decision", "merged", "held-backlog", "batch-checking", "in-batch", "batch-failed", "changes-requested"];
 const REASONS = [
   "Fixes the off-by-one in the page range and adds a test.",
   "Small, correct guard against an empty selection.",
@@ -38,7 +38,6 @@ function prBuildFor(state: QueueState, i: number): QueueRow["prBuild"] {
 
 const ROWS: QueueRow[] = (() => {
   const r = rng(606);
-  const mergeDecision = DECISIONS.find((d) => d.kind === "merge")?.id ?? null;
   const out: QueueRow[] = [];
   let k = 0;
   for (const state of STATES) {
@@ -64,12 +63,11 @@ const ROWS: QueueRow[] = (() => {
         size, label, verdict: state === "needs-fix-up" ? "take-fix" : "take", reason: REASONS[k % REASONS.length]!,
         fixes: state === "needs-fix-up" ? 1 + (i % 3) : 0, ci, mergeable: state === "conflict" ? "conflicts" : "clean", state,
         path: rulePath ? "rule" : state === "decision-answered-merge" || state === "refused" ? "operator" : null,
-        outsideRule, decisionId: state === "needs-decision" || state === "decision-answered-merge" || state === "declined" ? mergeDecision : null,
-        answer: state === "decision-answered-merge" ? "merge" : state === "declined" ? (i ? "close" : "hold") : null,
         refusedReason: state === "refused" ? "safe-merge: required check 'build (linux)' has not finished" : null,
         note: state === "changes-requested" ? "changes requested by a maintainer (reviewer)" : null,
         reviewedAt: new Date(NOW - (k + 1) * 3_600_000 * 5).toISOString(),
         verify: verifyFor(state, i),
+        outsideRule,
         prBuild: prBuildFor(state, i),
         closes: k % 3 === 0 ? [] : k % 5 === 0 ? [number - 40, number - 13] : [number - 17],
       });
@@ -109,8 +107,6 @@ const BATCHES: QueueBatch[] = Array.from({ length: 45 }, (_, k) => {
   };
 });
 
-export const QUEUE_ROWS = ROWS;
-
 // An open integration batch on designcraft: its members are the repo's first ready PRs, shown as in the batch.
 const OPEN_BATCH: QueueBatch = (() => {
   const prs = ROWS.filter((r) => r.repo === "designcraft" && (r.state === "ready" || r.state === "decision-answered-merge")).slice(0, 3).map((r): QueueRow => ({ ...r, state: "in-batch" }));
@@ -123,19 +119,7 @@ const OPEN_BATCH: QueueBatch = (() => {
 const BATCH_MEMBERS = new Set(OPEN_BATCH.prs.map((r) => r.number));
 BATCHES.unshift(OPEN_BATCH);
 
-export function queueList(f: QueueFilter): QueueList {
-  const all = ROWS.filter((x) => (!f.repo || x.repo === f.repo) && !(x.repo === "designcraft" && BATCH_MEMBERS.has(x.number)));
-  const counts = Object.fromEntries(STATES.map((s) => [s, all.filter((x) => x.state === s).length])) as Record<QueueState, number>;
-  const match = all.filter((x) => (f.state ? x.state === f.state : x.state !== "merged"));
-  const from = f.after ? match.findIndex((x) => `${x.repo}#${x.number}` === f.after) + 1 : 0;
-  const rows = match.slice(from, from + (f.limit ?? 100));
-  const last = rows[rows.length - 1];
-  return { rows, counts, total: match.length, next: last && from + rows.length < match.length ? `${last.repo}#${last.number}` : null };
-}
+/** The open PRs that are in no batch in flight. */
+export const queueRows = (): QueueRow[] => ROWS.filter((x) => x.state !== "merged" && !(x.repo === "designcraft" && BATCH_MEMBERS.has(x.number)));
 
-export function queueBatchList(f: BatchFilter): BatchList {
-  const all = BATCHES.filter((b) => !f.repo || b.repo === f.repo);
-  const from = f.after ? all.findIndex((b) => String(b.id) === f.after) + 1 : 0;
-  const batches = all.slice(from, from + (f.limit ?? 20));
-  return { batches, total: all.length, next: batches.length && from + batches.length < all.length ? String(batches[batches.length - 1]!.id) : null };
-}
+export const queueBatches = (): QueueBatch[] => BATCHES;

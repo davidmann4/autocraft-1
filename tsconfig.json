@@ -12,5 +12,5 @@
     "types": ["node"],
     "allowJs": true
   },
-  "include": ["src", "test", "worker", "scripts/golive-gate.ts", "scripts/remote-claim-bench.ts", "scripts/codemod-async.ts", "scripts/latency-proxy.ts", "scripts/gen-pg-schema.ts", "scripts/pg-schema-compare.ts"]
+  "include": ["src", "test", "worker", "scripts/remote-claim-bench.ts", "scripts/codemod-async.ts", "scripts/latency-proxy.ts", "scripts/gen-pg-schema.ts", "scripts/pg-schema-compare.ts"]
 }

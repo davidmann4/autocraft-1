@@ -1,29 +1,21 @@
-// Sandboxed calls stream their events: progress lines in order with the right wording, the final result and usage
-// unchanged, and the conversation turn showing progress while it is answered.
+// A call shows the progress lines its Task Runner reports while it runs, and the wording of the lines for a tool use.
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync } from "node:fs";
 import { join } from "node:path";
 import { describe, test } from "node:test";
-import { useTestAccount } from "./accounts-fixture.ts";
+import { fakeTaskRunner } from "./fake-runner.ts";
 import { SCRATCH } from "./scratch.ts";
-import { askClaude, setRunner, setWorkspace } from "../src/classify/run.ts";
+import { askClaude, setWorkspace } from "../src/classify/run.ts";
 import { eventLines } from "../src/classify/progress.ts";
-import type { Db } from "../src/db/index.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb, type Db } from "./helpers/raw-db.ts";
 
 mkdirSync(SCRATCH, { recursive: true });
 const dir = mkdtempSync(join(SCRATCH, "stream-"));
-process.env.AUTOCRAFT_CLAUDE_BIN = "/bin/true";
 process.env.AUTOCRAFT_CHECKOUT_DIR = join(dir, "checkouts");
-process.env.AUTOCRAFT_CLAUDE_CWD = join(dir, "cwd");
 setWorkspace(async () => []);
 
 async function fresh(): Promise<Db> {
-  const db = await connectDb(join(mkdtempSync(join(dir, "db-")), "t.db"));
-  const box = await useTestAccount(db);
-  mkdirSync(`${box.configDir}t`, { recursive: true });
-  writeFileSync(`${box.configDir}t/.credentials.json`, JSON.stringify({ claudeAiOauth: { expiresAt: Date.now() + 86_400_000 } }));
-  return db;
+  return await connectDb(join(mkdtempSync(join(dir, "db-")), "t.db"));
 }
 
 const tool = (name: string, input: unknown, parent: string | null = null) =>
@@ -44,19 +36,32 @@ const EVENTS = [
   result("[]", 7, { "claude-opus-4": { inputTokens: 7, outputTokens: 1, costUSD: 0.4 }, "claude-haiku-4": { inputTokens: 100, outputTokens: 5, costUSD: 0.1 } }),
 ];
 
-/** Emits the events one by one with a pause, as the CLI would. */
-const streaming = (events: string[], during?: (k: number) => Promise<void | Promise<void>>) =>
-  setRunner(async (_cmd, args, _in, _cwd, _t, _env, onLine) => {
-    assert.ok(args.includes("stream-json") && args.includes("--verbose"));
-    let out = "";
-    for (const [k, l] of events.entries()) {
-      out += `${l}\n`;
-      await onLine?.(l);
-      await during?.(k);
-      await new Promise((r) => setTimeout(r, 5));
+describe("a call's progress", () => {
+  const ask = (db: Db) => askClaude("conversation.turn", "opus", [{ ref: "app#1", item: "{}", turns: "" }], db, { checkout: dir });
+
+  test("the run shows the helper's latest progress line until the call ends, and the answer is its reply", async () => {
+    const db = await fresh();
+    const lines = EVENTS.flatMap((e) => eventLines(JSON.parse(e)));
+    let running: string | null | undefined;
+    const runner = await fakeTaskRunner(db, async (_c, beat) => {
+      for (const l of lines) { await beat(l); await new Promise((r) => setTimeout(r, 40)); }
+      running = (await db.prepare("SELECT progress FROM agent_runs WHERE state = 'running'").get() as { progress: string } | undefined)?.progress;
+      return { text: "[]", turns: 3, usage: { inputTokens: 7, outputTokens: 1 } };
+    });
+    try {
+      const r = await ask(db);
+      assert.equal(r?.text, "[]");
+      assert.equal(r?.usage.input, 7);
+    } finally {
+      await runner.stop();
     }
-    return { code: 0, stdout: out, stderr: "" };
+    assert.equal(running, lines.at(-1));
+    const row = await db.prepare("SELECT state, progress FROM agent_runs").get() as { state: string; progress: string | null };
+    assert.equal(row.state, "done");
+    assert.equal(row.progress, null);
   });
+});
+
 
 describe("progress lines", () => {
   test("wording, the explorer prefix, cap and plain text", () => {
@@ -76,46 +81,4 @@ describe("progress lines", () => {
   });
 
 
-});
-
-describe("askClaude with a stream", () => {
-  test("onProgress gets the lines in order; the answer is the last result event; the run shows the latest line until it ends", async () => {
-    const db = await fresh();
-    const seen: string[] = [];
-    let running: string | null | undefined;
-    const restore = streaming(EVENTS, async (k) => {
-      if (k === 1) running = (await db.prepare("SELECT progress FROM agent_runs WHERE state = 'running'").get() as { progress: string } | undefined)?.progress;
-    });
-    try {
-      const r = await askClaude("conversation.turn", "opus", [{ ref: "app#1", item: "{}", turns: "" }], db, { checkout: dir, onProgress: (l) => seen.push(l) });
-      assert.equal(r?.text, "[]");
-      assert.equal(r?.usage.input, 7);
-      assert.equal(r?.usage.extra?.[0]?.model, "haiku");
-      assert.equal(r?.usage.extra?.[0]?.usage.input, 100);
-      assert.equal(r?.turns, 3);
-    } finally {
-      restore();
-    }
-    assert.equal(seen.length, 7);
-    assert.equal(seen[0], "Reading craft-i18n/packs/hu/menu.ftl");
-    assert.equal(seen[2], 'Explorer: Searching for "spellcheck" in src');
-    assert.equal(running, "Reading craft-i18n/packs/hu/menu.ftl");
-    const row = await db.prepare("SELECT state, progress FROM agent_runs").get() as { state: string; progress: string | null };
-    assert.equal(row.state, "done");
-    assert.equal(row.progress, null);
-  });
-
-  test("an error result still fails the call", async () => {
-    const db = await fresh();
-    const restore = streaming([tool("Read", { file_path: "/repo/a" }), JSON.stringify({ type: "result", is_error: true, result: "boom" })]);
-    try {
-      assert.equal(await askClaude("conversation.turn", "opus", [{ ref: "app#1", item: "{}", turns: "" }], db, { checkout: dir }), null);
-    } finally {
-      restore();
-    }
-    assert.equal((await db.prepare("SELECT summary FROM agent_runs").get() as { summary: string }).summary, "model error");
-  });
-});
-
-describe("conversation turn progress", () => {
 });

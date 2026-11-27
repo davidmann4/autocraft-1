@@ -4,8 +4,9 @@ import { rmSync, utimesSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { CHECK_MAX_WALL_MS } from "../core/rules.ts";
 import { CLAUDE_PROMPTS } from "../prompts/index.ts";
+import { clearSessions, loadSessionRows, type SessionClear } from "../data/changes/index.ts";
+import { clearSessions as clearRoundSessions, loadFixSessionRows } from "../data/security/index.ts";
 import type { Db } from "../db/index.ts";
-import * as kx from "../db/kx.ts";
 
 /** How long after its last use a kept session is resumed: the prompt cache window. */
 export const RESUME_WINDOW_MS = 60 * 60_000;
@@ -27,8 +28,6 @@ export type StoredSession = KeptSession & { at: string };
 export type SessionAsk = { resume?: { session: KeptSession; message: string }; kept?: KeptSession };
 
 /** The tables whose rows keep a session, and the state in which a row waits for its result (lint or build). */
-export const SESSION_TABLES = ["fixups", "ci_fixes", "conflict_merges", "main_fixes", "security_fix_rounds"] as const;
-const WAITING: Record<(typeof SESSION_TABLES)[number], string> = { fixups: "linting", ci_fixes: "linting", conflict_merges: "linting", main_fixes: "linting", security_fix_rounds: "building" };
 
 export function resumeMessage(findings: string[]): string {
   return `The harness linted your answer. Rustfmt, clippy and the tests of the affected crates report these findings (rustfmt and clippy findings are on lines it changed):\n\n${findings.map((f) => f.trim()).join("\n\n")}\n\nFix them. Reply with your corrected answer in the same reply format as before: complete, not a change to your earlier answer.`;
@@ -86,26 +85,33 @@ export class SessionLedger {
   }
 }
 
+/** A session row of any table: `id` is the row id of a patch table, or `repo#number#round` of a security fix round. */
+type SessionOwner = { kind: string; id: number | string; state: string; session: string };
+const waitingState = (kind: string): string => (kind === "security" ? "building" : "linting");
+
 /** Removes the kept sessions whose row is no longer waiting for its lint result (pushed, failed, dropped) or is past the window. */
 export async function sweepSessions(db: Db, now: Date): Promise<number> {
-  let n = 0;
+  const [patchRows, roundRows] = await db.together(() => Promise.all([loadSessionRows(db), loadFixSessionRows(db)]));
+  const rows: SessionOwner[] = [...patchRows, ...roundRows].flatMap((r) => (r.session === null ? [] : [{ kind: r.kind, id: r.id, state: r.state, session: r.session }]));
   // A store that a row still waiting on its lint references stays, even when a sibling row (same head) left that state.
   const live = new Set<string>();
-  for (const t of SESSION_TABLES) {
-    for (const r of await db.all(db.k.selectFrom(t).select("session").where("session", "is not", null).where("state", "=", WAITING[t]).$narrowType<{ session: string }>())) {
-      for (const s of Object.values(parseSessions(r.session))) if (now.getTime() - Date.parse(s.at) <= RESUME_WINDOW_MS + LONGEST_CALL_MS) live.add(s.dir);
-    }
+  for (const r of rows) {
+    if (r.state !== waitingState(r.kind)) continue;
+    for (const s of Object.values(parseSessions(r.session))) if (now.getTime() - Date.parse(s.at) <= RESUME_WINDOW_MS + LONGEST_CALL_MS) live.add(s.dir);
   }
-  for (const t of SESSION_TABLES) {
-    const rows = await db.all(db.k.selectFrom(t).select([kx.rowid(t).as("id"), "state", "session"]).where("session", "is not", null)
-      .orderBy(kx.rowid(t)).$narrowType<{ session: string }>());
-    for (const r of rows) {
-      const all = Object.values(parseSessions(r.session));
-      if (all.length && r.state === WAITING[t] && all.every((s) => live.has(s.dir))) continue;
-      for (const s of all) if (!live.has(s.dir)) remove(s.dir);
-      await db.run(db.k.updateTable(t).set({ session: null }).where(kx.rowid(t), "=", r.id));
-      n++;
-    }
+  const clearPatch: SessionClear[] = [], clearRound: { repo: string; number: number; round: number }[] = [];
+  for (const r of rows) {
+    const all = Object.values(parseSessions(r.session));
+    if (all.length && r.state === waitingState(r.kind) && all.every((s) => live.has(s.dir))) continue;
+    for (const s of all) if (!live.has(s.dir)) remove(s.dir);
+    if (r.kind === "security") {
+      const [repo, number, round] = String(r.id).split("#") as [string, string, string];
+      clearRound.push({ repo, number: Number(number), round: Number(round) });
+    } else clearPatch.push({ kind: r.kind as SessionClear["kind"], id: Number(r.id) });
   }
-  return n;
+  await db.write(async () => {
+    await clearSessions(db, clearPatch);
+    await clearRoundSessions(db, clearRound);
+  });
+  return clearPatch.length + clearRound.length;
 }

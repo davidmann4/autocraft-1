@@ -6,8 +6,8 @@ import { cn } from "../cn";
 import { Block } from "../molecules/Block";
 import { NextItemRow } from "../molecules/NextItemRow";
 
-const TONE: Record<NextStep["kind"], Tone> = { ok: "ok", running: "accent", off: "neutral", breaker: "bad", limit: "warn", account: "warn", backoff: "warn", approval: "warn" };
-const LABEL: Record<NextStep["kind"], string> = { ok: "Can run", running: "Running", off: "Pipeline off", breaker: "Breaker tripped", limit: "Limit reached", account: "Paused", backoff: "Backing off", approval: "Not approved" };
+const TONE: Record<NextStep["kind"], Tone> = { ok: "ok", running: "accent", off: "neutral", breaker: "bad", limit: "warn", backoff: "warn", approval: "warn" };
+const LABEL: Record<NextStep["kind"], string> = { ok: "Can run", running: "Running", off: "Pipeline off", breaker: "Breaker tripped", limit: "Limit reached", backoff: "Backing off", approval: "Not approved" };
 
 /** A pipeline step: whether it can run now, the items its next job takes in order, and the items its guard holds back, collapsed. */
 export function NextStepBlock({ step, className }: { step: NextStep; className?: string }) {

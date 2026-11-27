@@ -72,7 +72,7 @@ export function sandboxCommand(s: SandboxSpec): { cmd: string; args: string[]; e
     "--ro-bind", "/etc/ssl", "/etc/ssl", "--ro-bind", "/etc/resolv.conf", "/etc/resolv.conf",
     "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
     "--tmpfs", HOME, "--tmpfs", CONFIG,
-    // Read-only: the sandbox never refreshes the token (src/sandbox/index.ts `tokenNearExpiry` keeps a call from starting on an account whose token is about to expire; it waits for a refresh). A long-lived token needs no refresh.
+    // Read-only: the sandbox never refreshes the token. A long-lived token needs no refresh.
     ...(s.oauthToken || !s.credentials ? [] : ["--ro-bind", s.credentials, `${CONFIG}/.credentials.json`]),
     ...(s.sessionDir ? ["--bind", s.sessionDir, `${CONFIG}/projects`] : []),
     "--ro-bind", s.claudeBin, CLAUDE_PATH,

@@ -10,7 +10,7 @@ import { claudeArgs } from "../src/prompts/index.ts";
 import { importReference, referenceDir } from "../src/reference.ts";
 import { trackRepo } from "../src/repos.ts";
 import { SCRATCH } from "./scratch.ts";
-import { openDb } from "../src/db/open.ts";
+import { openDb } from "./helpers/raw-db.ts";
 import * as kx from "../src/db/kx.ts";
 
 mkdirSync(SCRATCH, { recursive: true });

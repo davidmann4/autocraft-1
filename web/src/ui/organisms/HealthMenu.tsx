@@ -6,21 +6,21 @@ import { useApi, useQuery } from "../../api/client";
 import { useUser } from "../../shell/UserContext";
 import { useWrite } from "../../lib/hooks";
 import { Button } from "../atoms/Button";
-import type { NowProblem } from "../../api/types";
+import type { HealthProblem } from "../../api/types";
 import { cn } from "../cn";
 import { TimeAgo } from "../atoms/TimeAgo";
 
-const TONE: Record<NowProblem["tone"], { Icon: typeof WarningIcon; text: string }> = {
+const TONE: Record<HealthProblem["tone"], { Icon: typeof WarningIcon; text: string }> = {
   bad: { Icon: WarningCircleIcon, text: "text-bad" },
   warn: { Icon: WarningIcon, text: "text-warn" },
 };
 
 /** Problems keep one place in the list whatever order they arrive in. */
-const AREAS: NowProblem["area"][] = ["pipeline", "runner", "workers", "sync", "breaker", "limit", "account", "jev", "main-ci", "jobs", "deadline", "liveness"];
-const place = (p: NowProblem) => AREAS.indexOf(p.area);
+const AREAS: HealthProblem["area"][] = ["pipeline", "runner", "workers", "sync", "breaker", "limit", "account", "jev", "main-ci", "jobs", "deadline", "liveness", "database"];
+const place = (p: HealthProblem) => AREAS.indexOf(p.area);
 
 /** A problem's link: a dashboard page through the router, or a server page (an authorization flow) that comes back to this page. */
-function ProblemLink({ p, onClick, className, children }: { p: NowProblem; onClick: () => void; className: string; children: ReactNode }) {
+function ProblemLink({ p, onClick, className, children }: { p: HealthProblem; onClick: () => void; className: string; children: ReactNode }) {
   if (!p.fullPage) return <Link to={p.to} onClick={onClick} className={className}>{children}</Link>;
   const href = `${p.to}?${new URLSearchParams({ return_to: window.location.pathname + window.location.search })}`;
   return <a href={href} className={className}>{children}</a>;
@@ -28,12 +28,12 @@ function ProblemLink({ p, onClick, className, children }: { p: NowProblem; onCli
 
 /** Header indicator: icon and count of what is wrong, coloured by the worst problem; opens the list with a link to each fix. Renders nothing when healthy. */
 export function HealthMenu() {
-  const { data } = useQuery("now", (a) => a.now(), { pollMs: 30_000 });
+  const { data } = useQuery("health", (a) => a.health(), { pollMs: 30_000 });
   const [open, setOpen] = useState(false);
   const api = useApi();
   const operator = useUser().role === "operator";
   const write = useWrite();
-  const problems = data?.health.problems ?? [];
+  const problems = data?.problems ?? [];
   if (problems.length === 0) return null;
   const worst = problems.some((p) => p.tone === "bad") ? "bad" : "warn";
   const { Icon } = TONE[worst];

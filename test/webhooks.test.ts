@@ -1,13 +1,20 @@
 import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { join } from "node:path";
+import { generateKeyPairSync } from "node:crypto";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { test } from "node:test";
+import { redeliverWebhook } from "../src/github/write.ts";
 import { safeEqual } from "../src/dash/server/crypto.ts";
-import { drainSyncRequests, handleDelivery, signatureOf } from "../src/github/webhooks.ts";
-import { writeItemNode } from "../src/mirror.ts";
+import { checkDeliveries, parseDeliveries, type Delivery, type DeliveryPage } from "../src/github/deliveries.ts";
+import { drainSyncRequests, handleDelivery, resetDeliveryNote, signatureOf } from "../src/github/webhooks.ts";
+import { loadSyncState, saveSyncState } from "../src/data/mirror/index.ts";
+import { pollReason, writeItemNode } from "../src/mirror.ts";
+import type { AppSecrets } from "../src/dash/server/config.ts";
 import { validating } from "./gql.ts";
 import { SCRATCH } from "./scratch.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb } from "./helpers/raw-db.ts";
 
 const SECRET = "hook-secret";
 async function scratch() {
@@ -125,4 +132,93 @@ test("re-reading an unchanged item bumps no items topic and keeps its newest com
   node.comments = { nodes: [comment(2)] };
   await read();
   assert.deepEqual((await db.all(db.k.selectFrom("comments").select("id").where("repo", "=", "a").where("number", "=", 5))).map((r) => r.id), ["c2"]);
+});
+
+test("with webhooks arriving the poll waits for the backstop; a failed delivery is asked for again once per attempt and makes the run poll", async () => {
+  const db = await scratch();
+  resetDeliveryNote();
+  const t0 = Date.now();
+  const none = { webhooks: true, unread: false, deliveries: null };
+  assert.equal(pollReason(await loadSyncState(db), t0, none), "no webhook delivery yet");
+  await deliver(db, "ping", {});
+  const state = await loadSyncState(db);
+  assert.ok(state.webhook_at && state.webhook_started_at, "a delivery records that webhooks arrive");
+  // A poll right after the receiver started: nothing is due until the backstop.
+  await saveSyncState(db, { polled_at: new Date(t0 + 1000).toISOString() });
+  assert.equal(pollReason(await loadSyncState(db), t0 + 60_000, none), null);
+  assert.equal(pollReason(await loadSyncState(db), t0 + 60_000, { ...none, webhooks: false }), "webhooks are not set up");
+  assert.equal(pollReason(await loadSyncState(db), t0 + 16 * 60_000, none), "backstop");
+
+  const at = (ms: number) => new Date(ms).toISOString().replace(/\.\d+Z$/, "Z");
+  const page: Delivery[] = [
+    { id: "1", guid: "ok", delivered_at: at(t0 - 120_000), status_code: 202, event: "issues" },
+    { id: "2", guid: "down", delivered_at: at(t0 - 110_000), status_code: 502, event: "issue_comment" },
+    { id: "3", guid: "refused", delivered_at: at(t0 - 100_000), status_code: 401, event: "issues" },
+    { id: "4", guid: "fresh", delivered_at: at(t0 - 5_000), status_code: 0, event: "issues" },
+  ];
+  const asked: string[] = [];
+  const deps = { list: async () => ({ deliveries: [...page], next: null }), redeliver: async (d: Delivery) => { asked.push(d.guid); }, log: () => {} };
+  const app = {} as AppSecrets;
+  const first = await checkDeliveries(db, app, t0, deps);
+  assert.deepEqual(asked, ["down"], "only a delivery that got no good answer, settled and worth retrying, is asked for again");
+  assert.equal(first.failed, 2);
+  assert.ok(pollReason(await loadSyncState(db), t0 + 1000, { ...none, deliveries: first }), "a failed delivery makes the run poll");
+  // The same list read again (a redelivery of the check) asks for nothing new; the in-flight one is looked at once it settles.
+  const again = await checkDeliveries(db, app, t0 + 20_000, deps);
+  assert.deepEqual(asked, ["down"]);
+  assert.equal(again.failed, 0);
+  page.push({ id: "5", guid: "down", delivered_at: at(t0 + 25_000), status_code: 202, event: "issue_comment" });
+  await checkDeliveries(db, app, t0 + 60_000, deps);
+  assert.deepEqual(asked, ["down", "fresh"], "the redelivered one succeeded; the in-flight one failed once settled");
+});
+
+test("a failed delivery a check could not have sent again is asked for on the next check, past newer ones and on a later page, and its comment command arrives", async () => {
+  const db = await scratch();
+  const t0 = Date.now();
+  const at = (ms: number) => new Date(ms).toISOString().replace(/\.\d+Z$/, "Z");
+  const slug = "autocraft-bot";
+  const comment = { action: "created", repository: { full_name: "storytold/a", name: "a" }, issue: { number: 3 },
+    comment: { id: 77, body: `@${slug} review`, created_at: new Date(t0 - 90_000).toISOString(), user: { login: "someone", id: 5, type: "User" } } };
+  const lost: Delivery = { id: "9", guid: "cmd", delivered_at: at(t0 - 90_000), status_code: 502, event: "issue_comment" };
+  const newest: Delivery[] = [{ id: "10", guid: "newer", delivered_at: at(t0 - 40_000), status_code: 202, event: "issues" }];
+  const pages = (): Record<string, DeliveryPage> => ({
+    first: { deliveries: [...newest], next: "p2" },
+    p2: { deliveries: [lost, { id: "1", guid: "old", delivered_at: at(t0 - 4000_000), status_code: 202, event: "issues" }], next: null },
+  });
+  let down = true;
+  const asked: string[] = [];
+  const deps = {
+    list: async (cursor: string | null) => pages()[cursor ?? "first"]!,
+    redeliver: async (d: Delivery) => {
+      asked.push(d.guid);
+      if (down) throw new Error("HTTP 502");
+      const raw = Buffer.from(JSON.stringify(comment));
+      await handleDelivery(db, SECRET, { event: d.event, signature: signatureOf(SECRET, raw) }, raw, safeEqual, slug);
+    },
+    log: () => {},
+  };
+  await checkDeliveries(db, {} as AppSecrets, t0, deps);
+  assert.deepEqual(asked, ["cmd"]);
+  down = false;
+  newest.unshift({ id: "11", guid: "newest", delivered_at: at(t0 + 20_000), status_code: 202, event: "issues" });
+  await checkDeliveries(db, {} as AppSecrets, t0 + 60_000, deps);
+  assert.deepEqual(asked, ["cmd", "cmd"], "the next check reads back to the delivery left over and asks for it again");
+  const commands = await db.all(db.k.selectFrom("github_commands").select(["comment_id", "number"]));
+  assert.deepEqual(commands.map((r) => ({ ...r })), [{ comment_id: 77, number: 3 }]);
+});
+
+test("a delivery id above 2^53 reaches the redelivery request exactly", async () => {
+  const db = await scratch();
+  const id = "3856181105461821437";
+  const list = parseDeliveries(`[{"id":${id},"guid":"g","delivered_at":"2026-01-01T00:00:00Z","status_code":502,"event":"issues"}]`) as Delivery[];
+  assert.equal(list[0]!.id, id);
+  const paths: string[] = [];
+  const server = createServer((req, res) => { paths.push(`${req.method} ${req.url}`); res.statusCode = 202; res.end("{}"); });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  try {
+    const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+    const app = { clientId: "c", privateKey: privateKey.export({ type: "pkcs8", format: "pem" }).toString() };
+    await redeliverWebhook({ db, login: "t" }, { app, id: list[0]!.id, guid: "g", event: "issues", apiBase: `http://127.0.0.1:${(server.address() as AddressInfo).port}` });
+  } finally { server.close(); }
+  assert.deepEqual(paths, [`POST /app/hook/deliveries/${id}/attempts`]);
 });

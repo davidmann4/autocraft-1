@@ -1,18 +1,22 @@
 // The PR of an implementation: the checked diff is applied on the base commit in a hardened clone of ours (no working
 // tree; nothing of the repository runs), committed as the pipeline's identity, pushed to its own branch and opened as a
-// PR, all through src/github/write.ts. The queuer's pre-approval then sends it through Review, Verify and the merge queue.
+// PR, all through src/github/write.ts. The workflow approver's pre-approval then sends it through Review, Verify and the merge queue.
 // A run that stops part way is picked up by the next one: an open PR of ours on the branch (or the one stored on the row)
 // is adopted and the remaining steps run.
 import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import type { Db } from "../db/index.ts";
+import { listAudit } from "../data/control/index.ts";
+import { applyLocal, loadItems } from "../data/mirror/index.ts";
+import { linkWorkflows, listWorkflows } from "../data/workflow/index.ts";
 import { diffStat } from "../build/workspaces.ts";
 import { guardItem, guardRepo, type GuardedItem, type ItemWant } from "../core/guard.ts";
+import { implementMay } from "./gate.ts";
 import type { By } from "../core/gates.ts";
-import { addFastTrack } from "../fasttrack.ts";
+import { mergesFor } from "../core/may.ts";
 import { branchOf, forkOf } from "../github/fork.ts";
-import { hasOpenPr } from "../core/open-prs.ts";
+import { closedByOpenPr } from "../core/open-prs.ts";
 import { EMPTY_TREE, exec as realExec, fixupDir, Git, type Exec } from "../fixup/git.ts";
 import { buildScriptsAt, type BuildScripts } from "../fixup/patch.ts";
 import { ownPrSelect } from "../github/adopt.ts";
@@ -21,15 +25,14 @@ import { pipelineAccount, setPipelineLogin } from "../github/pipeline-account.ts
 import { ghComment, ghOpenPr, pushOwnBranch, type Writer } from "../github/write.ts";
 import { Client, ONE_QUERY, writeItemNode, type Querier } from "../mirror.ts";
 import { ownerOf, slugOf } from "../owners.ts";
-import { liveWorkflow, repoWorkflow } from "../workflow/store.ts";
 import { preapproveMerge, PreapprovalRefused } from "../preapproval/index.ts";
 import {
   MAX_BINARY_BYTES, MAX_IMPLEMENTATION_LINES, validateImplementation,
   type ChangedFile, type CompileTimeChange, type ImplementationCheck, type ManifestTexts,
 } from "./diff.ts";
-import { moveImplementationIf } from "./store.ts";
+import { writeStep } from "./attempt.ts";
 import { implBranch, implCommentText, implCommitMessage, implPrBody, implTitle, type CheckLine } from "./template.ts";
-import type { Implementation } from "./types.ts";
+import type { Implementation, ImplementationPatch, ImplementationState } from "./types.ts";
 
 /** The audit login of the stage's writes. */
 const ACTOR = "implement";
@@ -41,6 +44,8 @@ export type PrDeps = {
   root: string;
   /** GitHub GraphQL, to read the new PR into the mirror. Absent: the PR waits for the sync, and the run ends as `retry`. */
   querier?: Querier;
+  /** Replaces the installation-token minter (tests). */
+  mint?: Writer["mint"];
   log: (line: string) => void;
 };
 
@@ -76,7 +81,7 @@ export type OpenPrResult =
     retry: boolean;
     /** The diff check's problems, when the diff was refused. */
     problems?: string[];
-    /** The row left `opening` meanwhile (a cancel or a stuck decision): nothing more was written, and the caller writes nothing either. */
+    /** The row left `opening` meanwhile (a cancel or a stuck blocker): nothing more was written, and the caller writes nothing either. */
     stale?: true;
   };
 
@@ -104,7 +109,7 @@ export async function liveState(exec: Exec, repo: string, path: string): Promise
 /** True when the issue is closed on GitHub; the mirror row is brought up to date. */
 async function issueClosedLive(db: Db, d: PrDeps, repo: string, number: number): Promise<boolean> {
   if (await liveState(d.exec, repo, `issues/${number}`) !== "CLOSED") return false;
-  await db.run(db.k.updateTable("main.items").set({ state: "CLOSED" }).where("repo", "=", repo).where("number", "=", number).where("state", "=", "OPEN"));
+  await applyLocal(db, [{ kind: "state", repo, number, state: "CLOSED" }]);
   return true;
 }
 
@@ -180,10 +185,9 @@ async function committedProblems(git: Git, base: string, commit: string): Promis
 
 /** The last push this implementation made to `branch` that is known done: its commit, and the compile-time changes it was flagged for. */
 export async function lastPush(db: Db, im: Implementation, branch: string): Promise<{ commit: string; compileTime: CompileTimeChange[] } | null> {
-  const rows = await db.all(db.k.selectFrom("audit").select("details").where("action", "=", "implement-push").where("target", "=", refOf(im)).orderBy("at", "desc"));
+  const rows = await listAudit(db, { actions: ["implement-push"], targets: [refOf(im)], order: "desc" });
   for (const r of rows) {
-    let x: { impl?: unknown; branch?: unknown; commit?: unknown; state?: unknown; compileTime?: unknown };
-    try { x = JSON.parse(r.details ?? "{}"); } catch { continue; }
+    const x: { impl?: unknown; branch?: unknown; commit?: unknown; state?: unknown; compileTime?: unknown } = r.details ?? {};
     if (x.impl !== im.id || x.branch !== branch || x.state !== "done" || typeof x.commit !== "string") continue;
     return { commit: x.commit, compileTime: Array.isArray(x.compileTime) ? x.compileTime as CompileTimeChange[] : [] };
   }
@@ -219,9 +223,9 @@ function sameChanges(rows: string[][], files: ChangedFile[]): boolean {
  */
 async function commentOnce(db: Db, d: PrDeps, g: GuardedItem, im: Implementation, pr: { number: number; url: string; draft: boolean }, run?: string): Promise<string | null> {
   const ref = refOf(im);
-  const rows = await db.all(db.k.selectFrom("audit").select("details").where("action", "=", "implement-comment").where("target", "=", ref));
-  if (rows.some((r) => { try { const x = JSON.parse(r.details ?? "{}") as { pr?: unknown; state?: unknown }; return x.pr === pr.number && x.state !== "failed"; } catch { return false; } })) return null;
-  const cm = await ghComment({ db, login: ACTOR }, g, d.exec, "implement-comment", { repo: im.repo, number: im.number, pr: false }, { by: "fixed" }, implCommentText(pr.url, pr.draft), { pr: pr.number, ...(run && { run }) });
+  const rows = await listAudit(db, { actions: ["implement-comment"], targets: [ref] });
+  if (rows.some((r) => r.details?.pr === pr.number && r.details?.state !== "failed")) return null;
+  const cm = await ghComment({ db, login: ACTOR, ...(d.mint && { mint: d.mint }) }, g, d.exec, "implement-comment", { repo: im.repo, number: im.number, pr: false }, { by: "fixed" }, implCommentText(pr.url, pr.draft), { pr: pr.number, ...(run && { run }) });
   if (cm.code === 0) return null;
   d.log(`  ${ref}: comment failed: ${oneLine(cm.stderr)}`);
   return oneLine(cm.stderr || cm.stdout) || `exit code ${cm.code}`;
@@ -229,7 +233,10 @@ async function commentOnce(db: Db, d: PrDeps, g: GuardedItem, im: Implementation
 
 /** Reads the PR into the mirror, so the pre-approval and the planner see it now. True when the mirror has it with its head. */
 async function mirrorPr(db: Db, d: PrDeps, repo: string, number: number): Promise<boolean> {
-  const has = async () => !!(await db.get(db.k.selectFrom("main.items").select("head_oid").where("repo", "=", repo).where("number", "=", number).where("kind", "=", "pr")))?.head_oid;
+  const has = async () => {
+    const it = (await loadItems(db, [{ repo, number }], "pr")).get(`${repo}#${number}`);
+    return it?.kind === "pr" && !!it.head_oid;
+  };
   if (await has()) return true;
   if (!d.querier) return false;
   try {
@@ -243,9 +250,9 @@ async function mirrorPr(db: Db, d: PrDeps, repo: string, number: number): Promis
 }
 
 /**
- * Opens the implementation's PR, or adopts the one an earlier run opened, then pre-approves its merge as the queuer at the
- * commit this implementation pushed (not for a draft), fast-tracks it with the issue's weight and comments on the issue
- * once. A change with compile-time manifest changes opens only as a draft. Every write of the row is made only while it is
+ * Opens the implementation's PR, or adopts the one an earlier run opened, then pre-approves its merge at the commit this
+ * implementation pushed as whoever approved the issue's workflow (not for a draft, nor while nobody approved it; the PR's
+ * queue weight is the workflow's) and comments on the issue once. A change with compile-time manifest changes opens only as a draft. Every write of the row is made only while it is
  * `opening`: it moves there at the start, keeps the branch before the push and the PR number and URL as soon as the PR
  * exists, and moves to `pr-opened` when every step is done (or to `merged` on a run after our PR merged). A failure leaves
  * the state to the caller: `retry` says whether the same input may succeed later.
@@ -254,25 +261,31 @@ export async function openImplementationPr(db: Db, input: OpenPrInput, d: PrDeps
   const im = input.implementation;
   const { repo, number } = im;
   const ref = refOf(im);
-  const w: Writer = { db, login: ACTOR };
+  const w: Writer = { db, login: ACTOR, ...(d.mint && { mint: d.mint }) };
   const run = input.run ? { run: input.run } : {};
   const fail = (reason: string, retry: boolean, problems?: string[]): OpenPrResult => { d.log(`  ${ref}: PR not opened: ${reason}`); return { ok: false, reason, retry, ...(problems && { problems }) }; };
   const stale = (): OpenPrResult => { d.log(`  ${ref}: the implementation left opening meanwhile; nothing more is written`); return { ok: false, reason: "the implementation left opening meanwhile", retry: true, stale: true }; };
-  const write = (patch: Parameters<typeof moveImplementationIf>[4], to: "pr-opened" | null = null) => moveImplementationIf(db, im.id, ["opening"], to, patch);
+  const move = async (from: ImplementationState, to: ImplementationState | null, patch: ImplementationPatch = {}): Promise<boolean> =>
+    !!await writeStep(db, im, { ...(to && { to }), patch, expect: [from] });
+  const write = (patch: ImplementationPatch, to: "pr-opened" | null = null): Promise<boolean> => db.write(async () => {
+    if (!await move("opening", to, patch)) return false;
+    if (patch.prNumber !== undefined) await linkWorkflows(db, { issues: [{ repo, number }] });
+    return true;
+  });
   try {
     if (!im.baseSha) return fail("the implementation has no base commit", false);
     if (input.base !== im.baseSha) return fail(`the workspace diff is against ${input.base.slice(0, 12)}, not the implementation's base commit ${im.baseSha.slice(0, 12)}`, false);
     // A run after our PR merged: the work is done.
     const stored = im.prNumber !== null && im.prUrl ? await liveState(d.exec, repo, `pulls/${im.prNumber}`) : null;
     if (stored === "MERGED") {
-      if (!await moveImplementationIf(db, im.id, [im.state], "merged")) return stale();
+      if (!await move(im.state, "merged")) return stale();
       d.log(`  ${ref}: our PR ${im.prUrl} is merged`);
       return { ok: true, url: im.prUrl!, number: im.prNumber!, branch: im.branch ?? "", adopted: true, draft: false, notPreapproved: null, merged: true };
     }
     if (stored === "CLOSED") return fail(`our PR #${im.prNumber} was closed`, false);
-    const issue = await db.get(db.k.selectFrom("main.items").select(["state", "title"]).where("repo", "=", repo).where("number", "=", number));
+    const issue = (await loadItems(db, [{ repo, number }], "card")).get(ref);
     if (!issue || issue.state !== "OPEN" || await issueClosedLive(db, d, repo, number)) return fail("the issue is closed", false);
-    if (!await moveImplementationIf(db, im.id, [im.state], "opening")) return stale();
+    if (!await move(im.state, "opening")) return stale();
     const guard = async (): Promise<GuardedItem | string> => {
       const g = await guardItem(db, { repo, number }, input.want ?? { kind: "implement", bucket: "build" }, input.by);
       return "refused" in g ? g.refused : g;
@@ -300,7 +313,7 @@ export async function openImplementationPr(db: Db, input: OpenPrInput, d: PrDeps
     let pushed: { commit: string; compileTime: CompileTimeChange[] };
 
     if (url === null) {
-      if (await hasOpenPr(db, repo, number)) return fail("another pull request already covers the issue", false);
+      if (await closedByOpenPr(db, repo, number)) return fail("another pull request already covers the issue", false);
       const git = new Git(d.exec, d.root, repo);
       if (!await git.fetchBranch(ownerOf(repo), repo, base, im.baseSha)) return fail("the base commit is no longer in the repository", false);
       const author = await commitIdentity(db, repo, async () => who);
@@ -310,7 +323,7 @@ export async function openImplementationPr(db: Db, input: OpenPrInput, d: PrDeps
       const gi = await guard();
       if (typeof gi === "string") return fail(gi, true);
       g = gi;
-      const rg = await guardRepo(db, repo, "fix-issue", input.by);
+      const rg = await guardRepo(db, repo, "fix-issue", input.by, undefined, { members: [await implementMay(db, repo, number)] });
       if ("refused" in rg) return fail(rg.refused, true);
       const fork = await forkOnce(repo, () => forkOf(w, rg, d.exec, who.login, repo, run));
       // Kept before the push: a rerun pushes to the same branch and finds the PR on it, whatever the issue's title is by then.
@@ -347,31 +360,23 @@ export async function openImplementationPr(db: Db, input: OpenPrInput, d: PrDeps
       g = gi;
     }
     if (!await mirrorPr(db, d, repo, prNumber)) return fail(`#${prNumber} is not in the mirror yet`, true);
-    const row = await db.get(db.k.selectFrom("main.items").select(["is_draft", "head_oid"]).where("repo", "=", repo).where("number", "=", prNumber));
+    const row = (await loadItems(db, [{ repo, number: prNumber }], "pr")).get(`${repo}#${prNumber}`);
     if (row?.head_oid !== pushed.commit) return fail(`#${prNumber}'s head ${(row?.head_oid ?? "").slice(0, 12)} is not the commit this implementation pushed (${pushed.commit.slice(0, 12)})`, false);
     const isDraft = input.draft === true || pushed.compileTime.length > 0 || !!row?.is_draft;
     let notPreapproved: string | null = null;
     if (pushed.compileTime.length) notPreapproved = `a maintainer decides on its compile-time changes: ${pushed.compileTime.map((c) => `${c.path} ${c.what}`).join("; ")}`;
-    else if (isDraft) notPreapproved = "a draft is not pre-approved";
-    else if (await repoWorkflow(db, repo) === "new" && !(await liveWorkflow(db, repo, number))?.approvedBy) {
-      // On the maintainer workflow the PR merges only when its issue's workflow is approved; otherwise its review ends in a recommendation.
-      notPreapproved = "the merge is not approved: the review ends in a recommendation";
-    } else {
-      // On the maintainer workflow the approver's merge leg belongs to the issue's workflow (src/workflow/advance.ts).
-      const wf = await repoWorkflow(db, repo) === "new" ? await liveWorkflow(db, repo, number) : null;
-      try {
-        await preapproveMerge(db, { repo, number: prNumber, by: wf?.approvedBy ?? im.queuedBy, via: "implement", head: pushed.commit, ...(wf ? { workflowId: wf.id } : {}) });
+    else {
+      const wf = (await listWorkflows(db, { live: true, refs: [{ repo, number }] }))[0], by = mergesFor(wf);
+      // The PR merges only when its issue's workflow is approved; otherwise its review ends in a recommendation.
+      if (!wf || by === null) notPreapproved = "the merge is not approved: the review ends in a recommendation";
+      // The approver's merge leg belongs to the issue's workflow (src/workflow/advance.ts).
+      else try {
+        await preapproveMerge(db, { repo, number: prNumber, by, via: "implement", head: pushed.commit, workflowId: wf.id });
       } catch (e) {
         const why = oneLine(String((e as Error).message ?? e));
         if (!(e instanceof PreapprovalRefused)) return fail(`#${prNumber} could not be pre-approved: ${why}`, true);
         if (!e.active) { notPreapproved = why; d.log(`  ${ref}: #${prNumber} not pre-approved: ${why}`); }
       }
-    }
-    try {
-      const weight = (await db.get(db.k.selectFrom("main.fast_track").select("weight").where("repo", "=", repo).where("number", "=", number)))?.weight;
-      await addFastTrack(db, im.queuedBy, `${repo}#${prNumber}`, weight ?? undefined, "implement");
-    } catch (e) {
-      d.log(`  ${ref}: #${prNumber} not fast-tracked: ${oneLine(String((e as Error).message ?? e))}`);
     }
     const commented = await commentOnce(db, d, g, im, { number: prNumber, url, draft: isDraft }, input.run);
     if (commented !== null) return fail(`the issue comment failed: ${commented}`, true);

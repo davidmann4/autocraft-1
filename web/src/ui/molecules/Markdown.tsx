@@ -1,9 +1,8 @@
-import { Children, isValidElement, useLayoutEffect, useRef, useState } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { ImageIcon, ArrowSquareOutIcon } from "@phosphor-icons/react";
 import { cn } from "../cn";
-import { Swimlane } from "../organisms/Swimlane";
 import { proxiedImage, remarkHtmlToMarkdown, safeUrl } from "../markdownHtml";
 
 export { proxiedImage };
@@ -37,22 +36,12 @@ function Image({ src, alt }: { src?: string; alt?: string }) {
 // and only GitHub-hosted images load inline, through the same-origin proxy
 // (the CSP allows only same-origin images); others become a link the reader
 // can choose to open.
-function fenceLang(children: React.ReactNode): string | null {
-  const child = Children.toArray(children)[0];
-  if (!isValidElement<{ className?: string }>(child)) return null;
-  return /\blanguage-swimlane\b/.test(child.props.className ?? "") ? "swimlane" : null;
-}
-
 const components: Components = {
   a: ({ href, children }) => (
     <a href={href} target="_blank" rel="noopener noreferrer nofollow">
       {children}
     </a>
   ),
-  pre: ({ children }) => {
-    if (fenceLang(children) === "swimlane") return <Swimlane />;
-    return <pre>{children}</pre>;
-  },
   img: ({ src, alt }) => <Image src={typeof src === "string" ? src : undefined} alt={alt} />,
 };
 

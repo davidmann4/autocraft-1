@@ -184,20 +184,6 @@ export const approvalPatch = (w: WriteKind, on: boolean, by: string) => (r: Trac
 export const approved = (r: TrackedRepo) =>
   WRITES.filter((w) => r[w.field]?.approved);
 
-export function WriteBadges({ r }: { r: TrackedRepo }) {
-  const on = approved(r);
-  if (!on.length) return <span className="text-ink/40">None</span>;
-  return (
-    <span className="flex flex-wrap gap-1">
-      {on.map((w) => (
-        <Badge key={w.field} tone="ok">
-          {w.short}
-        </Badge>
-      ))}
-    </span>
-  );
-}
-
 export function Toggle({ r, write }: { r: TrackedRepo; write: Write }) {
   const api = useApi();
   const operator = useUser().role === "operator";

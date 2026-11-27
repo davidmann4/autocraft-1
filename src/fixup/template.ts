@@ -58,24 +58,6 @@ export function askText(fixes: { file: string; change: string }[]): string {
   return ASK_TEMPLATE.replace("{{fixes}}", items.join("\n"));
 }
 
-/** The comment after a carry-over push; `{{sources}}` are the closed PRs the parts came from. */
-export const CARRY_COMMENT_TEMPLATE = "Carried over from {{sources}}: {{files}}.";
-export function carryCommentText(sources: number[], files: string[]): string {
-  return CARRY_COMMENT_TEMPLATE.replace("{{sources}}", sources.map((n) => `#${n}`).join(", ")).replace("{{files}}", files.map((f) => `\`${f}\``).join(", "));
-}
-
-/** The comment on a kept PR we can't push to; one "- #n: part" line per carried point. Points are model-written from untrusted text. */
-export const CARRY_ASK_TEMPLATE = "Parts of the closed duplicates that fit here:\n{{points}}";
-export function carryAskText(sources: { number: number; points: string[] }[]): string {
-  const lines = sources.flatMap((s) => s.points.flatMap((p) => {
-    const t = cleanReason(p, ASK_ITEM_MAX);
-    if (!t) return [];
-    const line = `#${s.number}: ${t}`;
-    return [`- ${line.length > ASK_ITEM_MAX - 2 ? `${line.slice(0, ASK_ITEM_MAX - 3).trimEnd()}…` : line}`];
-  })).slice(0, ASK_MAX_ITEMS);
-  return CARRY_ASK_TEMPLATE.replace("{{points}}", lines.join("\n"));
-}
-
 /** The comment posted on the PR after the default branch was merged into it; `{{base}}` is the branch name. */
 export const CONFLICT_COMMENT_TEMPLATE = "Merged {{base}} into this branch to resolve the conflict.";
 /** The same comment edited after further merges; `{{count}}` is the number of merges, `{{time}}` the time of the last one (HH:MM). */

@@ -10,6 +10,7 @@ import { changedRsFiles, queueLint, queueLintFor, readLint, type Finding, type L
 import { cratesForTests } from "./tests.ts";
 import { ghCrates } from "../verify/crates.ts";
 import { slugOf } from "../owners.ts";
+import { loadItems } from "../data/mirror/index.ts";
 import type { Db } from "../db/index.ts";
 import { openDb } from "../db/open.ts";
 
@@ -39,7 +40,8 @@ function printFinding(f: Finding): void {
 
 export async function runLint(db: Db, a: { repo: string; number: number; patch: string | null; tests?: boolean }): Promise<number> {
   const ref = `${a.repo}#${a.number}`;
-  const item = await db.get(db.k.selectFrom("items").select(["head_oid", "state"]).where("repo", "=", a.repo).where("number", "=", a.number).where("kind", "=", "pr"));
+  const found = (await loadItems(db, [{ repo: a.repo, number: a.number }], "pr")).get(ref);
+  const item = found?.kind === "pr" ? found : undefined;
   if (!item?.head_oid) throw new Error(`${ref} is not a PR in the database`);
   const head = item.head_oid;
   const patch = a.patch ? readFileSync(a.patch, "utf8") : undefined;

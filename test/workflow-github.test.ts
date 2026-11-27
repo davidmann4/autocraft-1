@@ -3,6 +3,7 @@
 import assert from "node:assert/strict";
 import { afterEach, test } from "node:test";
 import { safeEqual } from "../src/dash/server/crypto.ts";
+import { recordSteps, startAttempt } from "../src/data/implement/index.ts";
 import { drainCommands, type CommandDeps, type CommentNow } from "../src/github/commands.ts";
 import { handleDelivery, signatureOf } from "../src/github/webhooks.ts";
 import { statusDue } from "../src/prstatus/index.ts";
@@ -129,4 +130,22 @@ test("a quiet PR's status comment carries no findings or recommendation text", a
     assert.ok(!quiet.includes(secret), "the quiet PR does not");
   }
   assert.doesNotMatch(quiet, /finding/i);
+});
+
+test("a stop comment on the pull request of an implementation halts the issue's work and answers in the thread", async () => {
+  const w = await newRepo();
+  await w.acting(OPERATOR);
+  await w.issue(7);
+  await w.pr(8, { author: "craft-bot" });
+  const id = await insertWorkflow(w.db, { repo: "app", number: 7, kind: "issue", entry: "implement", state: "running", startedBy: OPERATOR, startedAt: T0, startedVia: "github" });
+  const im = (await startAttempt(w.db, { repo: "app", number: 7, queuedBy: OPERATOR, textHash: "h" }))!;
+  await recordSteps(w.db, [{ id: im.id, to: "pr-opened", patch: { prNumber: 8, branch: "fix-8", prUrl: "https://example.invalid/8" } }]);
+  await comment(w, `@${SLUG} review`, { number: 8 });
+  await comment(w, `@${SLUG} stop`, { number: 8 });
+  await drain(w);
+  const [review, stop] = await commands(w);
+  assert.deepEqual([review!.state, stop!.state], ["refused", "done"], `${review!.result} / ${stop!.result}`);
+  assert.match(stop!.result!, /app#7: On hold \(held by /);
+  assert.equal(await liveWorkflow(w.db, "app", 7), null);
+  assert.equal((await w.db.get(w.db.k.selectFrom("main.item_workflows").select("stopped_by").where("id", "=", id)))!.stopped_by, OPERATOR);
 });

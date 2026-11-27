@@ -3,7 +3,6 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import { parseAreaReply } from "../src/areas/parse.ts";
-import { choicesTexts } from "../src/decide/choices-parse.ts";
 import { parsePairReply } from "../src/dupes/pair.ts";
 import { parseIssueComparison, parsePrComparison } from "../src/dupes/group.ts";
 import { parseVerdicts } from "../src/mainfix/index.ts";
@@ -11,24 +10,13 @@ import { parseCheck } from "../src/patchcheck/index.ts";
 import { parseFindings } from "../src/postmerge/parse.ts";
 import { parseHaikuImpacts } from "../src/priority/score.ts";
 import { parseChecks } from "../src/review/checks.ts";
+import { verdictToAct } from "../src/core/review-blocking.ts";
 import { parseOpusReply } from "../src/review/opus-parse.ts";
 import { parseGateCall } from "../src/worker/gate.ts";
 
 const fence = (o: unknown) => "Here is my answer.\n```json\n" + JSON.stringify(o) + "\n```\n";
 
 describe("model replies", () => {
-  test("choices block: the public texts are read from drafted extras, closing reasons and the ask, not from the pick's reason", () => {
-    const block = { pick: { core: "o:merge", reason: "internal" }, cores: [
-      { core: "o:close", reason: "Out of scope.", extras: [{ kind: "open_issue", on: true, repo: "app", title: "A  title", body: "Body." }] },
-      { core: "o:merge", extras: [{ kind: "comment", on: true, text: "Thanks." }, { kind: "label", on: false, label: "bugfix" }] },
-    ], add: [{ end: { review: true }, extras: [{ kind: "comment", on: false, text: "Please retest." }] }], ask: { text: "Which version?" } };
-    const texts = choicesTexts(`Summary.\n\`\`\`choices\n${JSON.stringify(block)}\n\`\`\``);
-    assert.deepEqual(texts.map((t) => [t.field, t.text]), [
-      ["cores[0].reason", "Out of scope."], ["cores[0].extras[0].title", "A title"], ["cores[0].extras[0].body", "Body."],
-      ["cores[1].extras[0].text", "Thanks."], ["add[0].extras[0].text", "Please retest."], ["ask.text", "Which version?"],
-    ]);
-    assert.deepEqual(choicesTexts("No block here."), []);
-  });
 
   test("main-fix verdicts: a check the reply leaves out or mislabels is code; a reply without checks is no reply", () => {
     const v = parseVerdicts(fence({ checks: [{ check: "lint", verdict: "flaky", reason: "timeout" }, { check: "test", verdict: "banana" }] }), ["lint", "test", "build"])!;
@@ -89,7 +77,8 @@ describe("model replies", () => {
     assert.match(held.reason, /^Claim shows wrong code/);
     const fixed = run({ claims: [{ ...bad, fix: { file: "src/a.rs", change: "add the encloses_area test" } }] });
     assert.equal(fixed.verdict, "take-fix");
-    assert.deepEqual(fixed.fixes, [{ file: "src/a.rs", change: "add the encloses_area test" }]);
+    // The claim's fix blocks the merge even of an approved PR: the PR does not do what it says.
+    assert.deepEqual(fixed.fixes.map((f) => [f.file, f.change, f.blocking?.class]), [["src/a.rs", "add the encloses_area test", "off-purpose"]]);
     const stale = run({ claims: [{ ...bad, impact: "description-only" }] });
     assert.deepEqual([stale.verdict, stale.sure], ["take", true], "a stale description does not block");
     assert.equal(run({ claims: [{ ...bad, impact: "unknown" }] }).sure, false);
@@ -98,6 +87,20 @@ describe("model replies", () => {
     assert.equal(run({ claims: [{ ...bad, impact: "description-only", evidence: "nowhere in particular" }] }).sure, false, "no path:line, so impact unknown");
     assert.equal(run({}).sure, false, "no claims list with a body");
     assert.equal(parseOpusReply(fence(take), "app#1")?.sure, true, "no body, nothing to claim");
+  });
+
+  test("Opus review: a code-incomplete claim's fix does not stop a PR approved for merge; without a fix it is a note", () => {
+    const take = { ref: "app#1", verdict: "take", sure: true, reason: "fine", fixes: [], summary: "Adds a filter.", why: "It is correct." };
+    const part = { claim: "documents open in request order", status: "contradicted", evidence: "src/open.rs:88 orders the queue; src/panel.rs:20 opens at once", impact: "code-incomplete" };
+    const run = (o: object) => parseOpusReply(fence({ ...take, ...o }), "app#1", true, new Set(), false, [], "body")!;
+    const r = run({ claims: [{ ...part, fix: { file: "src/panel.rs", change: "queue the open" } }] });
+    assert.deepEqual([r.verdict, r.sure, r.fixes.map((f) => f.blocking?.class)], ["take-fix", true, [null]]);
+    assert.equal(verdictToAct(r.verdict, r.fixes, [], true), "take", "approved: filed as a follow-up, not made");
+    assert.equal(verdictToAct(r.verdict, r.fixes, [], false), "take-fix", "not approved: made like any fix");
+    const rec = run({ claims: [{ ...part, fix: { file: "src/panel.rs", change: "queue the open" } }], recommendation: { text: "Merge it.", merge: true } });
+    assert.equal(rec.workflow?.recommendation?.merge, true, "the model's recommendation stays");
+    const bare = run({ claims: [part] });
+    assert.deepEqual([bare.verdict, bare.sure], ["take", true]);
   });
 
   test("Opus review: the ref must match, take-fix needs a fix, a one-element array is read", () => {

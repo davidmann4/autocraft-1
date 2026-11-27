@@ -4,9 +4,10 @@ import { PIPELINE_LOGIN_KEY } from "../core/rules.ts";
 import { slugOf } from "../owners.ts";
 import { gh } from "../review/diff.ts";
 import { sameRepo } from "./pushable.ts";
-import { setting } from "../settings-read.ts";
+import { setting } from "../data/control/index.ts";
+import { loadAuthorPermissions, loadItems, saveAuthorPermissions } from "../data/mirror/index.ts";
+import type { AuthorPermissionRow } from "../data/mirror/types.ts";
 import type { Db } from "../db/index.ts";
-import * as kx from "../db/kx.ts";
 
 export const AUTHOR_PERMISSION_TTL_MS = 24 * 3600_000;
 const WRITE = new Set(["write", "maintain", "admin"]);
@@ -17,7 +18,7 @@ export type AuthorWrite = "yes" | "no" | "unknown";
 
 type Row = { author: string | null; author_type: string | null; author_id: number | null };
 const authorOf = async (db: Db, repo: string, number: number): Promise<Row | undefined> =>
-  await db.get(db.k.selectFrom("items").select(["author", "author_type", "author_id"]).where("repo", "=", repo).where("number", "=", number));
+  (await loadItems(db, [{ repo, number }], "pr")).get(`${repo}#${number}`);
 
 /** The pipeline's own account and bots write to the repository by construction. */
 function writesByRole(me: string | undefined, r: Row): boolean {
@@ -29,8 +30,11 @@ type Cached = { permission: string | null; checked_at: string | null; failures: 
 /** The cached entry of the PR's author as stored; a permission read for another account under the login counts as never read. */
 const ownEntry = (c: Cached | undefined, r: Row): Cached | undefined =>
   c && c.permission && c.author_id !== null && r.author_id !== null && c.author_id !== r.author_id ? { ...c, permission: null, checked_at: null } : c;
+/** Entries by repo and lower-cased login: logins compare case-insensitively. */
+const entriesOf = (rows: Map<string, AuthorPermissionRow>): Map<string, Cached> =>
+  new Map([...rows.values()].map(({ login, repo, ...c }) => [`${repo}\n${login.toLowerCase()}`, c]));
 const cached = async (db: Db, repo: string, r: Row & { author: string }): Promise<Cached | undefined> =>
-  ownEntry(await db.get(db.k.selectFrom("main.author_permissions").select(["permission", "checked_at", "failures", "first_failure_at", "author_id"]).where("login", "=", r.author).where("repo", "=", repo)), r);
+  ownEntry(entriesOf(await loadAuthorPermissions(db, { repos: [repo], logins: [r.author] })).get(`${repo}\n${r.author.toLowerCase()}`), r);
 const old = (at: string | null, nowMs: number = Date.now()): boolean => !at || nowMs - Date.parse(at) > AUTHOR_PERMISSION_TTL_MS;
 /** The reads have failed too often or for too long. */
 const gaveUp = (c: Cached, nowMs: number = Date.now()): boolean => c.failures >= AUTHOR_READ_FAILURES || (!!c.first_failure_at && old(c.first_failure_at, nowMs));
@@ -52,17 +56,15 @@ export async function authorWrites(db: Db, repo: string, number: number): Promis
 }
 
 /**
- * authorWrites() for many PRs, from their items rows, at `nowMs`: the pipeline login and the cache are read once. `change` is told
- * when the answer would change with the clock alone (an entry aging past the TTL after its refresh failed).
+ * authorWrites() for many PRs, from their items rows and the stored permissions, at `nowMs`; `me` is the pipeline's login. `change` is
+ * told when the answer would change with the clock alone (an entry aging past the TTL after its refresh failed).
  */
-export async function authorWritesOf(db: Db, nowMs: number = Date.now()): Promise<(repo: string, r: Row, change?: (at: number) => void) => AuthorWrite> {
-  const me = await setting(db, PIPELINE_LOGIN_KEY);
-  const entries = new Map((await db.all(db.k.selectFrom("main.author_permissions").select(["login", "repo", "permission", "checked_at", "failures", "first_failure_at", "author_id"])))
-    .map(({ login, repo, ...c }) => [`${repo}\n${login}`, c]));
+export function authorWritesIn(me: string | null | undefined, permissions: Awaited<ReturnType<typeof loadAuthorPermissions>>, nowMs: number): (repo: string, r: Row, change?: (at: number) => void) => AuthorWrite {
+  const entries = entriesOf(permissions);
   return (repo, r, change) => {
     if (!r.author) return "no";
-    if (writesByRole(me, r)) return "yes";
-    const c = ownEntry(entries.get(`${repo}\n${r.author}`), r);
+    if (writesByRole(me ?? undefined, r)) return "yes";
+    const c = ownEntry(entries.get(`${repo}\n${r.author.toLowerCase()}`), r);
     const w = writesFrom(c, nowMs);
     if (c && w !== "no") change?.(noFrom(c));
     return w;
@@ -104,12 +106,7 @@ export async function ensureAuthorWrites(db: Db, repo: string, number: number, h
   if (!writesByRole(await setting(db, PIPELINE_LOGIN_KEY), r)) {
     const c = await cached(db, repo, { ...r, author: r.author });
     if (!c?.permission || old(c.checked_at)) {
-      const now = new Date().toISOString();
-      const p = await read(repo, r.author).catch(() => null);
-      if (p) await db.run(db.k.insertInto("main.author_permissions").values({ login: r.author, repo, permission: p, checked_at: now, failures: 0, first_failure_at: null, author_id: r.author_id })
-        .onConflict((oc) => oc.columns(["login", "repo"]).doUpdateSet((eb) => ({ ...kx.excluded(["permission", "checked_at", "author_id"])(eb), failures: 0, first_failure_at: null }))));
-      else await db.run(db.k.insertInto("main.author_permissions").values({ login: r.author, repo, failures: 1, first_failure_at: now })
-        .onConflict((oc) => oc.columns(["login", "repo"]).doUpdateSet((eb) => ({ failures: eb("main.author_permissions.failures", "+", 1), first_failure_at: eb.fn.coalesce("main.author_permissions.first_failure_at", "excluded.first_failure_at") }))));
+      await saveAuthorPermissions(db, [{ login: r.author, repo, permission: await read(repo, r.author).catch(() => null), at: new Date().toISOString(), authorId: r.author_id }]);
     }
   }
   return await authorWrites(db, repo, number);

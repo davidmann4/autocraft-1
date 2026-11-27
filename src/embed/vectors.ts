@@ -8,13 +8,14 @@
 // Loading never blocks a request: it runs in chunks between event-loop turns.
 // The first load is awaited by the request that needs it (`ready`); after that
 // the index serves what it has while rows added past the last rowid seen are
-// read in. A rewritten row is replaced (embedItems, kx.replaceRow) and so gets a rowid above every other: it is read
+// read in. A rewritten row is replaced (saveEmbeddings) and so gets a rowid above every other: it is read
 // again and overwrites its slot. Deleted rows and changed tracked repos need a
 // rebuild, done on the side and swapped in when complete; a rebuild also runs
 // every REBUILD_MS to drop vectors of deleted rows.
+import { apart } from "../apart.ts";
 import type { Embedder } from "./model.ts";
 import type { Db } from "../db/index.ts";
-import * as kx from "../db/kx.ts";
+import { embeddingIndexMark, streamEmbeddings } from "../data/triage/index.ts";
 
 export type Hit = { repo: string; number: number; score: number };
 
@@ -103,20 +104,16 @@ export class VectorIndex {
     const now = Date.now();
     if (this.store && now - this.checked < CHECK_MS) return;
     this.checked = now;
-    const s = (await db.get(db.k.selectNoFrom((eb) => [
-      eb.selectFrom("main.item_embeddings").select(eb.fn.countAll<number>().as("n")).as("n"),
-      eb.selectFrom("main.item_embeddings").select(eb.fn.max<number | null>(kx.rowid("main.item_embeddings")).as("m")).as("m"),
-      eb.selectFrom("main.tracked_repos").select(kx.groupConcat(db, "name", ",", "name").as("t")).as("t"),
-    ]).$narrowType<{ n: number }>()))!;
-    const tracked = s.t ?? "";
+    const s = await embeddingIndexMark(db);
+    const tracked = s.tracked;
     const cur = this.store;
-    const rebuild = !cur || cur.tracked !== tracked || s.n < this.tableRows || now - cur.builtAt > REBUILD_MS;
-    if (!rebuild && (s.m ?? 0) <= cur.lastRowid) {
-      this.tableRows = s.n;
+    const rebuild = !cur || cur.tracked !== tracked || s.rows < this.tableRows || now - cur.builtAt > REBUILD_MS;
+    if (!rebuild && (s.maxRowid ?? 0) <= cur.lastRowid) {
+      this.tableRows = s.rows;
       return;
     }
     this.loading = true;
-    this.job = this.load(db, rebuild ? null : cur, tracked, s.n).catch((e) => {
+    this.job = apart(() => this.load(db, rebuild ? null : cur, tracked, s.rows)).catch((e) => {
       console.error(`vector index: ${(e as Error).message}`);
     });
   }
@@ -130,17 +127,9 @@ export class VectorIndex {
   private async load(db: Db, into: Store | null, tracked: string, tableRows: number): Promise<void> {
     // A full rebuild fills a new store, swapped in at the end; an incremental load writes into the live one.
     const s = into ?? newStore(this.embedder.dim, Math.max(1024, Math.ceil(tableRows * 1.2)), tracked);
-    const next = (after: number) => db.k.selectFrom("main.item_embeddings")
-      .select([kx.rowid("main.item_embeddings").as("rid"), "repo", "number", "vec"])
-      .where((eb) => eb.and([
-        eb(kx.rowid("main.item_embeddings"), ">", after),
-        eb("model", "=", this.embedder.id),
-        eb("repo", "in", eb.selectFrom("main.tracked_repos").select("name")),
-      ]))
-      .orderBy(kx.rowid("main.item_embeddings")).limit(CHUNK);
     try {
       for (;;) {
-        const rows = await db.all(next(s.lastRowid));
+        const rows = await streamEmbeddings(db, this.embedder.id, s.lastRowid, CHUNK);
         for (const r of rows) put(s, r.repo, r.number, r.vec);
         if (rows.length) s.lastRowid = rows[rows.length - 1]!.rid;
         if (rows.length < CHUNK) break;

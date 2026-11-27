@@ -4,7 +4,7 @@ import { linkReviewCalls, type Ev } from "../src/dash/api/trace.ts";
 
 const call = (id: number, at: string, promptId: string): Ev => ({
   id: `run:${id}`, kind: "model-call", at, head: null, actor: { type: "model", name: "opus" }, summary: "x", ref: { runId: id },
-  call: { promptId, model: "opus", provider: "claude", account: null, state: "done", inputTokens: null, outputTokens: null, costUsd: id === 2 ? 0.9 : id === 3 ? 0.12 : null, toolCalls: 0, endedAt: null },
+  call: { promptId, model: "opus", provider: "claude", state: "done", inputTokens: null, outputTokens: null, costUsd: id === 2 ? 0.9 : id === 3 ? 0.12 : null, toolCalls: 0, endedAt: null },
 });
 const review = (id: string, at: string): Ev => ({ id, kind: "review", at, head: null, actor: { type: "model", name: "opus" }, summary: "r", ref: {} });
 

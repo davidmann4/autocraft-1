@@ -4,6 +4,7 @@
 // AUTOCRAFT_FENCE, so a job's writes are fenced with its runner's.
 import { envVar } from "../env.ts";
 import type { Db } from "./index.ts";
+import { queryDb } from "./query-db.ts";
 
 export type LeaderRole = "runner" | "periodic";
 export const LEADER_ROLES: readonly LeaderRole[] = ["runner", "periodic"];
@@ -58,6 +59,7 @@ export class FencedError extends Error {
 export async function assertFence(db: Db): Promise<void> {
   const f = currentFence();
   if (!f || db.dialect !== "postgres") return;
-  const r = await db.get(db.k.selectFrom("leader_leases").select("epoch").where("role", "=", f.role));
+  const q = queryDb(db);
+  const r = await q.get(q.k.selectFrom("leader_leases").select("epoch").where("role", "=", f.role));
   if (r === undefined || Number(r.epoch) !== f.epoch) throw new FencedError(`this process no longer leads the ${f.role}: another copy took over`);
 }

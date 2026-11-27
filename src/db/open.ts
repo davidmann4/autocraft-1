@@ -10,6 +10,8 @@ import { Handle } from "./handle.ts";
 import type { Db, DbRole } from "./index.ts";
 import { migratePg, newerPgSchema, pgStamp, storedPgStamp } from "./pg-triggers.ts";
 import { pgConnectionString, postgresEngine } from "./postgres.ts";
+import { queryDb } from "./query-db.ts";
+import { dbRole, setDbRole, testRedirect } from "./role.ts";
 import { bindSql } from "./sql.ts";
 import { sqliteEngine } from "./sqlite.ts";
 
@@ -70,23 +72,7 @@ export function dbLockName(target: string = dbTarget()): string {
   return `pg-${createHash("sha256").update(`${u.hostname}:${u.port || "5432"}${u.pathname}`).digest("hex").slice(0, 12)}`;
 }
 
-let role: DbRole = "cli";
-
-let testRedirect: ((sqliteTarget: string) => Promise<string>) | undefined;
-
-/**
- * Test hook: `connectDb` on a SQLite target opens the Postgres URL `map(target)` gives instead. test/pg-suite.ts installs
- * it to run the SQLite tests on Postgres; refused unless AUTOCRAFT_TEST_PG_URL is set.
- */
-export function setTestDbRedirect(map: (sqliteTarget: string) => Promise<string>): void {
-  if (!process.env.AUTOCRAFT_TEST_PG_URL) throw new Error("setTestDbRedirect is for tests on Postgres: AUTOCRAFT_TEST_PG_URL is not set");
-  testRedirect = map;
-}
-
-/** Sets the role of this process's handles (pool size on Postgres). Called by long-running commands before they open one. */
-export function setDbRole(r: DbRole): void {
-  role = r;
-}
+export { setDbRole };
 
 export interface ConnectOptions {
   /** How long a write waits for the write lock before failing with a lock timeout. */
@@ -95,8 +81,10 @@ export interface ConnectOptions {
   role?: DbRole;
   /** Postgres: bring the schema and triggers up to date first (default). False opens the database as it is. */
   migrate?: boolean;
-  /** Postgres: how long a transaction may sit idle before the server ends its session (default 60 s). */
+  /** Postgres: how long a transaction may sit idle before the server ends its session (default 10 s). */
   idleInTransactionMs?: number;
+  /** Postgres: longest a statement may run (default 120 s); a connection waits this long plus a margin for an answer. */
+  statementTimeoutMs?: number;
   /**
    * Postgres: write statements outside a transaction run under their row locks only, not as a transaction under the writer
    * lock, so they never wait for another process's long write; a row-lock wait still ends after busyTimeoutMs. For a
@@ -111,10 +99,11 @@ export interface ConnectOptions {
  * `migratePg()`).
  */
 export async function connectDb(target: string = dbTarget(), opts: ConnectOptions = {}): Promise<Db> {
-  if (testRedirect && !isPgUrl(target)) target = await testRedirect(target);
+  const redirect = testRedirect();
+  if (redirect && !isPgUrl(target)) target = await redirect(target);
   if (!isPgUrl(target)) return dbFor(connect(target, opts));
   const [k, pg] = await Promise.all([loadKysely(), loadPg()]);
-  const db = new Handle((ctx) => postgresEngine(k, pg, target, { role: opts.role ?? role, busyTimeoutMs: opts.busyTimeoutMs, idleInTransactionMs: opts.idleInTransactionMs, rowWrites: opts.rowWrites }, ctx));
+  const db = new Handle((ctx) => postgresEngine(k, pg, target, { role: opts.role ?? dbRole(), busyTimeoutMs: opts.busyTimeoutMs, idleInTransactionMs: opts.idleInTransactionMs, statementTimeoutMs: opts.statementTimeoutMs, rowWrites: opts.rowWrites }, ctx));
   if (opts.migrate === false) return db;
   try {
     // A current database costs two reads on the pool; only a stale one opens a connection of its own for the migration, and
@@ -152,7 +141,8 @@ export async function openDb(): Promise<Db> {
       // A process without the file never reads the keys by design (a build worker); say so only when a stored app is going unread.
       const file = envVar("SECRETS_FILE");
       if (!file || !existsSync(file)) return;
-      const stored = await db.get(db.k.selectFrom("github_app").select("id").where("id", "=", 1).where("keys_enc", "is not", null)).catch(() => undefined);
+      const q = queryDb(db);
+      const stored = await q.get(q.k.selectFrom("github_app").select("id").where("id", "=", 1).where("keys_enc", "is not", null)).catch(() => undefined);
       if (stored) console.error(`GitHub App keys not read: ${e.message}`);
     });
     return { db, close };

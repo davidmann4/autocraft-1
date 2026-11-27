@@ -6,13 +6,16 @@
 import { closeSync, openSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import type { CacheReport, EnvKind, KubeSettings } from "../../web/src/api/types.ts";
 import { envVar } from "../env.ts";
-import { trackedNames } from "../repos.ts";
+import { addWorkspaceCalls, claimSession, loadCheckpoint, loadSessions, loadToolCalls, loadWorkspaceCalls, loadWorkspacePage, loadWorkspaces, patchSessions } from "../data/build/index.ts";
+import { loadTrackedRepos } from "../data/control/index.ts";
+import { loadRepos } from "../data/mirror/index.ts";
+import { loadCallReply } from "../data/runners/index.ts";
 import { warmLineText } from "./warm-status.ts";
 import { cacheReport } from "./caches.ts";
 import { BuildError, createEnv, KINDS, listEnvs, rotateKey, updateEnv } from "./envs.ts";
 import { cancelTask, createTask, getTaskDetail, listTasks, memorySummary } from "./tasks.ts";
 import { autoBuildSize, clearBuildSize, gib, listSizings, setBuildSize, setWarmTarget, type RepoSizing } from "./sizing.ts";
-import { baseScopeRepos } from "../pilot.ts";
+import { scopeRepos } from "../runner/scope.ts";
 import { quantity } from "./pods.ts";
 import type { Db } from "../db/index.ts";
 import { openDb } from "../db/open.ts";
@@ -24,7 +27,7 @@ import { LAYOUT_CI, warmOf } from "./workspace-layout.ts";
 import { listHelpers } from "../remote/helpers.ts";
 import { capReply, requestTrySession, TRY_DEADLINE_SEC, TRY_PROMPT_MAX_BYTES, TRY_STEP } from "./workspace-session.ts";
 import { CLI_QUEUE_BY, enqueue, JobError } from "../runner/jobs.ts";
-import { capJson, createWorkspace, describeHeader, endWorkspace, execWs, getWorkspace, LIVE_STATES, WORKSPACE_COLUMNS, type WorkspaceRow, type WsHeader } from "./workspaces.ts";
+import { capJson, createWorkspace, describeHeader, endWorkspace, execWs, getWorkspace, type WorkspaceRow, type WsHeader } from "./workspaces.ts";
 
 const USAGE = `usage: autocraft-server envs list
        autocraft-server envs add <id> --label TEXT --kind local-sandbox|remote --slots N [--confidential yes|no] (--out FILE | --print)
@@ -317,7 +320,7 @@ async function sizes(db: Db, args: string[]): Promise<void> {
     return b > 0 ? b : die(`--${name} must be a Kubernetes quantity such as 6Gi`);
   };
   if (sub === "list") {
-    const rows = await listSizings(db, await baseScopeRepos(db));
+    const rows = await listSizings(db, await scopeRepos(db, { for: "builds" }));
     if (!rows.length) console.log("no repo in the pipeline scope: step pods get their environment's memory");
     for (const r of rows) console.log(sizingLine(r));
   } else if (sub === "set") {
@@ -398,8 +401,8 @@ async function enqueueTest(db: Db, args: string[]): Promise<void> {
   const sha = opt.get("sha");
   if (!os || !repo || !sha) die(USAGE);
   if (!OS.includes(os)) die(`--env-requires must be one of ${OS.join(", ")}`);
-  if (!(await trackedNames(db)).includes(repo)) die(`${repo} is not a tracked repo`);
-  const vis = (await db.get(db.k.selectFrom("main.repos").select("visibility").where("name", "=", repo)))?.visibility;
+  if (!(await loadTrackedRepos(db, [repo])).has(repo)) die(`${repo} is not a tracked repo`);
+  const vis = (await loadRepos(db, { names: [repo], all: true })).get(repo)?.visibility;
   if (vis?.toLowerCase() !== "public") die(`${repo} is not public; workers fetch source anonymously`);
   const build = opt.has("build");
   const id = await run(async () => await createTask(db, {
@@ -439,32 +442,37 @@ async function workspace(args: string[]): Promise<void> {
     const { pos, opt } = options(rest);
     const [repo, sha] = pos;
     if (!repo || !sha) die(USAGE);
-    if (!(await trackedNames(db)).includes(repo)) die(`${repo} is not a tracked repo`);
+    if (!(await loadTrackedRepos(db, [repo])).has(repo)) die(`${repo} is not a tracked repo`);
     const envId = await envOf(opt);
     const deadline = opt.has("deadline-sec") ? Number(opt.get("deadline-sec")) : undefined;
     const id = await run(async () => await createWorkspace(db, { repo, baseSha: sha, envId, app: opt.get("app") ?? null, ...(deadline !== undefined && { limits: { deadlineSec: deadline } }), owner: "cli" }));
     console.log(`workspace ${id} requested on ${envId}`);
   } else if (sub === "list") {
     const { opt } = options(rest, ["all"]);
-    let q = db.k.selectFrom("workspaces").select(WORKSPACE_COLUMNS).orderBy("id", "desc").limit(50);
-    if (!opt.has("all")) q = q.where("state", "in", LIVE_STATES);
-    for (const w of await db.all(q)) console.log(line(w));
+    const page = await loadWorkspacePage(db, { state: opt.has("all") ? "all" : "live", limit: 50 }, { hiddenRepos: [], staff: true });
+    const rows = await loadWorkspaces(db, { ids: page.rows.map((r) => r.id) });
+    for (const r of page.rows) console.log(line(rows.get(r.id)!));
   } else if (sub === "show") {
     const w = await getWorkspace(db, idOf(rest[0])) ?? die("no such workspace");
     console.log(line(w));
     console.log(`base ${w.base_sha}${w.base_commit ? ` (in the pod ${w.base_commit})` : ""}${w.app ? `  app ${safe(w.app)}` : ""}  limits ${w.limits}`);
     console.log(`pod ${w.pod ?? "-"}  volume ${w.pvc ?? "-"}  since ${w.state_at}${w.last_call_at ? `  last call ${w.last_call_at}` : ""}${w.ended_at ? `  ended ${w.ended_at}` : ""}`);
-    const size = (await db.get(db.k.selectFrom("workspaces").select((eb) => eb.fn<number | null>("length", ["checkpoint"]).as("bytes")).where("id", "=", w.id)))?.bytes;
+    const size = (await loadCheckpoint(db, w.id))?.length;
     console.log(`checkpoint ${size != null ? `${size} bytes at ${w.checkpoint_at}` : "none"}`);
     if (w.layout === LAYOUT_CI) {
       const warm = warmOf(w);
       console.log(`layout 2 (CI paths)  warm target ${warm?.target ?? "-"}  volume ${warm ? `${(warm.storageBytes / 1024 ** 3).toFixed(0)} GiB` : "-"}  ${warm?.note ? safe(warm.note) : warm?.use ? `copying ${warm.use.key}@${warm.use.commit.slice(0, 12)} on ${warm.use.node}` : warm?.why ? `cold: ${safe(warm.why)}` : w.prepared ? "" : "reading the CI gate"}`);
     }
     if (w.error) console.log(`error: ${safe(w.error)}`);
-    const reply = await db.get(db.k.selectFrom("workspace_sessions as s").innerJoin("remote_calls as c", "c.id", "s.remote_call_id").select(["s.id", "c.reply"])
-      .where("s.workspace_id", "=", w.id).where("s.kind", "=", "try").where("c.reply", "is not", null).orderBy("s.id", "desc").limit(1));
-    if (reply?.reply?.trim()) console.log(`reply of try session ${reply.id}:\n${safe(capReply(reply.reply.trim()))}`);
-    const calls = await db.all(db.k.selectFrom("workspace_calls").select(["id", "n", "tool", "state", "created_at", "finished_at", "result"]).where("workspace_id", "=", w.id).orderBy("id", "desc").limit(10));
+    const sessions = ((await loadSessions(db, { workspaceIds: [w.id] })).get(w.id) ?? []).filter((x) => x.kind === "try" && x.remote_call_id !== null).reverse();
+    for (const x of sessions) {
+      const reply = (await loadCallReply(db, x.remote_call_id!))?.reply;
+      if (!reply?.trim()) continue;
+      console.log(`reply of try session ${x.id}:\n${safe(capReply(reply.trim()))}`);
+      break;
+    }
+    const recent = await loadWorkspaceCalls(db, w.id, { limit: 10, ownTools: [] });
+    const calls = [...(await loadToolCalls(db, w.id, { ids: recent.rows.map((r) => r.id) }))].sort((a, b) => b.id - a.id);
     for (const c of calls.reverse()) {
       let summary = "";
       try {
@@ -498,7 +506,7 @@ async function workspace(args: string[]): Promise<void> {
     if (!await getWorkspace(db, id)) die("no such workspace");
     const api = inClusterApi() ?? die("this shell is not in the cluster: run it in the runner container, whose service account may exec in workspace pods");
     const at = new Date().toISOString();
-    const row = Number((await db.get(db.k.insertInto("workspace_calls").values({ workspace_id: id, tool: name, args: JSON.stringify(capJson(args)), state: "queued", created_at: at }).returning("id")))!.id);
+    const row = (await addWorkspaceCalls(db, [{ workspace_id: id, n: null, tool: name, args: JSON.stringify(capJson(args)), state: "queued", result: null, created_at: at, started_at: null, deadline_at: null, finished_at: null, run_id: null }]))[0]!;
     const r = await new WorkspaceSession(db, api, id).call(name, args, row);
     // With the image on stdout, the text goes to stderr so the bytes stay whole.
     const say = (line: string): void => void (outFile === "-" ? process.stderr : process.stdout).write(line.endsWith("\n") ? line : `${line}\n`);
@@ -533,12 +541,11 @@ async function workspace(args: string[]): Promise<void> {
       // Queued, not run here: the runner runs the job, so a runner restart resumes it.
       const job = await enqueue(db, TRY_STEP, { repo, session }, CLI_QUEUE_BY);
       // Recorded now so the session sweep sees a job that ends before it starts; a job that already claimed it keeps it.
-      await db.run(db.k.updateTable("workspace_sessions").set({ job_id: job.id }).where("id", "=", session).where("job_id", "is", null));
+      await claimSession(db, session, job.id);
       console.log(`session ${session}: job ${job.id} queued; its log has the result`);
     } catch (e) {
       const why = (e as Error).message ?? String(e);
-      await db.run(db.k.updateTable("workspace_sessions").set({ state: "failed", outcome: `not queued: ${why}`.slice(0, 300), ended_at: new Date().toISOString() })
-        .where("id", "=", session).where("job_id", "is", null));
+      await patchSessions(db, [{ id: session, whereState: ["queued"], set: { state: "failed", outcome: `not queued: ${why}`.slice(0, 300), ended_at: new Date().toISOString() } }]);
       if (!(e instanceof JobError)) throw e;
       die(`session ${session} not queued: ${why}`);
     }

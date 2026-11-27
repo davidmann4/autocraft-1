@@ -1,28 +1,29 @@
-// A stuck implementation (D8): one decision per issue, `<repo>#<n>:implement`, with Try again, Open as draft PR (only when
-// the change passes the PR step's diff check), Close issue and Backlog; decide.prepare recommends one like for any decision.
-// Three attempts per issue text version at most get Try again. Three implementations in a row on a repo that end stuck or
-// failed without a PR trip the repo's Implement breaker (`implement:<repo>`).
-import { audit } from "../dash/audit.ts";
+// A stuck implementation is a workflow blocker (a step failing twice): the attempt moves to `stuck` with a `question` round
+// that says why and what AutoCraft can do next: Try again (a new attempt; on our open PR, the same revision again) and Open as
+// draft PR (only when the change passes the PR step's diff check). Try again is recommended when it is offered. A maintainer's
+// answer is an `answer` round after it, which the next build job carries out (applyStuckAnswer); closing the issue or PR,
+// stopping and the backlog are commands of their own. Three attempts per issue text version at most get Try again. Three
+// implementations in a row on a repo that end stuck or failed without a PR trip the repo's Implement breaker (`implement:<repo>`).
 import type { Db } from "../db/index.ts";
-import { actionable, ask, BACKLOG, factsOf, getDecision, optionsOf, type DecisionRow, type Option } from "../decisions.ts";
+import { addAudit, loadTrip, tripStage } from "../data/control/index.ts";
+import { loadImplementFacts, loadStuckStreaks, restartAttempt, retryRevision } from "../data/implement/index.ts";
+import { loadItems } from "../data/mirror/index.ts";
 import { tripKey } from "../core/push-outcome.ts";
-import { sinceOf, trip, tripRow } from "../push-outcomes.ts";
 import { textHash } from "../core/open-prs.ts";
 import { queuerOf } from "./gate.ts";
-import { closeOnAnswer, type CloseDeps } from "./close.ts";
-import { settleQuestions } from "./questions.ts";
-import { addRound, implementationsOf, roundsOf, setImplementationState, startImplementation } from "./store.ts";
-import type { Implementation, ReviseRound } from "./types.ts";
+import { addRounds, writeStep, type Attempt } from "./attempt.ts";
+import { IMPLEMENT_ASKER, openQuestion, type QuestionOption } from "./questions.ts";
+import { ENDED_STATES, IMPLEMENTATION_STATES, type Implementation, type ImplementationRound, type QuestionRound } from "./types.ts";
 
-const ACTOR = "implement";
+const ACTOR = IMPLEMENT_ASKER;
+const OPEN_STATES = IMPLEMENTATION_STATES.filter((s) => !ENDED_STATES.has(s));
 
-/** Why an implementation got stuck, and the line the decision and the row's reason start with. */
+/** Why an implementation got stuck, and the line the blocker and the row's reason start with. */
 export const STUCK_CAUSES = {
   "plan-unparseable": "The plan call's reply could not be read, twice",
   "plan-failed": "The plan call failed",
   "plan-flagged": "The plan still mentions or quotes the reference documentation",
   "question-failed": "The plan's questions could not be posted or asked",
-  "close-failed": "The issue could not be closed",
   "reset-failed": "The workspace tree could not be reset after the plan",
   "session-failed": "The implementation session failed twice",
   "session-lost": "The Task Runner kept losing the session before the checks",
@@ -44,15 +45,15 @@ export const MAX_ATTEMPTS_PER_TEXT = 3;
 /** Implementations in a row on a repo that end stuck or failed without a PR before the repo's Implement breaker trips. */
 export const STUCK_IN_A_ROW = 3;
 
-export const implementDecisionId = (repo: string, number: number): string => `${repo}#${number}:implement`;
-
 export const STUCK_OPTIONS = {
   tryAgain: { key: "try-again", label: "Try again", hint: "Plan and implement it again in a new attempt. Text you add goes to the model as guidance." },
   draft: { key: "draft-pr", label: "Open as draft PR", hint: "Open the change as it is as a draft pull request for a person to finish." },
-  close: { key: "close-issue", label: "Close issue", hint: "AutoCraft comments that the issue is closed for now and closes it as not planned." },
-  closePr: { key: "close-pr", label: "Close PR", hint: "AutoCraft comments on the pull request and closes it; the implementation ends and the issue stays open." },
   reviseAgain: { key: "try-again", label: "Try again", hint: "Send the pull request back to the session for the same revision. Text you add goes to the model as guidance." },
-} as const satisfies Record<string, Option>;
+} as const satisfies Record<string, QuestionOption>;
+
+/** The `question` round of a stuck attempt: the blocker's options, and why it stopped. */
+export type StuckQuestion = QuestionRound & { stuck: true; cause: StuckCause; facts: string[] };
+export const isStuckQuestion = (r: ImplementationRound | null | undefined): boolean => r?.kind === "question" && (r.result as Partial<StuckQuestion> | null)?.stuck === true;
 
 /**
  * Whether the attempt's change would pass the PR step's diff check (validateImplementation), so Open as draft PR can be offered.
@@ -61,186 +62,130 @@ export const STUCK_OPTIONS = {
 export type DiffCheck = (db: Db, impl: Implementation) => Promise<{ ok: boolean; reason?: string }>;
 export const noDiffCheck: DiffCheck = async () => ({ ok: false, reason: "the diff check is not available" });
 
-/** The hash of the issue's current title and body, as attempts record it; null when the issue is not in the mirror. */
-async function currentTextHash(db: Db, repo: string, number: number): Promise<string | null> {
-  const it = await db.get(db.k.selectFrom("items").select(["title", "body"]).where("repo", "=", repo).where("number", "=", number));
-  return it ? textHash(it.title ?? "", it.body ?? "") : null;
+/** The hash of the issue's current title and body (or the attempt's when the issue is not in the mirror), and the attempts made on it. */
+async function textTries(db: Db, impl: Implementation): Promise<{ hash: string; tries: number }> {
+  const ref = `${impl.repo}#${impl.number}` as const;
+  const [facts, items] = await db.together(() => Promise.all([loadImplementFacts(db, [impl]), loadItems(db, [impl], "text")]));
+  const it = items.get(ref);
+  const hash = it ? textHash(it.title ?? "", it.body ?? "") : impl.textHash;
+  // The loader leaves out an only attempt that is not stuck yet: it is the one try.
+  const counts = facts.byIssue.get(ref)?.textCounts ?? {};
+  const tries = Object.keys(counts).length ? counts[hash] ?? 0 : impl.textHash === hash ? 1 : 0;
+  return { hash, tries };
 }
 
-/** The comment Close PR of a stuck revision posts on our PR before the close. */
-export const STUCK_CLOSE_PR_COMMENT = "Closing this pull request: the implementation could not finish its revision. The issue stays open.";
-/** The comment the stuck decision's Close issue posts before the close. */
-export const STUCK_CLOSE_COMMENT = "Closing this as not planned for now. Reopen it when it should be picked up again.";
-
-/** Clears the answer of the decision `id` (and its carrying-out state), so the question is open again. */
-async function clearAnswer(db: Db, id: string): Promise<void> {
-  await db.run(db.k.updateTable("main.decisions").set({ answer: null, answer_note: null, exceptions: null, answered_by: null, answered_at: null, applied_at: null, adopted_opinion: null, exec_state: null, exec_reason: null, dispute_by: null, dispute_reason: null, dispute_at: null })
-    .where("id", "=", id));
-}
-
-/** Attempts of the issue on its text version `hash`. */
-const attemptsOnText = async (db: Db, repo: string, number: number, hash: string): Promise<number> =>
-  (await implementationsOf(db, repo, number)).filter((r) => r.textHash === hash).length;
-
-/**
- * Moves the attempt to `stuck` and asks its decision. Any earlier answer of the issue's decision is cleared first, applied or
- * not (one an earlier attempt left unapplied included): the question is a new one. The attempt's question decisions are set
- * aside. Then the repo's breaker is checked. Returns the decision id.
- */
-export async function markStuck(db: Db, impl: Implementation, cause: StuckCause, detail: string | null, o: { diffCheck?: DiffCheck; at?: string } = {}): Promise<string> {
-  const at = o.at ?? new Date().toISOString();
-  const id = implementDecisionId(impl.repo, impl.number);
-  const hash = await currentTextHash(db, impl.repo, impl.number) ?? impl.textHash;
-  const tries = await attemptsOnText(db, impl.repo, impl.number, hash);
-  // A revision of our open PR is tried again on the same PR; the PR stays open, so there is no draft and no close of the issue.
+/** The blocker's question: the options that can be carried out for this attempt now, Try again recommended when offered. */
+async function stuckQuestion(db: Db, impl: Implementation, cause: StuckCause, reason: string, diffCheck: DiffCheck, head?: string): Promise<StuckQuestion> {
+  // A revision of our open PR is tried again on the same PR; the PR stays open, so there is no draft.
   const revising = impl.prNumber !== null;
-  const draft = revising || cause === "diff-refused" || cause === "no-change" ? { ok: false } : await (o.diffCheck ?? noDiffCheck)(db, impl);
-  const options: Option[] = revising ? [STUCK_OPTIONS.reviseAgain, STUCK_OPTIONS.closePr, BACKLOG] : [
+  const { tries } = revising ? { tries: 0 } : await textTries(db, impl);
+  const draft = revising || cause === "diff-refused" || cause === "no-change" ? { ok: false } : await diffCheck(db, impl);
+  const options: QuestionOption[] = revising ? [STUCK_OPTIONS.reviseAgain] : [
     ...(tries < MAX_ATTEMPTS_PER_TEXT ? [STUCK_OPTIONS.tryAgain] : []),
     ...(draft.ok ? [STUCK_OPTIONS.draft] : []),
-    STUCK_OPTIONS.close, BACKLOG,
   ];
-  const head = STUCK_CAUSES[cause];
-  const reason = `${head}${detail ? `: ${detail}` : ""}`.replace(/\s+/g, " ").slice(0, 300);
   const facts = revising ? [`revising pull request #${impl.prNumber}`, ...(impl.diffStat ? [`change: ${impl.diffStat}`] : [])] : [
     `attempt ${impl.attempt}; ${tries} of ${MAX_ATTEMPTS_PER_TEXT} on this issue text`,
     ...(impl.diffStat ? [`change: ${impl.diffStat}`] : []),
     ...(tries >= MAX_ATTEMPTS_PER_TEXT ? [`no Try again: ${MAX_ATTEMPTS_PER_TEXT} attempts were made on this issue text; editing the issue allows more`] : []),
   ];
-  await db.write(async () => {
-    await clearAnswer(db, id);
-    await ask(db, [{
-      id, kind: "other", repo: impl.repo, number: impl.number, question: "The implementation is stuck. What next?",
-      context: `${reason}.${impl.report?.summary ? `\nThe session's last report: ${impl.report.summary}` : ""}`.slice(0, 2000),
-      facts, options, asked_at: at, asked_by: ACTOR,
-    }], true);
-    await setImplementationState(db, impl.id, "stuck", { decisionId: id, reason }, at);
+  const text = `${head ? `${head}. ` : ""}The implementation is stuck: ${reason}.${impl.report?.summary ? ` The session's last report: ${impl.report.summary}` : ""}`.slice(0, 2000);
+  return { audience: "maintainer", text, options, recommended: options.some((o) => o.key === STUCK_OPTIONS.tryAgain.key) ? STUCK_OPTIONS.tryAgain.key : null, stuck: true, cause, facts };
+}
+
+/** Moves the attempt to `stuck` with its blocker question, records it, then checks the repo's breaker. Returns the reason. */
+export async function markStuck(db: Db, impl: Implementation, cause: StuckCause, detail: string | null, o: { diffCheck?: DiffCheck; at?: string } = {}): Promise<string> {
+  const at = o.at ?? new Date().toISOString();
+  const reason = `${STUCK_CAUSES[cause]}${detail ? `: ${detail}` : ""}`.replace(/\s+/g, " ").slice(0, 300);
+  const q = await stuckQuestion(db, impl, cause, reason, o.diffCheck ?? noDiffCheck);
+  const moved = await db.write(async () => {
+    // An attempt that ended meanwhile (a cancel, its PR merged) keeps its end.
+    if (!await writeStep(db, impl, { to: "stuck", patch: { reason }, expect: OPEN_STATES, rounds: [{ kind: "question", result: q }], at })) return false;
+    await addAudit(db, [{ login: ACTOR, action: "implement-stuck", target: `${impl.repo}#${impl.number}`, details: { implementation: impl.id, cause, reason }, at }]);
+    return true;
   });
-  await settleQuestions(db, impl, null, at);
-  await audit(db, ACTOR, "implement-stuck", `${impl.repo}#${impl.number}`, { implementation: impl.id, cause, reason });
-  await tripIfStuckInARow(db, impl.repo, at);
-  return id;
+  if (moved) await tripIfStuckInARow(db, impl.repo, at);
+  return reason;
 }
 
 /** Trips `implement:<repo>` when the repo's last STUCK_IN_A_ROW finished implementations since its last resume all ended stuck or failed without a PR. */
 export async function tripIfStuckInARow(db: Db, repo: string, at = new Date().toISOString()): Promise<boolean> {
   const key = tripKey("implement", repo);
-  if ((await tripRow(db, key))?.active) return false;
-  const since = await sinceOf(db, key);
-  const rows = await db.all(db.k.selectFrom("main.implementations").select(["number", "attempt", "state", "pr_number"])
-    .where("repo", "=", repo).where("updated_at", ">", since)
-    .where((eb) => eb.or([eb("pr_number", "is not", null), eb("state", "in", ["stuck", "failed"])]))
-    .orderBy("updated_at", "desc").orderBy("id", "desc").limit(STUCK_IN_A_ROW));
-  if (rows.length < STUCK_IN_A_ROW || rows.some((r) => r.pr_number !== null)) return false;
-  await trip(db, key, `${STUCK_IN_A_ROW} implementations in a row in ${repo} ended stuck or failed without a PR`, rows.map((r) => `${repo}#${r.number} attempt ${r.attempt}`), at);
-  return true;
+  const t = await loadTrip(db, key);
+  if (t?.active) return false;
+  const rows = (await loadStuckStreaks(db, new Map([[repo, t?.clearedAt ?? ""]]), STUCK_IN_A_ROW)).get(repo) ?? [];
+  if (rows.length < STUCK_IN_A_ROW || rows.some((r) => r.prNumber !== null)) return false;
+  const tripped = await tripStage(db, [{ key, reason: `${STUCK_IN_A_ROW} implementations in a row in ${repo} ended stuck or failed without a PR`, evidence: rows.map((r) => `${repo}#${r.number} attempt ${r.attempt}`), at }]);
+  return tripped.length > 0;
 }
 
 /** A Try again note for the attempt: who answered, when, and the text. */
 export type AttemptGuidance = { by: string | null; at: string; text: string };
 
 /** The guidance people gave the attempt (Try again notes) with who gave it, oldest first. */
-export async function attemptGuidance(db: Db, implementationId: number): Promise<AttemptGuidance[]> {
-  return (await roundsOf(db, implementationId)).filter((r) => r.kind === "guidance").flatMap((r) => {
+export function attemptGuidance(rounds: readonly ImplementationRound[]): AttemptGuidance[] {
+  return rounds.filter((r) => r.kind === "guidance").flatMap((r) => {
     const g = r.result as { text?: unknown; by?: unknown } | null;
     return typeof g?.text === "string" && g.text.trim() ? [{ by: typeof g.by === "string" ? g.by : null, at: r.at, text: g.text.trim() }] : [];
   });
 }
 
-/** The guidance people gave the attempt (Try again notes), oldest first. */
-export async function guidanceOf(db: Db, implementationId: number): Promise<string[]> {
-  return (await attemptGuidance(db, implementationId)).map((g) => g.text);
-}
-
-/** The PR step opens the attempt's PR as a draft: its stuck decision was answered Open as draft PR. */
-export async function opensAsDraft(db: Db, impl: Implementation): Promise<boolean> {
-  return impl.decisionId !== null && (await getDecision(db, impl.decisionId))?.answer === STUCK_OPTIONS.draft.key;
+/** The PR step opens the attempt's PR as a draft: its stuck blocker was answered Open as draft PR. */
+export function opensAsDraft(rounds: readonly ImplementationRound[]): boolean {
+  const { question, answer } = openQuestion(rounds);
+  return isStuckQuestion(question) && answer?.option === STUCK_OPTIONS.draft.key;
 }
 
 export type StuckOutcome = { did: string; next: Implementation | null };
 
 /**
- * Asks the stuck decision again because its answer cannot be carried out: the answer is cleared, `why` heads its context,
- * and Try again is no longer offered once the attempts on this issue text are used up.
+ * Carries out the answer to a stuck attempt's blocker: Try again ends the attempt and starts a new one (the answer's words become
+ * the new attempt's guidance), or sends our open PR's revision back to the session; Open as draft PR hands the attempt to the PR
+ * step. An answer that cannot be carried out is asked again with the reason (a new question round, so the answer no longer
+ * stands). Returns null when there is no answer to carry out.
  */
-async function askAgain(db: Db, impl: Implementation, d: DecisionRow, why: string, at: string): Promise<void> {
-  const hash = await currentTextHash(db, impl.repo, impl.number) ?? impl.textHash;
-  const tries = await attemptsOnText(db, impl.repo, impl.number, hash);
-  const options = optionsOf(d).filter((o) => o.key !== STUCK_OPTIONS.tryAgain.key || tries < MAX_ATTEMPTS_PER_TEXT);
-  const head = `Not carried out: ${why}`.replace(/\s+/g, " ").slice(0, 400);
-  const rest = (d.context ?? "").replace(/^Not carried out: [^\n]*\n/, "");
-  await db.write(async () => {
-    await clearAnswer(db, d.id);
-    await ask(db, [{
-      id: d.id, kind: d.kind, repo: impl.repo, number: impl.number, question: d.question, context: `${head}.\n${rest}`.slice(0, 2000),
-      facts: factsOf(d), options, asked_at: at, asked_by: ACTOR,
-    }], true);
-  });
-  await audit(db, ACTOR, "implement-reask", `${impl.repo}#${impl.number}`, { implementation: impl.id, decision: d.id, answer: d.answer, why });
-}
-
-/**
- * Carries out the answer of a stuck attempt's decision, when someone who settles on the repo gave one: Try again ends the
- * attempt and starts a new one (its note becomes the new attempt's guidance), Open as draft PR hands the attempt to the PR
- * step, Close issue comments and closes the issue (close.ts). Backlog only holds the item, which the planner reads. An
- * answer that cannot be carried out is asked again with the reason; one that waits (a sign-in, a transient failure) stays.
- * Returns null when there is no answer to carry out.
- */
-export async function applyStuckAnswer(db: Db, impl: Implementation, o: { at?: string; close?: CloseDeps } = {}): Promise<StuckOutcome | null> {
+export async function applyStuckAnswer(db: Db, a: Attempt, o: { at?: string } = {}): Promise<StuckOutcome | null> {
   const at = o.at ?? new Date().toISOString();
-  if (impl.state !== "stuck" || impl.decisionId === null) return null;
-  const a = (await actionable(db)).find((x) => x.id === impl.decisionId);
-  if (!a) return null;
-  const d = (await getDecision(db, a.id))!;
-  const applied = async () => void await db.run(db.k.updateTable("main.decisions").set({ applied_at: at }).where("id", "=", a.id).where("applied_at", "is", null));
+  const impl = a.impl, ref = `${impl.repo}#${impl.number}`;
+  if (impl.state !== "stuck") return null;
+  const { question, answer } = openQuestion(a.rounds);
+  if (!question || !isStuckQuestion(question) || !answer) return null;
+  const q = question.result as StuckQuestion;
+  const offered = (key: string) => (q.options ?? []).some((x) => x.key === key);
+  const note = answer.text?.trim();
+  const guidance = note ? { by: answer.by, text: note } : undefined;
   const again = async (why: string): Promise<StuckOutcome> => {
-    await askAgain(db, impl, d, why, at);
+    const next = await stuckQuestion(db, impl, q.cause, impl.reason ?? STUCK_CAUSES[q.cause], noDiffCheck, `Not carried out: ${why}`.replace(/\s+/g, " ").slice(0, 400));
+    // Open as draft PR stays offered when it was: the diff check that allowed it ran on the same change.
+    const keep = offered(STUCK_OPTIONS.draft.key) && !next.options!.some((x) => x.key === STUCK_OPTIONS.draft.key) ? [...next.options!, STUCK_OPTIONS.draft] : next.options!;
+    await db.write(async () => {
+      await addRounds(db, impl.id, [{ kind: "question", result: { ...next, options: keep } satisfies StuckQuestion }], at);
+      await addAudit(db, [{ login: ACTOR, action: "implement-reask", target: ref, details: { implementation: impl.id, answer: answer.option ?? null, by: answer.by, why }, at }]);
+    });
     return { did: `not carried out (${why}); asked again`, next: null };
   };
-  if (a.answer === STUCK_OPTIONS.tryAgain.key && impl.prNumber !== null) {
-    const last = (await roundsOf(db, impl.id)).filter((r) => r.kind === "revise").at(-1);
-    if (!last) return await again("the attempt has no revision to try again");
-    const note = d.answer_note?.trim();
-    const was = last.result as ReviseRound;
-    const message = note ? `${was.message}\n\nA maintainer's note on this revision:\n<guidance>\n${note.slice(0, 4000).replace(/</g, "\\u003c")}\n</guidance>` : was.message;
-    await db.write(async () => {
-      if (note) await addRound(db, impl.id, "guidance", { result: { by: d.answered_by, text: note.slice(0, 4000), decisionId: a.id } }, at);
-      await addRound(db, impl.id, "revise", { result: { ...was, message } satisfies ReviseRound }, at);
-      await setImplementationState(db, impl.id, "revising", {}, at);
+  if (answer.option === STUCK_OPTIONS.tryAgain.key && offered(answer.option) && impl.prNumber !== null) {
+    const ok = await db.write(async () => {
+      if (!await retryRevision(db, { id: impl.id, guidance, at })) return false;
+      await addAudit(db, [{ login: ACTOR, action: "implement-retry", target: ref, details: { from: impl.id, to: impl.id, pr: impl.prNumber, by: answer.by }, at }]);
+      return true;
     });
-    await applied();
-    await audit(db, ACTOR, "implement-retry", `${impl.repo}#${impl.number}`, { from: impl.id, to: impl.id, pr: impl.prNumber, by: d.answered_by });
-    return { did: `revision of #${impl.prNumber} started again`, next: null };
+    return ok ? { did: `revision of #${impl.prNumber} started again`, next: null } : await again("the attempt has no revision to try again");
   }
-  if (a.answer === STUCK_OPTIONS.tryAgain.key) {
-    const hash = await currentTextHash(db, impl.repo, impl.number) ?? impl.textHash;
-    if (await attemptsOnText(db, impl.repo, impl.number, hash) >= MAX_ATTEMPTS_PER_TEXT) return await again(`${MAX_ATTEMPTS_PER_TEXT} attempts were made on this issue text, so Try again is not available; editing the issue allows more`);
-    await setImplementationState(db, impl.id, "failed", { reason: `${impl.reason ?? "stuck"}; tried again` }, at);
-    const next = await startImplementation(db, { repo: impl.repo, number: impl.number, queuedBy: await queuerOf(db, impl.repo, impl.number) ?? impl.queuedBy, textHash: hash }, at);
-    const note = d.answer_note?.trim();
-    if (note) await addRound(db, next.id, "guidance", { result: { by: d.answered_by, text: note.slice(0, 4000), decisionId: a.id } }, at);
-    await applied();
-    await audit(db, ACTOR, "implement-retry", `${impl.repo}#${impl.number}`, { from: impl.id, to: next.id, by: d.answered_by });
+  if (answer.option === STUCK_OPTIONS.tryAgain.key && offered(answer.option)) {
+    const { hash, tries } = await textTries(db, impl);
+    if (tries >= MAX_ATTEMPTS_PER_TEXT) return await again(`${MAX_ATTEMPTS_PER_TEXT} attempts were made on this issue text, so Try again is not available; editing the issue allows more`);
+    const queuedBy = await queuerOf(db, impl.repo, impl.number) ?? impl.queuedBy;
+    const next = await db.write(async () => {
+      const n = await restartAttempt(db, { id: impl.id, reason: impl.reason ?? "stuck", queuedBy, textHash: hash, guidance, at });
+      await addAudit(db, [{ login: ACTOR, action: "implement-retry", target: ref, details: { from: impl.id, to: n.id, by: answer.by }, at }]);
+      return n;
+    });
     return { did: `attempt ${next.attempt} started`, next };
   }
-  if (a.answer === STUCK_OPTIONS.draft.key) {
-    if (!optionsOf(d).some((x) => x.key === STUCK_OPTIONS.draft.key)) return await again("Open as draft PR was not offered for this attempt");
-    await setImplementationState(db, impl.id, "opening", {}, at);
-    await applied();
+  if (answer.option === STUCK_OPTIONS.draft.key && offered(answer.option)) {
+    if (!await writeStep(db, impl, { to: "opening", expect: ["stuck"], at })) return { did: "left stuck meanwhile", next: null };
     return { did: "handed to the PR step as a draft", next: null };
   }
-  if (a.answer === STUCK_OPTIONS.closePr.key) {
-    if (impl.prNumber === null) return await again("the attempt has no pull request to close");
-    const r = await closeOnAnswer(db, impl, { decisionId: a.id, answer: a.answer, bucket: "build", comment: STUCK_CLOSE_PR_COMMENT, pr: impl.prNumber }, { ...o.close, now: () => at });
-    if ("done" in r) return { did: r.done, next: null };
-    if ("waiting" in r) return { did: `not closed yet: ${r.waiting}`, next: null };
-    return await again(r.refused);
-  }
-  if (a.answer === STUCK_OPTIONS.close.key) {
-    const r = await closeOnAnswer(db, impl, { decisionId: a.id, answer: a.answer, bucket: "build", comment: STUCK_CLOSE_COMMENT }, { ...o.close, now: () => at });
-    if ("done" in r) return { did: r.done, next: null };
-    if ("waiting" in r) return { did: `not closed yet: ${r.waiting}`, next: null };
-    return await again(r.refused);
-  }
-  return await again(`the answer ${a.answer} is not one of its options`);
+  return await again(answer.option ? `${answer.option} is not one of its options` : "the answer names none of its options");
 }

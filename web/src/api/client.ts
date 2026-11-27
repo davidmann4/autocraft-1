@@ -2,11 +2,10 @@ import { keepPreviousData, useInfiniteQuery, useQuery as useTanstackQuery } from
 import { createContext, useCallback, useContext, useRef } from "react";
 import { topicsFor } from "./topics";
 import { usePageProject, withProject } from "./scope";
-import type { WorkspaceCallOutput, WorkspaceCalls, WorkspaceDetail, WorkspacePage } from "./types";
+import type { WorkspaceCallOutput, WorkspaceCalls, WorkspaceDetail, WorkspacePage, TranscriptStoreInput, TranscriptStoreStatus, TranscriptView } from "./types";
 import type {
   CacheReport,
   DiscordAccount,
-  InferenceMode,
   InferenceEffort,
   InferenceSettings,
   InferenceTier,
@@ -19,58 +18,49 @@ import type {
   DiscordLinkCode,
   DiscordFilingAdded,
   DiscordSetup,
-  Home,
+  Health,
   MaintainHome,
   MaintainRepo,
   MaintainQueueMeta,
   MaintainStats,
   MaintainItems,
   MaintainItemsQuery,
+  BrowseQuery,
+  BrowseResult,
   MaintainCommandResult,
   MaintainItem,
   MaintainReply,
-  OpenDecisionCounts,
   ItemPageData,
-  ItemStatusFilter,
   ItemPeek,
   LiveBoard,
-  ItemStatusList,
   SecurityList,
   FindingPageData,
-  CardEdit,
-  DoChoiceBody,
-  Preapproval,
   NextPage,
-  ReleaseAction,
-  DecisionKind,
   AccessOverview,
   McpTokenCreated,
   McpTokens,
-  GithubAppStatus, GithubSetupLink,
-  AccountInput,
+  GithubAppStatus,
+  GithubSetupLink,
   AgentRunDetail,
   ActivityPage,
   ActivityQuery,
   ItemTrace,
-  Now,
-  NowFeed,
   ItemTraceDetail,
   ItemTraceQuery,
   ItemTraceUnchanged,
   ItemPageUnchanged,
+  ItemChat,
+  ItemChatUnchanged,
   AgentRunFilter,
+  RefusalBreakdown,
+  RefusalWindow,
   AgentRunPage,
-  ClaudeAccount,
-  UsagePause,
   JevStatus,
   Rates,
-  AnswerInput,
   AuditFilter,
   AuditPage,
-  NeedsFixPage,
-  NeedsOutsideList,
+  HeldAuthor,
   OutsideState,
-  NeedsPage,
   Contributor,
   ContributorFilter,
   ContributorList,
@@ -78,31 +68,18 @@ import type {
   CostReport,
   DownloadsReport,
   DownloadsRange,
-  Decision,
   RepoAreas,
-  Flow,
-  DecisionComment,
-  DecisionFilter,
-  DecisionList,
   DisagreementFilter,
   DisagreementList,
   Item,
-  ItemFilter,
-  ItemList,
   OverrideInput,
   MainCi,
   StuckItems,
   Progress,
   PromptsReport,
-  BatchFilter,
   BatchDetail,
-  BatchList,
-  QueueFilter,
   QueuePage,
   QueuePageFilter,
-  QueueList,
-  WorkFilter,
-  WorkList,
   RepoName,
   Role,
   RulePreview,
@@ -133,7 +110,6 @@ import type {
   NightlyGrid,
   NightlySeries,
   NightlySelectInput,
-  BuildSummary,
   BuildTask,
   BuildTaskDetail,
   EnvCreate,
@@ -143,8 +119,6 @@ import type {
   AreaDef,
   AreaEditBody,
   AreaStep,
-  Conversation,
-  ConversationCard,
 } from "./types";
 
 /** The dashboard API as the frontend sees it. The mock and the HTTP client both implement it. */
@@ -160,60 +134,6 @@ export interface Api {
   repos(): Promise<RepoName[]>;
   /** Owners of the visible repos that are not storytold's, by repo name. */
   repoOwners(): Promise<Record<string, string>>;
-  decisions: {
-    list(filter: DecisionFilter): Promise<DecisionList>;
-    /** The requester's inbox count in total and per repo, over every repo: the project picker's numbers. */
-    openCounts(): Promise<OpenDecisionCounts>;
-    get(id: string): Promise<Decision>;
-    /** The decision a readable link opens: the item's first open one, else its latest; null when it has none. */
-    forItem(repo: RepoName, number: number, kind?: DecisionKind): Promise<Decision | null>;
-    answer(id: string, input: AnswerInput): Promise<Decision>;
-    /** Null when it took back a Backlog press on an item with no question: that decision is gone. */
-    undo(id: string): Promise<Decision | null>;
-    /** Operator: runs the GitHub write of a waiting or failed answer again. */
-    retry(id: string): Promise<Decision>;
-    /** Someone who settles, other than the answerer, disputes an answer the pipeline has not applied; the reason is required. */
-    dispute(id: string, reason: string): Promise<Decision>;
-    /** The answerer or an operator keeps a disputed answer. */
-    keepAnswer(id: string): Promise<Decision>;
-    /** Clears a Backlog answer so the decision is open again; null for a Backlog press on an item with no question, which is deleted. */
-    reopen(id: string): Promise<Decision | null>;
-    /** Operator, or maintainer with write on the repo: snooze (`on`) or wake an open decision. */
-    snooze(id: string, on: boolean): Promise<Decision>;
-    /** The feedback box: an optional pick (replaces the user's live one) and free text, at least one. Text alone joins the thread. */
-    feedback(id: string, input: { option?: string | null; text?: string }): Promise<Decision>;
-    retract(id: string): Promise<Decision>;
-    /** Operator, or maintainer with write on the repo: has Opus prepare the open decision again in the choices format; the current choices stay until replaced. */
-    reprepare(id: string): Promise<Decision>;
-    /** Operator only: answer with the opinion's option. */
-    adopt(id: string, opinionId: string, textsHash?: string): Promise<Decision>;
-    claim(id: string): Promise<void>;
-    thread(id: string): Promise<DecisionComment[]>;
-  };
-  /** Opus conversations, one per item. Writes are for operators; a message is refused while Opus has not answered the last one. */
-  conversations: {
-    get(repo: RepoName, number: number): Promise<Conversation>;
-    /** `ask: false` posts the message without asking Opus (no reply is expected). */
-    say(repo: RepoName, number: number, text: string, ask?: boolean): Promise<Conversation>;
-    /** Includes (`on`) or excludes a maintainer post for Opus. Removing an include that was already sent is refused. */
-    include(repo: RepoName, number: number, source: string, on: boolean): Promise<Conversation>;
-    /** Withdraws the maintainer's message that waits for Opus (Conversation.canWithdraw). */
-    withdraw(repo: RepoName, number: number): Promise<Conversation>;
-    /** A proposed card's editable drafts: the comment `text`, the open-issue step's title and body, the fix-up step's instructions. Fields left out stay as they are. */
-    editCard(id: number, edit: CardEdit): Promise<ConversationCard>;
-    /** `skip`: indexes into `steps` the operator removed; the rest run in order. `note`: kept with the choice (on the decision it settles, in the thread), never posted to GitHub; at most 500 characters. */
-    doCard(id: number, opts: { digest: string; skip?: number[]; note?: string }): Promise<ConversationCard>;
-    dismissCard(id: number): Promise<ConversationCard>;
-    /** Someone else who settles disputes a queued press (a reason is required); the presser or an operator keeps it or dismisses it. */
-    disputeCard(id: number, reason: string): Promise<ConversationCard>;
-    keepCard(id: number): Promise<ConversationCard>;
-    /** Runs one core with its ticked extras as a card; returns that card. */
-    doChoice(choiceId: string, body: DoChoiceBody): Promise<ConversationCard>;
-    /** Operator or maintainer with write: stops the item's running pre-approved merge (state becomes "cancelled"); the PR's open question, if any, stays. */
-    cancelPreapproval(repo: RepoName, number: number): Promise<Preapproval>;
-    /** Operator or maintainer with write: queues the failed pre-approved merge again with the same instructions at the PR's current head (a new pre-approval). */
-    retryPreapproval(repo: RepoName, number: number): Promise<Preapproval>;
-  };
   /** A repo's area list. Reading is for everyone who sees the repo; every write is for whoever runs the repo (operator, or maintainer with write). */
   areas: {
     get(repo: RepoName): Promise<RepoAreas>;
@@ -225,12 +145,10 @@ export interface Api {
     accept(id: number, body?: { areas?: AreaDef[]; accept?: string[]; ignore?: string[] }): Promise<RepoAreas>;
     dismiss(id: number): Promise<void>;
   };
-  /** Health problems, everything in progress and the last things that happened, for the home page. */
-  now(): Promise<Now>;
+  /** What needs attention on the instance. */
+  health(): Promise<Health>;
   /** Running and queued work and what ended lately, on one time axis with estimates (the Live board on Home). */
   live(): Promise<LiveBoard>;
-  /** The next page of "Just happened", older than `before` (a `nextCursor`). */
-  nowFeed(before: string): Promise<NowFeed>;
   item(repo: RepoName, number: number): Promise<Item>;
   /**
    * Every event of the item, oldest first, with the header (now, next, who). `since` is the `stamp` of an earlier answer:
@@ -241,48 +159,50 @@ export interface Api {
   itemTraceDetail(repo: RepoName, number: number, id: string): Promise<ItemTraceDetail>;
   /** Every item's trace events in one stream, newest first; `since` as for `itemTrace`. */
   activity(q?: ActivityQuery): Promise<ActivityPage | ItemTraceUnchanged>;
-  /** Operator or maintainer with write: review the current head again, plan Verify again, or try the issue fix again. Writes nothing to GitHub. */
-  release(repo: RepoName, number: number, action: ReleaseAction): Promise<void>;
-  /** Operator or maintainer with write: puts an issue with a stopped fix in the Backlog or closes it (through a scope decision answered at once). */
-  stopFix(repo: RepoName, number: number, answer: "backlog" | "close"): Promise<void>;
-  /** Someone who settles on the repo puts the open item on the Backlog: answers its open question with Backlog, or holds it with an answered `backlog` decision. */
-  backlogItem(repo: RepoName, number: number): Promise<Decision>;
   /** Top bar: jumps by number, logins, words in titles and bodies. */
   search(q: string): Promise<SearchHit[]>;
-  /** The Items browser: every tracked repo, full-text search over titles, bodies and comments. */
-  items(filter: ItemFilter): Promise<ItemList>;
   progress(): Promise<Progress>;
-  /** Home: needs, problems, phase counts, progress and what was done today, in one payload; the page's project narrows all of it. */
-  home(): Promise<Home>;
-  /** The new dashboard (ui_v2). */
   maintain: {
     /** Home: what waits for the reader's answer, what they started, their Task Runner line and problems; the page's project narrows it. */
     home(): Promise<MaintainHome>;
-    /** Work queue: the repos on the new workflow and who approved each started item for merge. */
+    /** Work queue: who approved each started item for merge. */
     queue(): Promise<MaintainQueueMeta>;
     /** Stats: headline numbers and merges per day for 7 or 30 days. */
     stats(period: "7d" | "30d"): Promise<MaintainStats>;
-    /** Items: four lists of the open items (or the Backlog, or the closed items) with filters, search and the priority order; the page's project narrows it. */
+    /** Items: three lists of the open items (or the Backlog, or the closed items) with filters, search and the priority order; the page's project narrows it. */
     items(query: MaintainItemsQuery): Promise<MaintainItems>;
+    /** The Items browser: one page of the items matching a search with qualifiers; the page's project narrows it. */
+    browse(query: BrowseQuery): Promise<BrowseResult>;
     /** Sends a command written in the dashboard's box; the list form (`merge:` then items) names the items. */
-    command(text: string): Promise<MaintainCommandResult>;
+    /** `asked`: the `asked` of the rows shown, by repo#number. */
+    command(text: string, asked?: Record<string, string>): Promise<MaintainCommandResult>;
     /** Repos: every tracked repo the reader may see with its counts, Automatic state and paused steps. */
     repos(): Promise<MaintainRepo[]>;
+    /** Per visible repo, the started items that wait for an answer; repos with none are left out. */
+    /** Open questions addressed to the reader. */
+    asked(): Promise<{ count: number }>;
     /** A registered workflow control (resume a breaker, switch Automatic); answers with the line every surface shows. */
     control(input: { control: "resume-breaker"; key: string } | { control: "set-automatic"; repo: RepoName; on: boolean }): Promise<{ ok: boolean; line: string }>;
   };
-  /** The new item page (ui_v2): the item's workflow read, its command box and its controls. */
+  /** The item page: the item's workflow read, its command box and its controls. */
   maintainItem: {
     get(repo: RepoName, number: number): Promise<MaintainItem>;
     /** A command written on the item; the reply is the confirmation, or what was understood when nothing ran. */
-    command(repo: RepoName, number: number, text: string): Promise<MaintainReply>;
+    /** `asked`: the `asked` of the status shown. */
+    command(repo: RepoName, number: number, text: string, asked?: string | null): Promise<MaintainReply>;
     /** A registered control on the item: release an outside hold, or resume a breaker by its key. */
     control(body: { control: "release-outside"; repo: RepoName; number: number } | { control: "resume-breaker"; key: string }): Promise<MaintainReply>;
   };
   /** The item page's AutoCraft and GitHub sides: status, reviews with earlier ones, result cards, history, GitHub's own sections. `since` as for `itemTrace`. */
   itemPage(repo: RepoName, number: number, since?: string): Promise<ItemPageData | ItemPageUnchanged>;
-  /** The Items list with a status per row, one page at a time. */
-  itemStatusList(filter: ItemStatusFilter): Promise<ItemStatusList>;
+  /** The item's conversations with AutoCraft: what people said, AutoCraft's replies and work, GitHub and Discord activity folded into lines. `since` as for `itemTrace`. */
+  itemChat: {
+    get(repo: RepoName, number: number, since?: string): Promise<ItemChat | ItemChatUnchanged>;
+    /** Posts the reader's message to one conversation; `lines` is what AutoCraft understood or why nothing ran. */
+    send(repo: RepoName, number: number, conversation: string, text: string): Promise<{ chat: ItemChat; lines: string[] }>;
+    /** Withdraws the message that waits for Opus (a said entry's canWithdraw). */
+    withdraw(repo: RepoName, number: number): Promise<ItemChat>;
+  };
   /** The item in brief, for the hover card on its number. */
   itemPeek(repo: RepoName, number: number): Promise<ItemPeek>;
   /** Staff: all findings grouped by what they need. */
@@ -321,9 +241,6 @@ export interface Api {
     approveLabels(name: RepoName, approved: boolean): Promise<TrackedRepo>;
     /** Lets the pipeline merge pull requests in this repo, or stops it. */
     approveMerging(name: RepoName, approved: boolean): Promise<TrackedRepo>;
-    /** Most ready pull requests of a repo that merge one at a time instead of in a batch; 0 always batches. */
-    singleMerge(): Promise<{ max: number }>;
-    setSingleMerge(max: number): Promise<{ max: number }>;
     /** Lets the Fix-up step push commits to contributor branches here, or stops it. */
     approvePushing(name: RepoName, approved: boolean): Promise<TrackedRepo>;
     /** Lets the Act step comment on and close items here, or stops it. */
@@ -341,15 +258,17 @@ export interface Api {
     /** Switches one build feature for this repo. */
     setBuildFeature(name: RepoName, feature: BuildFeatureName, on: boolean): Promise<TrackedRepo>;
   };
-  /** Operator only: who runs the model calls, and the model families each tier accepts in the user-local mode. */
+  /** Operator only: the model families each tier accepts, and the Jev switch. */
   inference: {
     get(): Promise<InferenceSettings>;
-    put(body: { mode?: InferenceMode; models?: Record<InferenceTier, string[]>; /** A tier to its lowest effort, or null for none. */ minEffort?: Partial<Record<InferenceTier, InferenceEffort | null>> }): Promise<InferenceSettings>;
+    put(body: { models?: Record<InferenceTier, string[]>; /** A tier to its lowest effort, or null for none. */ minEffort?: Partial<Record<InferenceTier, InferenceEffort | null>> }): Promise<InferenceSettings>;
+    jev(): Promise<JevStatus>;
+    setJev(enabled: boolean): Promise<JevStatus>;
   };
   /** The signed-in user's own MCP Connector tokens: maintainers and operators make them; anyone lists and revokes their own. */
   mcp: {
     tokens(): Promise<McpTokens>;
-    /** `answer`: the token's agent may also answer decisions (operators, and maintainers who settle), and it lasts 7 days. */
+    /** `answer`: the token's agent may also send commands, and it lasts 7 days. */
     create(label: string, answer?: boolean): Promise<McpTokenCreated>;
     revoke(id: number): Promise<McpTokens>;
   };
@@ -411,6 +330,8 @@ export interface Api {
     setContact(contact: string): Promise<DiscordSetup>;
     setReact(on: boolean): Promise<DiscordSetup>;
     setReactEmoji(emoji: string): Promise<DiscordSetup>;
+    /** Sets the contributor role panel's channel and role, or turns it off (null). */
+    setRolePanel(panel: { channelId: string; roleId: string } | null): Promise<DiscordSetup>;
     removeLink(id: string): Promise<DiscordSetup>;
     /** `added` says whether the repo is link-only, and why. */
     addFilingRepo(repo: string): Promise<DiscordFilingAdded>;
@@ -429,21 +350,10 @@ export interface Api {
   cost(run?: string): Promise<CostReport>;
   /** Release downloads, issues, PRs and stars over a range; `app` is a repo name or "all". */
   downloads(range: DownloadsRange, app: string): Promise<DownloadsReport>;
-  /** The merge queue: every PR with a take or take-fix review at its head, and what it waits on. */
-  queue(filter: QueueFilter): Promise<QueueList>;
   /** Per pipeline step, the items its next job takes, in order, and what each step waits on. */
   next(): Promise<NextPage>;
   /** The name to type to address the app in a GitHub comment; null when no app is registered. */
   mention(): Promise<{ mention: string | null }>;
-  /** What waits on a person: counts for the tabs, feedback nobody answered yet (newest first, paged by cursor) and stopped stages. */
-  needs(filter: { feedback?: boolean; cursor?: string }): Promise<NeedsPage>;
-  /** A repo's issues with a stopped fix, 25 per page. */
-  needsFixes(repo: RepoName, cursor?: string): Promise<NeedsFixPage>;
-  needsOutside(author: string): Promise<NeedsOutsideList>;
-  /** Operator or maintainer with write (one item; Release all is the operator's): exempts one item held for its author's daily limit or a surge. */
-  releaseOutside(repo: RepoName, number: number): Promise<void>;
-  /** Integration batches of the merge queue, newest first, with their member PRs. */
-  queueBatches(filter: BatchFilter): Promise<BatchList>;
   /** One integration batch with its members, CI and history. */
   batch(id: number): Promise<BatchDetail>;
   /** Steps, jobs, the on/off switch and the stage limits: everyone reads; run, cancel, switch and limits are for operators. */
@@ -460,52 +370,32 @@ export interface Api {
     resetLimit(step: string): Promise<PipelineState>;
     /** Clears a stage the circuit breaker paused. */
     resumeTrip(stage: string): Promise<PipelineState>;
-    setOutsideLimits(input: Partial<Pick<OutsideState, "prsPerDay" | "issuesPerDay" | "surgePerHour">>): Promise<OutsideState>;
-    releaseOutsideAuthor(author: string): Promise<void>;
+    /** Operator only: outside authors with held items. */
+    heldAuthors(): Promise<HeldAuthor[]>;
+    /** Operator only: lets every item now held for the author through. */
+    releaseAuthor(author: string): Promise<{ released: number }>;
+    setOutsideLimits(input: Partial<Pick<OutsideState, "prsPerDay" | "issuesPerDay" | "surgePerHour">>): Promise<Pick<OutsideState, "prsPerDay" | "issuesPerDay" | "surgePerHour">>;
     /** Operator only: clears the warning about jobs of a step the runner stopped for running past their limit. */
     ackDeadline(step: string): Promise<{ ok: true }>;
-    /** Operator only: the model of the prepare step, one of `judgementModels`. */
-    setJudgementModel(model: string): Promise<PipelineState>;
     /** Operator only: the two blocker thresholds (changed lines). */
     setBlockers(input: Partial<PipelineState["blockers"]>): Promise<PipelineState>;
-    /** Limits the whole pipeline to these items ("repo#number"); an empty list clears the pilot. */
-    setPilot(items: string[]): Promise<PipelineState>;
   };
-  /** The pipeline as a flowchart: every stage with its branches and counts, for every tracked repo or one. */
-  flow(repo?: RepoName): Promise<Flow>;
 
-  /** Enabled accounts for everyone; operators also see disabled ones and edit label, enabled and max concurrent. Never an email or path. */
-  accounts: {
-    list(): Promise<ClaudeAccount[]>;
-    pause(): Promise<UsagePause>;
-    jev(): Promise<JevStatus>;
-    /** Operators: switches Jev on or off. */
-    setJev(input: { enabled: boolean }): Promise<JevStatus>;
-    /** Operators. */
-    setPause(input: UsagePause): Promise<UsagePause>;
-    update(id: string, input: AccountInput): Promise<ClaudeAccount>;
-    /** Operators: a new, disabled, signed-out account with this label. */
-    add(label: string): Promise<ClaudeAccount>;
-    /** Starts a sign-in; the answer's `login.url` is the page to open. */
-    loginStart(id: string): Promise<ClaudeAccount>;
-    /** Sends the code the sign-in page showed. */
-    loginCode(id: string, code: string): Promise<ClaudeAccount>;
-    loginCancel(id: string): Promise<ClaudeAccount>;
-    /** Starts a request for a long-lived token; the answer's `login.url` is the page to open. */
-    tokenStart(id: string): Promise<ClaudeAccount>;
-    /** Sends the code the token page showed; the token is stored on the server and never returned. */
-    tokenCode(id: string, code: string): Promise<ClaudeAccount>;
-    tokenCancel(id: string): Promise<ClaudeAccount>;
-    /** Deletes the account's long-lived token. */
-    tokenRemove(id: string): Promise<ClaudeAccount>;
-    signOut(id: string): Promise<ClaudeAccount>;
-    /** Reads sign-in state and plan usage now. */
-    refresh(id: string): Promise<ClaudeAccount>;
-  };
   /** Agent runs (one model call each): keyset-paged, filtered on the server. */
   agents: {
     list(filter: AgentRunFilter): Promise<AgentRunPage>;
     get(id: number): Promise<AgentRunDetail>;
+    /** Operators and maintainers. */
+    refusals(window: RefusalWindow): Promise<RefusalBreakdown>;
+    /** One full transcript of a run; operators and maintainers only. */
+    transcript(runId: number, id: number): Promise<TranscriptView>;
+  };
+  /** Operator only: where model-call transcripts are stored. `test` without input checks the active store. */
+  transcriptStore: {
+    status(): Promise<TranscriptStoreStatus>;
+    save(input: TranscriptStoreInput): Promise<TranscriptStoreStatus>;
+    clear(): Promise<TranscriptStoreStatus>;
+    test(input?: TranscriptStoreInput): Promise<{ ok: boolean; detail: string }>;
   };
   /** Build environments (workers that run untrusted code) and their tasks. Everyone reads; operators write. A worker key is returned once. */
   envs: {
@@ -526,6 +416,8 @@ export interface Api {
     grid(): Promise<NightlyGrid>;
     series(repo: string, bench: string): Promise<NightlySeries>;
     select(input: NightlySelectInput): Promise<NightlyGrid>;
+    /** Opens the issue of a failing check. */
+    openIssue(input: { repo: string; check: string }): Promise<NightlyGrid>;
   };
   /** The per-repo screenshot setup. Anyone who sees internals reads; operators write. */
   screenshotSetup: {
@@ -537,8 +429,6 @@ export interface Api {
     list(filter: TaskFilter): Promise<TaskPage>;
     get(id: number): Promise<BuildTaskDetail>;
     cancel(id: number): Promise<BuildTask>;
-    /** Queued and running tasks and free slots, for the flowchart's Verify node. */
-    summary(): Promise<BuildSummary>;
   };
   /** Workspace pods, their sessions and call logs. Operators and maintainers of the repo read calls and screenshots. */
   workspaces: {
@@ -558,38 +448,17 @@ export interface Api {
   signOut(): Promise<void>;
   /** Called after any write so open views can refetch. Returns an unsubscribe function. */
   subscribe(fn: () => void): () => void;
-  /** Nearest items by embedding across the tracked repos, best first, leaving out the item itself. */
-  similar(repo: RepoName, number: number, limit?: number): Promise<SimilarHit[]>;
   /** Search by meaning: the query's embedding against every item's. */
   semanticSearch(q: string): Promise<SimilarHit[]>;
-  /** Open items in work-score order with the parts of each score and the next pipeline step. Read-only. */
-  work(filter: WorkFilter): Promise<WorkList>;
-  /** Repos whose pipeline stages are on. */
-  pipelineRepos(): Promise<RepoName[]>;
-  /** Fast-tracked items as `repo#number`, first to run first. */
-  fastTrack(): Promise<string[]>;
-  /** PRs whose merge an operator holds, as `repo#number`. */
-  heldMerges(): Promise<string[]>;
   /** One tab of the Queue page over a repo filter. */
   queuePage(filter: QueuePageFilter): Promise<QueuePage>;
   /** Operator controls of the Queue page; items are `repo#number`. */
   queueControl: {
-    fastTrackAdd(item: string): Promise<string[]>;
-    fastTrackRemove(item: string): Promise<string[]>;
-    /** Sets the weight (1 to 10) of a fast-tracked item: heavier items go first. */
-    fastTrackWeight(item: string, weight: number): Promise<string[]>;
-    /**
-     * One "Queue items" line: a PR is pre-approved at its current head and fast-tracked with `weight`; an issue is fast-tracked, and the one open PR that closes it is queued too.
-     * `weight` is an operator's; a maintainer's line goes without one and gets the default weight for an item not fast-tracked yet.
-     */
-    add(item: string, weight?: number): Promise<{ label: string; fast: string[] }>;
-    hold(item: string): Promise<void>;
-    release(item: string): Promise<void>;
     batchRemove(item: string): Promise<void>;
     stopBatch(id: number): Promise<void>;
   };
   /** A registered workflow control (src/workflow/apply.ts `runControl`): hold or release a merge. The reply is the line every surface shows. */
-  controls: { run(input: { control: "hold-merge" | "release-merge"; item: { repo: RepoName; number: number } } | { control: "resume-breaker"; key: string }): Promise<{ ok: boolean; line: string }> };
+  controls: { run(input: { control: "resume-breaker"; key: string }): Promise<{ ok: boolean; line: string }> };
 }
 
 export const ApiContext = createContext<Api | null>(null);

@@ -9,16 +9,6 @@ const SEED: AreaDef[] = [
   { name: "Text", description: "Text frames, fonts and typesetting." },
 ];
 
-/** A fixed area per item for the mock lists: one of the seed areas, or none for every fifth number. */
-export const mockAreaOf = (number: number): string | null => (number % 5 === 0 ? null : SEED[number % SEED.length]!.name);
-
-/** The mock's `area` filter, as the server reads it: any of the names, `none` for the items without one. */
-export const mockAreaMatch = (want: string[] | undefined, number: number): boolean => {
-  if (!want?.length) return true;
-  const a = mockAreaOf(number);
-  return a === null ? want.includes("none") : want.includes(a);
-};
-
 export function createAreasMock(me: User, changed: () => void): Pick<Api, "areas"> {
   const state = new Map<string, RepoAreas>();
   let nextProposal = 1, nextJob = 1;

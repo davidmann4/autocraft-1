@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { afterEach, test } from "node:test";
 import { setRunner } from "../src/classify/run.ts";
 import { classifyNew } from "../src/runner/classify.ts";
-import { editAreas } from "../src/areas/store.ts";
+import { editAreas } from "../src/data/triage/index.ts";
 import { plannedItems } from "../src/core/select-items.ts";
 import type { StepContext } from "../src/runner/steps.ts";
 import { world, type World } from "./world-db.ts";

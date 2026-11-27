@@ -35,7 +35,7 @@ test("a SQLite database copied to Postgres and back verifies equal; a changed ro
   s.prepare("INSERT INTO item_embeddings (repo, number, model, hash, vec, at) VALUES ('a/b', 1, 'm', 'h', ?, 'x')").run(new Uint8Array([1, 2, 3, 255]));
   s.close();
 
-  const pg = await testDatabase("", "postgres");
+  const pg = await testDatabase("", "postgres", { empty: true });
   const back = join(SCRATCH, "copy-back.db");
   try {
     // A table of a retired feature that SQLite kept: refused unless left out on purpose.

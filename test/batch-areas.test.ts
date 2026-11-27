@@ -2,7 +2,7 @@
 // order, so a ready PR is never left out for an area match. GitHub and git are faked (test/world-db.ts).
 import assert from "node:assert/strict";
 import { afterEach, test } from "node:test";
-import { setItemArea } from "../src/areas/store.ts";
+import { editAreas, saveItemAreas } from "../src/data/triage/index.ts";
 import { runBatches } from "../src/merge/batch.ts";
 import { world, type World } from "./world-db.ts";
 
@@ -12,10 +12,11 @@ afterEach(() => current?.close());
 async function members(areas: (string | null)[], limit?: number): Promise<number[]> {
   current?.close();
   const w = (current = await (await world()).repo());
+  await editAreas(w.db, "app", { op: "replace", areas: [{ name: "render", description: "Drawing" }, { name: "text", description: "Type" }] }, null);
   for (const [i, area] of areas.entries()) {
     const n = i + 1;
     await (await (await (await w.pr(n)).review(n)).verified(n)).premerge(n, "clean");
-    await setItemArea(w.db, "app", n, area, "operator", null, 1);
+    await saveItemAreas(w.db, "app", 1, [{ repo: "app", number: n, area, source: "operator", confidence: null }]);
   }
   await runBatches(w.db, { repo: "app", ...(limit === undefined ? {} : { limit }) }, () => {}, w.gh.batchDeps());
   const rows = await w.db.all(w.db.k.selectFrom("merge_batch_prs").select("number").orderBy("batch_id").orderBy("position"));

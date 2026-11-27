@@ -3,35 +3,26 @@
 // session, and records the call in workspace_calls. Output from the pod is untrusted: it is decoded as UTF-8 with
 // replacement and stripped of control characters before it is stored or printed.
 import type { Db } from "../db/index.ts";
-import { BuildError } from "./envs.ts";
+import {
+  addWorkspaceCalls, loadCheckpoint, loadEnvs, loadWorkspaces, markCalls, moveWorkspaces, patchWorkspaces, requestWorkspaces, takeCallNumber as nextCallNumber, WorkspaceError,
+  DEFAULT_WORKSPACE_DEADLINE_SEC, LIVE_STATES, POD_STATES, WORKSPACE_STATES,
+} from "../data/build/index.ts";
+import type { WorkspaceRow, WorkspaceStateName } from "../data/build/index.ts";
+import { BuildError, envSettings } from "./envs.ts";
 import { KubeError, type ExecOptions, type ExecResult, type KubeApi } from "./kube-api.ts";
-import { ciCheckout, settingsOf } from "./pods.ts";
-import { repoWarmTarget } from "./sizing.ts";
-import { LAYOUT_CI } from "./workspace-layout.ts";
+import { ciCheckout } from "./pods.ts";
 import { WS_POD_PATH } from "./workspace.ts";
-import { DEFAULT_WORKSPACE_DEADLINE_SEC, WS_CONTAINER, workspaceSelector, type WorkspaceLimits } from "./workspace-pods.ts";
+import { WS_CONTAINER, workspaceSelector, type WorkspaceLimits } from "./workspace-pods.ts";
 
-export const WORKSPACE_STATES = ["requested", "starting", "seeding", "ready", "parked", "ended", "failed"] as const;
-export type WorkspaceStateName = (typeof WORKSPACE_STATES)[number];
-/** A live row owns its volume; one in POD_STATES also owns its pod. */
-export const LIVE_STATES: WorkspaceStateName[] = ["requested", "starting", "seeding", "ready", "parked"];
-export const POD_STATES: WorkspaceStateName[] = ["starting", "seeding", "ready"];
+export { LIVE_STATES, POD_STATES, WORKSPACE_STATES };
+export type { WorkspaceRow, WorkspaceStateName };
+
 /** Output kept per call, after the helper's own cap. */
 export const MAX_CALL_OUTPUT = 64 * 1024;
 
-const SHA = /^[0-9a-f]{40}$/;
-const REPO = /^[A-Za-z0-9._-]{1,100}$/;
 
-/** Every column but the checkpoint, which only a resume and `workspace show` read. */
-export const WORKSPACE_COLUMNS = [
-  "id", "repo", "base_sha", "base_commit", "app", "env_id", "state", "state_at", "pod", "pod_created_at", "create_tries", "pvc", "node", "limits",
-  "checkpoint_at", "last_call_at", "next_call", "error", "owner", "created_at", "updated_at", "ended_at", "remote_call_id",
-  "volume_fresh", "resume_tries", "checkpoint_error", "restored", "restored_at", "layout", "prepared", "warm", "warm_commit",
-] as const;
-export const getWorkspace = async (db: Db, id: number) => await db.get(db.k.selectFrom("workspaces").select(WORKSPACE_COLUMNS).where("id", "=", id));
-export type WorkspaceRow = NonNullable<Awaited<ReturnType<typeof getWorkspace>>>;
-export const getCheckpoint = async (db: Db, id: number): Promise<Uint8Array | null> =>
-  (await db.get(db.k.selectFrom("workspaces").select(["checkpoint"]).where("id", "=", id)))?.checkpoint ?? null;
+export const getWorkspace = async (db: Db, id: number): Promise<WorkspaceRow | undefined> => (await loadWorkspaces(db, { ids: [id] })).get(id);
+export const getCheckpoint = async (db: Db, id: number): Promise<Uint8Array | null> => await loadCheckpoint(db, id);
 
 /** A running call holds the pod until this long past its own time limit. */
 export const CALL_GRACE_MS = 30_000;
@@ -47,29 +38,22 @@ export const limitsOf = (w: { limits: string }): WorkspaceLimits => {
 
 /** Throws when `envId` is a warm writer environment: it holds the warm store's write credential, which a workspace must never see. */
 export async function refuseWarmWriter(db: Db, envId: string): Promise<void> {
-  const env = await db.get(db.k.selectFrom("build_envs").select(["kind", "settings"]).where("id", "=", envId));
-  if (env?.kind === "kubernetes" && settingsOf(env.settings).warmWriter) throw new BuildError(400, `${envId} is a warm writer environment and takes no workspaces`);
+  const env = (await loadEnvs(db, { ids: [envId] }))[0];
+  if (env?.kind === "kubernetes" && envSettings(env).warmWriter) throw new BuildError(400, `${envId} is a warm writer environment and takes no workspaces`);
 }
 
 export type WorkspaceRequest = { repo: string; baseSha: string; envId: string; app?: string | null; limits?: Partial<WorkspaceLimits>; owner: string | null };
 
+/** Maps the data module's refusals to the status errors the API answers with. */
+const mapped = (e: unknown): never => {
+  throw e instanceof WorkspaceError ? new BuildError(e.status, e.message) : e;
+};
+
 /** Records a `requested` workspace; the launcher creates its volume and pod when the environment has a free slot. */
 export async function createWorkspace(db: Db, r: WorkspaceRequest, now = Date.now()): Promise<number> {
-  if (!REPO.test(r.repo)) throw new BuildError(400, "repo must be a repository name");
-  if (!SHA.test(r.baseSha)) throw new BuildError(400, "the base must be a full 40-character commit sha");
-  const env = await db.get(db.k.selectFrom("build_envs").select(["kind"]).where("id", "=", r.envId));
-  if (env?.kind !== "kubernetes") throw new BuildError(400, `${r.envId} is not a kubernetes environment`);
-  await refuseWarmWriter(db, r.envId);
-  const deadlineSec = r.limits?.deadlineSec ?? DEFAULT_WORKSPACE_DEADLINE_SEC;
-  if (!Number.isInteger(deadlineSec) || deadlineSec < 300 || deadlineSec > 24 * 3600) throw new BuildError(400, "deadlineSec must be 300 to 86400");
-  const at = new Date(now).toISOString();
   // A repository with a warm target works at the CI paths, so its builds reuse the node's warm version (workspace-layout.ts).
-  const layout = ciCheckout(r.repo) && await repoWarmTarget(db, r.repo) !== "none" ? LAYOUT_CI : 1;
-  const row = await db.get(db.k.insertInto("workspaces").values({
-    repo: r.repo, base_sha: r.baseSha, app: r.app ?? null, env_id: r.envId, state: "requested", state_at: at, limits: JSON.stringify({ deadlineSec }),
-    owner: r.owner, created_at: at, updated_at: at, layout,
-  }).returning("id"));
-  return Number(row!.id);
+  const ids = await requestWorkspaces(db, [{ repo: r.repo, baseSha: r.baseSha, envId: r.envId, app: r.app, limits: r.limits, owner: r.owner, ciCheckout: ciCheckout(r.repo) !== null }], new Date(now).toISOString()).catch(mapped);
+  return ids[0]!;
 }
 
 /**
@@ -77,11 +61,7 @@ export async function createWorkspace(db: Db, r: WorkspaceRequest, now = Date.no
  * end got there first), so a step that ran in the background never revives a row that ended meanwhile.
  */
 export async function moveWorkspace(db: Db, id: number, from: WorkspaceStateName[], to: WorkspaceStateName, set: Partial<Omit<WorkspaceRow, "id" | "state">> = {}, now = Date.now()): Promise<boolean> {
-  const at = new Date(now).toISOString();
-  const r = await db.run(db.k.updateTable("workspaces")
-    .set({ ...set, state: to, state_at: at, updated_at: at, ...(to === "ended" || to === "failed" ? { ended_at: at } : {}) })
-    .where("id", "=", id).where("state", "in", from));
-  return r.changes > 0;
+  return (await moveWorkspaces(db, [{ id, from, to, set }], new Date(now).toISOString())).has(id);
 }
 
 /** Failed resumes after which a parked workspace stays parked, with its volume and checkpoint, until someone looks at it. */
@@ -152,8 +132,8 @@ export async function workspacePod(db: Db, api: KubeApi, id: number): Promise<{ 
   const row = await getWorkspace(db, id);
   if (!row) throw new BuildError(404, `no workspace ${id}`);
   if ((row.state !== "seeding" && row.state !== "ready") || !row.pod) throw new BuildError(409, `workspace ${id} is ${row.state}, with no pod to run in`);
-  const env = await db.get(db.k.selectFrom("build_envs").select(["settings"]).where("id", "=", row.env_id));
-  const ns = settingsOf(env?.settings ?? null).namespace;
+  const env = (await loadEnvs(db, { ids: [row.env_id] }))[0];
+  const ns = envSettings(env ?? { settings: null }).namespace;
   // An earlier pod of the workspace may still be shutting down (a resume while its node is gone); it never runs anything.
   const pods = (await api.listPods(ns, workspaceSelector(id))).filter((p) => !p.metadata.deletionTimestamp);
   const pod = pods.find((p) => p.metadata.name === row.pod);
@@ -191,11 +171,7 @@ export async function execHelper(db: Db, api: KubeApi, id: number, argv: string[
 }
 
 /** Takes the workspace's next `ws run` call number. */
-export async function takeCallNumber(db: Db, id: number): Promise<number> {
-  const r = await db.get(db.k.updateTable("workspaces").set((eb) => ({ next_call: eb("next_call", "+", 1) })).where("id", "=", id).returning("next_call"));
-  if (!r) throw new BuildError(404, `no workspace ${id}`);
-  return Number(r.next_call) - 1;
-}
+export const takeCallNumber = async (db: Db, id: number): Promise<number> => await nextCallNumber(db, id).catch(mapped);
 
 export type WsCallOptions = {
   /** What the call is for: a session tool name, or the launcher's `seed` and `checkpoint`. */
@@ -225,17 +201,16 @@ export async function execWs(db: Db, api: KubeApi, id: number, argv: string[], o
   const deadline = new Date(now() + o.timeoutMs + CALL_GRACE_MS).toISOString();
   let callId = o.row;
   if (callId === undefined) {
-    const r = await db.get(db.k.insertInto("workspace_calls").values({ workspace_id: id, n, tool: o.tool, args, state: "running", created_at: iso(), started_at: iso(), deadline_at: deadline }).returning("id"));
-    callId = Number(r!.id);
+    callId = (await addWorkspaceCalls(db, [{ workspace_id: id, n, tool: o.tool, args, state: "running", result: null, created_at: iso(), started_at: iso(), deadline_at: deadline, finished_at: null, run_id: null }]))[0]!;
   } else {
-    await db.run(db.k.updateTable("workspace_calls").set({ n, state: "running", started_at: iso(), deadline_at: deadline }).where("id", "=", callId).where("workspace_id", "=", id));
+    await markCalls(db, [{ id: callId, set: { n, state: "running", started_at: iso(), deadline_at: deadline } }]);
   }
   const touch = async () => {
-    if (o.touch) await db.run(db.k.updateTable("workspaces").set({ last_call_at: iso(), updated_at: iso() }).where("id", "=", id));
+    if (o.touch) await patchWorkspaces(db, [{ id, set: { last_call_at: iso(), updated_at: iso() } }]);
   };
   await touch();
   const finish = async (state: "done" | "failed", result: object) => {
-    await db.run(db.k.updateTable("workspace_calls").set({ state, result: JSON.stringify(result), finished_at: iso() }).where("id", "=", callId!));
+    await markCalls(db, [{ id: callId!, set: { state, result: JSON.stringify(result), finished_at: iso() } }]);
     await touch();
   };
   let r: WsRaw;

@@ -3,11 +3,11 @@ import { mkdirSync, mkdtempSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 import { calls, detail, image, list, output } from "../src/dash/api/workspaces.ts";
-import { TOPICS } from "../src/live.ts";
+import { TOPICS } from "../src/db/live.ts";
 import { INPUT_TOPICS } from "../src/runner/autopilot.ts";
 import type { Req } from "../src/dash/types.ts";
 import { SCRATCH } from "./scratch.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb } from "./helpers/raw-db.ts";
 
 mkdirSync(SCRATCH, { recursive: true });
 

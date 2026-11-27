@@ -7,8 +7,10 @@ import { after, before, describe, test } from "node:test";
 import type { BuildTaskDetail, TaskPage } from "../web/src/api/types.ts";
 import { addLogin } from "../src/access.ts";
 import { sniff } from "../src/build/artifacts.ts";
-import { authenticate, createEnv, hello, listEnvs, rotateKey, updateEnv } from "../src/build/envs.ts";
-import { appendLog, MAX_LOG_BYTES, cancelTask, claim, createTask, finishTask, getTask } from "../src/build/tasks.ts";
+import { authenticate, BuildError, createEnv, hello, listEnvs, rotateKey, updateEnv } from "../src/build/envs.ts";
+import { setCallContext } from "../src/agents/call.ts";
+import { loadClaimInputs } from "../src/data/build/index.ts";
+import { appendLog, MAX_LOG_BYTES, cancelTask, claim, cloneTask, createTask, finishTask, getTask, pickTasks } from "../src/build/tasks.ts";
 import { startWorkerServer } from "../src/build/worker-api.ts";
 import { useRunnerClient } from "../src/remote/runner-client.ts";
 import { apiRoutes } from "../src/dash/api/index.ts";
@@ -17,7 +19,7 @@ import { startServer } from "../src/dash/server/index.ts";
 import { FakeProvider } from "../src/dash/server/provider.ts";
 import { scopeToTracked } from "../src/repos.ts";
 import { SCRATCH } from "./scratch.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb } from "./helpers/raw-db.ts";
 
 mkdirSync(SCRATCH, { recursive: true });
 const dir = mkdtempSync(join(SCRATCH, "build-test-"));
@@ -98,6 +100,32 @@ describe("worker API", () => {
       method, headers: { ...(key ? { authorization: `Bearer ${key}` } : {}), ...(body !== undefined ? { "content-type": type } : {}) },
       body: body === undefined ? undefined : Buffer.isBuffer(body) ? new Uint8Array(body) : typeof body === "string" ? body : JSON.stringify(body),
     });
+
+  test("a batch build in a repo that is off is claimed only when a person started every member", async () => {
+    await clear();
+    const e = await env();
+    await task({ repo: "vault" });
+    const read = await loadClaimInputs(db, e.id, Date.now());
+    const pick = async (members: number[]) => {
+      const inputs = { ...read, startedRefs: new Set(["vault#1"]) as typeof read.startedRefs, batches: new Map(read.candidates.map((t) => [t.id, { repo: "vault", members }])) as unknown as typeof read.batches };
+      return (await pickTasks(db, e.id, 1, Date.now(), { inputs })).picks.length;
+    };
+    assert.equal(await pick([1, 2]), 0);
+    assert.equal(await pick([1]), 1);
+    assert.equal(await pick([]), 0);
+  });
+
+  test("a task queued again belongs to the job that queues it, and a full queue refuses it as a status error", async () => {
+    await clear();
+    const id = await task();
+    setCallContext({ jobId: 77, step: "verify", stage: 5, class: 0, cancelled: async () => false });
+    try {
+      assert.equal((await getTask(db, await cloneTask(db, id)))!.jobId, 77);
+    } finally { setCallContext(null); }
+    await db.run(db.k.insertInto("build_tasks").values(Array.from({ length: 500 }, () => ({ step: "verify", repo: "open-app", head_sha: SHA, requires: "{}", plan: "[]", state: "queued", queued_at: "2026-01-01T00:00:00Z" }))));
+    await assert.rejects(cloneTask(db, id), (e: BuildError) => e instanceof BuildError && e.status === 429);
+    await clear();
+  });
 
   test("keys: missing, wrong, other environment's and rotated keys are refused", async () => {
     const a = await env(), b = await env();

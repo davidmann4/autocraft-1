@@ -20,7 +20,7 @@ export type NightlyCheck = {
   kind: CheckKind;
   /** Whether the selection starts with the check on for a repo. */
   defaultOn: boolean;
-  /** Unproven in the sandbox: failures are shown but open no issue and ask no decision. */
+  /** Unproven in the sandbox: failures are shown but open no issue. */
   experimental?: boolean;
   /** What the repo must have for the check to mean anything; the selection page shows it. */
   needs?: "fuzz-dir" | "benches";

@@ -17,6 +17,7 @@ export default {
       panel: "var(--st-panel)",
       raised: "var(--st-raised)",
       sunken: "var(--st-sunken)",
+      bubble: "var(--st-bubble)",
       controls: rgb("--st-controls-rgb"),
       ink: rgb("--st-fg-rgb"),
       inv: rgb("--st-inv-rgb"),
@@ -44,6 +45,9 @@ export default {
       DEFAULT: "3px",
       md: "4px",
       lg: "6px",
+      /* chat surfaces: the reply box and message bubbles */
+      xl: "12px",
+      bubble: "18px",
       full: "9999px",
     },
     extend: {

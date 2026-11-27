@@ -4,25 +4,23 @@
 // (CacheReporter); the dashboard and the CLI combine that with the warm tasks and settings in the database (cacheReport).
 // The row is bookkeeping for the planner and bumps only the `envs` topic (src/live.ts).
 import type { CacheHeld, CacheNode, CachePlaced, CacheRepo, CacheReport, TaskState } from "../../web/src/api/types.ts";
-import { mapLimit } from "../async-seq.ts";
 import { normalizeRepo } from "../cratemirror/git.ts";
 import type { Db } from "../db/index.ts";
 import { envVar } from "../env.ts";
 import { filtered, isHiddenRepo, type HiddenRepos } from "../hidden-sql.ts";
-import { trackedNames } from "../repos.ts";
-import { setting, writeSetting } from "../settings-read.ts";
+import { loadCacheReport, saveWarmReport } from "../data/build/index.ts";
+import { loadTrackedRepos } from "../data/control/index.ts";
 import type { Placement } from "../warm/placement.ts";
 import type { NodeStatus } from "../warm/sync-agent.ts";
 import type { ConfigMapApi } from "./kube-api.ts";
 import { settingsOf } from "./pods.ts";
 import { autoWarmTarget } from "./sizing.ts";
-import { warmKeyOf, WARM_STEP } from "./tasks.ts";
+import { warmKeyOf } from "./tasks.ts";
 import { WARM_TARGETS } from "./warm-mount.ts";
 import type { WarmPlacer } from "./warm-place.ts";
-import { mainHead, warmCoverage, warmTaskImage, warmWriter } from "./warm-queue.ts";
+import { warmCoverage, warmTaskImage, warmWriter } from "./warm-queue.ts";
 import { STATUS_NAMESPACE, STATUS_STALE_MS, type WarmStatus } from "./warm-status.ts";
 
-export const CACHE_REPORT_KEY = "warm_report";
 /** The crate mirror's git allowlist (one `owner/repo` per line, `#` comments), in the warm status namespace. */
 export const MIRROR_ALLOWLIST_CONFIGMAP = "crate-mirror-git-allowlist";
 export const MIRROR_ALLOWLIST_DATA_KEY = "allowlist.txt";
@@ -38,15 +36,6 @@ export type StoredCaches = {
   placementNote: string | null;
   mirror: { allowlist: string[] | null; error: string | null; readAt: number } | null;
 };
-
-function parseStored(text: string | undefined): StoredCaches | null {
-  try {
-    const s = JSON.parse(text ?? "") as StoredCaches;
-    return s?.version === 1 && Array.isArray(s.nodes) ? s : null;
-  } catch {
-    return null;
-  }
-}
 
 /** The repositories in an allowlist file's text, sorted, as the mirror reads them. */
 export const parseAllowlist = (text: string): string[] =>
@@ -95,7 +84,7 @@ export class CacheReporter {
     // Node statuses are rewritten every 5 minutes with only `updated` moving: those changes wait for the refresh.
     const shape = JSON.stringify({ ...report, readAt: null, nodes: report.nodes.map((n) => ({ ...n, updated: 0 })), mirror: report.mirror && { ...report.mirror, readAt: 0 } });
     if (shape === this.shape && now - this.writtenAt < REFRESH_MS) return;
-    await writeSetting(db, CACHE_REPORT_KEY, full);
+    await saveWarmReport(db, full);
     this.written = full;
     this.shape = shape;
     this.writtenAt = now;
@@ -144,56 +133,31 @@ export function cacheNodes(stored: Pick<StoredCaches, "nodes" | "placement">, pu
   return { nodes, placement };
 }
 
-type TaskRow = { id: number; repo: string; state: string; summary: string | null; head_sha: string; ended_at: string | null; sandbox_env: string | null; warm_image: string | null };
-
 /** The report for a reader who may not see the `hidden` repositories. */
 export async function cacheReport(db: Db, hidden: HiddenRepos, now = Date.now()): Promise<CacheReport> {
-  const stored = parseStored(await setting(db, CACHE_REPORT_KEY));
-  const cov = await warmCoverage(db);
-  const warmTasks = () => db.k.selectFrom("build_tasks").where("step", "=", WARM_STEP);
-  const taskRepos = (await db.all(warmTasks().select("repo").distinct())).map((r) => r.repo);
-  const keyRepo = new Map([...await trackedNames(db), ...taskRepos, ...cov.added, ...cov.excluded].map((r) => [warmKeyOf(r), r]));
+  const [cov, tracked, writer] = await db.together(async () => await Promise.all([warmCoverage(db), loadTrackedRepos(db), warmWriter(db)]));
+  const covered = new Map(cov.repos.map((r) => [r.repo, r.why]));
+  const known = [...new Set([...tracked.keys(), ...covered.keys(), ...cov.added, ...cov.excluded])];
+  const inputs = await loadCacheReport(db, known, { hiddenRepos: hidden, staff: false });
+  const stored = inputs.stored as StoredCaches | null;
+  const { taskRepos, last, done, bytes, heads } = inputs;
+  const keyRepo = new Map([...known, ...taskRepos].map((r) => [warmKeyOf(r), r]));
   const visible = (repo: string | null) => (repo ? !isHiddenRepo(hidden, repo) : !filtered(hidden));
   const repoOf = (key: string) => {
     const repo = keyRepo.get(key) ?? null;
     return visible(repo) ? repo : undefined;
   };
 
-  const covered = new Map(cov.repos.map((r) => [r.repo, r.why]));
   const listed = [...new Set([...covered.keys(), ...cov.added, ...cov.excluded, ...taskRepos])].filter((r) => visible(r)).sort();
-  const newestIds = async (done: boolean) => {
-    let q = warmTasks().select((eb) => eb.fn.max("id").as("id")).groupBy("repo");
-    if (done) q = q.where("state", "=", "done");
-    return (await db.all(q)).map((r) => Number(r.id));
-  };
-  const ids = [...await newestIds(false), ...await newestIds(true)];
-  const rows: TaskRow[] = ids.length
-    ? await db.all(db.k.selectFrom("build_tasks").select(["id", "repo", "state", "summary", "head_sha", "ended_at", "sandbox_env", "warm_image"]).where("id", "in", ids))
-    : [];
-  const last = new Map<string, TaskRow>(), done = new Map<string, TaskRow>();
-  for (const r of rows.sort((a, b) => a.id - b.id)) {
-    last.set(r.repo, r);
-    if (r.state === "done") done.set(r.repo, r);
-  }
   const keys = listed.map(warmKeyOf);
-  const bytes = new Map<string, number>();
-  const sizes = new Map<string, string>();
-  if (listed.length) {
-    for (const r of await db.all(db.k.selectFrom("main.settings").select(["key", "value"]).where("key", "in", keys.map((k) => `warm_bytes:${k}`)))) {
-      const n = Number(r.value);
-      if (Number.isSafeInteger(n) && n > 0) bytes.set(r.key.slice("warm_bytes:".length), n);
-    }
-    for (const r of await db.all(db.k.selectFrom("build_sizes").select(["repo", "warm_target"]).where("repo", "in", listed))) if (r.warm_target) sizes.set(r.repo, r.warm_target);
-  }
-  const heads = await mapLimit(listed, 8, async (r) => await mainHead(db, r));
-  const writer = await warmWriter(db);
+  const sizes = inputs.warmTargets;
 
   const published = new Map([...done.values()].map((r) => [warmKeyOf(r.repo), r.head_sha]));
   const { nodes, placement } = stored ? cacheNodes(stored, published, now, repoOf) : { nodes: [], placement: null };
   const freshNodes = stored?.nodes.filter((s) => now - s.updated <= STATUS_STALE_MS) ?? [];
 
   const repos = listed.map((repo, i): CacheRepo => {
-    const key = keys[i]!, head = heads[i] ?? null, l = last.get(repo), d = done.get(repo);
+    const key = keys[i]!, head = heads.get(repo) ?? null, l = last.get(repo), d = done.get(repo);
     const image = d ? warmTaskImage(d) : null;
     const set = sizes.get(repo);
     const isSet = (WARM_TARGETS as readonly string[]).includes(set ?? "");
@@ -211,8 +175,7 @@ export async function cacheReport(db: Db, hidden: HiddenRepos, now = Date.now())
     };
   });
 
-  const mirrorEnvs = (await db.all(db.k.selectFrom("build_envs").select(["id", "settings"]).where("kind", "=", "kubernetes").where("enabled", "=", 1).orderBy("id")))
-    .filter((e) => settingsOf(e.settings).crateMirror).map((e) => e.id);
+  const mirrorEnvs = inputs.kubeEnvs.filter((e) => settingsOf(e.settings).crateMirror).map((e) => e.id);
   const m = stored?.mirror;
   return {
     readAt: stored?.readAt ? iso(stored.readAt) : null,

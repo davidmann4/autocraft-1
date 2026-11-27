@@ -1,10 +1,9 @@
 // The merge queue, on the Merge queue tab: every PR with a take or take-fix review as one Workable table, grouped by the step it waits on,
-// in the order a PR passes them; integration batches are groups of their own, then the stopped PRs. PRs queued with Queue items or
-// pre-approved that have no take review yet come first, in a Queued group, so what was queued shows at once; fast-tracked issues whose
-// PR is not in the queue yet are in that group too, since Fix builds their PR and it comes into the queue from there.
+// in the order a PR passes them; integration batches are groups of their own, then the stopped PRs. PRs approved for merge that have
+// no take review yet come first, in a Queued group, so what was queued shows at once.
 import { Fragment, useEffect, useMemo } from "react";
 import { useApi } from "../../api/client";
-import type { FastPosition, NextMerge, QueueBatch, QueueOrigin, QueuePendingRow, QueueRow, QueueState } from "../../api/types";
+import type { NextMerge, QueueBatch, QueueOrigin, QueuePendingRow, QueueRow, QueueState } from "../../api/types";
 import { useUser } from "../../shell/UserContext";
 import { canRun } from "../../registry/permissions";
 import { Badge } from "../../ui/atoms/Badge";
@@ -14,10 +13,10 @@ import { cn } from "../../ui/cn";
 import { num } from "../../lib/format";
 import { IMPLEMENTATION_STATE } from "../../lib/status";
 import { ConfirmButton, ErrorLine, useWrite } from "../admin/parts";
-import { FastMark } from "./fastTrack";
 import { useIsLinked } from "./highlight";
-import { BatchFacts, DecisionLink, STATE, StateChip, TIER, Why } from "./mergeParts";
+import { BatchFacts, STATE, StateChip, TIER, Why } from "./mergeParts";
 import { CHECK_COLUMNS, checkCells, Size, SIZE_COLUMN } from "./checks";
+import { PENDING_STEP } from "./pendingStep";
 import { RowMenu } from "./RowMenu";
 import { usePage } from "./usePage";
 
@@ -28,7 +27,7 @@ const STEPS: { id: StepId; label: string; hint: string; dot: string; states: Que
   { id: "verify", label: "Verify", hint: "Build and tests run at the reviewed head", dot: "bg-c1", states: ["waiting-verify"] },
   { id: "ci", label: "CI", hint: "Upstream CI at the head, a red default branch, or CI runs waiting for approval", dot: "bg-c2", states: ["waiting-ci", "waiting-main-ci", "ci-approval"] },
   { id: "premerge", label: "Pre-merge review", hint: "Opus reviews the head commit once more before it merges", dot: "bg-c3", states: ["waiting-premerge"] },
-  { id: "ready", label: "Ready", hint: "Covered by the merge rule or approved by an operator; merges on the next run", dot: "bg-ok", states: ["ready", "decision-answered-merge"] },
+  { id: "ready", label: "Ready", hint: "Covered by the merge rule or approved by a maintainer; merges on the next run", dot: "bg-ok", states: ["ready", "decision-answered-merge"] },
   { id: "batch", label: "In a batch", hint: "Lands with its integration batch once the batch's checks are green", dot: "bg-accent", states: ["batch-checking", "in-batch"] },
 ];
 
@@ -38,7 +37,7 @@ const BLOCKED: QueueState[] = ["refused", "ci-failed", "conflict", "needs-fix-up
 const STEP_OF = new Map<QueueState, StepId>(STEPS.flatMap((s) => s.states.map((st) => [st, s.id] as const)));
 const key = (r: { repo: string; number: number }) => `${r.repo}#${r.number}`;
 
-type Row = QueueRow & { held?: boolean; fast?: FastPosition | null; batch?: number; added?: QueueOrigin };
+type Row = QueueRow & { batch?: number; added?: QueueOrigin };
 type Next = Map<string, { position: number; merge: NextMerge }>;
 
 const COLUMNS: WorkableColumn[] = [
@@ -51,11 +50,10 @@ const COLUMNS: WorkableColumn[] = [
 ];
 
 const HOW: Record<QueueOrigin["how"], [string, string]> = {
-  review: ["Take review", "Came in with a take review; the merge rule or a Merge? answer lets it merge"],
-  answer: ["Merge answer", "An operator answered Merge?"],
-  queued: ["Queued", "Added with Queue items"],
-  preapproved: ["Pre-approved", "An operator pre-approved the merge with a fix-up"],
-  fast: ["Fast-tracked", "The issue is fast-tracked: Fix builds its PR first, and the PR comes into the queue through its review"],
+  review: ["Take review", "Came in with a take review; the merge rule or an approval lets it merge"],
+  answer: ["Approved", "Its merge approval was carried to this head"],
+  queued: ["Queued", "A maintainer put it into the merge queue"],
+  preapproved: ["Pre-approved", "Its merge was approved with a fix-up"],
 };
 
 /** How the PR came into the queue, by whom and when. */
@@ -75,32 +73,23 @@ function Added({ r }: { r: { added?: QueueOrigin; reviewedAt?: string } }) {
 
 function PrRow({ r, next }: { r: Row; next: Next }) {
   const n = next.get(key(r));
-  const fast = r.fast ?? n?.merge.fast ?? null;
   const linked = useIsLinked(r.repo, r.number);
   const wait = n?.merge.label;
-  const sub = (
-    <span className="flex flex-wrap items-center gap-x-3">
-      <Why row={r} />
-      {r.decisionId && <DecisionLink row={r} />}
-    </span>
-  );
   return (
     <WorkableRow
       item={{ repo: r.repo, number: r.number, kind: "pr", state: "open", title: r.title, closes: r.closes }}
       dataItem={`${r.repo}:${r.number}`}
       highlight={linked}
-      mark={<FastMark fast={fast} />}
-      sub={r.decisionId || r.refusedReason || r.note || r.outsideRule.length ? sub : undefined}
+      sub={r.refusedReason || r.note || r.outsideRule.length ? <Why row={r} /> : undefined}
       cells={{
         step: (
           <span className="flex flex-col items-start gap-0.5">
             <span className="flex flex-wrap items-center gap-1">
               <StateChip row={r} />
-              {r.held && <Badge tone="warn">Held</Badge>}
             </span>
             {r.conflictNote && <span className="text-2xs text-ink/55">{r.conflictNote}</span>}
             {wait && wait !== STATE[r.state][0] && <span className="text-2xs text-ink/50">{wait}</span>}
-            {r.path === "operator" && <span className="text-2xs text-ink/50">Approved by an operator</span>}
+            {r.path === "operator" && <span className="text-2xs text-ink/50">Approved by a maintainer</span>}
           </span>
         ),
         ...checkCells(r),
@@ -112,22 +101,14 @@ function PrRow({ r, next }: { r: Row; next: Next }) {
           </span>
         ),
         added: <Added r={r} />,
-        actions: <RowMenu repo={r.repo} number={r.number} fast={fast} held={!!r.held} pr inBatch={r.batch !== undefined} backlog={r.state !== "held-backlog"} />,
+        actions: <RowMenu repo={r.repo} number={r.number} inBatch={r.batch !== undefined} backlog={r.state !== "held-backlog"} />,
       }}
     />
   );
 }
 
-/** The Queued group: queued or pre-approved PRs before their take review, and fast-tracked issues whose PR is not in the queue yet. */
+/** The Queued group: PRs approved for merge before their take review. */
 const QUEUED = { id: "queued", label: "Queued", dot: "bg-ink/40" };
-
-const PENDING_STEP: Record<Exclude<QueuePendingRow["step"], "next" | "implement">, string> = {
-  fixup: "Fix-up first",
-  review: "Waiting for review",
-  ci: "Reviewed: take",
-  build: "Waiting for its PR",
-  pr: "PR open",
-};
 
 function PendingRow({ r }: { r: QueuePendingRow }) {
   const linked = useIsLinked(r.repo, r.number);
@@ -148,20 +129,18 @@ function PendingRow({ r }: { r: QueuePendingRow }) {
       item={{ repo: r.repo, number: r.number, kind: r.kind, state: "open", title: r.title }}
       dataItem={`${r.repo}:${r.number}`}
       highlight={linked}
-      mark={<FastMark fast={r.fast} />}
       sub={sub}
       cells={{
         step: (
           <span className="flex flex-wrap items-center gap-1">
             {label && <Badge tone={im ? IMPLEMENTATION_STATE[im.state].tone : "neutral"}>{label}</Badge>}
-            {r.held && <Badge tone="warn">Held</Badge>}
           </span>
         ),
         ...checkCells(null),
         size: r.size ? <Size size={r.size} /> : null,
         author: <span className="block truncate text-xs text-ink/70">{r.author || "unknown"}</span>,
         added: <Added r={r} />,
-        actions: <RowMenu repo={r.repo} number={r.number} fast={r.fast} held={r.held} pr={r.kind === "pr"} inBatch={false} backlog />,
+        actions: <RowMenu repo={r.repo} number={r.number} inBatch={false} backlog />,
       }}
     />
   );
@@ -219,7 +198,7 @@ export function MergeBoard({ repo }: { repo: string | null }) {
     const steps = new Map<StepId, Row[]>(STEPS.map((s) => [s.id, []]));
     const blocked: Row[] = [];
     for (const r of rows.values()) {
-      if (r.held || BLOCKED.includes(r.state)) blocked.push(r);
+      if (BLOCKED.includes(r.state)) blocked.push(r);
       else {
         const s = STEP_OF.get(r.state);
         if (s) steps.get(s)!.push(r);

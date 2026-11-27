@@ -1,5 +1,5 @@
 // Verify, Fix-up and Act results for the Item page, varied by item number.
-import type { Item, ItemAction, ItemFixup, ItemPatchCheck, ItemPostmerge, ItemPremerge, ItemReviews, ItemVerification, TaskResult } from "../types";
+import type { Item, ItemFixup, ItemPatchCheck, ItemPostmerge, ItemPremerge, ItemReviews, ItemVerification, TaskResult } from "../types";
 
 const H = 3600_000;
 const NOW = Date.parse("2026-11-02T10:40:00Z");
@@ -51,13 +51,6 @@ function fixupsFor(n: number): ItemFixup[] {
     ];
   }
   if (n % 6 === 4) return [{ fromHead: sha(n), toHead: null, state: "cannot-push", reason: "the contributor has not allowed edits from maintainers", files: [], attempt: 1, createdAt: iso(6 * H) }];
-  return [];
-}
-
-function actionsFor(n: number, kind: Item["kind"]): ItemAction[] {
-  if (n % 6 === 2) return [{ decisionId: `d-${n}`, kind: "comment-close", state: "done", commentUrl: `https://github.com/example-org/repo/pull/${n}#issuecomment-${n * 31}`, reason: null, createdAt: iso(3 * H) }];
-  if (kind === "issue" && n % 6 === 0) return [{ decisionId: `d-${n}`, kind: "comment-close", state: "failed", commentUrl: `https://github.com/example-org/repo/issues/${n}#issuecomment-${n * 31}`, reason: "the comment is posted; the close failed (HTTP 502)", createdAt: iso(2 * H) }];
-  if (n % 6 === 3 && kind === "pr") return [{ decisionId: `d-${n}`, kind: "comment-close", state: "skipped", commentUrl: null, reason: "the head moved after the decision", createdAt: iso(2 * H) }];
   return [];
 }
 
@@ -121,6 +114,6 @@ export function premergeFor(n: number, kind: Item["kind"]): ItemPremerge[] {
   return [newest, { head: sha(n + 5), at: iso(30 * H), model: "claude-opus-5-5", searched: null, error: null, tries: 0, findings: [] }];
 }
 
-export function prWorkFor(n: number, kind: Item["kind"]): Pick<Item, "verification" | "fixups" | "actions" | "reviews" | "patchChecks"> {
-  return { verification: kind === "pr" ? verificationFor(n) : null, fixups: kind === "pr" ? fixupsFor(n) : [], reviews: kind === "pr" ? reviewsFor(n) : null, actions: actionsFor(n, kind), patchChecks: kind === "pr" ? patchChecksFor(n) : [] };
+export function prWorkFor(n: number, kind: Item["kind"]): Pick<Item, "verification" | "fixups" | "reviews" | "patchChecks"> {
+  return { verification: kind === "pr" ? verificationFor(n) : null, fixups: kind === "pr" ? fixupsFor(n) : [], reviews: kind === "pr" ? reviewsFor(n) : null, patchChecks: kind === "pr" ? patchChecksFor(n) : [] };
 }

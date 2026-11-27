@@ -35,6 +35,8 @@ const SOURCES: { host: string; path: RegExp; token?: boolean }[] = [
   { host: "raw.githubusercontent.com", path: /^\/storytold\/./ },
   { host: "avatars.githubusercontent.com", path: /^\/./ },
 ];
+/** Text every served URL contains: the index reads only bodies that contain one of these. */
+export const IMAGE_TEXT_MARKS = ["githubusercontent.com", "user-attachments"];
 // GitHub redirects public attachments to this bucket; it is never requested directly.
 const REDIRECT_ONLY: { host: string; path: RegExp }[] = [
   { host: "github-production-user-asset-6210df.s3.amazonaws.com", path: /^\/./ },

@@ -23,10 +23,11 @@ test("incremental sync stops at the first old item and requests no further page"
 // ---- search-based incremental sync ----
 import { mkdtempSync } from "node:fs";
 import { join } from "node:path";
-import { runSync } from "../src/mirror.ts";
+import { reconcileRepo, runSync } from "../src/mirror.ts";
 import { itemText, textHash } from "../src/embed/text.ts";
 import { inputHash } from "../src/runner/classify.ts";
 import { SCRATCH } from "./scratch.ts";
+import { saveSyncState, loadSyncState } from "../src/data/mirror/index.ts";
 
 const node = (repo: string, number: number, state = "OPEN", updatedAt = "2026-11-02T10:00:00Z") => ({
   __typename: "Issue", repository: { name: repo }, number, title: `t${number}`, body: "", url: "u", author: { login: "a" },
@@ -54,13 +55,11 @@ async function scratch() {
   await db.run(db.k.insertInto("tracked_repos").values(["a", "b"].map((name) => ({ name, added_by: "t", added_at: "x", pipeline: 1 }))));
   const seen = "2026-11-02T09:00:00Z";
   await db.run(db.k.insertInto("repos").values(["a", "b"].map((name) => ({ name, synced_at: seen, high_water: seen, reconciled_at: seen }))));
-  await db.run(db.k.insertInto("settings").values([
-    { key: "org_high_water", value: "2026-11-02T09:30:00Z" }, { key: "repos_refreshed_at", value: "2999-01-01T00:00:00Z" }, { key: "search_catchup_at", value: "2999-01-01T00:00:00Z" },
-  ]));
+  await saveSyncState(db, { org_high_water: "2026-11-02T09:30:00Z", repos_refreshed_at: "2999-01-01T00:00:00Z", search_catchup_at: "2999-01-01T00:00:00Z" });
   return { dir, db };
 }
 const opts = { only: [], all: false, full: false, perRepo: false };
-const hw = async (db: Db) => (await db.get(db.k.selectFrom("settings").select("value").where("key", "=", "org_high_water")))!.value;
+const hw = async (db: Db) => (await loadSyncState(db)).org_high_water;
 
 
 test("search mode writes tracked results, ignores untracked, advances the high water", async () => {
@@ -172,6 +171,22 @@ test("sync stores the text hashes the planner compares", async () => {
 
 
 
+test("a reconcile keeps what it read before a read that fails, and a re-read item the mirror refuses costs no other", async () => {
+  const { db } = await scratch();
+  await db.run(db.k.insertInto("items").values([1, 2, 3, 4].map((number) => ({ repo: "a", number, kind: "issue", state: "OPEN", title: "t", created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" }))));
+  const reads: number[] = [];
+  const run = (read: (n: number) => unknown) => reconcileRepo(db, { spent: 0, remaining: 4000, async query(q: string, v: Record<string, unknown>) {
+    if (q.includes("issueOrPullRequest")) { reads.push(v.number as number); return { repository: { issueOrPullRequest: read(v.number as number) } }; }
+    return { repository: { items: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } }, issues: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } }, pullRequests: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } };
+  } }, "a");
+  const states = async () => (await db.all(db.k.selectFrom("items").select(["number", "state"]).where("repo", "=", "a").orderBy("number"))).map((r) => r.state);
+  await assert.rejects(run((n) => { if (n === 3) throw new Error("boom"); return n === 1 ? null : node("a", n, "CLOSED"); }), /boom/);
+  assert.deepEqual(reads, [1, 2, 3]);
+  assert.deepEqual(await states(), ["CLOSED", "CLOSED", "OPEN", "OPEN"], "the gone item and the closed one before the failure are stored");
+  await assert.rejects(run((n) => ({ ...node("a", n, "CLOSED"), ...(n === 3 && { createdAt: null, updatedAt: null, state: null }) })));
+  assert.deepEqual(await states(), ["CLOSED", "CLOSED", "OPEN", "CLOSED"]);
+});
+
 test("a deleted item reads as null; a missing repository still fails", async () => {
   const c = new Client(0);
   const answer = (data: unknown) => () => ({ data, errors: [{ type: "NOT_FOUND", message: "Could not resolve to an issue or pull request with the number of 2401." }], text: "", failed: true, stderr: "gh: Could not resolve" });
@@ -198,8 +213,7 @@ test("search results GitHub refuses for lack of access are dropped; other errors
 // ---- mergeable keeps its known value at one head ----
 import { tmpdir } from "node:os";
 import { saveChecks, type PrChecks } from "../src/review/checks.ts";
-import type { Db } from "../src/db/index.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb, type Db } from "./helpers/raw-db.ts";
 
 test("saveChecks keeps a known mergeable at the same head and replaces it at a new head", async () => {
   const db = await connectDb(join(mkdtempSync(join(tmpdir(), "mergeable-")), "t.db"));
@@ -237,12 +251,12 @@ test("saveChecks of many PRs records waiting runs, settles pushes and follows un
   assert.equal((await unknownOf(db, "app", 3, "h3"))?.reads, READS_BEFORE_REQUEST, "each read of the unknown state counts");
   assert.equal(await unknownOf(db, "app", 4, "h4"), null, "a known state is not followed");
   // A note left for a closed PR goes; the unknown one is requested and, with no answer, marked stuck.
-  await db.run(db.k.insertInto("main.settings").values({ key: "mergeable_unknown:app#30", value: JSON.stringify({ head: "h30", since: at, reads: 9, rereads: 0, stuck: false }) }));
+  await db.run(db.k.insertInto("merge_state").values({ repo: "app", number: 30, head: "h30", since: at, reads: 9, rereads: 0, stuck: 0 }));
   const asked: number[] = [];
   const done = await rereadUnknown(db, { query: async () => { throw new Error("no GitHub read expected"); } } as never, "app", () => {}, async (_repo, n) => { asked.push(n); return null; });
   assert.deepEqual([done, asked], [[3], [3]]);
   assert.equal((await unknownOf(db, "app", 3, "h3"))?.stuck, true);
-  assert.equal(await db.get(db.k.selectFrom("main.settings").select("key").where("key", "=", "mergeable_unknown:app#30")), undefined);
+  assert.equal(await db.get(db.k.selectFrom("merge_state").select("number").where("repo", "=", "app").where("number", "=", 30)), undefined);
   // GitHub now reports #3 as mergeable: the note goes.
   await saveChecks(db, [{ ...row(3), mergeable: "MERGEABLE" }]);
   assert.equal(await unknownOf(db, "app", 3, "h3"), null);

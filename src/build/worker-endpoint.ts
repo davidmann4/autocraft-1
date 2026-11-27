@@ -10,22 +10,20 @@
 import { readFileSync } from "node:fs";
 import type { Db } from "../db/index.ts";
 import { isFenced } from "../db/fence.ts";
-import { writeSetting } from "../settings-read.ts";
+import { saveEndpointStatus } from "../data/build/index.ts";
+import type { EndpointStatus } from "../data/build/index.ts";
 import { envVar } from "../env.ts";
 import { KubeError, SA_DIR, type EndpointSliceApi, type KEndpointSlice } from "./kube-api.ts";
 
-/** Settings row the leading runner writes at each check of the slice: EndpointStatus as JSON (src/health-checks.ts). */
+/** The `build_state` key of the leader's EndpointStatus (read through `loadEndpointStatus`); kept for the health check's old reader until phase 3. */
 export const ENDPOINT_KEY = "leader:runner:endpoint";
+
 /** Port name of the worker API's Service, used when the slice names none. */
 const PORT_NAME = "worker-api";
 
 export type WorkerEndpoint = { ns: string; name: string; ip: string; pod: string | null; port: number };
 
-/**
- * `ip` and `port`: what the slice should name. `slice`: the addresses it named at the last read, null when it could not
- * be read. `wrongSince`: when it was first seen naming anything else (or unreadable), null while it names this leader.
- */
-export type EndpointStatus = { ip: string; port: number; slice: string[] | null; wrongSince: string | null; at: string; error?: string };
+export type { EndpointStatus };
 
 /**
  * The slice this runner writes when it leads, from AUTOCRAFT_WORKER_ENDPOINTSLICE, AUTOCRAFT_POD_IP, AUTOCRAFT_POD_NAME
@@ -105,7 +103,7 @@ export class WorkerEndpointPublisher {
       if (right) this.#wrongSince = null;
       else this.#wrongSince ??= new Date(nowMs).toISOString();
       const status: EndpointStatus = { ip: this.ep.ip, port: this.ep.port, slice, wrongSince: this.#wrongSince, at: new Date(nowMs).toISOString(), ...(error ? { error } : {}) };
-      await writeSetting(this.db, ENDPOINT_KEY, JSON.stringify(status));
+      await saveEndpointStatus(this.db, status);
     } finally {
       this.#busy = false;
     }

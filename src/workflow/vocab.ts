@@ -5,7 +5,7 @@
 import { tk } from "../i18n/index.ts";
 import { WEIGHT_NORMAL, WEIGHT_WORDS, type Control, type Entry, type WeightWord } from "./types.ts";
 
-export type CommandWord = "review" | "fix-up" | "implement" | "merge" | "drop" | "fix" | "backlog" | "close" | "stop" | "autorepin";
+export type CommandWord = "review" | "fix-up" | "implement" | "merge" | "drop" | "fix" | "backlog" | "close" | "hold" | "resume" | "take" | "release" | "autorepin";
 
 export type CommandDef = {
   word: CommandWord;
@@ -31,16 +31,16 @@ export type CommandDef = {
 
 export const COMMANDS: readonly CommandDef[] = [
   {
-    word: "review", usage: "review", aliases: ["review again"], entry: "review",
+    word: "review", usage: "review", aliases: ["review again", "take a look", "take a look at", "have a look", "have a look at"], entry: "review",
     short: tk("Start at Review."),
-    does: tk("Reviews the pull request. On a started item, reviews it again."),
+    does: tk("Reviews the pull request. On an issue, reviews the issue against the code and recommends implement, close, ask the reporter or backlog; review and implement goes on to implement when the review recommends it. On a started item, reviews it again."),
     back: tk("When the review is done, with one recommendation. If the merge is approved: only at a blocker."),
     example: "review",
   },
   {
     word: "fix-up", usage: "fix-up", aliases: ["fixup", "fix up"], entry: "fixup",
     short: tk("Start at Fix-up: review, fix-up, review again."),
-    does: tk("Reviews the pull request, fixes what the review finds, and reviews the fixes."),
+    does: tk("Reviews the pull request, fixes what the review finds, and reviews the fixes. fix alone means the same."),
     back: tk("When the second review is done, with one recommendation. If the merge is approved: only at a blocker."),
     example: "fix-up and merge",
   },
@@ -52,46 +52,69 @@ export const COMMANDS: readonly CommandDef[] = [
     example: "implement",
   },
   {
-    word: "merge", usage: "merge", aliases: ["merge queue", "merge-queue", "mergequeue"], entry: "merge",
+    word: "merge", usage: "merge", aliases: ["merge queue", "merge-queue", "mergequeue", "land", "ship"], entry: "merge",
     short: tk("Approve for merge; on a pull request nobody started, the merge queue."),
     does: tk("Approves the merge. On a started item the steps stay the same and end in a merge. A pull request nobody started goes straight to the merge queue, with no review."),
     back: tk("Only at a blocker."),
     example: "merge",
   },
   {
-    word: "drop", usage: "drop <part>", aliases: [], entry: null, answer: true,
+    word: "drop", usage: "drop <part>", aliases: ["skip", "leave out"], entry: null, answer: true,
     short: tk("Remove a finding or change from the plan."),
     does: tk("Leaves one finding or change out, named by its number or by words from its title. Words that match no part or several parts run nothing."),
     back: tk("As the plan said before."),
     example: "drop 2",
   },
   {
-    word: "fix", usage: "fix <part>", aliases: [], entry: null, answer: true,
-    short: tk("Fix only the named findings."),
-    does: tk("Runs the fix-up on the named findings or changes, by number or by words from the title, then reviews again."),
+    word: "fix", usage: "fix <part or instructions>", aliases: [], entry: null, answer: true,
+    short: tk("Fix the named findings, or what your words after fix say."),
+    does: tk("Runs the fix-up on the named findings or changes, by number or by words from the title, then reviews again. Words that match no part are instructions: the fix-up does what they say, with the planned findings. With no part, fix is fix-up; if the review lists no fix, it fixes what the review found."),
     back: tk("As the plan said before."),
-    example: "fix 1, drop 2, then merge",
+    example: "fix the export normals, then merge",
   },
   {
-    word: "backlog", usage: "backlog", aliases: [], entry: null,
+    word: "backlog", usage: "backlog", aliases: ["park"], entry: null,
     short: tk("Keep it open, with no work planned."),
     does: tk("The item stays open with nothing planned and leaves the active lists."),
     back: tk("Never; send any command to start it again."),
     example: "backlog",
   },
   {
-    word: "close", usage: "close", aliases: [], entry: null,
+    word: "close", usage: "close [as completed | as not planned | as duplicate of <item>]", aliases: [], entry: null,
     short: tk("Close the item."),
-    does: tk("Closes the issue or pull request on GitHub. Nothing more runs."),
+    does: tk("Closes the issue or pull request on GitHub as you, with a short comment. The reason is optional: completed, not planned, or the item it duplicates. Nothing more runs."),
     back: tk("Never."),
-    example: "close",
+    example: "close as duplicate of #12",
   },
   {
-    word: "stop", usage: "stop", aliases: [], entry: null,
-    short: tk("Stop all work on the item."),
-    does: tk("Stops every step at once. Nothing runs until someone sends a new command."),
-    back: tk("Never; send any command to start again."),
-    example: "stop",
+    word: "hold", usage: "hold", aliases: ["stop", "pause", "wait", "halt", "hold on", "hold off", "on hold", "not yet", "not now", "don't merge yet", "dont merge yet", "do not merge yet"], entry: null,
+    short: tk("End all work on the item, and keep off it until someone resumes it."),
+    does: tk("Ends every step at once and takes the item out of its batch. AutoCraft keeps off it, whether anyone started it or not, and shows who holds it. stop, pause, wait and not yet mean the same."),
+    back: tk("Never; resume or yes goes on, and any other command starts again."),
+    example: "hold",
+  },
+  {
+    word: "resume", usage: "resume", aliases: ["continue", "carry on", "unpause"], entry: null,
+    short: tk("Go on with a held item."),
+    does: tk("Goes on with a held item where it was, with its merge approval, now in your name. yes does the same. If the author pushed commits meanwhile, AutoCraft reviews them first. An item nobody started goes back to how it was."),
+    back: tk("As the plan said before the hold."),
+    example: "resume",
+  },
+  {
+    word: "take", usage: "take", aliases: ["run on my task runner", "take on my task runner"], entry: null,
+    short: tk("Run the item's work on your own Task Runner too."),
+    does: tk("Your Task Runner takes this item's work while the Task Runners of the person who started or approved it are busy, away or held by their usage limit; theirs come first. Only this item: your other settings stay as they are. Until its work ends or you release it."),
+    back: tk("As the plan said before."),
+    example: "take",
+    more: true,
+  },
+  {
+    word: "release", usage: "release", aliases: ["release my task runner"], entry: null,
+    short: tk("Stop running the item's work on your Task Runner."),
+    does: tk("Ends a take: your Task Runner takes no more of this item's work. A call it runs now finishes."),
+    back: tk("As the plan said before."),
+    example: "release",
+    more: true,
   },
   {
     word: "autorepin", usage: "autorepin <pull request> [via <branch>]", aliases: ["auto-repin", "auto repin"], entry: null,
@@ -103,9 +126,12 @@ export const COMMANDS: readonly CommandDef[] = [
   },
 ];
 
+/** The words that mean a hold, lower case. */
+export const HOLD_WORDS: readonly string[] = COMMANDS.filter((c) => c.word === "hold").flatMap((c) => [c.word, ...c.aliases]);
+
 /** Answers that run the open recommendation as it stands, lower case and without punctuation. */
 export const YES_WORDS: readonly string[] = [
-  "yes", "y", "yep", "yeah", "yup", "ok", "okay", "approve", "approved", "lgtm", "go", "go ahead", "sounds good", "do it", "ship it",
+  "yes", "y", "yep", "yeah", "yup", "ok", "okay", "approve", "approved", "lgtm", "looks good", "looks good to me", "looks great", "go", "go ahead", "go for it", "sounds good", "do it", "ship it",
 ];
 /** Words a yes may carry after it without changing it: "yes please", "lgtm, thanks". */
 export const YES_TRAILERS: readonly string[] = ["please", "thanks", "thank you", "thx"];
@@ -129,8 +155,6 @@ export type ControlDef = { control: Control; name: string; short: string };
 
 /** State changes panels need beyond the command words; each is a registered command, so the agent can do it too. */
 export const CONTROLS: readonly ControlDef[] = [
-  { control: "hold-merge", name: tk("Hold merge"), short: tk("Keep an approved item out of the next merge until it is released.") },
-  { control: "release-merge", name: tk("Release merge"), short: tk("Let a held item merge again.") },
   { control: "resume-breaker", name: tk("Resume"), short: tk("Resume a step its circuit breaker paused.") },
   { control: "release-outside", name: tk("Release"), short: tk("Release an outside author's held items.") },
   { control: "set-automatic", name: tk("Automatic"), short: tk("Turn automatic work on a repository on or off.") },

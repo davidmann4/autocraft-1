@@ -44,11 +44,18 @@ export interface DiscordRest {
 
 export class RestError extends Error {
   status: number;
-  constructor(status: number, message: string) {
+  /** Discord's JSON error code (10003 Unknown Channel, 10008 Unknown Message, 50001 Missing Access, ...), when the body had one. */
+  code: number | null;
+  constructor(status: number, message: string, code: number | null = null) {
     super(message);
     this.status = status;
+    this.code = code;
   }
 }
+
+export const UNKNOWN_CHANNEL = 10003;
+export const UNKNOWN_MESSAGE = 10008;
+export const MISSING_ACCESS = 50001;
 
 export type RestDeps = { token: string; fetch?: typeof fetch; sleep?: (ms: number) => Promise<void>; now?: () => number };
 
@@ -104,6 +111,11 @@ export class RestClient implements DiscordRest {
     }
   }
 
+  /** Starts a public thread on a message; the thread's id is its channel id. It archives after a day without messages. */
+  async startThread(channelId: string, messageId: string, name: string): Promise<{ id: string }> {
+    return (await this.#queue("POST", `/channels/${channelId}/messages/${messageId}/threads`, { name: name.slice(0, 100), auto_archive_duration: 1440 }, true)) as { id: string };
+  }
+
   /** Adds the bot's own reaction (a unicode emoji) to a message. */
   async addReaction(channelId: string, messageId: string, emoji: string): Promise<void> {
     await this.#queue("PUT", `/channels/${channelId}/messages/${messageId}/reactions/${encodeURIComponent(emoji)}/@me`, undefined, true);
@@ -131,15 +143,41 @@ export class RestClient implements DiscordRest {
     return (await this.#queue("POST", "/users/@me/channels", { recipient_id: userId }, true)) as { id: string };
   }
 
+  /**
+   * Gives a guild member a role; `reason` shows in the server's audit log. The bot needs Manage Roles, and its highest role
+   * must sit above the role. Adding a role the member already has succeeds.
+   */
+  async addMemberRole(guildId: string, userId: string, roleId: string, reason: string): Promise<void> {
+    await this.#queue("PUT", `/guilds/${guildId}/members/${userId}/roles/${roleId}`, undefined, true, { "x-audit-log-reason": encodeURIComponent(reason.slice(0, 400)) });
+  }
+
+  /** A guild member's role ids; null when the user is not a member of the guild. */
+  async memberRoles(guildId: string, userId: string): Promise<string[] | null> {
+    try {
+      const m = (await this.#queue("GET", `/guilds/${guildId}/members/${userId}`, undefined, true)) as { roles?: unknown };
+      return Array.isArray(m.roles) ? m.roles.filter((r): r is string => typeof r === "string") : [];
+    } catch (e) {
+      if (e instanceof RestError && e.status === 404) return null;
+      throw e;
+    }
+  }
+
+  /** One guild role's permission bits and whether an integration manages it; null when the guild has no such role. */
+  async guildRole(guildId: string, roleId: string): Promise<{ permissions: string; managed: boolean } | null> {
+    const roles = (await this.#queue("GET", `/guilds/${guildId}/roles`, undefined, true)) as { id?: unknown; permissions?: unknown; managed?: unknown }[] | undefined;
+    const r = (roles ?? []).find((x) => x.id === roleId);
+    return r ? { permissions: typeof r.permissions === "string" ? r.permissions : "0", managed: r.managed === true } : null;
+  }
+
   async overwriteGuildCommands(applicationId: string, guildId: string, commands: CommandDef[]): Promise<void> {
     await this.#queue("PUT", `/applications/${applicationId}/guilds/${guildId}/commands`, commands, true);
   }
 
-  #queue(method: string, path: string, body: unknown, auth: boolean): Promise<unknown> {
+  #queue(method: string, path: string, body: unknown, auth: boolean, headers?: Record<string, string>): Promise<unknown> {
     const key = routeKey(method, path);
     // The chain is per bucket once Discord has named it, else per route.
     const chain = this.#stateKey(key, path);
-    const run = (this.#chains.get(chain) ?? Promise.resolve()).then(() => this.#send(method, path, key, body, auth));
+    const run = (this.#chains.get(chain) ?? Promise.resolve()).then(() => this.#send(method, path, key, body, auth, headers));
     const tail = run.catch(() => undefined);
     this.#chains.set(chain, tail);
     void tail.then(() => { if (this.#chains.get(chain) === tail) this.#chains.delete(chain); });
@@ -152,7 +190,7 @@ export class RestClient implements DiscordRest {
     return b ? `${b}|${majorOf(path)}` : `${key}|${majorOf(path)}`;
   }
 
-  async #send(method: string, path: string, key: string, body: unknown, auth: boolean): Promise<unknown> {
+  async #send(method: string, path: string, key: string, body: unknown, auth: boolean, headers?: Record<string, string>): Promise<unknown> {
     const f = this.#d.fetch ?? fetch;
     const now = this.#d.now ?? Date.now;
     const sleep = this.#d.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
@@ -163,7 +201,7 @@ export class RestClient implements DiscordRest {
       if (gap > 0) await sleep(Math.min(gap, MAX_WAIT_MS));
       const r = await f(`${API}${path}`, {
         method,
-        headers: { ...(auth && { authorization: `Bot ${this.#d.token}` }), ...(body !== undefined && { "content-type": "application/json" }) },
+        headers: { ...(auth && { authorization: `Bot ${this.#d.token}` }), ...(body !== undefined && { "content-type": "application/json" }), ...headers },
         ...(body !== undefined && { body: JSON.stringify(body) }),
       });
       const bucket = r.headers.get("x-ratelimit-bucket");
@@ -180,7 +218,11 @@ export class RestClient implements DiscordRest {
       }
       // The window is used up: the next request of the bucket waits for it to reset.
       if (r.headers.get("x-ratelimit-remaining") === "0") this.#notBefore.set(owner, now() + Math.ceil(Number(r.headers.get("x-ratelimit-reset-after") ?? 1) * 1000));
-      if (!r.ok) throw new RestError(r.status, `${method} ${key.slice(method.length + 1)} failed: HTTP ${r.status}`);
+      if (!r.ok) {
+        const code = (await r.json().catch(() => null) as { code?: unknown } | null)?.code;
+        const c = typeof code === "number" ? code : null;
+        throw new RestError(r.status, `${method} ${key.slice(method.length + 1)} failed: HTTP ${r.status}${c !== null ? ` (code ${c})` : ""}`, c);
+      }
       return r.status === 204 ? undefined : r.json().catch(() => undefined);
     }
   }

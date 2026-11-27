@@ -5,7 +5,7 @@ import { appendFileSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 import { SCRATCH } from "./scratch.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb } from "./helpers/raw-db.ts";
 import { copyLogs, JOB_LOG_KEEP_BYTES, JOB_LOG_KEEP_MS, JobLogCopy, pruneJobLogs } from "../src/runner/job-log.ts";
 import { jobDetail } from "../src/runner/jobs.ts";
 
@@ -17,7 +17,7 @@ test("a long job log keeps its end within the cap, and the job page reads it wit
     const t = new Date().toISOString();
     const id = Number((await db.get(db.k.insertInto("jobs").values({ step: "test-echo", params: "{}", requested_by: "boss", requested_at: t, state: "running", started_at: t, log_path: path })
       .returning("id")))!.id);
-    const copy = await JobLogCopy.open(db, id, path);
+    const copy = JobLogCopy.open(id, path);
     const line = (i: number) => `line ${i} ${"x".repeat(1000)}\n`;
     let n = 0;
     for (let batch = 0; batch < 20; batch++) {
@@ -55,7 +55,7 @@ test("a log chunk with a NUL byte is copied without it, and the next chunk still
     const t = new Date().toISOString();
     const id = Number((await db.get(db.k.insertInto("jobs").values({ step: "test-echo", params: "{}", requested_by: "boss", requested_at: t, state: "running", started_at: t, log_path: path })
       .returning("id")))!.id);
-    const copy = await JobLogCopy.open(db, id, path);
+    const copy = JobLogCopy.open(id, path);
     appendFileSync(path, "a\u0000b\u0007c\td\n");
     await copyLogs(db, [copy], true);
     appendFileSync(path, "second\n");

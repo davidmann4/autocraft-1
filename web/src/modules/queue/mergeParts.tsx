@@ -1,4 +1,4 @@
-// Parts of the merge queue: state labels and chips, Verify labels, why a PR waits, its decision link, and the batch header facts.
+// Parts of the merge queue: state labels and chips, Verify labels, why a PR waits, and the batch header facts.
 import { Link } from "react-router-dom";
 import type { BatchState, QueueBatch, QueueRow, QueueState, Tier } from "../../api/types";
 import { Badge, type Tone } from "../../ui/atoms/Badge";
@@ -8,11 +8,11 @@ import { cn } from "../../ui/cn";
 import { when } from "../../lib/format";
 import { TimeAgo } from "../../ui/atoms/TimeAgo";
 import { useNow } from "../../lib/useNow";
-import { batchPath, decisionPath, repoSlug } from "../../lib/links";
+import { batchPath, repoSlug } from "../../lib/links";
 
 export const STATE: Record<QueueState, [string, Tone, string]> = {
   ready: ["Ready", "ok", "Covered by the merge rule; merges on the next run"],
-  "decision-answered-merge": ["Merge approved", "ok", "The operator answered merge at this head; merges on the next run"],
+  "decision-answered-merge": ["Merge approved", "ok", "A maintainer approved the merge; merges on the next run"],
   refused: ["Refused", "bad", "The merge command or a pre-merge check said no; tried again next run"],
   "waiting-ci": ["Waiting for CI", "neutral", "CI is pending or hasn't run, or GitHub is still checking mergeability"],
   "waiting-main-ci": ["Waiting: main CI red", "neutral", "The repo's default branch fails CI; ready PRs wait until main is green"],
@@ -23,14 +23,12 @@ export const STATE: Record<QueueState, [string, Tone, string]> = {
   "waiting-verify": ["Waiting for Verify", "neutral", "No passed verification at this head yet: the build tasks are planned or running"],
   "verify-failed": ["Verify failed", "bad", "The build or tests failed at this head"],
   "verify-error": ["Verify error", "warn", "Verification could not run; it is retried once, then held"],
-  "needs-decision": ["Needs a decision", "warn", "Outside the merge rule (size, label, author, not verified or no CI): waits for the operator's Merge? answer"],
-  declined: ["Declined", "neutral", "The operator answered hold or close"],
+  "needs-decision": ["Needs approval", "warn", "Outside the merge rule (size, label, author, not verified or no CI): waits for a maintainer"],
   merged: ["Merged", "merged", "Merged"],
   "batch-checking": ["In batch: checking", "neutral", "Part of an integration batch whose combined tree is being built and tested in the sandbox"],
   "in-batch": ["In batch", "ok", "Part of an integration batch with an open PR; lands when upstream CI is green"],
   "batch-failed": ["Batch failed", "bad", "Failed alone in a batch: on hold until the PR has a new head"],
-  "held-duplicate": ["Held: Duplicate?", "warn", "An open Duplicate? decision keeps it out of every later stage; answer it in Decisions"],
-  "held-backlog": ["Backlog", "neutral", "Answered Backlog; reopen the decision to take it up again"],
+  "held-backlog": ["Backlog", "neutral", "On the Backlog; a command takes it up again"],
   "ci-approval": ["CI: waiting for run approval", "warn", "GitHub holds the workflow runs for a maintainer's approval; the pipeline approves them when the repo allows it"],
   "changes-requested": ["Changes requested", "bad", "A maintainer's changes-requested review stands; it waits for that reviewer to approve or for a maintainer to dismiss it"],
 };
@@ -87,22 +85,13 @@ export function BatchFacts({ b }: { b: QueueBatch }) {
 /** The PR's state as a chip, with why it is there in the chip's tip. */
 export function StateChip({ row }: { row: QueueRow }) {
   const [text, tone, hint] = STATE[row.state];
-  const why = row.state === "refused" && row.refusedReason ? row.refusedReason : row.state === "declined" && row.answer ? `The operator answered ${row.answer}` : hint;
+  const why = row.state === "refused" && row.refusedReason ? row.refusedReason : hint;
   return (
     <Tooltip title={text} content={why} align="start">
       <span tabIndex={0} className="inline-flex rounded-full outline-none focus-visible:ring-2 focus-visible:ring-accent/60">
         <Badge tone={tone}>{text}</Badge>
       </span>
     </Tooltip>
-  );
-}
-
-export function DecisionLink({ row }: { row: QueueRow }) {
-  if (!row.decisionId) return row.state === "needs-decision" ? <span className="text-2xs text-ink/45">asked on the next run</span> : <span className="text-ink/30">–</span>;
-  return (
-    <Link to={decisionPath({ id: row.decisionId, repo: row.repo, number: row.number })} className="relative z-10 text-xs text-accent-ink hover:underline">
-      {row.answer ? `Answered ${row.answer}` : "Open decision"}
-    </Link>
   );
 }
 

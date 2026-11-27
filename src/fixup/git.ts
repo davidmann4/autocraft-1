@@ -9,6 +9,8 @@ import { join, resolve } from "node:path";
 import { envVar } from "../env.ts";
 import { APP_CREDENTIAL_ARGS } from "../github/install-token.ts";
 import { readEnvFor } from "../github/read.ts";
+import { markUnsent } from "../github/unsent.ts";
+import { effect } from "../db/effects.ts";
 
 /** `sent: false`: the command failed before any request went out (the app lane could not get its token), so nothing reached GitHub. */
 export type ExecResult = { code: number; stdout: string; stderr: string; sent?: false };
@@ -19,10 +21,11 @@ export type ExecOpts = { cwd?: string; env?: Record<string, string>; input?: str
 export type Exec = (cmd: string, args: string[], opts?: ExecOpts) => Promise<ExecResult>;
 
 export const exec: Exec = async (cmd, args, opts = {}) => {
+  effect("process", `${cmd} ${args[0] ?? ""}`);
   // A command that brings its own whole environment (a write lane) or asks to inherit keeps it. Any other gh command and
   // the network reads of git (fetch, ls-remote, clone, pull) read as the current identity: the app's installation token
   // under `app`, the inherited login under `box`. Local git commands and pushes get no token.
-  const read = opts.replaceEnv || opts.inherit ? undefined : await readEnvFor(cmd, args);
+  const read = opts.replaceEnv || opts.inherit ? undefined : await readEnvFor(cmd, args).catch((e) => { throw markUnsent(e); });
   const env = opts.replaceEnv ? opts.env : { ...(read ?? process.env), ...opts.env };
   return spawned(cmd, args, opts, env);
 };
@@ -32,7 +35,7 @@ const spawned = (cmd: string, args: string[], opts: ExecOpts, env: NodeJS.Proces
   let stdout = "", stderr = "";
   p.stdout.on("data", (d) => (stdout += d));
   p.stderr.on("data", (d) => (stderr += d));
-  p.on("error", reject);
+  p.on("error", (e) => reject(p.pid === undefined ? markUnsent(e) : e));
   p.on("close", (code) => resolve({ code: code ?? 1, stdout, stderr }));
   p.stdin.on("error", () => {});
   p.stdin.end(opts.input ?? "");
@@ -128,6 +131,18 @@ export class Git {
     return have;
   }
 
+  /**
+   * Whether commit `sha` is in the cache, fetched by its id from `org/repo` when it is not. GitHub serves a commit by id after a force-push
+   * took it off every branch, until it is garbage collected; false when it does not have the commit.
+   */
+  async fetchCommit(org: string, repo: string, sha: string): Promise<boolean> {
+    await this.init();
+    const have = async () => (await this.git(["cat-file", "-e", `${sha}^{commit}`])).code === 0;
+    if (await have()) return true;
+    await this.git(["fetch", "--quiet", "--no-tags", "--no-recurse-submodules", "--no-write-fetch-head", `https://github.com/${org}/${repo}.git`, sha]);
+    return have();
+  }
+
   /** The blob at `sha:path` as text with its mode, or why it can't be used. */
   async file(sha: string, path: string): Promise<{ ok: true; mode: string; content: string } | { ok: false; reason: string; tooLarge?: true }> {
     const t = await this.git(["ls-tree", sha, "--", path]);
@@ -199,7 +214,7 @@ export class Git {
    * The merge of `base` into `head` in memory (`git merge-tree --write-tree`, no working tree): the result tree, and the
    * conflicted paths when it has conflicts. The tree then holds conflict markers in those files.
    */
-  async mergeInto(head: string, base: string): Promise<{ clean: boolean; tree: string; conflicted: string[] }> {
+  async mergeTreeOf(head: string, base: string): Promise<{ clean: boolean; tree: string; conflicted: string[] }> {
     const r = await this.git(["-c", "merge.conflictStyle=merge", "merge-tree", "--write-tree", "--name-only", "-z", head, base]);
     if (r.code !== 0 && r.code !== 1) throw new Error(`git merge-tree failed: ${r.stderr.trim().split("\n").pop() ?? r.code}`);
     const parts = r.stdout.split("\0");

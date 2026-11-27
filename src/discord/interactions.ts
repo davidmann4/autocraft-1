@@ -17,7 +17,7 @@ export type DiscordUser = { id: string; username?: string; global_name?: string 
 
 export type Interaction = {
   id: string; token: string; type: number; application_id?: string; guild_id?: string; channel_id?: string;
-  member?: { nick?: string | null; user?: DiscordUser }; user?: DiscordUser;
+  member?: { nick?: string | null; user?: DiscordUser; roles?: string[] }; user?: DiscordUser;
   data?: {
     name?: string; type?: number; custom_id?: string; target_id?: string;
     values?: string[];
@@ -147,7 +147,10 @@ export class Interactions {
     }
     if (i.type !== COMMAND) return undefined;
     const sub = i.data?.options?.find((o) => o.type === 1);
-    return this.#commands.get(sub ? `${i.data?.name} ${sub.name}` : (i.data?.name ?? ""));
+    // A subcommand with an `action` choice (autocraft account) is registered per action: "autocraft account link".
+    const action = sub?.options?.find((o) => o.name === "action")?.value;
+    const key = sub ? `${i.data?.name} ${sub.name}` : (i.data?.name ?? "");
+    return (typeof action === "string" ? this.#commands.get(`${key} ${action}`) : undefined) ?? this.#commands.get(key);
   }
 
   async #complete(i: Interaction): Promise<void> {

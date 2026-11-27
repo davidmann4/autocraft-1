@@ -2,7 +2,7 @@
 // like the other stage commands; the dashboard queues the same steps as jobs.
 import { assignAreas } from "./assign.ts";
 import { proposeAreas, suggestAreas } from "./propose.ts";
-import { acceptProposal, areaCounts, currentList, decideSuggestion, editAreas, proposalsOf, unassignedCount, type AreaEdit } from "./store.ts";
+import { acceptProposal, decideSuggestion, editAreas, loadAreaOverview, loadProposals, type AreaEdit } from "../data/triage/index.ts";
 import { openDb } from "../db/open.ts";
 
 const USAGE = "areas list|propose|accept [--id N] [--names A,B]|edit add NAME DESCRIPTION|rename FROM TO|merge FROM INTO|remove NAME|describe NAME DESCRIPTION|rescan [--limit N]|suggest --repo R";
@@ -46,15 +46,14 @@ export const commands = {
       const usageRun = `areas-cli-${new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z")}`;
       switch (what) {
         case "list": {
-          const cur = await currentList(db, repo);
+          const { list: cur, counts: open, unassigned, proposals } = await loadAreaOverview(db, repo);
           if (!cur) console.log(`${repo} has no area list`);
           else {
-            const open = new Map((await areaCounts(db, repo)).map((c) => [c.area, c.open]));
             console.log(`${repo}: version ${cur.version}`);
             for (const a of cur.areas) console.log(`  ${a.name} (${open.get(a.name) ?? 0} open): ${a.description}`);
-            console.log(`${await unassignedCount(db, repo)} open items without an area`);
+            console.log(`${unassigned} open items without an area`);
           }
-          for (const p of await proposalsOf(db, repo)) console.log(`${p.kind} ${p.id}: ${p.areas.map((a) => `${a.name}${a.state === "open" ? "" : ` [${a.state}]`}`).join(", ")}`);
+          for (const p of proposals) console.log(`${p.kind} ${p.id}: ${p.areas.map((a) => `${a.name}${a.state === "open" ? "" : ` [${a.state}]`}`).join(", ")}`);
           break;
         }
         case "propose": {
@@ -69,8 +68,9 @@ export const commands = {
           break;
         }
         case "accept": {
-          const id = flag(args, "--id") ? Number(flag(args, "--id")) : (await proposalsOf(db, repo))[0]?.id;
-          const p = (await proposalsOf(db, repo)).find((x) => x.id === id);
+          const open = await loadProposals(db, repo);
+          const id = flag(args, "--id") ? Number(flag(args, "--id")) : open[0]?.id;
+          const p = open.find((x) => x.id === id);
           if (!p) throw new Error("no open proposal; see `areas list`");
           const version = p.kind === "propose"
             ? await acceptProposal(db, p.id, BY)

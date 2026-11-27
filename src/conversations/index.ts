@@ -3,7 +3,8 @@ import { parseRef } from "../classify/parse.ts";
 import { getAccess } from "../access.ts";
 import { doCard } from "./act.ts";
 import { githubDiff, runConversations } from "./run.ts";
-import { ConversationError, addMessage, turnsOf } from "./store.ts";
+import { loadThreads } from "../data/conversations/index.ts";
+import { ConversationError, addMessage } from "./store.ts";
 import type { Db } from "../db/index.ts";
 import { openDb } from "../db/open.ts";
 
@@ -30,7 +31,7 @@ export const commands = {
           const by = flag(args, "--by"), id = Number(target);
           if (!Number.isInteger(id) || !by) throw new ConversationError(2, USAGE);
           await needOperator(db, by);
-          const r = await doCard(db, id, by);
+          const r = await doCard(db, id, by, { via: "cli" });
           console.log(r.ran ? `card ${id}: ${r.card.state}${r.card.error ? `: ${r.card.error}` : ""}${r.card.result_url ? ` ${r.card.result_url}` : ""}` : `card ${id} is already ${r.card.state}; nothing done`);
           return;
         }
@@ -51,9 +52,10 @@ export const commands = {
             else console.log(`${(await runConversations(db, { kind: "operator", limit: 1 })).answered} answered`);
           }
         }
-        for (const t of await turnsOf(db, ref.repo, ref.number)) {
+        const thread = (await loadThreads(db, [`${ref.repo}#${ref.number}`])).get(`${ref.repo}#${ref.number}`);
+        for (const t of thread?.turns ?? []) {
           console.log(`\n[${t.id}] ${t.login} ${t.at}${t.status ? ` (${t.status})` : ""}\n${t.body}`);
-          for (const c of await db.all(db.k.selectFrom("conversation_cards").select(["id", "state", "description", "text"]).where("turn_id", "=", t.id).orderBy("id"))) {
+          for (const c of thread!.cards.filter((x) => x.turn_id === t.id)) {
             console.log(`  card ${c.id} [${c.state}] ${c.description}${c.text ? `\n    ${c.text.replace(/\n/g, "\n    ")}` : ""}`);
           }
         }

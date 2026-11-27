@@ -2,8 +2,9 @@
 // Discord's attachment links expire after about a day and GitHub has no API for issue attachments, so the issue body
 // links our own copy. Only PNG, JPEG, GIF and WebP pass, decided by the file's first bytes, never by its declared type.
 // The PUT is signed with AWS Signature Version 4; the secret and the signed headers are never logged.
-import { createHash, createHmac, randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { envVar } from "../env.ts";
+import { encSegment, signV4 } from "../storage/s3.ts";
 
 export type AttachStore = { endpoint: string; bucket: string; accessKeyId: string; secretAccessKey: string; publicUrl: string };
 
@@ -52,27 +53,6 @@ export function safeName(name: string): string {
 }
 
 const sha256 = (data: string | Uint8Array): string => createHash("sha256").update(data).digest("hex");
-const hmac = (key: string | Buffer, data: string): Buffer => createHmac("sha256", key).update(data).digest();
-/** RFC 3986 encoding of one path segment, as Signature Version 4 wants it. */
-const encSegment = (s: string): string => encodeURIComponent(s).replace(/[!'()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
-
-/**
- * The Authorization header of an AWS Signature Version 4 request. `path` is already encoded; every header in `headers`
- * (plus host) is signed. `amzDate` is the x-amz-date value (yyyymmddThhmmssZ), which `headers` must carry too.
- */
-export function signV4(req: { method: string; host: string; path: string; query?: string; headers: Record<string, string>; payloadHash: string },
-  creds: { accessKeyId: string; secretAccessKey: string; region: string; service: string }, amzDate: string): string {
-  const h: Record<string, string> = { host: req.host };
-  for (const [k, v] of Object.entries(req.headers)) h[k.toLowerCase()] = v.trim().replace(/\s+/g, " ");
-  const names = Object.keys(h).sort();
-  const signed = names.join(";");
-  const canonical = [req.method, req.path, req.query ?? "", names.map((n) => `${n}:${h[n]}\n`).join(""), signed, req.payloadHash].join("\n");
-  const day = amzDate.slice(0, 8);
-  const scope = `${day}/${creds.region}/${creds.service}/aws4_request`;
-  const toSign = ["AWS4-HMAC-SHA256", amzDate, scope, sha256(canonical)].join("\n");
-  const key = hmac(hmac(hmac(hmac(`AWS4${creds.secretAccessKey}`, day), creds.region), creds.service), "aws4_request");
-  return `AWS4-HMAC-SHA256 Credential=${creds.accessKeyId}/${scope}, SignedHeaders=${signed}, Signature=${createHmac("sha256", key).update(toSign).digest("hex")}`;
-}
 
 export type CopyDeps = { fetch?: typeof fetch; now?: () => number; log: (line: string) => void };
 

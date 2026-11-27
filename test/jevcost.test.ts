@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { askJev, runJev, saveUsage, setRunner } from "../src/classify/run.ts";
 import { SCRATCH } from "./scratch.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb } from "./helpers/raw-db.ts";
 import { sqliteOnly } from "./test-db.ts";
 
 const answers = {

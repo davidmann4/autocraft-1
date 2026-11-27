@@ -5,7 +5,7 @@
 //   4. the older one;
 //   5. the lower number.
 import type { Db } from "../db/index.ts";
-import * as kx from "../db/kx.ts";
+import { loadCanonicalInfo } from "../data/triage/index.ts";
 
 export const ACTIVITY_MARGIN = 5;
 
@@ -22,18 +22,10 @@ export function compareCanonical(x: CanonInfo, y: CanonInfo): number {
   return x.number - y.number;
 }
 
-/** CanonInfo of the items, keyed by `repo#number`, in one query; an item not in the database has no entry. */
+/** CanonInfo of the items, keyed by `repo#number`, in one wave; an item not in the database has no entry. */
 export async function canonInfoAll(db: Db, items: { repo: string; number: number }[]): Promise<Map<string, CanonInfo>> {
-  // The issues merged PRs of these repos close, with each PR's list parsed once.
-  const rows = await db.all(db.k.with((cte) => cte("fixed").materialized(), (qb) => qb.selectFrom("items as p")
-    .crossJoin((eb) => kx.jsonEach(db, eb.case().when(kx.jsonValid(db, "p.closing_issues")).then(eb.ref("p.closing_issues")).else(eb.val("[]")).end(), "f", "bigint"))
-    .select(["p.repo", "f.value as number"]).distinct()
-    .where("p.kind", "=", "pr").where("p.state", "=", "MERGED").where(kx.inList(db, "p.repo", items.map((x) => x.repo))))
-    .selectFrom(kx.refPairs(db, items.map((x) => [x.repo, x.number] as const), "j"))
-    .innerJoin("items as i", (j) => j.onRef("i.repo", "=", "j.repo").onRef("i.number", "=", "j.number"))
-    .select((eb) => ["i.repo", "i.number", "i.state", "i.created_at", eb.fn.coalesce("i.comments_count", eb.lit(0)).as("comments"),
-      eb.case().when(eb.exists(eb.selectFrom("fixed as x").select(eb.lit(1).as("one")).whereRef("x.repo", "=", "i.repo").whereRef("x.number", "=", "i.number"))).then(eb.lit(1)).else(eb.lit(0)).end().as("fixed")]));
-  return new Map(rows.map((r) => [`${r.repo}#${r.number}`, { number: r.number, state: r.state, created_at: r.created_at, comments: r.comments, fixedByMerged: r.fixed === 1 }]));
+  const found = await loadCanonicalInfo(db, items);
+  return new Map([...found].map(([key, i]) => [key, { number: Number(key.slice(key.lastIndexOf("#") + 1)), state: i.state, created_at: i.created_at, comments: i.comments_count ?? 0, fixedByMerged: i.fixedBy !== null }]));
 }
 
 export async function canonInfo(db: Db, repo: string, numbers: number[], known?: Map<string, CanonInfo>): Promise<CanonInfo[]> {
@@ -45,7 +37,7 @@ export async function canonInfo(db: Db, repo: string, numbers: number[], known?:
   });
 }
 
-/** The item to keep, and a short reason for the decision card. */
+/** The item to keep, and a short reason. */
 export async function pickCanonical(db: Db, repo: string, numbers: number[], known?: Map<string, CanonInfo>): Promise<{ number: number; why: string }> {
   const sorted = (await canonInfo(db, repo, numbers, known)).sort(compareCanonical);
   const [best, next] = sorted as [CanonInfo, CanonInfo | undefined];

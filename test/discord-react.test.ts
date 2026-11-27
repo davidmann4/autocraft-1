@@ -8,7 +8,7 @@ import { dispatcher } from "../src/discord/index.ts";
 import { Reactor, setReactEmoji } from "../src/discord/react.ts";
 import { RestError } from "../src/discord/rest.ts";
 import { SCRATCH } from "./scratch.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb } from "./helpers/raw-db.ts";
 
 mkdirSync(SCRATCH, { recursive: true });
 const dir = mkdtempSync(join(SCRATCH, "discord-react-"));

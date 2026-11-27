@@ -1,5 +1,7 @@
 // The shared warm snapshot store: upload from one worker, download into another, key checks, interrupted upload.
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { createHash, sign } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { request } from "node:http";
 import { connect } from "node:net";
@@ -10,7 +12,7 @@ import { parseWorkerConfig } from "../src/worker/config.ts";
 import { createStore, parseStoreConfig } from "../src/worker/store.ts";
 import { generateSigningKeys } from "../src/worker/store.ts";
 import { copyWarm, storeWarm } from "../src/worker/warm.ts";
-import { byteCap, downloadWarm, uploadWarm } from "../src/worker/warm-sync.ts";
+import { byteCap, downloadWarm, signedText, uploadWarm } from "../src/worker/warm-sync.ts";
 import { SCRATCH } from "./scratch.ts";
 
 mkdirSync(SCRATCH, { recursive: true });
@@ -100,6 +102,38 @@ test("a main build's target dir reaches another worker; bad keys and interrupted
     assert.equal(readdirSync(join(root, "store")).filter((f) => f.startsWith(".up-") && f.endsWith(".tmp")).length, 0);
   } finally {
     // close() alone waits for every open connection, including the cut-off upload's.
+    store.closeAllConnections();
+    await new Promise((r) => store.close(r));
+  }
+});
+
+test("a snapshot whose archive runs on past its end marker downloads", { timeout: 60_000 }, async () => {
+  const store = createStore(parseStoreConfig({ dir: join(root, "pad-store"), readKey: READ, writeKey: WRITE }));
+  await new Promise<void>((r) => store.listen(0, "127.0.0.1", r));
+  const url = `http://127.0.0.1:${(store.address() as AddressInfo).port}`;
+  try {
+    const k = (n: string) => join(root, "pad-keys", n);
+    mkdirSync(join(root, "pad-keys"));
+    generateSigningKeys(k("a.key"), k("a.pub"));
+    const worker = parseWorkerConfig({ coordinatorUrl: "http://x.internal", keyFile: "/k", workDir: join(root, "pad", "w"), warmDir: join(root, "pad", "warm"), limits: { minFreeDiskGb: 0 }, warmStore: { url, readKey: READ, signKeyFile: k("a.key"), verifyKeyFiles: [k("a.pub")] } });
+    const src = join(root, "pad-src");
+    mkdirSync(src);
+    writeFileSync(join(src, "lib.rlib"), "built");
+    // Zero blocks past the end marker, more than a pipe holds: zstd exits only once all of its output has been read.
+    const tar = Buffer.concat([execFileSync("tar", ["-C", src, "-cf", "-", "."]), Buffer.alloc(4 << 20)]);
+    const blob = execFileSync("zstd", ["-q", "-c"], { input: tar });
+    const meta = { commit: "e".repeat(40), sha256: createHash("sha256").update(blob).digest("hex"), stored: Date.now(), bytes: tar.length };
+    const signature = sign(null, signedText("pad", meta), worker.warmStore!.signKey!).toString("base64");
+    const q = new URLSearchParams({ ...Object.fromEntries(Object.entries(meta).map(([n, v]) => [n, String(v)])), signature });
+    const put = await fetch(`${url}/store/pad?${q}`, { method: "PUT", headers: { authorization: `Bearer ${WRITE}`, "content-type": "application/zstd" }, body: blob });
+    assert.equal(put.status, 200, await put.text());
+    const log: string[] = [];
+    await downloadWarm(worker, "pad", (m) => log.push(m));
+    const out = join(root, "pad-out");
+    mkdirSync(out);
+    assert.equal(await copyWarm(worker, "pad", out), true, log.join("\n"));
+    assert.equal(readFileSync(join(out, "lib.rlib"), "utf8"), "built");
+  } finally {
     store.closeAllConnections();
     await new Promise((r) => store.close(r));
   }

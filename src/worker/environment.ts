@@ -125,7 +125,7 @@ export type PrepareOptions = { fetchImpl?: typeof fetch; log: (s: string) => voi
  * call the suite's gate, runs in the stock image. Throws on any failure, so
  * a task never runs in a weaker environment than CI without saying so.
  */
-export async function prepareEnvironment(cfg: WorkerConfig, task: { repo: string; baseSha: string | null; headSha: string; display?: boolean }, toolchain: string, baseImage: string, srcDir: string, o: PrepareOptions): Promise<PreparedEnv> {
+export async function prepareEnvironment(cfg: WorkerConfig, task: { repo: string; baseSha: string | null; headSha: string; display?: boolean }, toolchain: string, baseImage: string, _srcDir: string, o: PrepareOptions): Promise<PreparedEnv> {
   const toolImage = componentsFor(toolchain).length ? await ensureImage(cfg, toolchain, baseImage, [], (s) => o.log(`${s}\n`)) : baseImage;
   const display = task.display === true;
   const stock: PreparedEnv = { image: toolImage, env: {}, mounts: [], info: { image: toolImage, baseImage, packages: [], craftFontsRef: null, craftI18nRev: null } };

@@ -8,6 +8,7 @@ import { refreshChecks } from "./checks.ts";
 import { rereadUnknown } from "../merge/mergeable.ts";
 import { markReviewsStale, withRetry } from "./discussion.ts";
 import type { Db } from "../db/index.ts";
+import { listItems } from "../data/mirror/index.ts";
 import { openDb } from "../db/open.ts";
 
 export type ChecksParams = { repo: string };
@@ -39,8 +40,8 @@ export const commands = {
       const by = args[2] === "--by" && args[3] ? args[3] : "cli";
       if (args[0] !== "again" || !m || args.length !== (args[2] ? 4 : 2)) throw new Error("usage: autocraft-server review again <repo>#<number> [--by <login>]");
       const db = await openDb();
-      const open = await db.get(db.k.selectFrom("items").select((eb) => eb.lit(1).as("one")).where("repo", "=", m[1]!).where("number", "=", Number(m[2])).where("kind", "=", "pr").where("state", "=", "OPEN"));
-      if (!open) throw new Error(`${args[1]} is not an open pull request in the mirror`);
+      const open = await listItems(db, { repos: [m[1]!], numbers: [Number(m[2])], kind: "pr", states: ["OPEN"] }, "ref");
+      if (!open.length) throw new Error(`${args[1]} is not an open pull request in the mirror`);
       await markReviewsStale(db, by, m[1]!, Number(m[2]));
       console.log(`${args[1]}: its review is stale; Opus reviews it again`);
     },

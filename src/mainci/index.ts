@@ -4,15 +4,15 @@
 import type { Querier } from "../mirror.ts";
 import { contextState, type CheckState } from "../review/checks.ts";
 import { trackedNames } from "../repos.ts";
-import { optionalChecks } from "../optional-checks.ts";
-import { mainRedAfterMerge } from "../push-outcomes.ts";
+import { optionalChecks, optionalChecksOf } from "../optional-checks.ts";
+import { tripMergeBreakers } from "../data/control/index.ts";
+import { loadMergedInfo } from "../data/merge/index.ts";
 import { autocraftTexts } from "../mainfix/status.ts";
 import { classify, derive, type Culprit, type HeadRow, type MainCheck, type MainCiState } from "./classify.ts";
 import { ownerOf } from "../owners.ts";
-import { isHiddenRepo, type HiddenRepos } from "../hidden-sql.ts";
-import { setting } from "../settings-read.ts";
+import type { HiddenRepos } from "../hidden-sql.ts";
+import { loadDecidingHeads, loadRepos, loadSyncState, saveMainHeads, saveSyncState, type MainHeadSummary } from "../data/mirror/index.ts";
 import type { Db } from "../db/index.ts";
-import * as kx from "../db/kx.ts";
 import { openDb } from "../db/open.ts";
 import { warmPass } from "../build/warm-queue.ts";
 
@@ -21,16 +21,19 @@ export const MAIN_FIX_BRANCH_PREFIX = "autocraft/main-ci-";
 
 /** Repos whose current default-branch head is red. */
 export async function redMainRepos(db: Db): Promise<Set<string>> {
-  return new Set((await mainCiRepos(db)).filter((r) => r.state === "red").map((r) => r.repo));
+  return new Set([...await loadDecidingHeads(db, [])].filter(([, heads]) => currentHead(heads)?.cur.state === "red").map(([repo]) => repo));
+}
+
+/** The repo's current head among its stored ones, and what derive() says of them; null when they name none. */
+function currentHead<H extends MainHeadSummary>(heads: readonly H[]): { cur: H; d: NonNullable<ReturnType<typeof derive>> } | null {
+  const d = derive(heads.map((h): HeadRow => ({ sha: h.head_sha, state: h.state as MainCiState, committedAt: h.committed_at, headline: h.headline, firstSeenAt: h.first_seen_at, stateChangedAt: h.state_changed_at })));
+  return d ? { cur: heads.find((h) => h.head_sha === d.current.sha)!, d } : null;
 }
 
 /** Least time between two polls. */
 export const POLL_EVERY_MS = 2 * 60_000;
-/** Heads kept per repo. */
-const KEEP_HEADS = 50;
 /** Repos per query: 100 check contexts each keeps a query well under GitHub's node limit. */
 const REPOS_PER_QUERY = 30;
-const KEY_POLLED_AT = "main_ci_polled_at";
 
 export { optionalChecks };
 
@@ -76,39 +79,41 @@ export function parseHeads(repos: string[], data: Record<string, RepoNode | unde
   return out;
 }
 
-/** Stores a head: a new row, or the row of a head seen before with its current checks; state_changed_at moves only when the state does. Returns its state. */
-export async function saveHead(db: Db, h: Head, at: string): Promise<MainCiState> {
-  const state = classify(h.checks, await optionalChecks(db, h.repo));
-  const failing = JSON.stringify(h.checks.filter((c) => c.state === "failure").map((c) => ({ name: c.name, url: c.url })));
-  await db.run(db.k.insertInto("main_ci")
-    .values({ repo: h.repo, head_sha: h.sha, branch: h.branch, state, failing, checks: JSON.stringify(h.checks), committed_at: h.committedAt, headline: h.headline, first_seen_at: at, state_changed_at: at, updated_at: at })
-    .onConflict((oc) => oc.columns(["repo", "head_sha"]).doUpdateSet((eb) => ({
-      branch: eb.ref("excluded.branch"), state: eb.ref("excluded.state"), failing: eb.ref("excluded.failing"), checks: eb.ref("excluded.checks"),
-      committed_at: eb.ref("excluded.committed_at"), headline: eb.ref("excluded.headline"), updated_at: eb.ref("excluded.updated_at"),
-      state_changed_at: eb.case().when("main_ci.state", "=", eb.ref("excluded.state")).then(eb.ref("main_ci.state_changed_at")).else(eb.ref("excluded.updated_at")).end(),
-    }))));
-  await db.run(db.k.deleteFrom("main_ci").where("repo", "=", h.repo).where((eb) => eb("head_sha", "not in", eb.selectFrom("main_ci").select("head_sha").where("repo", "=", h.repo)
-    .orderBy(eb.fn.coalesce("committed_at", "first_seen_at"), "desc").orderBy("first_seen_at", "desc").limit(KEEP_HEADS))));
-  return state;
+/** Stores heads: a new row, or the row of a head seen before with its current checks; state_changed_at moves only when the state does. Returns the state of each head, keyed `repo@sha`. */
+export async function saveHeads(db: Db, heads: Head[], at: string): Promise<Map<string, MainCiState>> {
+  const optional = await optionalChecksOf(db);
+  const saved = await saveMainHeads(db, heads.map((h) => ({
+    repo: h.repo, sha: h.sha, branch: h.branch, state: classify(h.checks, optional(h.repo)),
+    failing: JSON.stringify(h.checks.filter((c) => c.state === "failure").map((c) => ({ name: c.name, url: c.url }))),
+    checks: JSON.stringify(h.checks), committed_at: h.committedAt, headline: h.headline,
+  })), at);
+  return saved as Map<string, MainCiState>;
 }
 
 /** Reads the default-branch heads of the synced repos (or of `only`) and stores them. */
 export async function pollMainCi(db: Db, client: Querier, only?: string, log: (line: string) => void = () => {}): Promise<{ repos: number; heads: number }> {
-  const synced = new Set((await db.all(db.k.selectFrom("repos").select("name").where("synced_at", "is not", null))).map((r) => r.name));
-  const repos = (await trackedNames(db)).filter((r) => synced.has(r) && (!only || r === only));
+  const [known, tracked] = await db.together(() => Promise.all([loadRepos(db), trackedNames(db)]));
+  const repos = tracked.filter((r) => known.get(r)?.synced_at != null && (!only || r === only));
   let heads = 0;
   for (let i = 0; i < repos.length; i += REPOS_PER_QUERY) {
     const chunk = repos.slice(i, i + REPOS_PER_QUERY);
-    const data = await client.query(mainCiQuery(chunk), mainCiVars(chunk));
+    // The time the read started: a head counts as newer than what was read from GitHub before that (src/verify/results.ts).
     const at = new Date().toISOString();
-    for (const h of parseHeads(chunk, data as Record<string, RepoNode>)) {
-      await saveHead(db, h, at);
-      heads++;
-    }
+    const data = await client.query(mainCiQuery(chunk), mainCiVars(chunk));
+    const parsed = parseHeads(chunk, data as Record<string, RepoNode>);
+    await saveHeads(db, parsed, at);
+    heads += parsed.length;
   }
   // A red head whose culprit is a PR we merged stops the merge path.
-  for (const r of await mainCiRepos(db)) if (r.state === "red" && r.culprit?.pr) await mainRedAfterMerge(db, r.repo, r.culprit.pr, r.culprit.sha);
-  if (!only) await db.run(db.k.insertInto("settings").values({ key: KEY_POLLED_AT, value: new Date().toISOString() }).onConflict((oc) => oc.column("key").doUpdateSet(kx.excluded(["value"]))));
+  const red = (await mainCiRepos(db)).flatMap((r) => (r.state === "red" && r.culprit?.pr ? [{ repo: r.repo, number: r.culprit.pr, sha: r.culprit.sha }] : []));
+  if (red.length) {
+    const merged = await loadMergedInfo(db, red.map((r) => ({ repo: r.repo, number: r.number })));
+    await tripMergeBreakers(db, red.flatMap((r) => {
+      const m = merged.get(`${r.repo}#${r.number}`);
+      return m?.lastAt ? [{ repo: r.repo, number: r.number, mergedAt: m.lastAt, reason: `main CI of ${r.repo} is red after our merge of #${r.number}`, evidence: [`${r.repo}#${r.number}`, `${r.repo}@${r.sha.slice(0, 8)}`] }] : [];
+    }));
+  }
+  if (!only) await saveSyncState(db, { main_ci_polled_at: new Date().toISOString() });
   // A new head, or a new toolchain image of the warm producer, queues the repo's warm build.
   const warm = await warmPass(db);
   log(`main-ci: ${heads} heads of ${repos.length} repos${warm ? `; ${warm} warm build${warm === 1 ? "" : "s"} queued` : ""}`);
@@ -117,7 +122,7 @@ export async function pollMainCi(db: Db, client: Querier, only?: string, log: (l
 
 /** Polls when the last full poll is older than POLL_EVERY_MS; the sync run calls it, so it runs with the pipeline on or off. */
 export async function pollMainCiIfDue(db: Db, client: Querier, now = Date.now()): Promise<boolean> {
-  const at = await setting(db, KEY_POLLED_AT);
+  const at = (await loadSyncState(db)).main_ci_polled_at;
   if (at && now - Date.parse(at) < POLL_EVERY_MS - 5_000) return false;
   await pollMainCi(db, client);
   return true;
@@ -130,27 +135,17 @@ export type MainCiRepoRow = {
   autocraft: string | null;
 };
 
-type Stored = { repo: string; head_sha: string; branch: string; state: MainCiState; failing: string; committed_at: string | null; headline: string | null; first_seen_at: string; state_changed_at: string; updated_at: string };
-
 /** One entry per repo with stored heads, red first, then by name. `hidden` repos are left out. */
 export async function mainCiRepos(db: Db, hidden: HiddenRepos = []): Promise<MainCiRepoRow[]> {
-  const by = new Map<string, Stored[]>();
-  for (const r of await db.all(db.k.selectFrom("main_ci").select(["repo", "head_sha", "branch", "state", "failing", "committed_at", "headline", "first_seen_at", "state_changed_at", "updated_at"])
-    .$narrowType<{ state: MainCiState }>())) {
-    if (isHiddenRepo(hidden, r.repo)) continue;
-    (by.get(r.repo) ?? by.set(r.repo, []).get(r.repo)!).push(r);
-  }
-  const tracked = new Set(await trackedNames(db));
+  const by = await loadDecidingHeads(db, hidden);
   const out: MainCiRepoRow[] = [];
-  for (const [repo, rows] of by) {
-    if (!tracked.has(repo)) continue;
-    const rank = (h: Stored): HeadRow => ({ sha: h.head_sha, state: h.state, committedAt: h.committed_at, headline: h.headline, firstSeenAt: h.first_seen_at, stateChangedAt: h.state_changed_at });
-    const d = derive(rows.map(rank));
-    if (!d) continue;
-    const cur = rows.find((r) => r.head_sha === d.current.sha)!;
+  for (const [repo, heads] of by) {
+    const at = currentHead(heads);
+    if (!at) continue;
+    const { cur, d } = at;
     let failing: { name: string; url: string | null }[] = [];
     try { failing = JSON.parse(cur.failing) as typeof failing; } catch { /* malformed: none shown */ }
-    out.push({ repo, state: cur.state, branch: cur.branch, headSha: cur.head_sha, headline: cur.headline, committedAt: cur.committed_at, failing, redSince: d.redSince, lastGreenSha: d.lastGreenSha, culprit: d.culprit, updatedAt: cur.updated_at, autocraft: null });
+    out.push({ repo, state: cur.state as MainCiState, branch: cur.branch, headSha: cur.head_sha, headline: cur.headline, committedAt: cur.committed_at, failing, redSince: d.redSince, lastGreenSha: d.lastGreenSha, culprit: d.culprit, updatedAt: cur.updated_at, autocraft: null });
   }
   const texts = await autocraftTexts(db, out.map((r) => ({ repo: r.repo, headSha: r.headSha, state: r.state })));
   for (const r of out) r.autocraft = texts.get(`${r.repo}\0${r.headSha}`) ?? null;

@@ -27,7 +27,7 @@ export function LinkDiscordDialog({ open, linked, onClose }: { open: boolean; li
     <Dialog open={open} onClose={onClose} title="Link Discord">
       <p className="text-sm text-ink/80">In Discord, run this command.</p>
       <p className="mt-2 break-all rounded-md border border-line bg-ink/[0.04] px-3 py-2 font-mono text-sm select-all">
-        /autocraft link code:<span className="font-semibold tracking-widest">{code?.code ?? "········"}</span>
+        /autocraft account action:link code:<span className="font-semibold tracking-widest">{code?.code ?? "········"}</span>
       </p>
       {code && <p className="mt-2 text-xs text-ink/55">Works once, until {hhmm(code.expiresAt)}.</p>}
       <ErrorLine error={error} className="mt-2" />

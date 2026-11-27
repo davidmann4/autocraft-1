@@ -3,15 +3,13 @@
 // planner's room counts only runners whose last status is `ready` and fresh, by their free slots (room.ts); the Connect
 // page (GET /api/runners) and my_work list the user's own.
 import { HttpError } from "../dash/server/util.ts";
-import { cooloffOf } from "./cooloff.ts";
 import { isTier } from "./mode.ts";
-import { scaled } from "./time-scale.ts";
-import { READINESS, STATUS_EVERY_S, type HarnessId, type HelperInfo, type HelperStatus, type Machine, type Readiness, type Reserve, type Tier, type UsageReading, type UsageWindow } from "./protocol.ts";
+import { READINESS, type HarnessId, type HelperInfo, type HelperStatus, type Machine, type Readiness, type Tier, type UsageReading, type UsageWindow } from "./protocol.ts";
 import type { Db } from "../db/index.ts";
-import { excluded } from "../db/kx.ts";
+import * as runners from "../data/runners/index.ts";
 
 /** A status this old no longer counts: one report interval and a minute of slack. */
-export const STATUS_FRESH_MS = scaled((STATUS_EVERY_S + 60) * 1000);
+export const STATUS_FRESH_MS = runners.STATUS_FRESH_MS;
 
 const HARNESSES: HarnessId[] = ["claude", "codex"];
 const REASON_MAX = 300;
@@ -75,52 +73,26 @@ export function parseStatus(raw: unknown): HelperStatus {
   };
 }
 
-/**
- * Keeps a helper's status as the last one of its credential, and the machine it names on the credential. Rows of deleted
- * credentials go with the dashboard's minute maintenance (pruneRemote).
- */
+/** Keeps a helper's status as the last one of its credential, with the machine it names. Rows of deleted credentials go with the dashboard's minute maintenance (pruneRemote). */
 export async function storeStatus(db: Db, tokenId: number, login: string, s: HelperStatus, nowMs: number = Date.now()): Promise<void> {
-  await db.run(db.k.insertInto("main.remote_helpers")
-    .values({
-      token_id: tokenId, login, readiness: s.readiness, until: s.until ?? null, reason: s.reason ?? null, harness: s.harness, models: JSON.stringify(s.models),
-      reserve: JSON.stringify(s.reserve), usage: s.usage ? JSON.stringify(s.usage) : null, reported_at: nowMs, slots: s.slots, busy: s.busy,
-      last_error: s.lastError ? JSON.stringify(s.lastError) : null, helper_version: s.helperVersion ?? null,
-    })
-    .onConflict((oc) => oc.column("token_id").doUpdateSet((eb) => ({
-      ...excluded(["login", "readiness", "until", "reason", "harness", "models", "reserve", "usage", "reported_at", "slots", "busy", "last_error"])(eb),
-      helper_version: eb.fn.coalesce("excluded.helper_version", "main.remote_helpers.helper_version"),
-    }))));
-  if (s.machine) await db.run(db.k.updateTable("main.mcp_tokens").set({ machine: JSON.stringify(s.machine) }).where("id", "=", tokenId).where("machine", "is distinct from", JSON.stringify(s.machine)));
+  await runners.saveHelperStatus(db, tokenId, login, s, nowMs);
 }
 
 /** Whether the login has a Task Runner whose last status is fresh (the MCP Connector then offers the task tools). */
 export async function hasFreshRunner(db: Db, login: string, nowMs: number = Date.now()): Promise<boolean> {
-  return await db.get(db.k.selectFrom("main.mcp_tokens as t").innerJoin("main.remote_helpers as h", "h.token_id", "t.id").select((eb) => eb.lit(1).as("one"))
-    .where("t.login", "=", login).where("t.kind", "=", "runner").where("t.expires_at", ">", new Date(nowMs).toISOString()).where("h.reported_at", ">=", nowMs - STATUS_FRESH_MS).limit(1)) !== undefined;
+  return (await runners.hasFreshRunners(db, [login], nowMs)).has(login.toLowerCase());
 }
 
 /** The login's helpers: every live Task Runner credential, with its last status. */
 export async function listHelpers(db: Db, login: string, nowMs: number = Date.now()): Promise<HelperInfo[]> {
-  const rows = await db.all(db.k.selectFrom("main.mcp_tokens as t").leftJoin("main.remote_helpers as h", "h.token_id", "t.id")
-    .select(["t.id", "t.label", "t.last_used_at", "h.readiness", "h.until", "h.reason", "h.harness", "h.models", "h.reserve", "h.usage", "h.reported_at", "h.slots", "h.busy", "h.last_error"])
-    .$narrowType<{ readiness: Readiness | null; harness: HarnessId | null }>()
-    .where("t.login", "=", login).where("t.kind", "=", "runner").where("t.expires_at", ">", new Date(nowMs).toISOString())
-    .orderBy("t.created_at", "desc").orderBy("t.id", "desc"));
-  const cooloff = await cooloffOf(db, login, nowMs);
-  return rows.map((r) => {
-    const reported = r.reported_at === null ? null : Number(r.reported_at);
-    const used = r.last_used_at ? Date.parse(r.last_used_at) : null;
-    const seen = Math.max(reported ?? -Infinity, used ?? -Infinity);
+  const helpers = await runners.loadHelpers(db, [login], nowMs);
+  return (helpers.get(login.toLowerCase()) ?? []).map((h) => {
     // The server's own cool-off of the login shows even before the helper has reported it.
-    const cooled = cooloff !== null && r.readiness !== "cooled-off";
+    const cooled = h.cooledUntil !== null;
     return {
-      tokenId: Number(r.id), label: r.label, slots: r.slots === null ? null : Number(r.slots), busy: r.busy === null ? null : Number(r.busy),
-      lastError: r.last_error ? JSON.parse(r.last_error) as { text: string; at: string } : null,
-      ...(cooled ? { readiness: "cooled-off" as const, until: new Date(cooloff.until).toISOString(), reason: cooloff.reason } : { readiness: r.readiness, until: r.until, reason: r.reason }),
-      fresh: reported !== null && nowMs - reported <= STATUS_FRESH_MS,
-      lastSeen: Number.isFinite(seen) ? new Date(seen).toISOString() : null,
-      harness: r.harness, models: r.models ? JSON.parse(r.models) as Partial<Record<Tier, string>> : {},
-      reserve: r.reserve ? JSON.parse(r.reserve) as Reserve : null, usage: r.usage ? JSON.parse(r.usage) as UsageReading : null,
+      tokenId: h.tokenId, label: h.label, slots: h.slots, busy: h.busy, lastError: h.lastError,
+      ...(cooled ? { readiness: "cooled-off" as const, until: h.cooledUntil, reason: h.cooledReason } : { readiness: h.readiness, until: h.until, reason: h.reason }),
+      fresh: h.fresh, lastSeen: h.lastSeen, harness: h.harness as HarnessId | null, models: h.models, reserve: h.reserve, usage: h.usage as UsageReading | null,
     };
   });
 }

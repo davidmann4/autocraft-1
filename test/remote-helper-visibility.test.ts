@@ -7,15 +7,13 @@ import { test } from "node:test";
 import { createToken } from "../src/dash/mcp/tokens.ts";
 import { computeChecks, THRESHOLDS } from "../src/health-checks.ts";
 import { listHelpers, parseStatus, storeStatus } from "../src/remote/helpers.ts";
-import { setInferenceMode } from "../src/remote/mode.ts";
 import { SCRATCH } from "./scratch.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb } from "./helpers/raw-db.ts";
 
 mkdirSync(SCRATCH, { recursive: true });
 
 test("a helper's last error and busy count are listed, and a starved tier warns", async () => {
   const db = await connectDb(join(mkdtempSync(join(SCRATCH, "helper-vis-")), "t.db"));
-  await setInferenceMode(db, "user-local", "test");
   await db.prepare("INSERT INTO access (login, role) VALUES ('alice', 'maintainer')").run();
   const tokenId = (await createToken(db, "alice", "laptop", { kind: "runner" })).row.id;
   const now = Date.now();

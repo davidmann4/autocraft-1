@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { after, before, test } from "node:test";
 import { ackRemovals, AllowedOwnerError, allowedOwners, allowOwner, installationEvent, removeOwner, sweepInstallations, unackedRemovals } from "../src/github/allowed-owners.ts";
 import type { AppSecrets } from "../src/dash/server/config.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb } from "./helpers/raw-db.ts";
 import { SCRATCH } from "./scratch.ts";
 
 mkdirSync(SCRATCH, { recursive: true });

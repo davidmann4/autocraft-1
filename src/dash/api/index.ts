@@ -5,36 +5,40 @@
 import { live } from "./live.ts";
 import { mayRunRepo } from "../repo-access.ts";
 import { isHiddenRepo, type HiddenRepos } from "../../hidden-sql.ts";
-import * as kx from "../../db/kx.ts";
 import { prBuildView } from "../../prbuild/view.ts";
+import { loadItems, loadComments, loadFiles, loadChecks, loadRepos, loadSyncState, listItems } from "../../data/mirror/index.ts";
+import { loadStageLog, loadStageFacts, loadStageVersion } from "../../data/planner/index.ts";
+import { loadTrackedRepos } from "../../data/control/index.ts";
+import { loadReviewRecord } from "../../data/review/index.ts";
+import type { ReviewRecord } from "../../data/review/index.ts";
+import type { PatchTimelineRow } from "../../data/changes/index.ts";
+import type { VerificationView } from "../../data/merge/index.ts";
+import { loadPatchTimeline } from "../../data/changes/index.ts";
+import { loadLatestVerification } from "../../data/merge/index.ts";
+import { loadStatementViews } from "../../data/conversations/index.ts";
 import { checksOf } from "../../patchcheck/index.ts";
 import { priorityOf } from "../../priority/read.ts";
 import { preapprovalOf } from "../../preapproval/index.ts";
 import type {
-  CiState, DecisionKind, Done, Funnel, Item, ItemAction, ItemComment, ItemFixup, ItemPremerge, ItemReviews, ItemState, ItemVerification, ReviewSide, Mergeable, Progress, RepoProgress, Tier, User,
+  CiState, Done, Funnel, Item, ItemComment, ItemFixup, ItemPremerge, ItemReviews, ItemState, ItemVerification, ReviewSide, Mergeable, Progress, RepoProgress, Tier, User,
 } from "../../../web/src/api/types.ts";
 import { trackedNames } from "../../repos.ts";
-import { excludeHiddenExpr, hiddenRepos, allVisibleRepos, needVisible, repoOwners, visibleRepos } from "./visible.ts";
-import { withoutHiddenExpr } from "./decisions.ts";
+import { hiddenRepos, allVisibleRepos, needVisible, repoOwners, visibleRepos } from "./visible.ts";
 import { contributors } from "../../whitelist.ts";
-import { doneByRepo, funnelByRepo, latestCteExpr, trackedExpr, trackingStart, trend, type DoneRow, type FunnelRow } from "./stats.ts";
-import { HttpError, RateLimiter, share } from "../server/util.ts";
-import { findingsOf, type PremergeRow } from "../../premerge/store.ts";
+import { doneByRepo, funnelByRepo, trackingStart, trend, type DoneRow, type FunnelRow } from "./stats.ts";
+import { HttpError } from "../server/util.ts";
 import type { Req, Res, Route } from "../types.ts";
 import * as adm from "./admin.ts";
 import { githubUserId } from "../../github/users.ts";
-import { maintainersSettle } from "../../settlers.ts";
 import * as discord from "./discord.ts";
 import * as agents from "./agents.ts";
 import * as build from "./build.ts";
 import * as workspaces from "./workspaces.ts";
-import * as dec from "./decisions.ts";
-import * as conv from "./conversations.ts";
 import * as mcp from "./mcp.ts";
 import * as userSettings from "./user-settings.ts";
 import * as maintain from "./maintain.ts";
+import * as itemsBrowse from "./items-browse.ts";
 import * as maintainItem from "./maintain-item.ts";
-import { uiV2 } from "../../workflow/settings.ts";
 import * as runners from "./runners.ts";
 import * as modelQueue from "./model-queue.ts";
 import * as areas from "./areas.ts";
@@ -44,47 +48,38 @@ import * as insight from "./insight.ts";
 import * as pipeline from "./pipeline.ts";
 import * as outside from "./outside.ts";
 import { prompts } from "./prompts.ts";
-import { queue, queueBatches } from "./queue.ts";
 import { next } from "./next.ts";
-import { work } from "./work.ts";
-import { flow } from "./flow.ts";
-import { now, nowFeed } from "./now.ts";
+import { health } from "./health.ts";
 import { queueSlots } from "../../rank/position.ts";
 import * as items from "./items.ts";
 import { activity } from "./activity.ts";
 import { downloads } from "./downloads.ts";
 import { itemPage } from "./item-page.ts";
+import { itemChat, postChat, postChatWithdraw } from "./item-chat.ts";
 import { trace as itemTrace, traceDetail as itemTraceDetail } from "./trace.ts";
-import { postmergeOf } from "./postmerge.ts";
+import { mergedAsApproved, postmergeOf } from "./postmerge.ts";
 import * as nightly from "./nightly.ts";
 import { canSeeInternals } from "./staff.ts";
 import * as operator from "./operator.ts";
 import * as stuck from "./stuck.ts";
 import { actionsOf as releasesOf } from "../../operator-actions.ts";
-import { verificationOf } from "../../verify/results.ts";
-import { areaNameOf } from "../../areas/store.ts";
-import { settledOf, unflagged } from "../../classify/settled.ts";
-import { isQuiet } from "../../security/quiet.ts";
-import { classificationsOf, itemState, relatedOf } from "./decisions.ts";
+import { settle, unflagged } from "../../classify/settled.ts";
+import { classifyRun, loadItemAreas, loadSettled } from "../../data/triage/index.ts";
+import { loadQuiet } from "../../data/security/index.ts";
+import { classificationsOf, relatedOf } from "./related.ts";
+import { itemState } from "./shown.ts";
 import * as sim from "./similar.ts";
 import * as inference from "./inference.ts";
-import { inferenceMode } from "../../remote/mode.ts";
-import { fixes as needsFixes, needs } from "./needs.ts";
-import { home } from "./home.ts";
 import { localEmbedder, type Embedder } from "../../embed/model.ts";
 import type { Exec } from "../../fixup/git.ts";
 import { batchOne } from "./batch-page.ts";
-import { batchRemovePr, batchStop, fastTrackAdd, fastTrackRefs, fastTrackRemove, fastTrackWeight, queueAdd, heldMergeRefs, mergeHoldPr, pipelineRepoNames, queuePage } from "./queue-page.ts";
+import { batchRemovePr, batchStop, queuePage } from "./queue-page.ts";
 import { VectorIndex } from "../../embed/vectors.ts";
 import { mainCiRepos, summarize } from "../../mainci/index.ts";
 import * as commands from "./commands.ts";
 import type { Db } from "../../db/index.ts";
 
 export type ApiOptions = {
-  // Opinions and comments by non-operators, per login per hour.
-  writesPerHour?: number;
-  // The limiter itself, when the Inbox MCP server's feedback must share it (see AppOptions.feedbackLimiter); overrides writesPerHour.
-  limiter?: RateLimiter;
   // Embeds search queries and items without a stored vector; default: the local model, loaded on first use.
   embedder?: Embedder;
   // Runs `gh` for the batch controls that close a PR; default: the real one. Tests fake it.
@@ -117,16 +112,11 @@ async function runRepos(db: Db, req: Req): Promise<string[]> {
 }
 
 async function me(db: Db, req: Req): Promise<User> {
-  const mw = await db.get(db.k.selectFrom("settings").select("value").where("key", "=", "maintainer_writes"));
   return {
     login: req.user.login,
     role: req.user.role,
     writeRepos: await writeRepos(db, req),
     runRepos: await runRepos(db, req),
-    maintainerWrites: mw?.value === "1",
-    maintainerSettles: await maintainersSettle(db),
-    inference: await inferenceMode(db),
-    uiV2: await uiV2(db, req.user.login),
   };
 }
 
@@ -140,8 +130,10 @@ export async function itemCore(db: Db, req: Req): Promise<Item> {
   const repo = req.params.repo!;
   const n = Number(req.params.n);
   if (!Number.isInteger(n)) throw new HttpError(400, "not an item number");
+  const ref = `${repo}#${n}`;
   // The visibility check decides first: an item of a hidden repo is a 404 for its repo whether or not the mirror has it.
-  const [, it] = await Promise.all([needVisible(db, req, repo), db.get(db.k.selectFrom("items").select(kx.cols("items")).where("repo", "=", repo).where("number", "=", n))]);
+  await needVisible(db, req, repo);
+  const it = (await loadItems(db, [{ repo, number: n }], "full")).get(ref);
   if (!it) throw new HttpError(404, `no item ${repo}#${n} in the mirror`);
   let labels: string[] = [];
   try {
@@ -150,33 +142,34 @@ export async function itemCore(db: Db, req: Req): Promise<Item> {
   } catch { /* malformed: no labels */ }
   const internals = canSeeInternals(req);
   const pr = it.kind === "pr";
+  const key = [{ repo, number: n }];
   // The parts read independently, so they run together.
-  const [c, stages, comments, decisionIds, quiet, files, ciChecks, tracked, related, classifications, area, discordOf, settled, priority, work, checks, reviews, premerge, postmerge, actions, releases, slots, preapproval] = await Promise.all([
+  const [c, stageLog, commentRows, quiet, files, checkRows, tracked, related, classifications, area, discordOf, settled, priority, checks, record, timeline, verification, postmerge, asApproved, releases, slots, preapproval, hidden] = await db.together(() => Promise.all([
     it.author ? contributors(db, { login: it.author }).then((cs) => cs.find((x) => x.login === it.author)) : undefined,
-    db.all(db.k.selectFrom("stages").select(["stage", "at", "actor as by", "note"]).where("repo", "=", repo).where("number", "=", n)
-      .orderBy("at").orderBy(kx.rowid("stages")).$narrowType<{ stage: Item["stages"][number]["stage"] }>()),
-    db.all(db.k.selectFrom("comments").select(["id", "author", "created_at as at", "body", "kind", "review_state as reviewState"])
-      .where("repo", "=", repo).where("number", "=", n)
-      .where((eb) => eb.not(eb.and([eb("kind", "=", "review"), eb(eb.fn.coalesce(eb.fn("trim", ["body"]), eb.val("")), "=", "")])))
-      .orderBy("created_at", (o) => o.asc().nullsFirst()).orderBy(kx.rowid("comments")).$narrowType<{ kind: ItemComment["kind"] | null }>()),
-    db.all(db.k.selectFrom("decisions").select("id").where((eb) => eb.or([
-      eb.and([eb("repo", "=", repo), eb("number", "=", n)]),
-      eb.and([eb("number", "is", null), eb.exists(
-        db.k.selectFrom(kx.jsonEach(db, eb.case().when(kx.jsonValid(db, "items")).then(eb.ref("items")).else("[]").end(), "j")).select(eb.lit(1).as("one"))
-          .where((e) => e.and([e(kx.jsonText(db, "j.value", "$.repo"), "=", repo), e(kx.jsonNum(db, "j.value", "$.number"), "=", n)])))]),
-    ])).orderBy("asked_at")).then((rows) => rows.map((r) => r.id)),
-    isQuiet(db, repo, n),
-    pr ? filesOf(db, repo, n) : [], pr ? ciChecksOf(db, repo, n) : [],
-    db.get(db.k.selectFrom("tracked_repos").select("pipeline").where("name", "=", repo)),
-    relatedOf(db, repo, n), classificationsOf(db, repo, n), areaNameOf(db, repo, n), discord.discordOf(db, repo, n), settledOf(db, repo, n), priorityOf(db, repo, n),
-    pr ? prWork(db, repo, n, internals) : { verification: null, fixups: [], prBuild: null },
+    loadStageLog(db, [ref]),
+    loadComments(db, key, { order: "created", body: true }),
+    loadQuiet(db, [`${repo}#${n}`]).then((q) => q.size > 0),
+    pr ? loadFiles(db, key) : new Map<string, never[]>(),
+    pr ? loadChecks(db, key) : new Map<string, never>(),
+    loadTrackedRepos(db, [repo]),
+    relatedOf(db, repo, n), classificationsOf(db, repo, n), loadItemAreas(db, key).then((m) => m.get(ref)?.area ?? null), discord.discordOf(db, repo, n), classifyRun(db).then((run) => loadSettled(db, key, run)).then((m) => m.get(ref) ?? settle(null, null)), priorityOf(db, repo, n),
     checksOf(db, repo, n),
-    pr ? hiddenRepos(db, req).then((hidden) => reviewsOf(db, repo, n, internals, hidden)) : null,
-    pr ? premergeOf(db, repo, n) : [], pr ? postmergeOf(db, repo, n, internals) : null,
-    actionsOf(db, repo, n), releasesOf(db, repo, n),
+    pr ? loadReviewRecord(db, key) : new Map<string, ReviewRecord>(),
+    pr ? loadPatchTimeline(db, key, { internals }) : new Map(),
+    pr ? loadLatestVerification(db, key) : new Map(),
+    pr ? postmergeOf(db, repo, n, internals) : null,
+    pr ? mergedAsApproved(db, repo, n) : false,
+    releasesOf(db, repo, n),
     visibleRepos(db, req).then((v) => queueSlots(db, v)),
     pr ? preapprovalOf(db, repo, n) : null,
-  ]);
+    pr ? hiddenRepos(db, req) : [],
+  ]));
+  const rec = record.get(ref);
+  const [work, reviews] = pr ? await Promise.all([
+    prWork(db, repo, n, it.head_oid, internals, timeline.get(ref) ?? [], verification.get(ref)),
+    reviewsOf(db, rec, it.head_oid, internals, hidden),
+  ]) : [{ verification: null, fixups: [], prBuild: null }, null];
+  const premerge = pr ? premergeOf(rec) : [];
   // The quiet pull request of a security fix: viewers get none of the model text about it.
   const veil = !internals && quiet;
   const out: Item = {
@@ -186,26 +179,28 @@ export async function itemCore(db: Db, req: Req): Promise<Item> {
     additions: it.additions ?? 0, deletions: it.deletions ?? 0,
     changedFiles: it.kind === "pr" ? it.changed_files : null,
     // Per-check states of the head come from pr_checks and per-file rows from pr_files (src/activity.ts).
-    files, ciChecks,
+    files: (files.get(ref) ?? []).map((f) => ({ path: f.path, additions: f.additions, deletions: f.deletions })), ciChecks: ciChecksOf(it.head_oid, checkRows.get(ref)),
     ci: it.kind === "pr" ? (CI[it.ci_state ?? ""] ?? "none") : "none",
     mergeable: MERGEABLE[it.mergeable ?? ""] ?? "unknown",
     labels, createdAt: it.created_at ?? "", updatedAt: it.updated_at ?? "",
     closedAt: it.closed_at, mergedAt: it.merged_at, mergedBy: it.merged_by,
-    pipelineOn: tracked?.pipeline === 1,
+    pipelineOn: tracked.get(repo)?.pipeline === true,
     related, classifications, area,
     // Stage notes quote review reasons, verification summaries and fix-up reasons: staff only.
-    stages: stages.map((s) => ({ ...s, by: s.by ?? "", note: internals ? s.note : null })),
+    stages: (stageLog.get(ref) ?? []).map((s) => ({ stage: s.stage as Item["stages"][number]["stage"], at: s.at, by: s.actor ?? "", note: internals ? s.note : null })),
     discord: discordOf,
-    comments: comments.map((x) => ({ ...x, author: x.author ?? "", body: x.body ?? "" })),
-    decisionIds, settled: unflagged(settled, quiet, !veil) as Item["settled"], priority,
+    comments: (commentRows.get(ref) ?? []).filter((x) => !(x.kind === "review" && (x.body ?? "").trim() === "")).map((x) => ({
+      id: x.id, author: x.author ?? "", at: x.created_at, body: x.body ?? "", kind: x.kind as ItemComment["kind"] | null, reviewState: x.review_state,
+    })),
+    settled: unflagged(settled, quiet, !veil) as Item["settled"], priority,
     ...work,
     // The reviewer's reasons quote the patch, so viewers get the verdict only.
     patchChecks: checks.map(({ kind, subject, patchHash, round, verdict, reasons, problems, model, createdAt }) =>
       ({ kind, subject, patchHash, round, verdict, reasons: internals ? reasons : "", problems: internals ? problems : [], model, createdAt })),
     reviews,
     premerge,
-    postmerge,
-    actions, releases,
+    postmerge, ...(asApproved && { mergedAsApproved: true }),
+    releases,
     queue: slots.get(`${repo}#${n}`) ?? null,
     // The operator's instructions are shown to those who see the internals only.
     ...(pr ? { preapproval: preapproval && !internals ? { ...preapproval, instructions: "" } : preapproval } : {}),
@@ -220,102 +215,68 @@ export async function itemCore(db: Db, req: Req): Promise<Item> {
   };
 }
 
-/** The changed files the activity sync stored for the current head; empty until the sync has read the PR. */
-async function filesOf(db: Db, repo: string, n: number): Promise<Item["files"]> {
-  return db.all(db.k.selectFrom("pr_files as f")
-    .innerJoin("items as i", (j) => j.onRef("i.repo", "=", "f.repo").onRef("i.number", "=", "f.number").onRef("i.head_oid", "=", "f.head"))
-    .select(["f.path", "f.additions", "f.deletions"]).where("f.repo", "=", repo).where("f.number", "=", n).orderBy("f.path"));
-}
-
 /** The head's check contexts as the checks sync stored them; empty when they belong to an older head. */
-async function ciChecksOf(db: Db, repo: string, n: number): Promise<Item["ciChecks"]> {
-  const r = await db.get(db.k.selectFrom("pr_checks as c").innerJoin("items as i", (j) => j.onRef("i.repo", "=", "c.repo").onRef("i.number", "=", "c.number"))
-    .select("c.checks").where("c.repo", "=", repo).where("c.number", "=", n)
-    .where((eb) => eb.or([eb("i.head_oid", "is", null), eb("i.head_oid", "=", eb.ref("c.head_oid"))])));
-  if (!r) return [];
+function ciChecksOf(head: string | null, row: { head_oid: string | null; checks: string | null } | undefined): Item["ciChecks"] {
+  if (!row || (head !== null && head !== row.head_oid)) return [];
   let list: unknown = [];
-  try { list = JSON.parse(r.checks); } catch { /* malformed: none */ }
+  try { list = JSON.parse(row.checks ?? "[]"); } catch { /* malformed: none */ }
   return (Array.isArray(list) ? (list as ({ name?: unknown; state?: unknown } | null)[]) : []).flatMap((c) =>
     c && typeof c.name === "string" ? [{ name: c.name, state: CI[typeof c.state === "string" ? c.state.toUpperCase() : ""] ?? "none", minutes: null }] : []);
 }
 
+const jsonList = <T>(s: string | null | undefined): T[] => { try { const v = JSON.parse(s ?? "[]") as unknown; return Array.isArray(v) ? (v as T[]) : []; } catch { return []; } };
+
 /** Pre-merge review rows of the PR, newest first. */
-async function premergeOf(db: Db, repo: string, n: number): Promise<ItemPremerge[]> {
-  const rows: PremergeRow[] = await db.all(db.k.selectFrom("premerge_reviews").select(kx.cols("premerge_reviews")).where("repo", "=", repo).where("number", "=", n)
-    .orderBy("at", "desc").orderBy("head_oid", "desc"));
-  return rows.map((r) => ({ head: r.head_oid, at: r.at, model: r.model, findings: findingsOf(r), searched: r.searched, error: r.error, tries: r.tries }));
+function premergeOf(rec: ReviewRecord | undefined): ItemPremerge[] {
+  return [...(rec?.premerge ?? [])].sort((a, b) => (a.at === b.at ? (a.head_oid < b.head_oid ? 1 : -1) : a.at < b.at ? 1 : -1))
+    .map((r) => ({ head: r.head_oid, at: r.at, model: r.model, findings: jsonList<ItemPremerge["findings"][number]>(r.findings), searched: r.searched, error: r.error, tries: r.tries }));
 }
 
-/** The Opus review of the newest reviewed head, which is also the final verdict. */
 /**
  * The owner statements the Opus or the pre-merge review at the head named as conflicts, with the reviews' reasons and the item each
  * was said about. A statement made in a repo hidden from the reader is left out; viewers (`internals` false) get no excerpt or reason.
  */
-async function conflictsNamed(db: Db, repo: string, n: number, head: string, internals: boolean, hidden: HiddenRepos): Promise<ItemReviews["conflicts"]> {
-  const stored = [
-    (await db.get(db.k.selectFrom("opus_reviews").select("conflicts").where("repo", "=", repo).where("number", "=", n).where("head_oid", "=", head)))?.conflicts,
-    (await db.get(db.k.selectFrom("premerge_reviews").select("conflicts").where("repo", "=", repo).where("number", "=", n).where("head_oid", "=", head)))?.conflicts,
+async function conflictsNamed(db: Db, rec: ReviewRecord, head: string, internals: boolean, hidden: HiddenRepos): Promise<ItemReviews["conflicts"]> {
+  const stored: { id?: unknown; reason?: unknown }[][] = [
+    rec.latest?.conflicts ?? [],
+    jsonList(rec.premerge.find((p) => p.head_oid === head)?.conflicts),
   ];
+  const named = stored.flat().filter((h): h is { id: number; reason?: unknown } => typeof h?.id === "number");
+  const statements = await loadStatementViews(db, named.map((h) => h.id));
   const out: ItemReviews["conflicts"] = [];
-  for (const raw of stored) {
-    let v: unknown = [];
-    try { v = JSON.parse(raw ?? "[]"); } catch { /* unreadable: none */ }
-    for (const h of Array.isArray(v) ? (v as { id?: unknown; reason?: unknown }[]) : []) {
-      if (typeof h?.id !== "number" || out.some((d) => d.id === h.id)) continue;
-      const d = await db.get(db.k.selectFrom("owner_statements as s").leftJoin("items as i", (j) => j.onRef("i.repo", "=", "s.repo").onRef("i.number", "=", "s.number"))
-        .select(["s.repo", "s.number", "s.text", "s.item_title", "i.kind", "i.state", "i.title"]).where("s.id", "=", h.id)
-        .$narrowType<{ kind: "pr" | "issue" | null }>());
-      if (!d || isHiddenRepo(hidden, d.repo)) continue;
-      out.push({
-        id: h.id, repo: d.repo, number: d.number, kind: d.kind, state: d.state ? (d.state.toLowerCase() as ItemState) : null, title: d.title ?? (d.item_title || null),
-        excerpt: internals ? d.text.replace(/\s+/g, " ").trim().slice(0, 200) : "", reason: internals && typeof h.reason === "string" ? h.reason : "",
-      });
-    }
+  for (const h of named) {
+    if (out.some((d) => d.id === h.id)) continue;
+    const d = statements.get(h.id);
+    if (!d || isHiddenRepo(hidden, d.repo)) continue;
+    out.push({
+      id: h.id, repo: d.repo, number: d.number as number, kind: d.kind as "pr" | "issue" | null, state: d.state ? (d.state.toLowerCase() as ItemState) : null, title: d.title,
+      excerpt: internals ? d.text.replace(/\s+/g, " ").trim().slice(0, 200) : "", reason: internals && typeof h.reason === "string" ? h.reason : "",
+    });
   }
   return out.sort((a, b) => a.id - b.id);
 }
 
 /** `internals` false (viewers): the verdict only; the reviewer's reason, fixes and risks quote the patch. */
-async function reviewsOf(db: Db, repo: string, n: number, internals: boolean, hidden: HiddenRepos): Promise<ItemReviews | null> {
-  // The view holds the rows of opus_reviews that have a verdict; its head, time and mode columns are NOT NULL there.
-  const o = await db.get(db.k.selectFrom("final_reviews").select(["head_oid", "at", "mode", "base_head", "verdict", "sure", "reason", "fixes", "risks"])
-    .where("repo", "=", repo).where("number", "=", n).orderBy("at", "desc").orderBy("head_oid", "desc").limit(1)
-    .$narrowType<{ head_oid: string; at: string; mode: "full" | "delta"; verdict: ReviewSide["verdict"] }>());
-  if (!o) return null;
-  const list = <T>(s: string | null): T[] => { try { const v = JSON.parse(s ?? "[]") as unknown; return Array.isArray(v) ? (v as T[]) : []; } catch { return []; } };
-  const head = (await db.get(db.k.selectFrom("items").select("head_oid").where("repo", "=", repo).where("number", "=", n)))?.head_oid ?? null;
+async function reviewsOf(db: Db, rec: ReviewRecord | undefined, head: string | null, internals: boolean, hidden: HiddenRepos): Promise<ItemReviews | null> {
+  const o = rec?.latest;
+  if (!rec || !o) return null;
   return {
-    head: o.head_oid, current: o.head_oid === head, conflicts: await conflictsNamed(db, repo, n, o.head_oid, internals, hidden),
-    opus: { verdict: o.verdict, reason: internals ? o.reason ?? "" : "", fixes: internals ? list(o.fixes) : [], risks: internals ? list(o.risks) : [], at: o.at, sure: o.sure === 1, mode: o.mode, baseHead: o.base_head },
-    final: { verdict: o.verdict, reason: internals ? o.reason ?? "" : "", decided: true },
+    head: o.head, current: o.head === head, conflicts: await conflictsNamed(db, rec, o.head, internals, hidden),
+    opus: { verdict: o.verdict as ReviewSide["verdict"], reason: internals ? o.reason : "", fixes: internals ? o.fixes as unknown as ReviewSide["fixes"] : [], risks: internals ? o.risks : [], at: o.at, sure: o.sure, mode: o.mode as "full" | "delta", baseHead: o.base_head },
+    final: { verdict: o.verdict as ReviewSide["verdict"], reason: internals ? o.reason : "", decided: true },
   };
 }
 
 /** `internals` false (viewers): states only, without job errors or model output. */
-async function prWork(db: Db, repo: string, n: number, internals: boolean): Promise<Pick<Item, "verification" | "fixups" | "prBuild">> {
-  const head = (await db.get(db.k.selectFrom("items").select("head_oid").where("repo", "=", repo).where("number", "=", n)))?.head_oid ?? null;
-  const latest = await db.get(db.k.selectFrom("verifications").select("head_sha").where("repo", "=", repo).where("number", "=", n)
-    .$if(head !== null, (q) => q.orderBy((eb) => eb("head_sha", "=", head!), "desc")).orderBy("created_at", "desc").limit(1));
-  const v = latest ? await verificationOf(db, repo, n, latest.head_sha) : null;
+async function prWork(db: Db, repo: string, n: number, head: string | null, internals: boolean, timeline: PatchTimelineRow[], latest: { head: string; view: VerificationView } | undefined): Promise<Pick<Item, "verification" | "fixups" | "prBuild">> {
+  const v = latest?.view ?? null;
   const plan = (v?.plan ?? null) as Record<string, unknown> | null;
   const strings = (x: unknown): string[] => (Array.isArray(x) ? x.filter((s): s is string => typeof s === "string") : []);
-  const fixups = (await db.all(db.k.selectFrom("fixups").select(["from_head", "to_head", "state", "reason", "files", "attempt", "created_at"])
-    .where("repo", "=", repo).where("number", "=", n).orderBy("created_at").orderBy(kx.rowid("fixups"))))
-    .map((f): ItemFixup => {
-      let files: string[] = [];
-      try { files = strings(JSON.parse(f.files ?? "[]")); } catch { /* malformed: none */ }
-      return { fromHead: f.from_head, toHead: f.to_head, state: f.state as ItemFixup["state"], reason: internals ? f.reason : null, files: internals ? files : [], attempt: f.attempt, createdAt: f.created_at };
-    });
-  // CI fix tries are listed with the fix-ups, oldest first.
-  const ciFixes = (await db.all(db.k.selectFrom("ci_fixes").select(["head", "to_head", "state", "reason", "files", "attempt", "created_at"])
-    .where("repo", "=", repo).where("number", "=", n).orderBy("created_at").orderBy(kx.rowid("ci_fixes"))))
-    .map((f): ItemFixup => {
-      let files: string[] = [];
-      try { files = strings(JSON.parse(f.files ?? "[]")); } catch { /* malformed: none */ }
-      return { kind: "ci-fix", fromHead: f.head, toHead: f.to_head, state: f.state as ItemFixup["state"], reason: internals ? f.reason : null, files: internals ? files : [], attempt: f.attempt, createdAt: f.created_at };
-    });
-  fixups.push(...ciFixes);
-  fixups.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  // Fix-ups and CI fix tries are listed together, oldest first.
+  const fixups = timeline.filter((r) => r.kind === "fixup" || r.kind === "cifix").map((f): ItemFixup => ({
+    ...(f.kind === "cifix" ? { kind: "ci-fix" as const } : {}),
+    fromHead: f.head, toHead: f.toHead, state: f.state as ItemFixup["state"], reason: internals ? f.reason : null, files: internals ? f.files : [], attempt: f.attempt, createdAt: f.createdAt,
+  }));
   return {
     fixups,
     prBuild: await prBuildView(db, repo, n, head, internals),
@@ -326,13 +287,6 @@ async function prWork(db: Db, repo: string, n: number, internals: boolean): Prom
       tasks: v.tasks.map((t) => ({ id: t.id, role: t.role, state: t.state, results: internals ? t.results : [], endedAt: t.endedAt })),
     },
   };
-}
-
-async function actionsOf(db: Db, repo: string, n: number): Promise<ItemAction[]> {
-  return (await db.all(db.k.selectFrom("actions").select(["decision_id", "kind", "state", "comment_url", "reason", "created_at"])
-    .select((eb) => eb.selectFrom("decisions as d").select("d.kind").whereRef("d.id", "=", "actions.decision_id").limit(1).as("decision_kind"))
-    .where("repo", "=", repo).where("number", "=", n).orderBy("created_at").orderBy("id")))
-    .map((a): ItemAction => ({ decisionId: a.decision_id, decisionKind: a.decision_kind as DecisionKind | null, kind: a.kind, state: a.state as ItemAction["state"], commentUrl: a.comment_url, reason: a.reason, createdAt: a.created_at }));
 }
 
 // ---- progress ----------------------------------------------------------------
@@ -350,7 +304,7 @@ const sum = <T extends object>(xs: T[], zero: T): T => {
   return out as T;
 };
 
-type Heavy = Omit<Progress, "decisionsOpen" | "decisionsAnsweredToday" | "mainCi">;
+type Heavy = Omit<Progress, "mainCi">;
 // One entry per set of hidden repos (nearly always the operator's empty set and one other).
 const progressCache = new WeakMap<Db, Map<string, { key: string; at: number; value: Heavy }>>();
 const PROGRESS_MAX_AGE = 60_000;
@@ -359,13 +313,11 @@ const PROGRESS_MAX_AGE = 60_000;
 // the mirror, the stages or the tracked repos change, or for a minute at most
 // (classifier verdicts and the hourly counts show within that minute).
 async function progressItems(db: Db, hidden: HiddenRepos): Promise<Heavy> {
-  const sig = await db.get(db.k.selectNoFrom((eb) => [
-    eb.selectFrom("main.repos").select((e) => e.fn.max<string | null>("synced_at").as("m")).as("synced"),
-    eb.selectFrom("main.settings").select("value").where("key", "=", "org_high_water").as("hw"),
-    eb.selectFrom("main.stages").select((e) => e.fn.countAll<number>().as("c")).as("st_count"),
-    eb.selectFrom("main.stages").select((e) => e.fn.max<number | null>(kx.rowid("main.stages")).as("m")).as("st_max"),
-    eb.selectFrom("main.tracked_repos").select(kx.groupConcat(db, "name", ",", "name").as("g")).as("tr"),
-  ]));
+  const [repoRows, sync, stages, trackedRepos] = await db.together(() => Promise.all([loadRepos(db, { all: true }), loadSyncState(db), loadStageVersion(db), loadTrackedRepos(db)]));
+  const sig = {
+    synced: [...repoRows.values()].reduce<string | null>((m, r) => (r.synced_at !== null && (m === null || r.synced_at > m) ? r.synced_at : m), null),
+    hw: sync.org_high_water, st_count: stages.count, st_max: stages.maxRowid, tr: [...trackedRepos.keys()].sort().join(","),
+  };
   const key = JSON.stringify(sig);
   const cache = progressCache.get(db) ?? progressCache.set(db, new Map()).get(db)!;
   const slot = JSON.stringify([hidden, hidden.visible ?? null]);
@@ -378,13 +330,9 @@ async function progressItems(db: Db, hidden: HiddenRepos): Promise<Heavy> {
   const perHour = new Array<number>(24).fill(0);
   const perHourPipeline = new Array<number>(24).fill(0);
   const since = now - 24 * 3600_000;
-  for (const r of await db.all(latestCteExpr(db).selectFrom("main.items as i")
-    .leftJoin("latest as l", (j) => j.onRef("l.repo", "=", "i.repo").onRef("l.number", "=", "i.number"))
-    .select((eb) => ["i.closed_at", eb("l.stage", "in", ["merged", "closed", "fixed-by-us"]).as("ours")])
-    .where("i.closed_at", ">=", new Date(since).toISOString()).where("i.state", "<>", "OPEN")
-    .where((eb) => trackedExpr(db, eb, "i.repo"))
-    .where((eb) => excludeHiddenExpr(db, "i.repo", hidden) ?? eb.lit(true))
-    .$narrowType<{ closed_at: string }>())) {
+  const closed = await listItems(db, { repos: [...trackedRepos.keys()], states: ["CLOSED", "MERGED"], closedBetween: [new Date(since).toISOString(), new Date(now + 3600_000).toISOString()], hidden }, "card");
+  const latest = await loadStageFacts(db, closed.map((r) => ({ repo: r.repo, number: r.number })));
+  for (const r of closed.map((i) => ({ closed_at: i.closed_at!, ours: ["merged", "closed", "fixed-by-us"].includes(latest.get(`${i.repo}#${i.number}`)?.stage ?? "") }))) {
     const h = Math.floor((Date.parse(r.closed_at) - since) / 3600_000);
     if (h >= 0 && h < 24) {
       perHour[h]!++;
@@ -395,7 +343,7 @@ async function progressItems(db: Db, hidden: HiddenRepos): Promise<Heavy> {
   const { series } = await trend(db, start, new Map(names.map((n) => [n, funnels.get(n)?.open ?? 0])));
   const repos: RepoProgress[] = names.map((repo) => ({
     repo, funnel: toFunnel(funnels.get(repo)), done: toDone(done.get(repo)),
-    decisionsOpen: 0, openTrend: series.get(repo)!,
+    openTrend: series.get(repo)!,
   }));
   const value: Heavy = {
     trackingSince: start, now: new Date(now).toISOString(),
@@ -409,35 +357,13 @@ async function progressItems(db: Db, hidden: HiddenRepos): Promise<Heavy> {
 }
 
 async function progress(db: Db, hidden: HiddenRepos): Promise<Progress> {
-  const heavy = await progressItems(db, hidden);
-  const openDec = new Map<string, number>();
-  let decisionsOpen = 0;
-  for (const r of await db.all(db.k.selectFrom("decisions").select(["repo", "number", "items"]).where("answer", "is", null)
-    .where((eb) => withoutHiddenExpr(db, eb, hidden) ?? eb.lit(true)))) {
-    decisionsOpen++;
-    let repos = r.number !== null && r.repo ? [r.repo] : [];
-    if (r.number === null) {
-      try {
-        repos = [...new Set((JSON.parse(r.items ?? "[]") as { repo: string }[]).map((x) => x.repo))];
-      } catch { /* malformed batch: counted for no repo */ }
-    }
-    for (const x of repos) openDec.set(x, (openDec.get(x) ?? 0) + 1);
-  }
-  const today = new Date().toISOString().slice(0, 10);
-  const answeredToday = (await db.get(db.k.selectFrom("decisions").select((eb) => eb.fn.countAll<number>().as("n")).where("answered_at", ">=", `${today}T00:00:00`)
-    .where((eb) => withoutHiddenExpr(db, eb, hidden) ?? eb.lit(true))))!.n;
-  return {
-    ...heavy,
-    repos: heavy.repos.map((r) => ({ ...r, decisionsOpen: openDec.get(r.repo) ?? 0 })),
-    decisionsOpen, decisionsAnsweredToday: answeredToday,
-    mainCi: summarize(await mainCiRepos(db, hidden)),
-  };
+  const [heavy, ci] = await Promise.all([progressItems(db, hidden), mainCiRepos(db, hidden)]);
+  return { ...heavy, mainCi: summarize(ci) };
 }
 
 // ---- routes --------------------------------------------------------------
 
 export function apiRoutes(opts: ApiOptions = {}): Route[] {
-  const limiter = opts.limiter ?? new RateLimiter(share(opts.writesPerHour ?? 60), 3600_000);
   const vectors = new VectorIndex(opts.embedder ?? localEmbedder({ threads: 2 }));
   const get = (pattern: string, fn: (db: Db, req: Req) => Promise<unknown>): Route => ({ method: "GET", pattern, handler: ok(fn) });
   const post = (pattern: string, fn: (db: Db, req: Req) => Promise<unknown>): Route => ({ method: "POST", pattern, handler: ok(fn) });
@@ -448,39 +374,22 @@ export function apiRoutes(opts: ApiOptions = {}): Route[] {
     get("/api/me", me),
     get("/api/repos", allVisibleRepos),
     get("/api/repos/owners", repoOwners),
-    scoped(get("/api/decisions", async (db, req) => dec.listDecisions(db, req))),
-    get("/api/decisions/open-counts", dec.openCounts),
-    get("/api/decisions/:id", dec.getOne),
-    get("/api/decisions/:id/thread", dec.thread),
-    post("/api/decisions/:id/answer", dec.answer),
-    post("/api/decisions/:id/undo", dec.undo),
-    post("/api/decisions/:id/retry", dec.retry),
-    post("/api/decisions/:id/dispute", dec.dispute),
-    post("/api/decisions/:id/keep", dec.keepAnswer),
-    { method: "POST", pattern: "/api/decisions/:id/snooze", handler: ok(dec.snooze) },
-    { method: "POST", pattern: "/api/decisions/:id/reprepare", handler: ok(dec.reprepare) },
-    post("/api/decisions/:id/reopen", dec.reopen),
-    post("/api/items/:repo/:n/backlog", dec.backlogItemRoute),
     // The maintainer workflow's commands and controls (src/workflow/apply.ts).
     post("/api/items/:repo/:n/command", commands.itemCommand),
     get("/api/mention", (db) => commands.mention(db)),
     post("/api/commands", commands.listCommand),
     post("/api/controls", commands.control),
-    { method: "POST", pattern: "/api/decisions/backlog", handler: ok(dec.backlogBulk) },
-    post("/api/decisions/:id/adopt", dec.adopt),
-    post("/api/decisions/:id/feedback", async (db, req) => dec.feedback(db, req, limiter)),
-    post("/api/decisions/:id/retract", async (db, req) => dec.retract(db, req, limiter)),
-    post("/api/decisions/:id/claim", dec.claim),
     get("/api/mcp/tokens", mcp.tokens),
     post("/api/mcp/tokens", mcp.create),
     post("/api/mcp/tokens/revoke", mcp.revoke),
-    // The new dashboard (ui_v2).
     scoped(get("/api/maintain/home", maintain.home)),
+    get("/api/maintain/asked", maintain.asked),
     get("/api/maintain/queue", maintain.queueMeta),
     scoped(get("/api/maintain/stats", maintain.stats)),
-    // The new Items page: four lists of the open items, the Backlog or the closed items, with filters and search.
+    // The Items page: three lists of the open items, the Backlog or the closed items, with filters and search.
     scoped(get("/api/maintain/items", maintain.items)),
-    // The new item page.
+    // The Items browser: one page of the items matching a search with qualifiers, presets and quick-filter values.
+    scoped(get("/api/maintain/browse", itemsBrowse.browse)),
     get("/api/maintain/items/:repo/:n", maintainItem.item),
     get("/api/maintain/repos", maintain.repos),
     get("/api/me/settings", userSettings.settings),
@@ -496,22 +405,14 @@ export function apiRoutes(opts: ApiOptions = {}): Route[] {
     post("/api/model-queue/:id/unpick", modelQueue.unpick),
     get("/api/items/:repo/:n", itemCore),
     get("/api/items/:repo/:n/page", itemPage),
+    get("/api/items/:repo/:n/chat", itemChat),
+    post("/api/items/:repo/:n/chat", postChat),
+    post("/api/items/:repo/:n/chat/withdraw", postChatWithdraw),
     get("/api/items/:repo/:n/peek", items.peek),
     scoped(get("/api/activity", activity)),
     get("/api/downloads", downloads),
     get("/api/items/:repo/:n/trace", itemTrace),
     get("/api/items/:repo/:n/trace/event", itemTraceDetail),
-    get("/api/items/:repo/:n/decision", dec.forItem),
-    get("/api/conversations/:repo/:n", conv.getConversation),
-    { method: "POST", pattern: "/api/conversations/:repo/:n/messages", handler: ok(async (db, req) => conv.postMessage(db, req)) },
-    { method: "POST", pattern: "/api/conversations/:repo/:n/withdraw", handler: ok(async (db, req) => conv.postWithdraw(db, req)) },
-    { method: "POST", pattern: "/api/conversations/:repo/:n/includes", handler: ok(async (db, req) => conv.postInclude(db, req)) },
-    { method: "POST", pattern: "/api/conversation-cards/:id/edit", handler: ok(conv.editCardText) },
-    { method: "POST", pattern: "/api/conversation-cards/:id/do", handler: ok(async (db, req) => conv.doIt(db, req)) },
-    { method: "POST", pattern: "/api/conversation-cards/:id/dismiss", handler: ok(conv.dismiss) },
-    { method: "POST", pattern: "/api/conversation-cards/:id/dispute", handler: ok(conv.disputePress) },
-    { method: "POST", pattern: "/api/conversation-cards/:id/keep", handler: ok(conv.keepPress) },
-    { method: "POST", pattern: "/api/decision-choices/:id/do", handler: ok(async (db, req) => conv.doChoice(db, req)) },
     { method: "POST", pattern: "/api/items/:repo/:n/preapproval/cancel", handler: ok(operator.cancelItemPreapproval) },
     { method: "POST", pattern: "/api/items/:repo/:n/preapproval/retry", handler: ok(operator.retryItemPreapproval) },
     { method: "POST", pattern: "/api/items/:repo/:n/review-again", handler: ok(operator.reviewItemAgain) },
@@ -523,7 +424,6 @@ export function apiRoutes(opts: ApiOptions = {}): Route[] {
     { method: "POST", pattern: "/api/area-proposals/:id/accept", handler: ok(areas.acceptProposalApi) },
     { method: "POST", pattern: "/api/area-proposals/:id/dismiss", handler: ok(areas.dismiss) },
     { method: "POST", pattern: "/api/items/:repo/:n/batch-again", handler: ok(operator.batchItemAgain) },
-    scoped(get("/api/items", items.listItems)),
     heavy(get("/api/search", async (db, req) => req.query.get("mode") === "semantic" ? sim.semanticSearch(db, req, vectors) : items.quickSearch(db, req)), (q) => q.get("mode") === "semantic"),
     get("/api/progress", async (db, req) => await progress(db, await hiddenRepos(db, req))),
     get("/api/main-ci", async (db, req) => {
@@ -558,11 +458,14 @@ export function apiRoutes(opts: ApiOptions = {}): Route[] {
     post("/api/account/discord/code", discord.linkCode),
     { method: "PUT", pattern: "/api/admin/discord/contact", operator: true, handler: ok(discord.putContact) },
     { method: "PUT", pattern: "/api/admin/discord/react", operator: true, handler: ok(discord.putReact) },
+    { method: "PUT", pattern: "/api/admin/discord/role-panel", operator: true, handler: ok(discord.putRolePanel) },
     { method: "PUT", pattern: "/api/sandbox/workspace", operator: true, handler: ok(adm.setWorkspaceInfo) },
     get("/api/merge/single", adm.singleMerge),
     { method: "PUT", pattern: "/api/merge/single", operator: true, handler: ok(adm.setSingleMerge) },
     { method: "GET", pattern: "/api/settings/inference", operator: true, handler: ok(inference.get) },
     { method: "PUT", pattern: "/api/settings/inference", operator: true, handler: ok(inference.put) },
+    { method: "GET", pattern: "/api/settings/jev", operator: true, handler: ok(inference.getJev) },
+    { method: "PUT", pattern: "/api/settings/jev", operator: true, handler: ok(inference.putJev) },
     post("/api/repos/comment-approve", async (db, req) => await adm.commentApproval(db, req, true)),
     post("/api/repos/comment-revoke", async (db, req) => await adm.commentApproval(db, req, false)),
     post("/api/repos/push-approve", async (db, req) => await adm.pushApproval(db, req, true)),
@@ -595,39 +498,28 @@ export function apiRoutes(opts: ApiOptions = {}): Route[] {
     { method: "POST", pattern: "/api/pipeline/jobs/:id/cancel", handler: ok(pipeline.cancel) },
     get("/api/pipeline/state", pipeline.state),
     { method: "PUT", pattern: "/api/pipeline/state", operator: true, handler: ok(pipeline.putState) },
-    { method: "GET", pattern: "/api/pipeline/judgement-model", operator: true, handler: ok(async (db) => await pipeline.getJudgementModel(db)) },
-    { method: "PUT", pattern: "/api/pipeline/judgement-model", operator: true, handler: ok(pipeline.putJudgementModel) },
     { method: "PUT", pattern: "/api/pipeline/blocker-thresholds", operator: true, handler: ok(pipeline.putBlockers) },
     { method: "PUT", pattern: "/api/pipeline/limits/:step", operator: true, handler: ok(pipeline.putLimit) },
     { method: "POST", pattern: "/api/pipeline/limits/:step/reset", operator: true, handler: ok(pipeline.resetLimit) },
     { method: "POST", pattern: "/api/pipeline/steps/:step/deadline-ack", operator: true, handler: ok(pipeline.ackStepDeadline) },
     { method: "POST", pattern: "/api/pipeline/trips/:stage/resume", handler: ok(pipeline.resumeTrip) },
-    { method: "PUT", pattern: "/api/pipeline/pilot", operator: true, handler: ok(adm.putPilot) },
     { method: "PUT", pattern: "/api/pipeline/outside-limits", operator: true, handler: ok(outside.putLimits) },
     { method: "GET", pattern: "/api/pipeline/blocker-thresholds", handler: ok((db) => outside.getBlockerThresholds(db)) },
     { method: "PUT", pattern: "/api/pipeline/blocker-thresholds", operator: true, handler: ok(outside.putBlockerThresholds) },
+    { method: "GET", pattern: "/api/pipeline/outside/held", operator: true, handler: ok(outside.held) },
     { method: "POST", pattern: "/api/pipeline/outside/release", operator: true, handler: ok(outside.releaseAll) },
     { method: "POST", pattern: "/api/items/:repo/:n/release-outside", handler: ok(outside.release) },
-    scoped(get("/api/needs/outside/:author", outside.held)),
     get("/api/prompts", prompts),
-    get("/api/accounts", agents.accounts),
-    get("/api/accounts/pause", agents.getPause),
-    { method: "PUT", pattern: "/api/accounts/pause", operator: true, handler: ok(agents.putPause) },
-    get("/api/accounts/jev", agents.getJev),
-    { method: "PUT", pattern: "/api/accounts/jev", operator: true, handler: ok(agents.putJev) },
-    { method: "PUT", pattern: "/api/accounts/:id", operator: true, handler: ok(agents.putAccount) },
-    { method: "POST", pattern: "/api/accounts", operator: true, handler: ok(agents.postAccount) },
-    { method: "POST", pattern: "/api/accounts/:id/login", operator: true, handler: ok(agents.loginStart) },
-    { method: "POST", pattern: "/api/accounts/:id/login/code", operator: true, handler: ok(agents.loginCode) },
-    { method: "POST", pattern: "/api/accounts/:id/login/cancel", operator: true, handler: ok(agents.loginCancel) },
-    { method: "POST", pattern: "/api/accounts/:id/token", operator: true, handler: ok(agents.tokenStart) },
-    { method: "POST", pattern: "/api/accounts/:id/token/code", operator: true, handler: ok(agents.tokenCode) },
-    { method: "POST", pattern: "/api/accounts/:id/token/cancel", operator: true, handler: ok(agents.tokenCancel) },
-    { method: "POST", pattern: "/api/accounts/:id/token/remove", operator: true, handler: ok(agents.tokenRemove) },
-    { method: "POST", pattern: "/api/accounts/:id/sign-out", operator: true, handler: ok(agents.accountSignOut) },
-    { method: "POST", pattern: "/api/accounts/:id/refresh", operator: true, handler: ok(agents.accountRefresh) },
     get("/api/agents", agents.list),
+    get("/api/agents/refusals", agents.refusals),
     get("/api/agents/:id", agents.detail),
+    // A transcript is read from the store and inflated (up to RAW_MAX): each read spends the expensive-GET budget.
+    heavy({ method: "GET", pattern: "/api/agents/:id/transcripts/:tid", external: true, handler: ok(agents.transcript) }),
+    heavy({ method: "GET", pattern: "/api/agents/:id/transcripts/:tid/download", external: true, handler: agents.transcriptDownload }),
+    { method: "GET", pattern: "/api/admin/transcript-store", operator: true, handler: ok(agents.storeGet) },
+    { method: "PUT", pattern: "/api/admin/transcript-store", operator: true, handler: ok(agents.storePut) },
+    { method: "DELETE", pattern: "/api/admin/transcript-store", operator: true, handler: ok(agents.storeClear) },
+    { method: "POST", pattern: "/api/admin/transcript-store/test", operator: true, external: true, handler: ok(agents.storeTest) },
     get("/api/rates", agents.rates),
     get("/api/envs", build.envs),
     get("/api/envs/caches", build.caches),
@@ -642,11 +534,12 @@ export function apiRoutes(opts: ApiOptions = {}): Route[] {
     get("/api/tasks", build.tasks),
     get("/api/tasks/:id", build.task),
     { method: "POST", pattern: "/api/tasks/:id/cancel", handler: ok(build.cancel) },
-    { method: "GET", pattern: "/api/tasks/:id/artifacts/:name", handler: build.artifact },
-    { method: "GET", pattern: "/api/implementations/:id/shots/:file", handler: build.implementationShot },
+    { method: "GET", pattern: "/api/tasks/:id/artifacts/:name", external: true, handler: build.artifact },
+    { method: "GET", pattern: "/api/implementations/:id/shots/:file", external: true, handler: build.implementationShot },
     get("/api/nightly", nightly.grid),
     get("/api/nightly/bench/:repo/:bench", nightly.series),
     { method: "POST", pattern: "/api/nightly/select", handler: ok(nightly.select) },
+    { method: "POST", pattern: "/api/nightly/issue", handler: ok((db, req) => nightly.openIssue(db, req)) },
     get("/api/build/summary", build.buildSummary),
     get("/api/build/features", build.features),
     { method: "POST", pattern: "/api/build/features", handler: ok(build.postFeature) },
@@ -654,20 +547,8 @@ export function apiRoutes(opts: ApiOptions = {}): Route[] {
     { method: "PUT", pattern: "/api/build/screenshots/:repo", handler: ok(build.putScreenshots) },
     { method: "DELETE", pattern: "/api/build/screenshots/:repo", handler: ok(build.deleteScreenshots) },
     scoped(get("/api/next", next)),
-    scoped(heavy(get("/api/queue", queue))),
-    scoped(heavy(get("/api/queue/batches", queueBatches))),
     get("/api/batches/:id", batchOne),
-    scoped(get("/api/work", work)),
     scoped(get("/api/queue/page", queuePage)),
-    get("/api/repos/pipeline", pipelineRepoNames),
-    get("/api/fast-track", fastTrackRefs),
-    get("/api/merge/held", heldMergeRefs),
-    { method: "POST", pattern: "/api/fast-track", handler: ok(fastTrackAdd) },
-    { method: "POST", pattern: "/api/fast-track/remove", handler: ok(fastTrackRemove) },
-    { method: "POST", pattern: "/api/fast-track/weight", handler: ok(fastTrackWeight) },
-    post("/api/queue/add", queueAdd),
-    { method: "POST", pattern: "/api/merge/hold", handler: ok(async (db, req) => mergeHoldPr(db, req, true)) },
-    { method: "POST", pattern: "/api/merge/release", handler: ok(async (db, req) => mergeHoldPr(db, req, false)) },
     { method: "POST", pattern: "/api/merge/batch-remove", handler: ok(async (db, req) => batchRemovePr(db, req, opts.exec)) },
     { method: "POST", pattern: "/api/queue/batches/:id/stop", handler: ok(async (db, req) => batchStop(db, req, opts.exec)) },
     get("/api/repos/:repo/security", security.security),
@@ -678,16 +559,10 @@ export function apiRoutes(opts: ApiOptions = {}): Route[] {
     post("/api/security/scans/:id/continue", security.continueScan),
     get("/api/security/findings/:repo/:n", security.finding),
     post("/api/security/findings/:repo/:n", security.actOnFinding),
-    scoped(get("/api/needs", needs)),
-    get("/api/needs/fixes/:repo", needsFixes),
-    get("/api/flow", flow),
-    scoped(get("/api/now", now)),
-    scoped(get("/api/live", live)),
-    scoped(get("/api/now/feed", nowFeed)),
+    scoped(get("/api/live-board", live)),
+    get("/api/health", health),
     heavy(get("/api/similar/:repo/:n", async (db, req) => sim.similar(db, req, vectors))),
     get("/api/security/findings", securityPage.securityFindings),
     get("/api/security/findings/:repo/:n/page", securityPage.findingPage),
-    scoped(get("/api/home", async (db, req) => home(db, req, { progress: async (hidden) => await progress(db, hidden) }))),
-    scoped(get("/api/items/status", items.statusList)),
   ];
 }

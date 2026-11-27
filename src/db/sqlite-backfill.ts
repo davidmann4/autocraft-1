@@ -1,10 +1,11 @@
 // SQLite-only migration and maintenance code that runs on the synchronous DatabaseSync inside connect()'s migrations
 // (src/db.ts), or maintains the SQLite change-log triggers. Raw SQL lives here so the rest of src/ uses the query builder.
 import type { DatabaseSync } from "node:sqlite";
-import { markFull, BULK_ROWS } from "../core/plan-changes.ts";
+import { markFull, BULK_ROWS } from "./plan-triggers.ts";
 import { BATCH, FIELD_COLUMNS, SCHEME_ID, classifyHash, embedHash, type Fields } from "../itemhash.ts";
 import { textRefs } from "../core/open-prs.ts";
 import type { Db } from "./index.ts";
+import { queryDb } from "./query-db.ts";
 
 const FIELDS = FIELD_COLUMNS.join(", ");
 
@@ -79,12 +80,13 @@ export function fillTextRefs(db: DatabaseSync): void {
 export async function dropPlanChanges(db: Db): Promise<number> {
   // Postgres has no release before the change log; its triggers serve the live topics too (src/db/pg-triggers.ts).
   if (db.dialect === "postgres") throw new Error("dropping the change log is for SQLite databases only");
-  const triggers = await db.prepare("SELECT name FROM main.sqlite_master WHERE type = 'trigger' AND name LIKE 'plan\\_%' ESCAPE '\\'").all() as { name: string }[];
+  const q = queryDb(db);
+  const triggers = await q.prepare("SELECT name FROM main.sqlite_master WHERE type = 'trigger' AND name LIKE 'plan\\_%' ESCAPE '\\'").all() as { name: string }[];
   await db.write(async () => {
-    for (const { name } of triggers) await db.script(`DROP TRIGGER IF EXISTS main.${name}`);
-    for (const t of ["item_changes", "plan_full", "plan_full_causes", "plan_bulk", "plan_shadow_diffs", "plan_pass_stats", "review_blockers"] as const) await db.run(db.k.schema.dropTable(`main.${t}`).ifExists());
-    await db.script("DELETE FROM main.sqlite_sequence WHERE name = 'item_changes'");
-    await db.run(db.k.deleteFrom("main.settings").where("key", "=", "schema_stamp"));
+    for (const { name } of triggers) await q.script(`DROP TRIGGER IF EXISTS main.${name}`);
+    for (const t of ["item_changes", "plan_full", "plan_full_causes", "plan_bulk", "plan_shadow_diffs", "plan_pass_stats", "review_blockers"] as const) await q.run(q.k.schema.dropTable(`main.${t}`).ifExists());
+    await q.script("DELETE FROM main.sqlite_sequence WHERE name = 'item_changes'");
+    await q.run(q.k.deleteFrom("main.settings").where("key", "=", "schema_stamp"));
   });
   return triggers.length;
 }

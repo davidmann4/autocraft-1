@@ -1,7 +1,7 @@
 // The dashboard's command box and controls: the same text and the same command core as GitHub, Discord and the agent
 // (src/workflow/apply.ts). Every reply is the lines every surface shows; a refused or unclear command is a line, not an error.
 //
-//   POST /api/items/:repo/:n/command  { text }            a command written on one item
+//   POST /api/items/:repo/:n/command  { text, asked? }    a command written on one item
 //   POST /api/commands                { text, items? }    a command for a list: the list after a colon in the text, or `items`
 //   POST /api/controls                { control, ... }    a registered control (hold or release a merge, resume a breaker, ...)
 import type { Db } from "../../db/index.ts";
@@ -11,8 +11,10 @@ import { needVisible, allVisibleRepos } from "./visible.ts";
 import { appSlug } from "../../github/identity.ts";
 import { mentionName, shownMention } from "../../github/slugs.ts";
 import { parse } from "../../workflow/parse.ts";
-import { runCommand, runControl, type CommandResult, type ControlInput } from "../../workflow/apply.ts";
-import type { ItemRef } from "../../workflow/types.ts";
+import { runControl, type CommandResult, type ControlInput } from "../../workflow/apply.ts";
+import { refsIn, runText } from "../../workflow/read.ts";
+import { saying } from "../../workflow/said.ts";
+import type { ItemRef, Parsed } from "../../workflow/types.ts";
 
 /** Longer text is no command anyone types. */
 const TEXT_MAX = 4000;
@@ -28,7 +30,7 @@ function textOf(req: Req): string {
   return text;
 }
 
-const actorOf = (req: Req) => ({ login: req.user.login, canWrite: (repo: string) => req.user.canWrite(repo) });
+export const actorOf = (req: Req) => ({ login: req.user.login, canWrite: (repo: string) => req.user.canWrite(repo) });
 
 async function visibleFn(db: Db, req: Req): Promise<(repo: string) => Promise<boolean>> {
   const repos = new Set(await allVisibleRepos(db, req));
@@ -36,7 +38,7 @@ async function visibleFn(db: Db, req: Req): Promise<(repo: string) => Promise<bo
 }
 
 /** `owner/name#n`, `name#n` or `{ repo, number }`. */
-function itemOf(v: unknown): ItemRef {
+export function itemOf(v: unknown): ItemRef {
   if (typeof v === "string") {
     const m = /^((?:[A-Za-z0-9._-]+\/)?[A-Za-z0-9._-]+)#([1-9][0-9]*)$/.exec(v.trim());
     if (m) return { repo: m[1]!, number: Number(m[2]) };
@@ -46,30 +48,49 @@ function itemOf(v: unknown): ItemRef {
   throw new HttpError(400, "each item is repo#number");
 }
 
+/** When the question the page showed was asked (`asked` of the item or row it read); null from a page that does not say. */
+const timeOf = (v: unknown): string | null => (typeof v === "string" && !Number.isNaN(Date.parse(v)) ? v : null);
+
 export async function itemCommand(db: Db, req: Req): Promise<CommandResult> {
   const repo = req.params.repo!;
   const n = Number(req.params.n);
   if (!Number.isInteger(n) || n < 1) throw new HttpError(400, "not an item number");
   await needVisible(db, req, repo);
-  const parsed = parse(textOf(req), { repo });
+  const text = textOf(req);
+  const parsed = parse(text, { repo });
   if (parsed.kind !== "ambiguous" && (parsed.items?.length ?? 0) > ITEMS_MAX) throw new HttpError(400, `at most ${ITEMS_MAX} items in one command`);
-  return await runCommand(db, actorOf(req), "dashboard", { parsed, items: [{ repo, number: n }], visible: await visibleFn(db, req) });
+  const asked = obj(req.json).asked;
+  return await runItemText(db, req, repo, n, text, parsed, timeOf(asked));
+}
+
+/** Text written on one item through the command core, stored as the person's message in the item's chat. */
+export async function runItemText(db: Db, req: Req, repo: string, n: number, text: string, parsed: Parsed, asked: string | null): Promise<CommandResult> {
+  const visible = await visibleFn(db, req);
+  return await saying(db, { login: req.user.login, via: "dashboard", text, items: [{ repo, number: n }], by: { canWrite: actorOf(req).canWrite, role: req.user.role, visible } }, async () =>
+    await runText(db, actorOf(req), "dashboard", { parsed, items: [{ repo, number: n }], visible, asked: ({ ref }) => (ref === `${repo}#${n}` ? asked : null) },
+      { text, own: [{ repo, number: n }], named: false, parse: { repo } }));
 }
 
 export async function listCommand(db: Db, req: Req): Promise<CommandResult> {
   const raw = obj(req.json).items;
   if (raw !== undefined && !Array.isArray(raw)) throw new HttpError(400, "items must be a list");
   const items = (raw ?? []).map(itemOf);
-  const parsed = parse(textOf(req));
+  const text = textOf(req);
+  const parsed = parse(text);
   if (Math.max(items.length, parsed.kind !== "ambiguous" ? parsed.items?.length ?? 0 : 0) > ITEMS_MAX) throw new HttpError(400, `at most ${ITEMS_MAX} items in one command`);
-  return await runCommand(db, actorOf(req), "dashboard", { parsed, items, visible: await visibleFn(db, req) });
+  const asked = obj(obj(req.json).asked);
+  const own = items.length ? items : refsIn(text).slice(0, ITEMS_MAX);
+  const visible = await visibleFn(db, req);
+  return await saying(db, { login: req.user.login, via: "dashboard", text, items: own, by: { canWrite: actorOf(req).canWrite, role: req.user.role, visible } }, async () =>
+    await runText(db, actorOf(req), "dashboard", { parsed, items, visible, asked: ({ ref }) => timeOf(Object.hasOwn(asked, ref) ? asked[ref] : null) },
+      { text, own, named: !items.length }));
 }
 
 export async function control(db: Db, req: Req): Promise<{ ok: boolean; line: string }> {
   const b = obj(req.json);
   let input: ControlInput;
   switch (b.control) {
-    case "hold-merge": case "release-merge": case "release-outside": {
+    case "release-outside": {
       const item = itemOf({ repo: b.repo, number: b.number });
       await needVisible(db, req, item.repo.split("/").pop()!);
       input = { control: b.control, item };
@@ -85,7 +106,7 @@ export async function control(db: Db, req: Req): Promise<{ ok: boolean; line: st
       input = { control: "set-automatic", repo: b.repo, on: b.on };
       break;
     default:
-      throw new HttpError(400, "control must be hold-merge, release-merge, release-outside, resume-breaker or set-automatic");
+      throw new HttpError(400, "control must be release-outside, resume-breaker or set-automatic");
   }
   return await runControl(db, actorOf(req), "dashboard", input);
 }

@@ -11,7 +11,7 @@ import { createEnv } from "../src/build/envs.ts";
 import type { ExecOptions, ExecResult, KPod, KubeApi } from "../src/build/kube-api.ts";
 import { WorkspaceSession } from "../src/build/workspace-tools.ts";
 import { createWorkspace, moveWorkspace } from "../src/build/workspaces.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb } from "./helpers/raw-db.ts";
 import { SCRATCH } from "./scratch.ts";
 
 mkdirSync(SCRATCH, { recursive: true });

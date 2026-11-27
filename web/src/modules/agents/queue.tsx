@@ -35,7 +35,7 @@ export function RunsQueueSwitch({ value }: { value: "runs" | "queue" }) {
   );
 }
 
-const WHY_TONE: Record<ModelQueueWhyCode, Tone> = { picked: "accent", session: "neutral", bound: "neutral", "bound-off": "warn", "no-runner": "warn", "manual-only": "warn", busy: "neutral", "no-repo-access": "warn", "task-off": "warn", "items-off": "warn", behind: "neutral" };
+const WHY_TONE: Record<ModelQueueWhyCode, Tone> = { picked: "accent", session: "neutral", bound: "neutral", "bound-off": "warn", owner: "neutral", "owner-off": "warn", login: "neutral", "no-runner": "warn", "manual-only": "warn", busy: "neutral", "no-repo-access": "warn", "task-off": "warn", "items-off": "warn", behind: "neutral" };
 
 export function ModelQueueView({ user }: ViewProps) {
   const q = useQuery<ModelQueue>("model-queue", (a) => a.modelQueue.get());
@@ -53,7 +53,7 @@ export function ModelQueueView({ user }: ViewProps) {
   );
   return (
     <Page title="Model call queue">
-      {user.inference === "user-local" && <RunsQueueSwitch value="queue" />}
+      <RunsQueueSwitch value="queue" />
       <Block
         className="mt-4"
         flush

@@ -1,257 +1,69 @@
-// Duplicate groups and their comparison sets. Items joined by duplicate pairs form
-// a group; the members of one kind (PRs, issues) are compared together in one call
-// (compare.ts), and the stored result is current while no member's state has changed,
-// no member joined or left, no issue's text has changed and no PR's diff size has moved by
-// more than 20% since the compared head. A head push or a PR text edit alone does not
-// make it stale, but a decision binds each PR member to the head the comparison read.
-import { createHash } from "node:crypto";
-import { canonInfoAll, pickCanonical } from "./canonical.ts";
-import { inPilot, pilotExpr } from "../pilot.ts";
-import { backlogHeldExpr } from "./held.ts";
-import { cols, excluded, inList, jsonEach, jsonText, like, refIn } from "../db/kx.ts";
-import { setting } from "../settings-read.ts";
-import type { Db } from "../db/index.ts";
-import { mapSeq, someSeq } from "../async-seq.ts";
+// Duplicate groups and their comparison sets, as pure functions over the stored duplicate state (triage.loadDupeState). Items
+// joined by duplicate pairs form a group; the members of one kind (PRs, issues) are compared together in one call (compare.ts),
+// and the stored result is current while no member's state has changed, no member joined or left, no issue's text has changed and
+// no PR's diff size has moved by more than 20% since the compared head.
+import { currentComparison, dupeGroups, kindSets, type DupeGroupPut, type DupeState, type KindSet } from "../data/triage/index.ts";
 
-type Edge = { repo: string; a: number; b: number; similarity: number; jev_p: number | null; haiku: string | null };
+export {
+  compareOf, currentComparison, dueSets, dupeGroups, kindSets, ruleOutcome, setHash, setKey,
+  DIFF_SIZE_CHANGE, DROP_PAUSE_MS, RULE_ATTEMPTS, RULE_RETRY_MS, type DupeGroup, type DupeKind, type KindSet,
+} from "../data/triage/index.ts";
 
-/** Duplicate pairs whose items still have the checked text. */
-export async function duplicateEdges(db: Db, repo?: string): Promise<Edge[]> {
-  return await db.all(db.k.selectFrom("duplicate_pairs as p")
-    .innerJoin("items as ia", (j) => j.onRef("ia.repo", "=", "p.repo").onRef("ia.number", "=", "p.a").onRef("ia.embed_hash", "=", "p.a_hash"))
-    .innerJoin("items as ib", (j) => j.onRef("ib.repo", "=", "p.repo").onRef("ib.number", "=", "p.b").onRef("ib.embed_hash", "=", "p.b_hash"))
-    .select(["p.repo", "p.a", "p.b", "p.similarity", "p.jev_p", "p.haiku"])
-    .where("p.verdict", "=", "duplicate").where("p.by_operator", "=", 0)
-    .$if(!!repo, (q) => q.where("p.repo", "=", repo!))
-    .orderBy("p.repo").orderBy("p.a").orderBy("p.b"));
-}
+type Role = "keep" | "close" | "stay";
+type Others = { number: number; duplicate?: boolean }[];
 
-export type Group = { repo: string; canonical: number; why: string; members: number[]; edges: Edge[] };
-
-export async function duplicateGroups(db: Db, repo?: string): Promise<Group[]> {
-  const parent = new Map<string, string>();
-  const find = (x: string): string => {
-    let r = x;
-    while (parent.get(r) !== r) r = parent.get(r)!;
-    parent.set(x, r);
-    return r;
-  };
-  const edges = await duplicateEdges(db, repo);
-  for (const e of edges) {
-    for (const n of [e.a, e.b]) if (!parent.has(`${e.repo}#${n}`)) parent.set(`${e.repo}#${n}`, `${e.repo}#${n}`);
-    parent.set(find(`${e.repo}#${e.a}`), find(`${e.repo}#${e.b}`));
-  }
-  const by = new Map<string, Edge[]>();
-  for (const e of edges) by.set(find(`${e.repo}#${e.a}`), [...(by.get(find(`${e.repo}#${e.a}`)) ?? []), e]);
-  const groups = [...by.values()].map((es) => ({ es, members: [...new Set(es.flatMap((e) => [e.a, e.b]))].sort((x, y) => x - y) }));
-  const known = await canonInfoAll(db, groups.flatMap((g) => g.members.map((number) => ({ repo: g.es[0]!.repo, number }))));
-  return await mapSeq(groups, async ({ es, members }) => {
-    const c = await pickCanonical(db, es[0]!.repo, members, known);
-    return { repo: es[0]!.repo, canonical: c.number, why: c.why, members, edges: es };
-  });
-}
-
-export type Kind = "pr" | "issue";
-export type Member = { number: number; kind: Kind; state: string; title: string | null; head_oid: string | null; embed_hash: string | null; comments_count: number | null; additions: number | null; deletions: number | null; closing_issues: string | null };
-
-/** The members of one kind of a group: what one comparison covers. */
-export type KindSet = { repo: string; kind: Kind; key: string; members: Member[]; hash: string };
-
-/** How a set is settled without a model call: a closed or merged member wins, a lone member is kept; null when a model compares it. */
-export const ruleOutcome = (s: Pick<KindSet, "members">): "closed" | "single" | null =>
-  s.members.some((m) => m.state !== "OPEN") ? "closed" : s.members.length < 2 ? "single" : null;
-
-export const setKey = (kind: Kind, numbers: number[]): string => `${kind}:${[...numbers].sort((a, b) => a - b).join(",")}`;
-
-/** Changes whenever a member's state does, an issue's text, or the issues a PR closes; a PR's head and other text are left out (its diff size is checked on its own). */
-export function setHash(members: Member[]): string {
-  const rows = [...members].sort((a, b) => a.number - b.number).map((m) => (m.kind === "pr" ? [m.number, m.state, m.closing_issues] : [m.number, m.state, m.embed_hash]));
-  return createHash("sha1").update(JSON.stringify(rows)).digest("hex");
-}
-
-/** The hash that rows stored before diff sizes were kept carry: state, head commit and text of every member. */
-function legacySetHash(members: Member[]): string {
-  const rows = [...members].sort((a, b) => a.number - b.number).map((m) => [m.number, m.state, m.head_oid, m.embed_hash]);
-  return createHash("sha1").update(JSON.stringify(rows)).digest("hex");
-}
-
-export const DIFF_SIZE_CHANGE = 0.2;
-const sizeOf = (m: { additions: number | null; deletions: number | null }): number | null => (m.additions === null || m.deletions === null ? null : m.additions + m.deletions);
-
-export async function kindSetsOf(db: Db, g: Group): Promise<KindSet[]> {
-  return (await kindSetsLoader(db, [g]))(g);
-}
-
-/** kindSetsOf() for the given groups, with their members' rows read once; `inPilot` and `backlogHeld` answer for the members the same way. */
-export async function kindSetsLoader(db: Db, groups: Group[]): Promise<((g: Group) => KindSet[]) & { inPilot: (repo: string, number: number) => Promise<boolean>; backlogHeld: (repo: string, number: number) => boolean }> {
-  const rows = new Map<string, { m: Member; reason: string | null; pilot: boolean; backlog: boolean }>();
-  for (const { k, state_reason, in_pilot, held_backlog, ...m } of await db.all(db.k.selectFrom("items as i")
-    .select(["i.number", "i.kind", "i.state", "i.title", "i.head_oid", "i.embed_hash", "i.comments_count", "i.additions", "i.deletions", "i.closing_issues"])
-    .$narrowType<{ kind: Kind }>()
-    .select((eb) => [eb(eb("i.repo", "||", eb.val("#")), "||", eb.cast<string>("i.number", "text")).as("k"), "i.state_reason", pilotExpr(db, eb, "i").as("in_pilot"), backlogHeldExpr(db, eb, "i").as("held_backlog")])
-    .where(refIn(db, "i", groups.flatMap((g) => g.members.map((n): [string, number] => [g.repo, n])))))) {
-    rows.set(k, { m, reason: state_reason ?? null, pilot: !!in_pilot, backlog: !!held_backlog });
-  }
-  // Left out: a rejected (closed, unmerged) PR; an item already closed as a duplicate, or whose pair decision is answered close (the act step closes it).
-  const gone = new Set((await db.all(db.k.selectFrom("decisions").select((eb) => eb(eb("repo", "||", eb.val("#")), "||", eb.cast<string>("number", "text")).as("k"))
-    .where("kind", "=", "duplicate").where((eb) => like(db, "id", eb.val("%:duplicate@%"))).where("answer", "=", "close"))).map((r) => r.k));
-  // A member our own group Act closed can never become a kept item later.
-  const closedByUs = new Set((await db.all(db.k.selectFrom("dupe_group_posts as p").innerJoin("dupe_groups as g", "g.decision_id", "p.decision_id")
-    .select((eb) => eb(eb("g.repo", "||", eb.val("#")), "||", eb.cast<string>("p.number", "text")).as("k"))
-    .where("p.step", "=", "close").where("p.url", "is not", null))).map((r) => r.k));
-  const setsOf = (g: Group): KindSet[] => {
-    const members = g.members.flatMap((n): Member[] => {
-      const ref = `${g.repo}#${n}`, r = rows.get(ref);
-      if (!r) return [];
-      if (r.m.kind === "pr" && r.m.state === "CLOSED") return [];
-      return gone.has(ref) || closedByUs.has(ref) || r.reason === "DUPLICATE" ? [] : [r.m];
-    });
-    return (["pr", "issue"] as const).flatMap((kind) => {
-      const ms = members.filter((m) => m.kind === kind);
-      return ms.length ? [{ repo: g.repo, kind, key: setKey(kind, ms.map((m) => m.number)), members: ms, hash: setHash(ms) }] : [];
-    });
-  };
-  return Object.assign(setsOf, {
-    inPilot: async (repo: string, number: number): Promise<boolean> => rows.get(`${repo}#${number}`)?.pilot ?? await inPilot(db, repo, number),
-    // An item not in the mirror is not held (backlogHeld reads the items row).
-    backlogHeld: (repo: string, number: number): boolean => rows.get(`${repo}#${number}`)?.backlog ?? false,
-  });
-}
-
-export type StoredComparison = {
-  repo: string; key: string; kind: Kind; members: number[]; hash: string; kept: number; source: "model" | "closed" | "rule" | "single";
-  model: string | null; reason: string | null; result: ComparisonResult | null; error: string | null; attempts: number; at: string;
-  /** What the model wrote for the decision: 2 or 3 sentences, and one sentence of reason. Absent or null on rows stored earlier. */
-  summary?: string | null; why?: string | null;
-  /** JSON {number: additions + deletions} of the PR members when compared; null on rows stored earlier. */
-  sizes?: string | null;
-  /** JSON {number: head} of the PR members the comparison read; null on rows stored earlier. */
-  heads?: string | null;
-};
-/** The per-member answers of a comparison, in the shape of the prompt replies. */
-export type ComparisonResult = {
-  others: { number: number; duplicate?: boolean; better?: string[]; carry?: string[]; adds?: string[]; via?: number }[];
-  rounds: number;
-};
-
-type ComparisonRow = Omit<StoredComparison, "members" | "result"> & { members: string; result: string | null };
-type ComparisonKinds = { kind: Kind; source: StoredComparison["source"] };
-
-export async function storedComparison(db: Db, repo: string, key: string): Promise<StoredComparison | null> {
-  const r = await db.get(db.k.selectFrom("dupe_comparisons").select(cols("dupe_comparisons")).$narrowType<ComparisonKinds>().where("repo", "=", repo).where("key", "=", key));
-  return r ? parseComparison(r) : null;
-}
-
-/** storedComparison() for the sets of the repo (every repo without one), from one reading of the table. */
-export async function storedComparisons(db: Db, repo?: string): Promise<(repo: string, key: string) => Promise<StoredComparison | null>> {
-  const rows = new Map((await db.all(db.k.selectFrom("dupe_comparisons").select(cols("dupe_comparisons")).$narrowType<ComparisonKinds>()
-    .$if(repo !== undefined, (q) => q.where("repo", "=", repo!)))).map((r) => [`${r.repo}\n${r.key}`, r]));
-  return async (r, key) => { const row = rows.get(`${r}\n${key}`); return row ? parseComparison(row) : null; };
-}
-
-function parseComparison(r: ComparisonRow): StoredComparison {
-  let result: ComparisonResult | null = null;
-  try { result = r.result ? (JSON.parse(r.result) as ComparisonResult) : null; } catch { /* no result */ }
-  return { ...r, members: JSON.parse(r.members) as number[], result };
-}
-
-/** `set` is the compared snapshot: its members' sizes are stored, not whatever the items hold by now. */
-export async function saveComparison(db: Db, c: StoredComparison, set?: KindSet): Promise<void> {
-  const sizes: Record<number, number> = {}, heads: Record<number, string> = {};
-  if (c.kind === "pr" && set) {
-    for (const m of set.members) { const z = sizeOf(m); if (z !== null) sizes[m.number] = z; if (m.head_oid) heads[m.number] = m.head_oid; }
-  } else if (c.kind === "pr") {
-    for (const n of c.members) {
-      const m = (await db.get(db.k.selectFrom("items").select(["additions", "deletions", "head_oid"]).where("repo", "=", c.repo).where("number", "=", n))) ?? { additions: null, deletions: null, head_oid: null };
-      const z = sizeOf(m); if (z !== null) sizes[n] = z; if (m.head_oid) heads[n] = m.head_oid;
-    }
-  }
-  await db.run(db.k.insertInto("dupe_comparisons").values({
-    repo: c.repo, key: c.key, kind: c.kind, members: JSON.stringify(c.members), hash: c.hash, kept: c.kept, source: c.source, model: c.model, reason: c.reason,
-    result: c.result ? JSON.stringify(c.result) : null, error: c.error, attempts: c.attempts, at: c.at, summary: c.summary ?? null, why: c.why ?? null,
-    sizes: c.kind === "pr" ? JSON.stringify(sizes) : null, heads: c.kind === "pr" ? JSON.stringify(heads) : null,
-  }).onConflict((oc) => oc.columns(["repo", "key"]).doUpdateSet(excluded(["kind", "members", "hash", "kept", "source", "model", "reason", "result", "error", "attempts", "at", "summary", "why", "sizes", "heads"]))));
-}
-
-/** True when a PR member's diff size differs by more than 20% from the size stored at compare time. */
-function diffMoved(c: StoredComparison, members: Member[]): boolean {
-  let at: Record<string, number>;
-  try { at = JSON.parse(c.sizes ?? "{}") as Record<string, number>; } catch { return false; }
-  return members.some((m) => {
-    const then = at[m.number], now = sizeOf(m);
-    // A size unknown at compare time counts as moved once it is known.
-    if (now === null) return false;
-    return then === undefined || Math.abs(now - then) > DIFF_SIZE_CHANGE * Math.max(then, 1);
-  });
-}
+/** The id of the group whose lowest member is `lowest`. */
+export const groupId = (repo: string, lowest: number): string => `${repo}:dupegroup:${lowest}`;
 
 /**
- * The head of PR `n` that its latest stored comparison read; undefined when no comparison is stored or the latest recorded no
- * heads (stored before heads were kept), so nothing binds the PR to code a comparison saw; null when the comparison read no head of it.
+ * The groups whose comparisons are all current, with the role of each member: the kept item of each kind, the open in-scope members
+ * that duplicate it (`close`), and the rest (`stay`). A group with nothing to close is still a group: its roles are the signal.
  */
-export async function comparedHead(db: Db, repo: string, n: number): Promise<string | null | undefined> {
-  const r = await db.get(db.k.selectFrom("dupe_comparisons").select(["heads", jsonText(db, "heads", `$."${n}"`).as("head")])
-    .where("repo", "=", repo).where("kind", "=", "pr")
-    .where((eb) => eb.exists(eb.selectFrom(jsonEach(db, "dupe_comparisons.members", "je", "bigint")).select(eb.lit(1).as("one")).where("je.value", "=", n)))
-    .orderBy("at", "desc").limit(1));
-  return !r || r.heads == null ? undefined : r.head ?? null;
-}
-
-/** The stored comparison of the set when it is current. */
-export const currentComparison = async (db: Db, s: KindSet, stored: (repo: string, key: string) => Promise<StoredComparison | null> = async (r, k) => await storedComparison(db, r, k)): Promise<StoredComparison | null> => {
-  const c = await stored(s.repo, s.key);
-  if (!c) return null;
-  if (c.hash === s.hash) return diffMoved(c, s.members) ? null : c;
-  return c.sizes == null && c.hash === legacySetHash(s.members) ? c : null;
-};
-
-export const DROP_PAUSE_MS = 10 * 60_000;
-export const RULE_RETRY_MS = 15 * 60_000;
-export const RULE_ATTEMPTS = 3;
-const dropKey = (s: { repo: string; key: string }) => `dupe_drop:${s.repo}:${s.key}`;
-
-/** Remembers that the set changed on GitHub since the sync, so it is not tried again for a while. */
-export async function rememberDrop(db: Db, s: KindSet, at: string): Promise<void> {
-  await db.run(db.k.insertInto("settings").values({ key: dropKey(s), value: `${s.hash}|${at}` }).onConflict((oc) => oc.column("key").doUpdateSet(excluded(["value"]))));
-}
-
-/** When the set's current snapshot was last dropped (ms), or null. */
-async function droppedAt(db: Db, s: KindSet): Promise<number | null> {
-  const v = await setting(db, dropKey(s));
-  if (!v) return null;
-  const [hash, at] = v.split("|");
-  return hash === s.hash ? Date.parse(at!) : null;
-}
-
-async function recentlyDropped(db: Db, s: KindSet, nowMs: number): Promise<boolean> {
-  const at = await droppedAt(db, s);
-  return at !== null && nowMs - at < DROP_PAUSE_MS;
-}
-
-/** A stored rule result is tried again after 15 minutes, three times at most, while no decision of the group is answered. */
-async function retryable(db: Db, c: StoredComparison, nowMs: number): Promise<boolean> {
-  if (c.source !== "rule" || c.attempts >= RULE_ATTEMPTS || nowMs - Date.parse(c.at) < RULE_RETRY_MS) return false;
-  return !await db.get(db.k.selectFrom("dupe_group_items as gi").innerJoin("decisions as d", "d.id", "gi.decision_id").select((eb) => eb.lit(1).as("one"))
-    .where("gi.repo", "=", c.repo).where(inList(db, "gi.number", c.members, "bigint")).where("d.answer", "is not", null).where("d.answer", "<>", "superseded").limit(1));
-}
-
-/**
- * Sets that need a comparison: an open member is in the pilot and no current result is stored (or a rule result may be retried), and the set did not just change on GitHub.
- * `change` is told, per set, when its answer changes with the clock alone: a rule result's retry wait or a drop's pause ends.
- */
-export async function dueSets(db: Db, repo?: string, nowMs: number = Date.now(), change?: (s: KindSet, at: number) => void): Promise<KindSet[]> {
-  const out: KindSet[] = [];
-  const groups = await duplicateGroups(db, repo), setsOf = await kindSetsLoader(db, groups), stored = await storedComparisons(db, repo);
-  for (const g of groups)
-    for (const s of setsOf(g)) {
-      if (!await someSeq(s.members, async (m) => m.state === "OPEN" && await setsOf.inPilot(s.repo, m.number))) continue;
-      const c = await currentComparison(db, s, stored);
-      if (change) {
-        if (c && c.source === "rule" && c.attempts < RULE_ATTEMPTS) change(s, Date.parse(c.at) + RULE_RETRY_MS);
-        const dropped = await droppedAt(db, s);
-        if (dropped !== null) change(s, dropped + DROP_PAUSE_MS);
+export function groupPlans(state: DupeState): DupeGroupPut[] {
+  const out: DupeGroupPut[] = [];
+  for (const g of dupeGroups(state)) {
+    const sets = kindSets(state, g).filter((s) => s.members.some((m) => m.state === "OPEN" && m.in_scope));
+    if (!sets.length) continue;
+    const ready = sets.map((set) => ({ set, cmp: currentComparison(state, set) }));
+    if (ready.some((r) => !r.cmp)) continue;
+    const items: DupeGroupPut["items"] = [];
+    for (const { set, cmp } of ready as { set: KindSet; cmp: NonNullable<ReturnType<typeof currentComparison>> }[]) {
+      let others: Others = [];
+      try { others = (JSON.parse(cmp.result ?? "null") as { others?: Others } | null)?.others ?? []; } catch { /* no per-member answers */ }
+      for (const m of set.members) {
+        if (m.number === cmp.kept) { items.push({ number: m.number, kind: set.kind, role: "keep", target: null, detail: null }); continue; }
+        const other = others.find((o) => o.number === m.number);
+        const dup = set.kind === "issue" || other?.duplicate !== false;
+        const role: Role = m.state === "OPEN" && dup && m.in_scope ? "close" : "stay";
+        items.push({ number: m.number, kind: set.kind, role, target: role === "close" ? cmp.kept : null, detail: other ? JSON.stringify(other) : null });
       }
-      if ((!c || await retryable(db, c, nowMs)) && !await recentlyDropped(db, s, nowMs)) out.push(s);
     }
+    // The kept PR is linked to the kept issue.
+    const keepPr = items.find((i) => i.role === "keep" && i.kind === "pr"), keepIssue = items.find((i) => i.role === "keep" && i.kind === "issue");
+    if (keepPr && keepIssue) keepPr.detail = JSON.stringify({ ...(keepPr.detail ? JSON.parse(keepPr.detail) as object : {}), link: keepIssue.number });
+    const sources = ready.map((r) => r.cmp!.source);
+    out.push({
+      id: groupId(g.repo, Math.min(...items.map((i) => i.number))), repo: g.repo, items,
+      source: sources.includes("rule") ? "rule" : sources.every((s) => s === "closed" || s === "single") ? "closed" : "model",
+    });
+  }
+  return out;
+}
+
+/**
+ * The stored groups that stay beside `groupPlans`: those of a group waiting for a comparison, until it has been made. A stored group
+ * keeps its members that are still in such a group; one whose edges are gone, or whose comparisons are all current, is left out.
+ */
+export function waitingGroups(state: DupeState, stored: DupeGroupPut[]): DupeGroupPut[] {
+  const waiting = new Set<string>();
+  for (const g of dupeGroups(state)) {
+    const sets = kindSets(state, g).filter((s) => s.members.some((m) => m.state === "OPEN" && m.in_scope));
+    if (sets.some((s) => !currentComparison(state, s))) for (const n of g.members) waiting.add(`${g.repo}#${n}`);
+  }
+  const out: DupeGroupPut[] = [];
+  for (const g of stored) {
+    const items = g.items.filter((i) => waiting.delete(`${g.repo}#${i.number}`));
+    if (items.length > 1) out.push({ ...g, id: groupId(g.repo, Math.min(...items.map((i) => i.number))), items });
+  }
   return out;
 }

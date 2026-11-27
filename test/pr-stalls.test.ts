@@ -8,131 +8,76 @@ const kinds = (f: Parameters<typeof prFacts>[0]) => decidePr(prFacts(f)).actions
 const cifix = (o: Record<string, unknown> = {}) => ({ states: [] as string[], tries: 0, rerunAt: null, infraRuns: null, formattingTask: null, formatterEnded: true, totalPushes: 0, totalTries: 0, checksAt: null, skipReason: null, ...o });
 const HOLD = { review: { verdict: "hold" } } as const;
 
-test("a hold review asks the Hold question once, waits on the person, then on the author after Wait", () => {
-  assert.deepEqual(kinds(HOLD), ["ask-merge:hold"]);
-  const open = decidePr(prFacts({ ...HOLD, decision: { hold: { asked: true, open: true, answer: null, otherOpen: false } } }));
-  assert.deepEqual(open.actions.filter((a) => a.kind !== "unassign"), []);
-  assert.equal(open.waitKind, "person");
-  const waiting = decidePr(prFacts({ ...HOLD, decision: { hold: { asked: true, open: false, answer: "wait", otherOpen: false } } }));
-  assert.equal(waiting.waitKind, "contributor");
-});
-
-test("a Hold question left open for a head that is no longer held is set aside", () => {
-  assert.deepEqual(kinds({ review: { verdict: "take", stale: true }, decision: { hold: { asked: true, open: true, answer: null, otherOpen: false } } }).filter((k) => k.startsWith("ask-merge")), ["ask-merge:hold:withdraw"]);
-});
-
 test("red CI that holds the review with no take review at the head asks the contributor", () => {
   const f = { review: { verdict: "hold", head: "h0" }, ci: "failure", cifix: cifix(), reviewHold: { kind: "ci", wait: "CI on the latest commit to pass", red: true } } as const;
   assert.deepEqual(kinds(f), ["cifix:ask"]);
   const asked = decidePr(prFacts({ ...f, cifix: cifix({ states: ["asked"] }) }));
-  assert.equal(asked.waitKind, "contributor");
+  assert.deepEqual([asked.waitKind, asked.waitCode], ["contributor", "ci-contributor"]);
   const skipped = decidePr(prFacts({ ...f, cifix: cifix({ states: ["skipped"], skipReason: "nothing to fix" }) }));
-  assert.equal(skipped.waitKind, "person");
+  assert.deepEqual([skipped.waitKind, skipped.waitCode], ["person", "ci-nothing-to-fix"]);
 });
 
 test("a CI fix whose comment failed, or did not reach GitHub after the last retry, waits on a person", () => {
   for (const c of [cifix({ states: ["comment-failed"] }), cifix({ states: ["comment-unsent", "comment-unsent", "comment-unsent"], unsent: "final" })]) {
     const p = decidePr(prFacts({ ci: "failure", cifix: c }));
-    assert.deepEqual([p.actions.filter((a) => a.kind !== "unassign"), p.wait, p.waitKind], [[], "a person: the CI fix comment failed", "person"]);
+    assert.deepEqual([p.actions.filter((a) => a.kind !== "unassign"), p.wait, p.waitKind, p.waitCode], [[], "a person: the CI fix comment failed", "person", "ask-failed"]);
   }
 });
 
-test("a failed or errored verification asks Merge? with the failure, and the answer stands", () => {
+test("a PR with a documentation label is planned for a review and does not wait on a person", () => {
+  const p = decidePr(prFacts({ review: null, label: "documentation" }));
+  assert.equal(p.state, "not-reviewed");
+  assert.deepEqual(p.actions.map((a) => a.kind), ["review"]);
+  assert.equal(p.waitKind, null);
+});
+
+test("a failed or errored verification blocks the merge with the failure as the reason", () => {
   for (const state of ["failed", "error"]) {
     const p = decidePr(prFacts({ verification: { state, kind: "tests", summary: "2 tests fail", note: null } }));
     assert.equal(p.state, "needs-decision");
-    assert.ok(p.actions.some((a) => a.kind === "ask-merge"));
     assert.ok(p.reasons.some((r) => r.startsWith("verification") && r.includes("2 tests fail")));
-    const merged = decidePr(prFacts({ verification: { state, kind: "tests", summary: "2 tests fail", note: null }, decision: { asked: true, answer: "merge", mergeAnswerAfterReview: true }, verifyOverride: true }));
-    assert.equal(merged.path, "operator");
-    const merge = merged.actions.find((a) => a.kind === "merge");
-    assert.equal(merge?.params?.singleOnly, true);
-    // An answer given before the verification result does not override it.
-    const before = decidePr(prFacts({ verification: { state, kind: "tests", summary: "2 tests fail", note: null }, decision: { asked: true, answer: "merge", mergeAnswerAfterReview: true }, verifyOverride: false }));
-    assert.ok(!before.actions.some((a) => a.kind === "merge"));
   }
 });
 
-test("a mergeable state still unknown after GitHub was asked to compute it asks Merge?; before that the wait says how often it was asked", () => {
+test("a mergeable state still unknown after GitHub was asked to compute it blocks the merge; before that the wait says how often it was asked", () => {
   const since = new Date(NOW - 10 * 3600_000).toISOString();
   const reading = decidePr(prFacts({ mergeable: "UNKNOWN", unknown: { since, reads: 3, rereads: 0, stuck: false } }));
   assert.equal(reading.state, "waiting-ci");
   assert.match(reading.wait ?? "", /3 checks reads/);
+  assert.equal(reading.waitCode, "mergeable-unknown");
   const stuck = decidePr(prFacts({ mergeable: "UNKNOWN", unknown: { since, reads: 6, rereads: 1, stuck: true } }));
   assert.equal(stuck.state, "needs-decision");
-  assert.ok(stuck.actions.some((a) => a.kind === "ask-merge"));
   assert.ok(stuck.reasons.some((r) => r.includes("unknown")));
+  assert.equal(stuck.waitCode, "mergeable-stuck");
 });
 
-test("an idle CI fix asks the Hold question with the reason; a refusal from GitHub is retried once first", () => {
-  const idle = decidePr(prFacts({ ci: "failure", cifix: cifix({ states: ["skipped"], skipReason: "only an optional check failed" }) }));
-  const ask = idle.actions.find((a) => a.kind === "ask-merge");
-  assert.equal(ask?.params?.hold, true);
-  assert.match(String(ask?.params?.ci), /nothing to fix/);
-  const flaky = (refusals: number) => decidePr(prFacts({ lastMerge: { outcome: "refused", reason: "gh: HTTP 502 Bad Gateway", ci: "success", mergeable: "MERGEABLE", refusals } }));
-  assert.ok(flaky(1).actions.some((a) => a.kind === "merge"));
-  assert.equal(flaky(2).state, "needs-decision");
-});
-
-test("a Hold question settled without a pending action is never a silent wait", () => {
-  const p = decidePr(prFacts({ ...HOLD, decision: { hold: { asked: true, open: false, answer: "handled", otherOpen: false } } }));
-  assert.equal(p.waitKind, "person");
-  const grouped = decidePr(prFacts({ ...HOLD, decision: { inOpenGroup: true } }));
-  assert.deepEqual(grouped.actions.filter((a) => a.kind === "ask-merge"), []);
-  assert.equal(grouped.waitKind, "person");
-});
-
-test("a PR whose label gets no review names what it waits on", () => {
-  const p = decidePr(prFacts({ review: null, label: "documentation" }));
-  assert.equal(p.state, "label-not-reviewed");
-  assert.equal(p.waitKind, "person");
-});
-
-test("a merge refused for a reason other than CI or mergeable asks Merge?; a state refusal waits for the change", () => {
+test("a merge refused for a reason other than CI or mergeable blocks the merge; a state refusal waits for the change", () => {
   const refused = (reason: string) => ({ lastMerge: { outcome: "refused", reason, ci: "success", mergeable: "MERGEABLE" } });
   const other = decidePr(prFacts(refused("REFUSED app#1: the PR touches a protected file")));
   assert.equal(other.state, "needs-decision");
   assert.ok(other.reasons.some((r) => r.includes("protected file")));
   const state = decidePr(prFacts(refused("not ready at merge time: CI pending, mergeable unknown")));
-  assert.equal(state.state, "refused");
-  // An operator who already answered Merge and was refused is shown a person wait with the reason.
-  const answered = decidePr(prFacts({ ...refused("REFUSED app#1: the PR touches a protected file"), decision: { asked: true, answer: "merge", mergeAnswerAfterReview: true } }));
-  assert.equal(answered.waitKind, "person");
-  assert.match(answered.wait ?? "", /protected file/);
+  assert.deepEqual([state.state, state.waitCode, state.waitKind], ["refused", "refusal-retry", "system"]);
 });
 
-test("the Hold question is written once per head, prepared like other questions, and set aside by a new review", async () => {
+test("a batch the PR failed alone in waits on a person until the PR is handed over anew", async () => {
   const { world } = await import("./world-db.ts");
-  const { askHoldDecisions } = await import("../src/act/index.ts");
-  const { saveOpus } = await import("../src/review/opus.ts");
-  const w = await (await (await (await world()).repo()).pr(1)).review(1, { verdict: "hold", reason: "needs a design call" });
+  const w = await (await (await (await (await (await world()).repo()).acting()).pr(1)).review(1)).verified(1);
   try {
-    assert.equal((await w.prPlan(1)).state, "opus-hold");
-    const ids = await askHoldDecisions(w.db, new Date().toISOString());
-    assert.deepEqual(ids, ["app#1:hold@" + ((await w.prPlan(1)).head ?? "")]);
-    const d = (await w.rows("SELECT kind, question, options, facts FROM decisions WHERE id = ?", ids[0]!))[0]!;
-    assert.equal(d.kind, "hold");
-    assert.deepEqual((JSON.parse(String(d.options)) as { key: string }[]).map((o) => o.key), ["wait", "close"]);
-    assert.ok(String(d.facts).includes("needs a design call"));
-    // Asked: the plan waits on a person and does not ask again.
-    assert.deepEqual((await w.prPlan(1)).actions.filter((a) => a.kind === "ask-merge"), []);
-    assert.equal((await w.prPlan(1)).waitKind, "person");
-    assert.deepEqual(await askHoldDecisions(w.db, new Date().toISOString()), []);
-    // A new review at the same head sets the question aside; a hold again asks it anew.
-    await saveOpus(w.db, "rv2", { repo: "app", number: 1, head_oid: (await w.prPlan(1)).head! }, { mode: "full", base: null, model: "m", review: { ref: "app#1", verdict: "hold", sure: true, reason: "still open", fixes: [], risks: [], summary: null, why: null, public: null, conflicts: [], claims: [], blocked_by: [] } });
-    // A review made again that still says hold keeps the open question (its prepare is redone from the newer review time).
-    assert.equal((await w.rows("SELECT 1 FROM decisions WHERE id LIKE '%:hold@%~replaced-%'")).length, 0);
-    assert.deepEqual(await askHoldDecisions(w.db, new Date().toISOString()), []);
-    // A changed verdict sets it aside.
-    await saveOpus(w.db, "rv3", { repo: "app", number: 1, head_oid: (await w.prPlan(1)).head! }, { mode: "full", base: null, model: "m", review: { ref: "app#1", verdict: "take", sure: true, reason: "fine now", fixes: [], risks: [], summary: null, why: null, public: null, conflicts: [], claims: [], blocked_by: [] } });
-    assert.equal((await w.rows("SELECT 1 FROM decisions WHERE id LIKE '%:hold@%~replaced-%'")).length, 1);
+    await w.workflow(1);
+    await w.premerge(1, "clean");
+    await w.handedOver(1);
+    const at = (await w.rows("SELECT head, updated_at FROM preapprovals WHERE number = 1"))[0] as { head: string; updated_at: string };
+    const failed = async (minutes: number) => {
+      const t = new Date(Date.parse(at.updated_at) + minutes * 60_000).toISOString();
+      const b = (await w.db.get(w.db.k.insertInto("main.merge_batches").values({ repo: "app", branch: "b", state: "failed", base_sha: "m", commit_sha: "c", summary: "CI failed", created_at: t, updated_at: t }).returning("id")))!;
+      await w.db.run(w.db.k.insertInto("main.merge_batch_prs").values({ batch_id: b.id, number: 1, head_oid: at.head, position: 0 }));
+      const p = await w.prPlan(1);
+      return [p.state === "batch-failed", p.actions.some((a) => a.kind === "merge"), p.waitCode];
+    };
+    assert.deepEqual(await failed(-5), [false, true, null]);
+    assert.deepEqual(await failed(5), [true, false, "batch-failed"]);
   } finally { w.close(); }
-});
-
-test("a hold review whose item has another open question waits for it instead of replacing it", () => {
-  const p = decidePr(prFacts({ ...HOLD, decision: { hold: { asked: false, open: false, answer: null, otherOpen: true } } }));
-  assert.deepEqual(p.actions.filter((a) => a.kind !== "unassign"), []);
-  assert.equal(p.waitKind, "person");
 });
 
 test("from database rows: red CI at a new head with an earlier non-take review asks the contributor once", async () => {
@@ -141,26 +86,5 @@ test("from database rows: red CI at a new head with an earlier non-take review a
   try {
     const p = await w.prPlan(1);
     assert.deepEqual(p.actions.filter((a) => a.kind === "cifix").map((a) => a.params?.bucket), ["ask"]);
-  } finally { w.close(); }
-});
-
-test("from database rows: a Merge answer given while verification ran does not cover its failure; the question is asked again", async () => {
-  const { world } = await import("./world-db.ts");
-  const { setAsideAnswerBeforeFailure, verifyOverride } = await import("../src/merge/verify-override.ts");
-  const w = await (await (await (await (await (await world()).repo()).pr(1, { ci: "success" })).review(1, { verdict: "take" })).verified(1, "running")).answer(1, "merge");
-  try {
-    const head = (await w.prPlan(1)).head!;
-    // The verification fails after the answer.
-    await w.db.prepare("UPDATE verifications SET state = 'failed', summary = 'tests fail', finished_at = '2999-01-01T00:00:00.000Z' WHERE repo = 'app' AND number = 1").run();
-    assert.equal(await verifyOverride(w.db, "app", 1, head), false);
-    assert.ok(!(await w.prPlan(1)).actions.some((a) => a.kind === "merge"));
-    assert.equal(await setAsideAnswerBeforeFailure(w.db, "app", 1, head, new Date().toISOString()), true);
-    const p = await w.prPlan(1);
-    assert.equal(p.state, "needs-decision");
-    assert.ok(p.actions.some((a) => a.kind === "ask-merge"));
-    // An answer given after the result stands.
-    await w.db.prepare("UPDATE verifications SET finished_at = '2000-01-01T00:00:00.000Z' WHERE repo = 'app' AND number = 1").run();
-    await w.answer(1, "merge");
-    assert.equal(await verifyOverride(w.db, "app", 1, head), true);
   } finally { w.close(); }
 });

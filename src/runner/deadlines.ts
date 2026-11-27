@@ -7,6 +7,9 @@ import { CLAUDE_PROMPTS, type ClaudePromptId } from "../prompts/index.ts";
 import { AREAS_MAX, FINDINGS_PER_AREA_MAX } from "../security/rules.ts";
 import { stepMaxMin } from "../stages/registry.ts";
 
+/** How long a part of the runner's work fails before it counts as failing (the health check, and which failure it shows). */
+export const RUNNER_FAILING_MS = 60_000;
+
 /** One call per item. `lint`: follow-up turns of the same call (one per lint round). */
 type Call = { id: ClaudePromptId; lint?: boolean };
 /** `items`: the job's items when its params have no `limit`. */
@@ -21,7 +24,6 @@ const item = (id: ClaudePromptId, lint = false): Call => ({ id, ...(lint && { li
 export const STEP_PLANS: Record<string, Plan> = {
   referee: { calls: [item("referee.sonnet")], items: 100 },
   "dupes-compare": { calls: [item("dupes.compare-prs.opus"), item("dupes.compare-issues.sonnet")], items: 20 },
-  decide: { calls: [item("decide.prepare")], items: 50 },
   conversation: { calls: [item("conversation.turn")], items: 30 },
   "areas-propose": { calls: [item("areas.propose")], items: 1 },
   "areas-suggest": { calls: [item("areas.suggest")], items: 1 },

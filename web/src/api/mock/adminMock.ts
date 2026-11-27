@@ -150,7 +150,7 @@ let appRemoved = false;
 export const AUDIT_ACTIONS = [
   "answer", "undo", "dispute", "dispute-resolve", "answer-sweep", "adopt", "opinion", "opinion-retract", "comment", "override", "rule", "access-add", "access-remove", "access-role",
   "session-revoke", "mcp-token-create", "mcp-token-revoke", "usage-reserve", "my-repos", "max-calls", "sign-in", "sign-in-refused", "repo-track", "repo-untrack",
-  "session-revoke", "sign-in", "sign-in-refused", "github-app-register", "github-app-register-failed", "github-app-remove", "github-identity", "github-app-link-create", "github-app-link-revoke", "github-app-link-use", "github-app-manager", "app-owner-allow", "app-owner-remove", "app-install-removed", "repo-track", "repo-untrack",
+  "session-revoke", "sign-in", "sign-in-refused", "github-app-register", "github-app-register-failed", "github-app-remove", "github-identity", "github-app-link-create", "github-app-link-revoke", "github-app-link-use", "github-app-manager", "app-owner-allow", "app-owner-remove", "app-install-removed", "webhook-redeliver", "repo-track", "repo-untrack",
 ];
 
 function buildAudit(): AuditEntry[] {
@@ -179,7 +179,6 @@ type AdminApi = Pick<Api, "contributors" | "repoAdmin" | "access" | "githubApp">
 
 export function createAdminMock(me: User, changed: () => void): AdminApi {
   const authors = buildAuthors();
-  let singleMax = 3;
   let githubIdentity: "box" | "app" = typeof location !== "undefined" && location.search.includes("identity=app") ? "app" : "box";
   const repos = buildRepos(me.role);
   const access = structuredClone(ACCESS);
@@ -362,16 +361,6 @@ export function createAdminMock(me: User, changed: () => void): AdminApi {
         log("repo-untrack", name);
         changed();
         return this.list();
-      },
-      async singleMerge() {
-        return { max: singleMax };
-      },
-      async setSingleMerge(max) {
-        requireOperator("change the single-merge limit");
-        if (!Number.isInteger(max) || max < 0 || max > 100) throw new Error("the single-merge limit must be a whole number from 0 to 100");
-        singleMax = max;
-        log("single-merge-max", "merge");
-        return { max };
       },
       async approveMerging(name, approved) {
         requireRun(name);

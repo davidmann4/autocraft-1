@@ -19,11 +19,10 @@
     "db-types:check": "node scripts/gen-db-types.ts --check",
     "docs": "node scripts/gen-docs.ts",
     "docs:check": "node scripts/gen-docs.ts --check",
-    "docs:image": "node scripts/flowchart-shot.mjs",
     "gql-schema": "scripts/gql-schema.sh",
     "pg-schema": "node scripts/gen-pg-schema.ts",
     "pg-schema:check": "node scripts/gen-pg-schema.ts --check",
-    "test": "node --test",
+    "test": "node --no-warnings scripts/test.ts",
     "test:pg": "scripts/pg-test.sh run",
     "test:pg:suite": "scripts/pg-test.sh suite"
   },

@@ -3,15 +3,21 @@
 // pass. The Postgres tests need a server (AUTOCRAFT_TEST_PG_URL; `pnpm test:pg` starts one) and are skipped otherwise.
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { bulkWrites, changeCursor, changesSince, planTriggers, pruneChanges, type ChangeCursor } from "../src/core/plan-changes.ts";
+import "../src/trigger-sources.ts";
+import { bulkWrites, changeCursor, changesSince, pruneChanges, type ChangeCursor } from "../src/core/plan-changes.ts";
+import { planTriggers } from "../src/db/plan-triggers.ts";
 import { pgExpr } from "../src/core/pg-expr.ts";
-import type { Db } from "../src/db/index.ts";
+import type { Db } from "./helpers/raw-db.ts";
 import { loadPg } from "../src/db/open.ts";
 import { PG_COLUMNS_SQL, pgColumns } from "../src/db/pg-triggers.ts";
-import { liveTriggers, readSeqs } from "../src/live.ts";
+import { liveTriggers } from "../src/db/live.ts";
+import { planDue } from "../src/runner/autopilot.ts";
 import { needsPg, testDatabase, type TestDatabase } from "./test-db.ts";
 
 const T = "2026-01-01T00:00:00Z";
+/** The start of a workflow: a write that moves the full-pass generation and logs its item. */
+const startWorkflow = (number: number): string => `INSERT INTO item_workflows (repo, number, kind, entry, state, started_by, started_at, started_via, updated_at)
+  VALUES ('app', ${number}, 'pr', 'review', 'running', 'op', '${T}', 'dashboard', '${T}')`;
 
 /** Writes over most kinds of trigger: item, cross-item and global inputs, bookkeeping-only updates, malformed JSON, a transaction, a bulk write. */
 const STEPS: [string, (db: Db) => Promise<unknown>][] = [
@@ -32,18 +38,20 @@ const STEPS: [string, (db: Db) => Promise<unknown>][] = [
   ["batch merged", (db) => db.prepare("UPDATE merge_batches SET state = 'merged' WHERE id = 1").run()],
   ["hold review", (db) => db.prepare(`INSERT INTO opus_reviews (repo, number, head_oid, at, mode, verdict, blocked_by) VALUES ('app', 1, 'h1', ?, 'full', 'hold', '["app#2", 7, "app#2"]')`).run(T)],
   ["blocker closes", (db) => db.run(db.k.updateTable("items").set({ state: "CLOSED" }).where("number", "=", 2))],
-  ["decision with a list", (db) => db.run(db.k.insertInto("decisions").values({ id: "d1", kind: "merge", repo: "app", number: 3, items: '[{"repo": "app", "number": 5}, "app#6"]', asked_at: T, asked_by: "x", question: "q", options: "[]" }))],
-  ["decision list malformed", (db) => db.run(db.k.updateTable("decisions").set({ items: '{"repo": "app"' }).where("id", "=", "d1"))],
-  ["pair decision", (db) => db.run(db.k.insertInto("decisions").values({ id: "dup:app#3@12x", kind: "duplicate", repo: "app", number: 3, asked_at: T, asked_by: "x", question: "q", options: "[]" }))],
+  ["issue links", (db) => db.run(db.k.updateTable("items").set({ text_refs: "[[12],[12,13]]", closing_issues: "[14]" }).where("number", "=", 1))],
+  ["issue links malformed", (db) => db.run(db.k.updateTable("items").set({ text_refs: '{"a": [', closing_issues: '{"repo": "app"}' }).where("number", "=", 1))],
   ["assign", (db) => db.prepare("INSERT INTO audit (at, login, action, target) VALUES (?, 'op', 'assign', 'app#9')").run(T)],
   ["assign odd target", (db) => db.prepare("INSERT INTO audit (at, login, action, target) VALUES (?, 'op', 'assign', 'app#x9')").run(T)],
-  ["fast track", (db) => db.prepare("INSERT INTO fast_track (repo, number, added_by, added_at) VALUES ('app', 9, 'op', ?)").run(T)],
+  ["workflow starts", (db) => db.run(db.k.insertInto("item_workflows").values({ repo: "app", number: 9, kind: "pr", entry: "review", state: "running", started_by: "op", started_at: T, started_via: "dashboard", updated_at: T }))],
+  ["workflow weight", (db) => db.run(db.k.updateTable("item_workflows").set({ weight: 8 }).where("number", "=", 9))],
+  ["workflow recommendation", (db) => db.run(db.k.updateTable("item_workflows").set({ rec: "{}", updated_at: "2026-01-02T00:00:00Z" }).where("number", "=", 9))],
+  ["workflow ends", (db) => db.run(db.k.updateTable("item_workflows").set({ state: "done" }).where("number", "=", 9))],
   ["surge breaker", (db) => db.prepare("INSERT INTO stage_trips (stage, reason, evidence, tripped_at) VALUES ('outside-surge', 'r', 'e', ?)").run(T)],
   ["env", (db) => db.prepare("INSERT INTO build_envs (id, label, kind, slots, key_hash, created_at) VALUES ('e1', 'E', 'remote', 1, 'k', ?)").run(T)],
   ["env poll", (db) => db.prepare("UPDATE build_envs SET last_seen_at = ? WHERE id = 'e1'").run(T)],
   ["transaction", (db) => db.write(async () => {
-    await db.prepare("INSERT INTO merge_holds (repo, number, held_by, held_at) VALUES ('app', 11, 'op', ?)").run(T);
-    await db.prepare("INSERT INTO merge_holds (repo, number, held_by, held_at) VALUES ('app', 12, 'op', ?)").run(T);
+    await db.prepare("INSERT INTO item_rank (repo, number, score, breakdown, computed_at) VALUES ('app', 11, 1, '{}', ?)").run(T);
+    await db.prepare("INSERT INTO item_rank (repo, number, score, breakdown, computed_at) VALUES ('app', 12, 1, '{}', ?)").run(T);
     await db.run(db.k.updateTable("items").set({ title: "again" }).where("number", "=", 1));
   })],
   ["bulk", (db) => bulkWrites(db, "test", async () => {
@@ -54,12 +62,12 @@ const STEPS: [string, (db: Db) => Promise<unknown>][] = [
 
 /** Per step: the topics whose counter moved and what the change log answers. */
 async function observe(db: Db): Promise<string[]> {
-  let seqs = await readSeqs(db);
+  let seqs = await db.seqs();
   let cursor = await changeCursor(db);
   const out: string[] = [];
   for (const [label, run] of STEPS) {
     await run(db);
-    const now = await readSeqs(db);
+    const now = await db.seqs();
     const c = await changesSince(db, cursor);
     const topics = Object.keys(now).filter((t) => now[t] !== seqs[t]).sort();
     out.push(`${label}: topics ${topics.join(" ")}; ${c.full ? "full" : `items ${[...c.refs].sort().join(" ")}`}`);
@@ -84,6 +92,9 @@ test("the same writes touch the same topics and log the same items on SQLite and
     // The steps reach the paths they are for.
     assert.ok(want.some((s) => s.startsWith("bulk:") && s.endsWith("full")));
     assert.ok(want.some((s) => s.startsWith("blocker closes:") && / app#1\b/.test(s)));
+    assert.ok(want.some((s) => s.startsWith("workflow starts:") && s.endsWith("full")));
+    assert.ok(want.some((s) => s.startsWith("workflow weight:") && s.endsWith("items app#9")));
+    assert.ok(want.some((s) => s.startsWith("issue links:") && / app#12 app#13 app#14\b/.test(s)));
     assert.deepEqual(await observe(pg.db), want);
   } finally {
     await lite.t.close();
@@ -116,7 +127,7 @@ test("a log row that commits after a later seq is read once, by the next pass, a
     let cursor = await db.read(() => changeCursor(db));
     await a.q("BEGIN");
     await a.q(`INSERT INTO item_rank (repo, number, score, breakdown, computed_at) VALUES ('app', 1, 1, '{}', '${T}')`);
-    await a.q(`INSERT INTO fast_track (repo, number, added_by, added_at) VALUES ('app', 1, 'op', '${T}')`);
+    await a.q(startWorkflow(1));
     await b.q("BEGIN");
     await b.q(`INSERT INTO item_rank (repo, number, score, breakdown, computed_at) VALUES ('app', 2, 1, '{}', '${T}')`);
     await b.q("COMMIT");
@@ -151,6 +162,27 @@ test("a log row that commits after a later seq is read once, by the next pass, a
   }
 });
 
+test("a job and a sandbox task that ended before the planner's mark and commit after it make the planner due", { skip: needsPg }, async () => {
+  const { t, db } = await appDb("postgres");
+  const a = await client(t);
+  const T = "2026-01-01T00:00:00Z";
+  try {
+    const job = (await db.get(db.k.insertInto("jobs").values({ step: "embed", params: "{}", requested_by: "pipeline", requested_at: T, state: "queued" }).returning("id")))!.id;
+    const task = (await db.get(db.k.insertInto("build_tasks").values({ step: "verify", repo: "app", number: 1, head_sha: "h", state: "running", requires: "{}", queued_at: T, plan: "[]" } as never).returning("id")))!.id;
+    for (const sql of [`UPDATE jobs SET state = 'cancelled', ended_at = '${T}' WHERE id = ${job}`, `UPDATE build_tasks SET state = 'done', ended_at = '${T}' WHERE id = ${task}`]) {
+      await a.q("BEGIN");
+      await a.q(sql);
+      await planDue(db);
+      assert.equal(await planDue(db), false);
+      await a.q("COMMIT");
+      assert.equal(await planDue(db), true, sql);
+    }
+  } finally {
+    await a.end();
+    await t.close();
+  }
+});
+
 test("counters move once per transaction, at commit, and not for a rolled-back savepoint", { skip: needsPg }, async () => {
   const { t, db } = await appDb("postgres");
   const a = await client(t);
@@ -158,17 +190,18 @@ test("counters move once per transaction, at commit, and not for a rolled-back s
     // The full-pass cause of a new PR, named after its planner input.
     const source = planTriggers("postgres").flatMap((p) => ("full" in p && p.table === "items" && p.op === "INSERT" ? [p.full] : []))[0]!;
     const seqs = async () => {
-      const s = await readSeqs(db);
+      const s = await db.seqs();
       const gen = (await db.get(db.k.selectFrom("plan_full").select("seq")))!.seq;
       const n = (await db.get(db.k.selectFrom("plan_full_causes").select("n").where("source", "=", source)))?.n ?? 0;
-      return { items: s.items!, fasttrack: s.fasttrack!, gen, n };
+      return { items: s.items!, workflows: s.workflows!, gen, n };
     };
     const before = await seqs();
+    assert.equal(typeof before.workflows, "number");
     await a.q("BEGIN");
     await a.q(`INSERT INTO items (repo, number, kind, state, title, created_at) VALUES ('app', 1, 'pr', 'OPEN', 'a', '${T}'), ('app', 2, 'pr', 'OPEN', 'b', '${T}')`);
     await a.q("UPDATE items SET title = 'c' WHERE number = 1");
     await a.q("SAVEPOINT s");
-    await a.q(`INSERT INTO fast_track (repo, number, added_by, added_at) VALUES ('app', 1, 'op', '${T}')`);
+    await a.q(startWorkflow(1));
     await a.q("ROLLBACK TO SAVEPOINT s");
     assert.deepEqual(await seqs(), before);
     await a.q("COMMIT");
@@ -176,7 +209,7 @@ test("counters move once per transaction, at commit, and not for a rolled-back s
     assert.equal(after.items, before.items + 1);
     assert.equal(after.gen, before.gen + 1);
     assert.equal(after.n, before.n + 1);
-    assert.equal(after.fasttrack, before.fasttrack);
+    assert.equal(after.workflows, before.workflows);
   } finally {
     await a.end();
     await t.close();
@@ -192,7 +225,7 @@ test("every Postgres trigger condition and log query plans against the schema", 
       ...planTriggers("postgres", columns).map((p) => "full" in p
         ? `SELECT 1 FROM ${rows(p.table)} WHERE ${p.cond || "true"}`
         : `INSERT INTO item_changes (repo, number) SELECT s.repo, s.number FROM ${rows(p.table)}, LATERAL (${p.refs}) AS s WHERE ${p.cond || "true"}`),
-      ...liveTriggers(columns).map((l) => `SELECT 1 FROM ${rows(l.table)} WHERE ${l.cond ? pgExpr(l.cond) : "true"}`),
+      ...liveTriggers(columns).map((l) => `SELECT 1 FROM ${rows(l.table)} WHERE ${l.pg ?? (l.cond ? pgExpr(l.cond) : "true")}`),
     ];
     assert.ok(checks.length > 300);
     const failed: string[] = [];

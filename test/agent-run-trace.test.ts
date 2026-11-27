@@ -2,10 +2,9 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { finishRun, getRun, insertRun, pruneRuns, rates, RUN_KEEP_MS, runTools } from "../src/agents/runs.ts";
 import { saveTools } from "../src/agents/tools.ts";
-import type { Db } from "../src/db/index.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb, type Db } from "./helpers/raw-db.ts";
 
-const start = async (db: Db) => await insertRun(db, { jobId: null, step: "fixup", stage: 1, promptId: "p", promptVersion: "1", provider: "claude", model: "m", accountId: null, items: [{ repo: "app", number: 1 }], prompt: "the prompt" });
+const start = async (db: Db) => await insertRun(db, { jobId: null, step: "fixup", stage: 1, promptId: "p", promptVersion: "1", provider: "claude", model: "m", items: [{ repo: "app", number: 1 }], prompt: "the prompt" });
 const use = (id: string, name: string, input: unknown) => ({ type: "assistant", message: { content: [{ type: "tool_use", id, name, input }] } });
 const result = (id: string, content: unknown, is_error = false) => ({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: id, content, is_error }] } });
 

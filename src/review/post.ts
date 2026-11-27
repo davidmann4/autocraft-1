@@ -5,21 +5,24 @@
 //   autocraft-server review-post --repo R [--limit N] [--apply]
 //
 // Without --apply it is a dry run: it reads the local tables only and lists what would be posted.
-import { commentApprovalOf } from "../act/approval.ts";
 import { type Note, editReview, postReview, type Writer } from "../github/write.ts";
 import { guard } from "../core/guard.ts";
 import { auditIdentity, githubIdentity } from "../github/identity.ts";
 import { ownerOf } from "../owners.ts";
-import { planned } from "../core/select.ts";
-import { isQueueState } from "../core/plan.ts";
-import { CLI_BY, type By } from "../core/gates.ts";
+import { planned, runnable } from "../core/select.ts";
+import { isQueueState, type PrFacts } from "../core/plan.ts";
+import { fixesToMake, followUpClaims, reviewFollowUps } from "../core/review-blocking.ts";
+import { claimFindings } from "../premerge/parse.ts";
+import { mayRun } from "../core/authority.ts";
+import { partTitle } from "../workflow/work.ts";
+import { CLI_BY, mergeAllowed, pushAllowed, type By } from "../core/gates.ts";
 import { Client, GithubError, type Querier } from "../mirror.ts";
 import { prInfo } from "../merge/index.ts";
-import { postSource } from "./post-source.ts";
+import { postSourcesOf, type PostSource } from "./post-source.ts";
+import { loadPosts, saveReviewPosts } from "../data/review/index.ts";
 import { reviewBody, recommendation } from "./post-template.ts";
 import { jobItem } from "../runner/job-items.ts";
 import type { Db } from "../db/index.ts";
-import * as kx from "../db/kx.ts";
 import { openDb } from "../db/open.ts";
 
 const ACTOR = "review-post";
@@ -43,32 +46,56 @@ export const defaultPostDeps = (): PostDeps => ({ querier: new Client(1000), now
 /**
  * Open PRs of `repo` whose Plan holds a `post-review` action: an Opus review (with public text unless it edits an earlier post) at
  * their current head that no review of ours describes yet. The Plan leaves out PRs by the pipeline's own account, batch PRs,
- * held duplicates and items outside the pilot.
+ * items outside the pipeline's scope.
  */
-export async function postCandidates(db: Db, repo: string): Promise<PostCandidate[]> {
-  const posted = (number: number) => db.get(db.k.selectFrom("review_posts").select(["review_id", "posted_as"]).where("repo", "=", repo).where("number", "=", number));
+export const postCandidates = async (db: Db, repo: string, by: By = CLI_BY): Promise<PostCandidate[]> => (await postsDue(db, repo, by)).due;
+
+/** postCandidates, and why the other reviews to post are held back (null: none is). */
+async function postsDue(db: Db, repo: string, by: By): Promise<{ due: PostCandidate[]; held: string | null }> {
   // A review is edited only by the lane that posted it: a NULL `posted_as` is a row from before it was recorded, written by the box account.
   const lane = (as: string | null | undefined): "legacy" | "app" => (as && as !== "legacy" ? "app" : "legacy");
   const nowLane = await githubIdentity(db) === "app" ? "app" : "legacy";
   const out: PostCandidate[] = [];
-  for (const { facts: f, plan, action } of await planned(db, "post-review", { repo })) {
+  const { may: rows, held } = runnable(await planned(db, "post-review", { repo, refused: true }), by);
+  const refs = rows.map((p) => ({ repo, number: p.facts.number }));
+  const [posts, source] = await Promise.all([loadPosts(db, refs), postSourcesOf(db, refs.map((r) => `${r.repo}#${r.number}`))]);
+  for (const { facts: f, plan, action } of rows) {
     const head = action.head!;
-    const o = await postSource(db, repo, f.number, head);
+    const o = await source(repo, f.number, head);
     if (!o) continue;
     // A newer review with no public text still edits an earlier post, so the verdict line stays current.
     const pub = o.public;
     if (!pub) continue;
-    const prev = await posted(f.number);
+    const prev = posts.get(`${repo}#${f.number}`);
     const editId = prev && lane(prev.posted_as) === nowLane ? prev.review_id ?? null : null;
+    const fu = postFollowUps(o, f);
     out.push({
       repo, number: f.number, head_oid: head, editId, opusAt: o.at, model: o.model,
       body: reviewBody({
-        verdict: o.sourceVerdict, sure: o.sure, summary: pub.summary, points: pub.points, claims: o.claims, head: o.reviewedAt, owner: ownerOf(repo), fixedIn: o.fixedIn,
-        recommendation: recommendation({ verdict: o.verdict, queue: o.verdict === "take" && isQueueState(plan.state) ? { path: plan.path, state: plan.state } : null, mergeApproved: f.repoFacts.mergeApproved, canPush: f.repoFacts.pushApproved && f.pushable }),
+        verdict: o.sourceVerdict, sure: o.sure, summary: pub.summary, points: pub.points, claims: o.claims, head: o.reviewedAt, owner: ownerOf(repo), fixedIn: o.fixedIn, followUps: fu,
+        recommendation: recommendation({
+          verdict: o.verdict, queue: o.verdict === "take" && isQueueState(plan.state) ? { path: plan.path, state: plan.state } : null, mergeApproved: mergeAllowed(f), canPush: f.pushable && pushAllowed(f, "fixup"),
+          followUps: fu ? { blocking: fu.fixes.length, later: fu.later.length, filed: !fu.notFiled } : null,
+        }),
       }),
     });
   }
-  return out;
+  return { due: out, held };
+}
+
+/**
+ * On a PR approved for merge, what the review's post lists apart: the fixes made before the merge, and the fixes, hold and claims
+ * covered only in part that do not block it and are filed as a follow-up issue (src/core/review-blocking.ts). Null elsewhere, or when nothing is filed.
+ */
+function postFollowUps(o: PostSource, f: PrFacts): { fixes: string[]; later: string[]; notFiled: string | null } | null {
+  if (!f.workflow?.approved) return null;
+  const fu = reviewFollowUps({ verdict: o.sourceVerdict, fixes: o.fixes, hold: o.hold, blockedBy: o.blockedBy }, f.workflow.dropped);
+  const claims = claimFindings(followUpClaims({ ...o, verdict: o.sourceVerdict }, f.review?.verdict === "take" || f.review?.verdict === "take-fix"), []).map((x) => x.title);
+  const later = [...fu.fixes.map(partTitle), ...(fu.hold ? [fu.hold] : []), ...claims];
+  if (!later.length) return null;
+  // The same gate as the filing itself (src/core/decide.ts reviewFollowUpsDue): a refused one says why.
+  const may = mayRun({ facts: f, action: { kind: "followups", head: f.head } }, "pipeline");
+  return { fixes: fixesToMake(o.fixes, f.workflow.dropped, true).map(partTitle), later, notFiled: may.ok ? null : may.why.text };
 }
 
 /** Whether an edit failed because the review no longer exists or the token may not edit it. */
@@ -84,12 +111,12 @@ export async function runReviewPost(db: Db, params: PostParams, log: (line: stri
   const dryRun = params.dryRun ?? true;
   if (params.limit !== undefined && !(Number.isInteger(params.limit) && params.limit >= 0)) throw new Error("limit must be a whole number ≥ 0");
   const s: PostSummary = { repo, dryRun, candidates: 0, posted: [], edited: [], skipped: [], failed: [], note: null };
-  if (!await commentApprovalOf(db, repo)) {
-    s.note = `commenting in ${repo} is not approved`;
-    log(`review-post ${repo}: ${s.note}; nothing done`);
-    return s;
+  const { due, held } = await postsDue(db, repo, params.by ?? CLI_BY);
+  if (held) {
+    s.note = held;
+    log(`review-post ${repo}: ${held}`);
   }
-  let todo = await postCandidates(db, repo);
+  let todo = due;
   s.candidates = todo.length;
   if (params.limit !== undefined) todo = todo.slice(0, params.limit);
   if (dryRun) {
@@ -115,7 +142,7 @@ export async function runReviewPost(db: Db, params: PostParams, log: (line: stri
       if (c.editId) {
         try {
           await editReview(w, d.querier, g, c.editId, REVIEW_NOTE(c), c.body);
-          await db.run(db.k.updateTable("review_posts").set({ head_oid: c.head_oid, edited_at: at, opus_at: c.opusAt, posted_as: as }).where("repo", "=", repo).where("number", "=", c.number));
+          await saveReviewPosts(db, [{ kind: "edited", repo, number: c.number, head: c.head_oid, edited_at: at, opus_at: c.opusAt, posted_as: as }]);
           s.edited.push(refOf(c));
           edited = true;
         } catch (e) {
@@ -127,8 +154,7 @@ export async function runReviewPost(db: Db, params: PostParams, log: (line: stri
         const id = await postReview(w, d.querier, g, live.id, REVIEW_NOTE(c), c.body);
         if (!id) throw new Error("GitHub returned no review");
         // Every column is written: a fresh post clears the edit time of the review it replaces.
-        await db.run(db.k.insertInto("review_posts").values({ repo, number: c.number, review_id: id, head_oid: c.head_oid, posted_at: at, edited_at: null, opus_at: c.opusAt, posted_as: as })
-          .onConflict((oc) => oc.columns(["repo", "number"]).doUpdateSet(kx.excluded(["review_id", "head_oid", "posted_at", "edited_at", "opus_at", "posted_as"]))));
+        await saveReviewPosts(db, [{ kind: "posted", repo, number: c.number, review_id: id, head: c.head_oid, posted_at: at, edited_at: null, opus_at: c.opusAt, posted_as: as }]);
         s.posted.push(refOf(c));
       }
       await jobItem(db, c.repo, c.number, `${edited ? "edited" : "posted"} review at ${c.head_oid.slice(0, 7)}`, log);
@@ -158,7 +184,6 @@ export const commands = {
       }
       if (!repo) throw new Error("missing --repo");
       if (limit !== undefined && !(Number.isInteger(limit) && limit > 0)) throw new Error("--limit is a positive whole number");
-      const { connect } = await import("../db.ts");
       await runReviewPost(await openDb(), { repo, limit, dryRun: !apply });
     },
   },

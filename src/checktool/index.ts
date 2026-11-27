@@ -11,8 +11,9 @@ import { scrub } from "../runner/scrub.ts";
 import type { Git } from "../fixup/git.ts";
 import { artifactText, changedRsFiles, lintPlan, lintSteps, readLint } from "../prepush/index.ts";
 import { rustPlan } from "../worker/rust.ts";
+import { endModelCheck, loadCheckDurations, startModelCheck } from "../data/changes/index.ts";
+import { loadTaskStates } from "../data/build/index.ts";
 import type { Db } from "../db/index.ts";
-import * as kx from "../db/kx.ts";
 
 export const CHECK_COMMANDS = ["fmt", "clippy", "check", "test"] as const;
 export type CheckCommand = (typeof CHECK_COMMANDS)[number];
@@ -86,21 +87,9 @@ const firstLines = (text: string, n: number): string => {
  * does not stretch the history. A successful run is exit code 0 for cargo; fmt and clippy count whenever they gave a result.
  */
 export async function checkLimitMs(db: Db, repo: string, i: Pick<CheckInput, "command" | "crate" | "test_name">): Promise<number> {
-  const rows = await db.all(db.k.selectFrom("model_checks as m").innerJoin("build_tasks as t", "t.id", "m.task_id")
-    .select((eb) => eb(eb(eb.fn<number>("julianday", ["t.ended_at"]), "-", eb.fn<number>("julianday", [eb.fn("coalesce", ["t.started_at", "t.claimed_at"])])), "*", 86400000).as("ms"))
-    .where("m.repo", "=", repo).where("m.command", "=", i.command)
-    .where("m.crate", i.crate === undefined ? "is" : "is not", null)
-    .where("m.test_name", i.test_name === undefined ? "is" : "is not", null)
-    .where((eb) => i.command === "check" || i.command === "test" ? eb("m.outcome", "=", "exit 0") : eb.and([
-      eb.not(kx.like(db, "m.outcome", eb.val("failed%"))), eb.not(kx.like(db, "m.outcome", eb.val("refused%"))),
-      eb.not(kx.like(db, "m.outcome", eb.val("cancelled%"))), eb.not(kx.like(db, "m.outcome", eb.val("stopped%"))),
-      eb("m.outcome", "<>", "out of time"),
-    ]))
-    .where("t.state", "=", "done").where("t.ended_at", "is not", null)
-    .where((eb) => eb.or([eb("t.started_at", "is not", null), eb("t.claimed_at", "is not", null)]))
-    .orderBy("m.id", "desc").limit(CHECK_HISTORY_RUNS));
-  if (rows.length < CHECK_HISTORY_MIN) return CHECK_LIMIT_MAX_MS;
-  const ms = rows.map((r) => r.ms).sort((a, b) => a - b);
+  const ms = await loadCheckDurations(db, repo, { command: i.command, crate: i.crate, testName: i.test_name }, CHECK_HISTORY_RUNS);
+  if (ms.length < CHECK_HISTORY_MIN) return CHECK_LIMIT_MAX_MS;
+  ms.sort((a, b) => a - b);
   const median = ms.length % 2 ? ms[(ms.length - 1) / 2]! : (ms[ms.length / 2 - 1]! + ms[ms.length / 2]!) / 2;
   return Math.min(CHECK_LIMIT_MAX_MS, Math.max(CHECK_LIMIT_MIN_MS, Math.round(median * CHECK_LIMIT_FACTOR)));
 }
@@ -203,10 +192,8 @@ export class CheckTool {
     this.calls++;
     const started = Date.now();
     const perCheck = this.checkLimitMs?.(i.command) ?? await checkLimitMs(t.db, t.recordRepo ?? t.repo, i);
-    const row = (await t.db.get(t.db.k.insertInto("model_checks")
-      .values({ run_id: runId, step: t.step, repo: t.recordRepo ?? t.repo, number: t.number, head: t.head, command: i.command, crate: i.crate ?? null, test_name: i.test_name ?? null, started_at: new Date().toISOString() })
-      .returning("id")))!.id;
-    const end = async (outcome: string, taskId: number | null) => await t.db.run(t.db.k.updateTable("model_checks").set({ outcome: outcome.slice(0, 200), task_id: taskId, ended_at: new Date().toISOString() }).where("id", "=", row));
+    const row = await startModelCheck(t.db, { runId, step: t.step, repo: t.recordRepo ?? t.repo, number: t.number, head: t.head, command: i.command, crate: i.crate ?? null, testName: i.test_name ?? null, startedAt: new Date().toISOString() });
+    const end = async (outcome: string, taskId: number | null) => await endModelCheck(t.db, row, { outcome, taskId, endedAt: new Date().toISOString() });
     let taskId: number | null = null;
     try {
       taskId = await createTask(t.db, {
@@ -214,7 +201,7 @@ export class CheckTool {
         warm: { key: warmKeyOf(t.repo), role: "use" }, plan, patch: i.patch,
       });
       this.open.add(taskId);
-      let state = (await getTask(t.db, taskId))?.state;
+      let state = (await loadTaskStates(t.db, [taskId])).get(taskId)?.state;
       let ranFrom: number | null = null;
       while (state && !TERMINAL.includes(state)) {
         if (this.closed) { await end("cancelled: the model call ended", taskId); return { text: "the model call is over", isError: true }; }
@@ -228,7 +215,7 @@ export class CheckTool {
           return { text: overCheck ? `the check ran past its limit of ${Math.round(perCheck / 60_000)} minutes and was stopped; answer with your best patch` : "the check ran out of the time allowed for checks and was stopped; answer with your best patch", isError: true };
         }
         await new Promise((r) => setTimeout(r, this.pollMs));
-        state = (await getTask(t.db, taskId))?.state;
+        state = (await loadTaskStates(t.db, [taskId])).get(taskId)?.state;
       }
       const r = await this.read(i, taskId);
       if (!r.isError) this.ran.add(i.command);
@@ -259,7 +246,7 @@ export class CheckTool {
     const { db } = this.target;
     if (i.command === "clippy" || i.command === "fmt") {
       const r = await readLint(db, taskId, { against: i.patch });
-      if (r.kind !== "result" && !(i.command === "fmt" && (await getTask(db, taskId))?.state === "done")) {
+      if (r.kind !== "result" && !(i.command === "fmt" && (await loadTaskStates(db, [taskId])).get(taskId)?.state === "done")) {
         const reason = r.kind === "infra-failed" ? r.reason : "the task is still pending";
         return { text: `the check failed to run: ${reason}`, outcome: `failed: ${reason}`, isError: true };
       }

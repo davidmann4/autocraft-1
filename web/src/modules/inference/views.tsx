@@ -1,22 +1,17 @@
 import { useState } from "react";
 import { XIcon } from "@phosphor-icons/react";
 import { useApi, useQuery } from "../../api/client";
-import type { InferenceEffort, InferenceMode, InferenceSettings, InferenceTier } from "../../api/types";
+import type { InferenceEffort, InferenceSettings, InferenceTier } from "../../api/types";
 import type { ViewProps } from "../../registry/types";
 import { Button } from "../../ui/atoms/Button";
 import { ErrorLine } from "../../ui/atoms/ErrorLine";
 import { Input } from "../../ui/atoms/Input";
 import { Select } from "../../ui/atoms/Select";
 import { Block } from "../../ui/molecules/Block";
-import { Dialog } from "../../ui/molecules/Dialog";
-import { Segmented } from "../../ui/molecules/Segmented";
 import { Page } from "../../ui/organisms/Page";
 import { useWrite } from "../../lib/hooks";
+import { clock } from "../../lib/format";
 
-const MODES: { value: InferenceMode; label: string }[] = [
-  { value: "server", label: "Server accounts" },
-  { value: "user-local", label: "Users' machines" },
-];
 const TIERS: { tier: InferenceTier; label: string }[] = [
   { tier: "top", label: "Top" },
   { tier: "mid", label: "Mid" },
@@ -29,15 +24,8 @@ export function InferenceView(_: ViewProps) {
   const api = useApi();
   const write = useWrite();
   const { data, error } = useQuery("inference", (a) => a.inference.get());
-  const [pending, setPending] = useState<InferenceMode | null>(null);
   if (!data) return <Page title="Inference"><ErrorLine error={error?.message} className="mt-3" /></Page>;
 
-  // The session's user (and with it the rail) carries the mode, so a reload picks the change up everywhere.
-  const switchMode = (mode: InferenceMode) =>
-    void write.run("mode", async () => {
-      await api.inference.put({ mode });
-      location.reload();
-    });
   const saveModels = (models: InferenceSettings["models"]) => write.run("models", () => api.inference.put({ models }));
 
   const saveEffort = (tier: InferenceTier, effort: InferenceEffort | null) => write.run("effort", () => api.inference.put({ minEffort: { [tier]: effort } }));
@@ -45,9 +33,7 @@ export function InferenceView(_: ViewProps) {
   return (
     <Page title="Inference">
       <ErrorLine error={write.error} className="mt-3" />
-      <Block className="mt-4" title="Model calls run on">
-        <Segmented label="Where model calls run" value={data.mode} options={MODES} onChange={(m) => m !== data.mode && setPending(m)} />
-      </Block>
+      <Jev />
       <Block className="mt-4" title="Accepted models" aside="model families and lowest effort per tier">
         <ul className="divide-y divide-line">
           {TIERS.map(({ tier, label }) => (
@@ -55,22 +41,27 @@ export function InferenceView(_: ViewProps) {
           ))}
         </ul>
       </Block>
-      <Dialog open={pending !== null} onClose={() => setPending(null)} title="Change who runs model calls?">
-        {pending && (
-          <div className="space-y-4">
-            <p className="text-sm">
-              {pending === "user-local" ? "Every model call will wait for a maintainer's or operator's helper instead of running on the registered accounts." : "Every model call will run on the registered accounts again; helpers stop receiving work."}
-            </p>
-            <div className="flex justify-end gap-2">
-              <Button onClick={() => setPending(null)}>Cancel</Button>
-              <Button variant="primary" loading={write.busy === "mode"} onClick={() => switchMode(pending)}>
-                Switch to {MODES.find((m) => m.value === pending)!.label.toLowerCase()}
-              </Button>
-            </div>
-          </div>
-        )}
-      </Dialog>
     </Page>
+  );
+}
+
+/** Jev runs on the host beside the Task Runners; off or unavailable, Haiku does its work. */
+function Jev() {
+  const api = useApi();
+  const write = useWrite();
+  const q = useQuery("inference-jev", (a) => a.inference.jev());
+  if (!q.data) return <ErrorLine error={q.error?.message} className="mt-3" />;
+  const { enabled, unavailable } = q.data;
+  return (
+    <Block className="mt-4" title="Jev">
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-sm">
+        <span className="min-w-0 flex-1">{unavailable ? `Unavailable (${unavailable.reason}) since ${clock(unavailable.since)}: Haiku does Jev's work` : "In use"}</span>
+        <Button size="sm" loading={write.busy === "jev"} onClick={() => void write.run("jev", () => api.inference.setJev(!enabled)).then((ok) => ok && q.refetch())} className="max-md:h-11">
+          {enabled ? "Turn Jev off" : "Turn Jev on"}
+        </Button>
+      </div>
+      <ErrorLine error={write.error} className="mt-2" />
+    </Block>
   );
 }
 

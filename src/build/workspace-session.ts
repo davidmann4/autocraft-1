@@ -7,11 +7,11 @@ import { createHash } from "node:crypto";
 import type { Db } from "../db/index.ts";
 import { CLAUDE_PROMPTS } from "../prompts/index.ts";
 import { promptTier } from "../remote/bundle.ts";
-import { inferenceMode } from "../remote/mode.ts";
 import { noOwnRunnerReason, ownTaker } from "../remote/takers.ts";
 import { awaitCall, type Outcome } from "../remote/calls.ts";
-import type { JobState } from "../../web/src/api/types.ts";
-import { trackedNames } from "../repos.ts";
+import { addSession, claimSession, loadSessions, loadWorkspaceCallSince, moveWorkspaces, patchSessions, sweepSessions as sweepRows } from "../data/build/index.ts";
+import { loadTrackedRepos } from "../data/control/index.ts";
+import { loadItems } from "../data/mirror/index.ts";
 import type { Params, StepContext } from "../runner/steps.ts";
 import { BuildError } from "./envs.ts";
 import { assertFence } from "../db/fence.ts";
@@ -68,14 +68,14 @@ export type TryRequest = {
 
 /** Checks and records a try session; returns its id. The caller queues the `workspace-try` job with `{repo, session}`. */
 export async function requestTrySession(db: Db, r: TryRequest): Promise<number> {
-  if (!(await trackedNames(db)).includes(r.repo)) throw new BuildError(400, `${r.repo} is not a tracked repo`);
+  if (!(await loadTrackedRepos(db, [r.repo])).has(r.repo)) throw new BuildError(400, `${r.repo} is not a tracked repo`);
   if (!GITHUB_LOGIN.test(r.forLogin)) throw new BuildError(400, "--for must be a GitHub login");
   if (!SHA.test(r.baseSha)) throw new BuildError(400, "the base must be a full 40-character commit sha");
   if (!Number.isInteger(r.item) || r.item < 1) throw new BuildError(400, "the item must be an issue or PR number");
-  if (!await db.get(db.k.selectFrom("items").select("number").where("repo", "=", r.repo).where("number", "=", r.item))) throw new BuildError(404, `${r.repo}#${r.item} is not in the mirror`);
+  if (!(await loadItems(db, [{ repo: r.repo, number: r.item }], "ref")).size) throw new BuildError(404, `${r.repo}#${r.item} is not in the mirror`);
   // Checked at the request: a call bound to this user that none of their runners may take would wait queued for ever.
   // Only their runners count, whatever their My repos say (the call is bound to them).
-  if (await inferenceMode(db) === "user-local" && !await ownTaker(db, r.forLogin, { prompt_id: TRY_PROMPT_ID, repos: [r.repo], tier: promptTier("implement.session") }))
+  if (!await ownTaker(db, r.forLogin, { prompt_id: TRY_PROMPT_ID, repos: [r.repo], tier: promptTier("implement.session") }))
     throw new BuildError(409, noOwnRunnerReason(r.forLogin));
   const bytes = Buffer.byteLength(r.prompt, "utf8");
   if (!r.prompt.trim()) throw new BuildError(400, "the prompt is empty");
@@ -92,16 +92,15 @@ export async function requestTrySession(db: Db, r: TryRequest): Promise<number> 
   }
   if (envId) await refuseWarmWriter(db, envId);
   const at = iso();
-  const row = await db.get(db.k.insertInto("workspace_sessions").values({
+  return await addSession(db, {
     kind: "try", repo: r.repo, base_sha: r.baseSha, item: r.item, prompt: r.prompt, env_id: envId, keep: r.keep ? 1 : 0, deadline_sec: deadline,
     workspace_id: r.workspaceId ?? null, requested_by: r.by, for_login: r.forLogin, created_at: at, updated_at: at,
-  }).returning("id"));
-  return Number(row!.id);
+  });
 }
 
 /** The step's check: the session exists for the repo and has not ended. */
 export async function checkTrySession(db: Db, p: Params): Promise<string | null> {
-  const s = await db.get(db.k.selectFrom("workspace_sessions").select(["repo", "kind", "state"]).where("id", "=", Number(p.session)));
+  const s = (await loadSessions(db, { ids: [Number(p.session)] })).get(Number(p.session))?.[0];
   if (!s || s.kind !== "try" || s.repo !== p.repo) return "no such try session";
   return s.state === "done" || s.state === "failed" ? `the session already ended (${s.state})` : null;
 }
@@ -111,14 +110,12 @@ class SessionEnd extends Error {}
 /** The `workspace-try` job. Returns the one-line summary; throws when the session did not run to a reply. */
 export async function runTrySession(ctx: StepContext): Promise<string> {
   const db = ctx.db, id = Number(ctx.params.session);
-  const s = await db.get(db.k.selectFrom("workspace_sessions").selectAll().where("id", "=", id));
+  const s = (await loadSessions(db, { ids: [id] })).get(id)?.[0];
   if (!s || s.prompt === null) throw new Error(`no try session ${id}`);
   const update = async (set: { state?: string; outcome?: string; workspace_id?: number; remote_call_id?: number; ended_at?: string }) =>
-    await db.run(db.k.updateTable("workspace_sessions").set({ ...set, updated_at: iso() }).where("id", "=", id));
+    void await patchSessions(db, [{ id, set }]);
   // One job runs a session: the first to claim it, or the same job resumed. Another job stops here and touches nothing.
-  const claimed = await db.get(db.k.updateTable("workspace_sessions").set({ job_id: ctx.job.id, updated_at: iso() })
-    .where("id", "=", id).where((eb) => eb.or([eb("job_id", "is", null), eb("job_id", "=", ctx.job.id)])).where("state", "in", ["queued", "starting", "running"])
-    .returning("state"));
+  const claimed = await claimSession(db, id, ctx.job.id);
   if (!claimed) throw new Error(`session ${id} belongs to another job or has ended`);
   if (claimed.state === "queued") await update({ state: "starting" });
   const model = IMPLEMENT.models[0]!;
@@ -207,7 +204,7 @@ export async function runTrySession(ctx: StepContext): Promise<string> {
     return `session ${id} in workspace ${wsId}: ${line}`;
   } catch (e) {
     if (e instanceof SessionEnd) throw e;
-    const st = await db.get(db.k.selectFrom("workspace_sessions").select("state").where("id", "=", id));
+    const st = (await loadSessions(db, { ids: [id] })).get(id)?.[0];
     if (st && st.state !== "failed" && st.state !== "done") await finish("failed", (e as Error).message ?? String(e));
     throw e;
   }
@@ -235,9 +232,7 @@ const formatMs = (ms: number): string => (ms < 60_000 ? `${Math.round(ms / 1000)
  * foreground commands' run time, and background commands' once a shell_status or shell_kill saw them end.
  */
 export async function sessionStats(db: Db, workspaceId: number, callId: number): Promise<{ calls: number; shellMs: number }> {
-  const since = (await db.get(db.k.selectFrom("remote_calls").select("since").where("id", "=", callId)))?.since;
-  const rows = await db.all(db.k.selectFrom("workspace_calls").select(["tool", "result"]).where("workspace_id", "=", workspaceId)
-    .where("tool", "not in", OWN_CALLS).$if(since != null, (q) => q.where("created_at", ">=", iso(Number(since)))));
+  const { stats: rows } = await loadWorkspaceCallSince(db, workspaceId, callId, OWN_CALLS);
   let fg = 0;
   const bg = new Map<number, number>();
   for (const r of rows) {
@@ -290,19 +285,12 @@ async function logDiffStat(ctx: StepContext, wsId: number): Promise<string | nul
  * unless kept. A job queued to resume keeps its session. Run on the launcher's passes; returns the sessions ended.
  */
 export async function sweepSessions(db: Db, log: (line: string) => void = () => {}): Promise<number> {
-  const rows = await db.all(db.k.selectFrom("workspace_sessions as s").innerJoin("jobs as j", "j.id", "s.job_id")
-    .select(["s.id", "s.workspace_id", "s.keep", "j.id as job", "j.state as job_state", "j.error"])
-    .where("s.state", "not in", ["done", "failed"]).where("j.state", "in", ["done", "failed", "cancelled"] satisfies JobState[]));
-  let n = 0;
-  for (const r of rows) {
-    const outcome = `job ${r.job} ended (${r.job_state}${r.error ? `: ${r.error}` : ""}) before the session did`.slice(0, 300);
-    const at = iso();
-    const ch = await db.run(db.k.updateTable("workspace_sessions").set({ state: "failed", outcome, ended_at: at, updated_at: at })
-      .where("id", "=", r.id).where("state", "not in", ["done", "failed"]));
-    if (!ch.changes) continue;
-    n++;
-    const ended = r.workspace_id !== null && !r.keep && await endWorkspace(db, r.workspace_id);
-    log(`workspace sessions: session ${r.id} failed: ${outcome}${ended ? `; workspace ${r.workspace_id} ended` : ""}`);
+  const swept = await sweepRows(db, iso());
+  const ending = swept.filter((r) => r.workspaceId !== null && !r.keep).map((r) => r.workspaceId!);
+  const ended = ending.length ? await moveWorkspaces(db, ending.map((id) => ({ id, from: LIVE_STATES, to: "ended" as const })), iso()) : new Set<number>();
+  for (const r of swept) {
+    const outcome = `job ${r.jobId} ended (${r.jobState}${r.error ? `: ${r.error}` : ""}) before the session did`.slice(0, 300);
+    log(`workspace sessions: session ${r.id} failed: ${outcome}${r.workspaceId !== null && ended.has(r.workspaceId) ? `; workspace ${r.workspaceId} ended` : ""}`);
   }
-  return n;
+  return swept.length;
 }

@@ -5,22 +5,20 @@
 // (src/github/vault.ts) refreshes it through refreshShared (token-refresh.ts).
 import type { TokenBox } from "./crypto.ts";
 import type { Tokens } from "./provider.ts";
+import * as access from "../../data/access/index.ts";
+import type { Sealed } from "../../data/access/index.ts";
 import type { Db } from "../../db/index.ts";
 
 const aad = (login: string): string => `user_tokens:${login.toLowerCase()}`;
+const sealTokens = (box: TokenBox, login: string, tokens: Tokens): Sealed => box.seal(JSON.stringify(tokens), aad(login)) as Sealed;
 
 export async function saveUserTokens(db: Db, box: TokenBox, login: string, githubId: number, tokens: Tokens): Promise<void> {
-  await db.run(db.k.insertInto("user_tokens")
-    .values({ login, github_id: githubId, token_enc: box.seal(JSON.stringify(tokens), aad(login)), version: 1, updated_at: new Date().toISOString(), status: "ok" })
-    .onConflict((oc) => oc.column("login").doUpdateSet((eb) => ({
-      github_id: eb.ref("excluded.github_id"), token_enc: eb.ref("excluded.token_enc"), version: eb("user_tokens.version", "+", 1),
-      updated_at: eb.ref("excluded.updated_at"), status: "ok", refresh_error: null,
-    }))));
+  await access.saveUserToken(db, { login, githubId, sealed: sealTokens(box, login, tokens), now: new Date().toISOString() });
 }
 
 export async function loadUserTokens(db: Db, box: TokenBox, login: string): Promise<Tokens | null> {
-  const row = await db.get(db.k.selectFrom("user_tokens").select("token_enc").where("login", "=", login).where("status", "=", "ok"));
-  const plain = row ? box.open(row.token_enc, aad(login)) : null;
+  const row = await access.loadUserTokenSealed(db, login);
+  const plain = row?.status === "ok" ? box.open(row.sealed, aad(login)) : null;
   try {
     return plain ? (JSON.parse(plain) as Tokens) : null;
   } catch {
@@ -30,14 +28,14 @@ export async function loadUserTokens(db: Db, box: TokenBox, login: string): Prom
 
 /** The login's row with its opened tokens, whatever its status (null tokens: unreadable). */
 export async function readUserTokens(db: Db, box: TokenBox, login: string): Promise<{ tokens: Tokens | null; version: number; status: string } | null> {
-  const row = await db.get(db.k.selectFrom("user_tokens").select(["token_enc", "version", "status"]).where("login", "=", login));
+  const row = await access.loadUserTokenSealed(db, login);
   if (!row) return null;
-  const plain = box.open(row.token_enc, aad(login));
+  const plain = box.open(row.sealed, aad(login));
   let tokens: Tokens | null = null;
   try {
     tokens = plain ? (JSON.parse(plain) as Tokens) : null;
   } catch { /* unreadable: the caller treats it as no token */ }
-  return { tokens, version: Number(row.version), status: row.status };
+  return { tokens, version: row.version, status: row.status };
 }
 
 /**
@@ -45,16 +43,12 @@ export async function readUserTokens(db: Db, box: TokenBox, login: string): Prom
  * its status: a row healed from a session's newer token set is usable again. Returns false when it lost.
  */
 export async function swapUserTokens(db: Db, box: TokenBox, login: string, version: number, tokens: Tokens): Promise<boolean> {
-  return Number((await db.run(db.k.updateTable("user_tokens")
-    .set((eb) => ({ token_enc: box.seal(JSON.stringify(tokens), aad(login)), version: eb("version", "+", 1), updated_at: new Date().toISOString(), status: "ok", refresh_error: null }))
-    .where("login", "=", login).where("version", "=", version))).changes) > 0;
+  return await access.swapUserToken(db, login, version, sealTokens(box, login, tokens), new Date().toISOString());
 }
 
 /** Marks the row as needing a new sign-in, with the reason (never a token value), if it still has `version`. Returns false when it lost. */
 export async function failUserTokens(db: Db, login: string, version: number, reason: string): Promise<boolean> {
-  return Number((await db.run(db.k.updateTable("user_tokens")
-    .set((eb) => ({ status: "refresh-failed", refresh_error: reason, version: eb("version", "+", 1), updated_at: new Date().toISOString() }))
-    .where("login", "=", login).where("version", "=", version).where("status", "=", "ok"))).changes) > 0;
+  return await access.failUserToken(db, login, version, new Date().toISOString(), reason);
 }
 
 /**
@@ -63,10 +57,7 @@ export async function failUserTokens(db: Db, login: string, version: number, rea
  * Not for ending one session: that is dropSessionTokens.
  */
 export async function dropUserTokens(db: Db, login: string): Promise<boolean> {
-  const row = await db.get(db.k.deleteFrom("user_tokens").where("login", "=", login).returning("token_enc"));
-  if (!row) return false;
-  await db.run(db.k.insertInto("user_token_revocations").values({ login, token_enc: row.token_enc, queued_at: new Date().toISOString(), kind: "grant" }));
-  return true;
+  return await access.dropUserTokens(db, [login]) > 0;
 }
 
 /**
@@ -76,7 +67,7 @@ export async function dropUserTokens(db: Db, login: string): Promise<boolean> {
  */
 export async function dropSessionTokens(db: Db, login: string, idHash: string, tokenEnc: string | null): Promise<boolean> {
   if (!tokenEnc) return false;
-  await db.run(db.k.insertInto("user_token_revocations").values({ login, token_enc: tokenEnc, queued_at: new Date().toISOString(), kind: "token", aad: idHash }));
+  await access.queueSessionTokenRevocation(db, [{ login, sealed: tokenEnc as Sealed, aad: idHash, now: new Date().toISOString() }]);
   return true;
 }
 

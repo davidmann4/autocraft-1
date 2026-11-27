@@ -10,12 +10,8 @@ import { TimeAgo } from "../../ui/atoms/TimeAgo";
 import { useUser } from "../../shell/UserContext";
 import { Badge } from "../../ui/atoms/Badge";
 import { Button } from "../../ui/atoms/Button";
-import { Select } from "../../ui/atoms/Select";
-import { ItemRef } from "../../ui/molecules/ItemRef";
-import { repoSlug } from "../../lib/links";
 import { Block, ConfirmButton, ErrorLine, TextInput, useWrite } from "../admin/parts";
 import { useNow } from "../../lib/useNow";
-import { cn } from "../../ui/cn";
 
 const usePipelineState = () => useQuery<PipelineState>("pipeline-state", (a) => a.pipeline.state());
 
@@ -39,7 +35,7 @@ function ConfirmOn({ limits, open, busy, onCancel, onConfirm }: { limits: StageL
     <dialog ref={ref} onClose={onCancel} aria-labelledby="pipeline-on-title" className="w-[min(32rem,calc(100vw-2rem))] rounded-md border border-line bg-raised p-5 text-ink backdrop:bg-black/40">
       <h2 id="pipeline-on-title" className="text-base font-semibold">Turn the pipeline on?</h2>
       <p className="mt-2 text-sm text-ink/70">
-        The pipeline then watches all issues and pull requests and runs every stage on its own: classifying, asking decisions, reviewing, labelling approved repos and merging by the merge rule. Model stages use quota.
+        The pipeline then watches all issues and pull requests and runs every stage on its own: classifying, reviewing, labelling approved repos and merging by the merge rule. Model stages use quota.
       </p>
       <p className="mt-2 text-sm text-ink/70">Each stage stops at its daily limit until {dayResetLocal()}. {limitSummary(limits)}</p>
       <div className="mt-4 flex justify-end gap-2">
@@ -148,24 +144,7 @@ function TripLine({ t, stage }: { t: StageTrip; stage?: string }) {
   );
 }
 
-/** The repos where the stage's breaker tripped, oldest first. */
-function StageTrips({ l, className }: { l: StageLimit; className?: string }) {
-  if (!l.trips?.length) return null;
-  return (
-    <ul aria-label={`${l.title}: tripped breakers`} className={cn("flex flex-col gap-2", className)}>
-      {l.trips.map((t) => <TripLine key={t.key} t={t} />)}
-    </ul>
-  );
-}
-
 const trippedIn = (trips: StageTrip[]) => (trips.some((t) => t.repo === null) ? "Tripped on all repos" : `Tripped in ${trips.length} repo${trips.length === 1 ? "" : "s"}`);
-
-function PauseBadge({ l }: { l: StageLimit }) {
-  // A trip on every repo is the pause reason; StageTrips shows it.
-  if (l.trips?.some((t) => t.repo === null)) return null;
-  if (l.pausedReason) return <Badge tone="warn">{l.pausedReason}</Badge>;
-  return l.status ? <span className="text-xs text-ink/50">{l.status}</span> : null;
-}
 
 /** Number input for the daily limit: empty means no limit, 0 pauses the stage. */
 function LimitEditor({ l }: { l: StageLimit }) {
@@ -193,29 +172,6 @@ function LimitEditor({ l }: { l: StageLimit }) {
   );
 }
 
-function useLimit(step: string): { l: StageLimit | undefined; operator: boolean; error?: string } {
-  const q = usePipelineState();
-  return { l: q.data?.limits.find((x) => x.step === step), operator: useUser().role === "operator", error: q.error?.message };
-}
-
-/** One stage's limit, usage today and (for operators) its editor, for use inside a stage panel. */
-export function StageLimitRow({ step }: { step: string }) {
-  const { l, operator, error } = useLimit(step);
-  if (!l) return <ErrorLine error={error} />;
-  return (
-    <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-sm">
-      <span className="num">
-        Today: {usage(l)} items
-        {l.perDay === null && <span className="text-ink/50"> (no limit)</span>}
-      </span>
-      {operator && <ResetCount l={l} />}
-      <PauseBadge l={l} />
-      {operator && <LimitEditor l={l} />}
-      <StageTrips l={l} className="basis-full" />
-    </div>
-  );
-}
-
 /** Every stage's daily limit with usage today. */
 export function StageLimits() {
   const q = usePipelineState();
@@ -224,9 +180,9 @@ export function StageLimits() {
     <Block flush title="Daily limits" aside={`items per day, resets at ${dayResetLocal()}; empty is no limit, 0 pauses the stage`}>
       <ErrorLine error={q.error?.message} className="p-4" />
       {q.data && (
-        <div className="overflow-x-auto">
-          <table className="num w-full min-w-[560px] text-sm">
-            <thead className="bg-ink/[0.03] text-xs text-ink/55">
+        <div className="md:overflow-x-auto">
+          <table className="num w-full text-sm max-md:block md:min-w-[560px]">
+            <thead className="bg-ink/[0.03] text-xs text-ink/55 max-md:hidden">
               <tr>
                 <th className="h-8 px-3 text-left font-medium">Stage</th>
                 <th className="h-8 px-3 text-right font-medium">Used today</th>
@@ -234,15 +190,15 @@ export function StageLimits() {
                 <th className="h-8 px-3 text-left font-medium">Status</th>
               </tr>
             </thead>
-            <tbody>
+            <tbody className="max-md:block">
               {q.data.limits.map((l) => (
-                <tr key={l.step} className="border-t border-line align-middle">
-                  <td className="px-3 py-1.5">
+                <tr key={l.step} className="border-t border-line align-middle max-md:flex max-md:flex-wrap max-md:items-center max-md:gap-x-3 max-md:gap-y-1.5 max-md:px-3 max-md:py-2.5 max-md:first:border-t-0">
+                  <td className="md:px-3 md:py-1.5 max-md:min-w-0 max-md:flex-1 max-md:basis-40">
                     {l.title} <span className="code text-xs text-ink/45">{l.step}</span>
                   </td>
-                  <td className="whitespace-nowrap px-3 text-right">{usage(l)}</td>
-                  <td className="px-3 py-1.5">{operator ? <LimitEditor l={l} /> : limitText(l)}</td>
-                  <td className="px-3">
+                  <td className="whitespace-nowrap text-right md:px-3">{usage(l)}</td>
+                  <td className="max-md:basis-full md:px-3 md:py-1.5">{operator ? <LimitEditor l={l} /> : limitText(l)}</td>
+                  <td className="max-md:basis-full md:px-3">
                     <div className="flex flex-wrap items-center gap-2">
                       {/* A trip on every repo is the pause reason; its row below the table says why. */}
                       {l.trips?.some((t) => t.repo === null) ? null : l.pausedReason ? <Badge tone="warn">{l.pausedReason}</Badge> : <span className="text-ink/45">{l.status ?? "ready"}</span>}
@@ -263,102 +219,6 @@ export function StageLimits() {
         </ul>
       )}
     </Block>
-  );
-}
-
-const plural = (n: number, w: string) => `${n} ${w}${n === 1 ? "" : "s"}`;
-const pilotCount = (pilot: string[]) => {
-  const repos = pilot.filter((r) => !r.includes("#")).length, items = pilot.length - repos;
-  return [repos && plural(repos, "repo"), items && plural(items, "item")].filter(Boolean).join(", ");
-};
-
-const repoUrl = (repo: string) => `https://github.com/${repoSlug(repo)}`;
-
-/** The items the pipeline is limited to, with links; operators set or clear the list. Nothing shows when there is no pilot and the viewer is no operator. */
-export function PilotPanel({ className }: { className?: string }) {
-  const api = useApi();
-  const operator = useUser().role === "operator";
-  const q = usePipelineState();
-  const write = useWrite();
-  const pilot = q.data?.pilot ?? [];
-  const [text, setText] = useState(pilot.join("\n"));
-  useEffect(() => setText(pilot.join("\n")), [pilot.join(" ")]);
-  if (!q.data || (!pilot.length && !operator)) return null;
-  const refs = text.split(/[\s,]+/).filter(Boolean);
-  const save = (items: string[]) => void write.run("pilot", () => api.pipeline.setPilot(items));
-  return (
-    <div className={className}>
-      <div className="rounded-md border border-line p-4">
-        <div className="text-sm font-semibold">{pilot.length ? `Pilot: ${pilotCount(pilot)}` : "Pilot"}</div>
-        {pilot.length > 0 && (
-          <div className="mt-2 flex flex-col gap-1.5">
-            {pilot.map((r) => {
-              const [repo = "", n] = r.split("#");
-              return n ? (
-                <ItemRef key={r} repo={repo} number={Number(n)} title={null} />
-              ) : (
-                <a key={r} href={repoUrl(repo)} target="_blank" rel="noopener noreferrer" className="code text-sm hover:text-accent-ink hover:underline">
-                  {r}
-                </a>
-              );
-            })}
-          </div>
-        )}
-        {operator && (
-          <div className="mt-3 flex flex-col gap-2">
-            <label htmlFor="pilot-items" className="text-sm font-medium">
-              Items <span className="font-normal text-ink/55">(repo#number or a whole repo, one per line or separated by spaces)</span>
-            </label>
-            <textarea
-              id="pilot-items"
-              rows={3}
-              value={text}
-              onChange={(e) => setText(e.target.value)}
-              className="num w-full rounded border border-line bg-sunken px-2.5 py-1.5 text-sm outline-none focus:border-accent/60"
-            />
-            <div className="flex flex-wrap items-center gap-2">
-              <ConfirmButton idle="secondary" label="Save" confirmLabel="Confirm save" loading={write.busy === "pilot"} onConfirm={() => save(refs)} />
-              {pilot.length > 0 && <ConfirmButton idle="secondary" label="Clear" confirmLabel="Confirm clear" loading={write.busy === "pilot"} onConfirm={() => save([])} />}
-            </div>
-            <ErrorLine error={write.error} />
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
-const MODEL_LABEL: Record<string, string> = { opus: "Opus", sonnet: "Sonnet" };
-const modelLabel = (m: string) => MODEL_LABEL[m] ?? m;
-
-/** The model that prepares every question's options and recommendation. Operators pick it; everyone else sees it. */
-export function JudgementModel({ className }: { className?: string }) {
-  const api = useApi();
-  const operator = useUser().role === "operator";
-  const q = usePipelineState();
-  const write = useWrite();
-  const s = q.data;
-  if (!s) return null;
-  return (
-    <div className={className}>
-      <div className="flex flex-wrap items-center gap-3 rounded-md border border-line p-4">
-        <label htmlFor="judgement-model" className="text-sm font-semibold">
-          Judgement model
-        </label>
-        {operator ? (
-          <Select id="judgement-model" value={s.judgementModel} disabled={write.busy === "model"} onChange={(e) => void write.run("model", () => api.pipeline.setJudgementModel(e.target.value))}>
-            {s.judgementModels.map((m) => (
-              <option key={m} value={m}>
-                {modelLabel(m)}
-              </option>
-            ))}
-          </Select>
-        ) : (
-          <span id="judgement-model" className="text-sm">{modelLabel(s.judgementModel)}</span>
-        )}
-      </div>
-      <ErrorLine error={write.error} className="mt-2" />
-    </div>
   );
 }
 
@@ -425,7 +285,44 @@ export function OutsideLimits({ className }: { className?: string }) {
           )}
         </form>
         <ErrorLine error={write.error} className="mt-2" />
+        {operator && held && <HeldAuthors />}
       </Block>
+    </div>
+  );
+}
+
+const count = (n: number, one: string) => `${num(n)} ${one}${n === 1 ? "" : "s"}`;
+
+/** The outside authors with held items; an operator lets everything held for one author through at once. */
+function HeldAuthors() {
+  const api = useApi();
+  const { data } = useQuery("outside-held", (a) => a.pipeline.heldAuthors());
+  const write = useWrite();
+  if (!data?.length) return null;
+  return (
+    <div className="mt-4">
+      <h3 className="text-xs text-ink/60">Held items by author</h3>
+      <ul className="mt-1 divide-y divide-line border-y border-line">
+        {data.map((h) => (
+          <li key={h.author} className="flex min-h-[44px] flex-wrap items-center gap-x-3 gap-y-1 py-1.5">
+            <div className="min-w-0 flex-1 basis-52">
+              <span className="break-words text-sm font-medium">{h.author}</span>
+              {h.surge && <Badge tone="warn" className="ml-2">Surge</Badge>}
+              <p className="text-xs text-ink/60">
+                {[h.prs && count(h.prs, "PR"), h.issues && count(h.issues, "issue")].filter(Boolean).join(", ")}
+                {h.oldest && (
+                  <>
+                    {", oldest "}
+                    <TimeAgo iso={h.oldest} />
+                  </>
+                )}
+              </p>
+            </div>
+            <ConfirmButton label="Release all" confirmLabel={`Release ${h.prs + h.issues} for ${h.author}`} loading={write.busy === h.author} onConfirm={() => void write.run(h.author, () => api.pipeline.releaseAuthor(h.author))} />
+          </li>
+        ))}
+      </ul>
+      <ErrorLine error={write.error} className="mt-2" />
     </div>
   );
 }

@@ -4,7 +4,8 @@ import { test } from "node:test";
 import { createEnv } from "../src/build/envs.ts";
 import { parseSettings } from "../src/build/pods.ts";
 import { changeWarmRepos, warmPass, warmRepos } from "../src/build/warm-queue.ts";
-import { connectDb } from "../src/db/open.ts";
+import { runCollect } from "../src/verify/results.ts";
+import { connectDb } from "./helpers/raw-db.ts";
 
 test("warmPass queues only repos that are in scope and in the allowlist", async () => {
   const d = await connectDb(":memory:");
@@ -27,4 +28,19 @@ test("warmPass queues only repos that are in scope and in the allowlist", async 
   assert.deepEqual(queued.map((r) => r.repo), ["other"]);
   await changeWarmRepos(d, "remove", "other", "op");
   assert.deepEqual(await warmRepos(d), ["off"]);
+});
+
+test("a queued warm build is cancelled on a main-CI reading made after it was queued, not on an older one", async () => {
+  const d = await connectDb(":memory:");
+  const head = (sha: string, at: string) => d.run(d.k.insertInto("main_ci").values({
+    repo: "app", head_sha: sha.repeat(40), branch: "main", state: "green", failing: "[]", checks: "[]", committed_at: at, headline: null, first_seen_at: at, state_changed_at: at, updated_at: at,
+  }));
+  await head("a", "2026-01-01T00:00:00Z");
+  await d.run(d.k.insertInto("build_tasks").values({ step: "verify", repo: "app", head_sha: "b".repeat(40), requires: "{}", plan: "[]", state: "queued", queued_at: "2026-01-01T00:01:00Z", warm_key: "app", warm_role: "build" }));
+  const cancelled = async () => (await runCollect(d, {}, () => {})).warmCancelled;
+  assert.equal(await cancelled(), 0, "the poll had not seen its head yet");
+  await head("b", "2026-01-01T00:02:00Z");
+  assert.equal(await cancelled(), 0);
+  await head("c", "2026-01-01T00:04:00Z");
+  assert.equal(await cancelled(), 1, "the branch moved on");
 });

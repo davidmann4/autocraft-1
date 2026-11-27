@@ -11,7 +11,6 @@ import { loadConfig } from "../src/dash/server/config.ts";
 import { startServer } from "../src/dash/server/index.ts";
 import { FakeProvider } from "../src/dash/server/provider.ts";
 import { RateLimiter } from "../src/dash/server/util.ts";
-import { setInferenceMode } from "../src/remote/mode.ts";
 import { ROUTES } from "../src/remote/protocol.ts";
 import { SCRATCH } from "./scratch.ts";
 import { connectDb } from "../src/db/open.ts";
@@ -25,12 +24,11 @@ test("a helper route answers 503 with Retry-After while the database is locked, 
   const file = join(dir, "t.db"), perms = join(dir, "perms.json");
   writeFileSync(perms, "{}");
   const db = await connectDb(file), remoteDb = await connectDb(file, { busyTimeoutMs: 100 }), other = await connectDb(file);
-  await setInferenceMode(db, "user-local", "test");
   await addLogin(db, "cli", "bob", "maintainer", null);
   const { token } = await createToken(db, "bob", "helper", { kind: "runner" });
   const config = loadConfig({ AUTOCRAFT_DEV_AUTH: "1", AUTOCRAFT_LISTEN: "127.0.0.1:0", AUTOCRAFT_DB: file, AUTOCRAFT_DEV_PERMS: perms });
   const limiter = new RateLimiter(60, 3600_000);
-  const s = await startServer({ config, db, remoteDb, provider: new FakeProvider(perms), feedbackLimiter: limiter, routes: apiRoutes({ limiter }) });
+  const s = await startServer({ config, db, remoteDb, provider: new FakeProvider(perms), routes: apiRoutes() });
   try {
     const status = () => fetch(`${s.url}${ROUTES.status}`, {
       method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },

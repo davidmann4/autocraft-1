@@ -1,15 +1,12 @@
-// Starting a model call: picks the account (Claude) and records the agent run,
-// in one transaction so two job processes cannot both take the last slot.
-import { boxAccounts } from "./box.ts";
-import { accountHasRoom, chooseAccount, freeSlots, RUN_SLOT_MS, type Choice } from "./accounts.ts";
-import { insertRun, onRunEnd, type RunStart } from "./runs.ts";
-import { scrubError } from "./text.ts";
-import { levelBand } from "../rank/level.ts";
-import { inferenceMode } from "../remote/mode.ts";
-import { remoteRoom, roomOf, roomState, type RoomState } from "../remote/room.ts";
-import { batchKey, roomKey, takerTest } from "../remote/takers.ts";
-import { mapSeq } from "../async-seq.ts";
+// The context of the model calls a job makes (its job, step and queue class), the claim order of queued calls, and the room
+// and taker questions a step asks before it queues Task Runner calls. Jev runs are recorded here too.
+import { insertRun, type RunStart } from "./runs.ts";
+import { remoteRoom, roomOf, roomRisesAt, roomState, SEEN_EVERY_MS, type RoomState } from "../remote/room.ts";
+import { batchKey, roomKey, takerTestIn, type TakerCall } from "../remote/takers.ts";
+import { loadRunningCounts } from "../data/inference/index.ts";
+import { cachedSnapshot, dropSnapshotCache } from "../data/runners/index.ts";
 import type { Db } from "../db/index.ts";
+import { AsyncLocalStorage } from "node:async_hooks";
 
 /** Set by the job process: which job and step the calls belong to, and whether a cancel was asked. */
 export type CallContext = { jobId: number; step: string; stage: number; /** Queue class of the step (StepDef.priority). */ class?: 0 | 1 | 2; /** The job's repo param. */ repo?: string; cancelled(): Promise<boolean>; /** True once the job is cancelled or the pipeline is switched off: no new model call starts. */ stopping?(): Promise<boolean> };
@@ -24,6 +21,13 @@ export async function throwIfHalted(what: string): Promise<void> {
   if (await context?.cancelled()) throw new CancelledError(`cancelled while ${what}`);
   if (await context?.stopping?.()) throw new StoppedError("the pipeline was switched off");
 }
+/** A pool unit (classify/run.ts pool) runs in a store of its own: `called` turns true once it queued a model call (enqueueCall). */
+export type PoolUnit = { called: boolean };
+const units = new AsyncLocalStorage<PoolUnit>();
+/** Runs `fn` as the pool unit `u`. */
+export const runAsUnit = <T>(u: PoolUnit, fn: () => Promise<T>): Promise<T> => units.run(u, fn);
+/** Marks the current pool unit, if any, as having queued its call: the queue's room counts it from now on. */
+export const unitCalled = (): void => { const u = units.getStore(); if (u) u.called = true; };
 /** Queue fields of a call made now: the job's repo and the queue class of the call's prompt. */
 export const callQueue = (promptId: string): { repo: string | null; cls: 0 | 1 | 2; jobId: number | null } => ({ repo: context?.repo ?? null, cls: currentClass(promptId), jobId: context?.jobId ?? null });
 
@@ -35,17 +39,19 @@ const PROMPT_STEP: Record<string, { step: string; stage: number }> = {
   "dupes.jev": { step: "dupes", stage: 3 }, "dupes.haiku": { step: "dupes", stage: 3 },
   "review.opus": { step: "opus-review", stage: 5 }, "postmerge.opus": { step: "postmerge", stage: 8 }, "premerge.opus": { step: "premerge", stage: 6 },
   "dupes.compare-prs.opus": { step: "dupes-compare", stage: 3 }, "dupes.compare-issues.sonnet": { step: "dupes-compare", stage: 3 },
-  "decide.prepare": { step: "decide", stage: 3 }, "fixup.check": { step: "fixup", stage: 6 },
+  "fixup.check": { step: "fixup", stage: 6 },
   "conversation.turn": { step: "conversation", stage: 3 },
   "areas.jev": { step: "classify-new", stage: 2 }, "areas.haiku": { step: "classify-new", stage: 2 },
   "areas.propose": { step: "areas-propose", stage: 2 }, "areas.suggest": { step: "areas-suggest", stage: 2 },
   "fixup.conflict": { step: "fixup", stage: 6 }, "discord.signal.jev": { step: "discord-signal", stage: 3 }, "discord.signal.haiku": { step: "discord-signal", stage: 3 },
   "discord.issue-questions": { step: "discord-issue", stage: 3 }, "discord.issue-draft": { step: "discord-issue", stage: 3 }, "discord.junk.jev": { step: "discord-issue", stage: 3 }, "discord.junk.haiku": { step: "discord-issue", stage: 3 },
+  "discord.result.haiku": { step: "discord-result", stage: 3 },
+  "command.read": { step: "command-read", stage: 3 }, "interactive.command-read": { step: "command-read", stage: 3 }, "command.read.jev": { step: "command-read", stage: 3 },
   "cifix.patch": { step: "cifix", stage: 6 }, "mainfix.classify": { step: "main-fix", stage: 6 },
   "lint.reference.jev": { step: "opus-review", stage: 5 }, "lint.reference.haiku": { step: "opus-review", stage: 5 },
   "security.model": { step: "security-scan", stage: 9 }, "security.area": { step: "security-scan", stage: 9 }, "security.verify": { step: "security-scan", stage: 9 },
   "security.scantest": { step: "security-scan", stage: 9 }, "security.fix": { step: "security-fix", stage: 9 }, "security.fixcheck": { step: "security-fix", stage: 9 },
-  "implement.session": { step: "implement", stage: 7 },
+  "implement.session": { step: "implement", stage: 7 }, "review.issue": { step: "issue-review", stage: 5 },
 };
 
 /** The step a call of `promptId` made now is stored under (stepOf), for room and taker questions; undefined when neither is known. */
@@ -58,7 +64,6 @@ export function stepOf(promptId: string): { jobId: number | null; step: string; 
 
 export const allocation = { pollMs: 3000, logEveryMs: 5 * 60_000, staleMs: 30_000 };
 
-export class NoAccountError extends Error {}
 export class CancelledError extends Error {}
 /** The pipeline was switched off: the job ends as done, not failed. */
 export class StoppedError extends Error {}
@@ -67,6 +72,12 @@ export class StoppedError extends Error {}
  * is skipped and left for a later pass, with no failure counted (pool skips it; a job it ends finishes as done).
  */
 export class NoTakerError extends Error {}
+/**
+ * A user-local call withdrawn because of its item (src/data/runners ITEM_WITHDRAWN_PREFIX): the item merged or closed, a person ended its
+ * work, or a person's workflow took it over. Handled as a NoTakerError (the unit is skipped, no failure counted, no model asked again),
+ * without the skip that makes the planner plan the step again.
+ */
+export class ItemWithdrawnError extends NoTakerError {}
 /** True for an error that ends a step's work, or a unit of it (NoTakerError), without a failure row. */
 export const isHalt = (e: unknown): boolean => e instanceof CancelledError || e instanceof StoppedError || e instanceof NoTakerError;
 
@@ -79,22 +90,7 @@ const classOfStep = (step: string): 0 | 1 | 2 =>
 export const currentClass = (promptId?: string): 0 | 1 | 2 =>
   context?.class ?? classOfStep(promptId ? (PROMPT_STEP[promptId]?.step ?? "unknown") : (context?.step ?? "unknown"));
 
-/** Sleeps up to `ms`, or less when a run of this process ends (its slot may be free). */
-function sleepOrWake(ms: number): Promise<void> {
-  return new Promise<void>((resolve) => {
-    let off = () => {};
-    const t = setTimeout(() => { off(); resolve(); }, ms);
-    off = onRunEnd(() => { clearTimeout(t); off(); resolve(); });
-  });
-}
-
 export type Waiter = { id: number; cls: number; level: number; step: string; repo: string | null; since: number };
-
-const runningBy = async (db: Db, nowMs: number, col: "j.repo" | "r.step"): Promise<Map<string, number>> =>
-  new Map((await db.all(db.k.selectFrom("agent_runs as r").leftJoin("jobs as j", "j.id", "r.job_id")
-    .select((eb) => [eb.ref(col).as("k"), eb.fn.countAll<number>().as("n")])
-    .where("r.state", "=", "running").where("r.provider", "=", "claude").where("r.started_at", ">=", new Date(nowMs - RUN_SLOT_MS).toISOString())
-    .where(col, "is not", null).groupBy(col).$narrowType<{ k: string }>())).map((r) => [r.k, Number(r.n)]));
 
 /** A waiter gains one level band for each of these minutes it has waited (at most all 4 bands), so a steady flow of P0 calls cannot starve P2 ones. Aging orders waiters; nothing waits on a timer. */
 export const LEVEL_AGING_MS = 30 * 60_000;
@@ -115,8 +111,7 @@ export type RunningCounts = { repoN: Map<string, number>; stepN: Map<string, num
 
 /** What queueOrder reads, for a caller that reads it at the same time as the rows. */
 export async function runningCounts(db: Db, nowMs: number): Promise<RunningCounts> {
-  const [repoN, stepN] = await Promise.all([runningBy(db, nowMs, "j.repo"), runningBy(db, nowMs, "r.step")]);
-  return { repoN, stepN };
+  return await loadRunningCounts(db, nowMs);
 }
 
 /** queueOrder with its counts already read. */
@@ -125,25 +120,15 @@ export function sortQueue<T extends Waiter>(rows: T[], { repoN, stepN }: Running
   return rows.sort((x, y) => cls.get(y)! - cls.get(x)! || (repoN.get(x.repo ?? "") ?? 0) - (repoN.get(y.repo ?? "") ?? 0) || agedLevel(y.level, y.since, nowMs) - agedLevel(x.level, x.since, nowMs) || (stepN.get(x.step) ?? 0) - (stepN.get(y.step) ?? 0) || x.since - y.since || x.id - y.id);
 }
 
-/** Fresh, eligible waiters in claim order (queueOrder). */
-async function waiterOrder(db: Db, nowMs: number): Promise<Waiter[]> {
-  return await queueOrder(db, nowMs, await db.all(db.k.selectFrom("model_waits").select(["id", "class as cls", "level", "step", "repo", "since"])
-    .where("provider", "=", "claude").where("eligible", "=", 1).where("seen_at", ">=", nowMs - allocation.staleMs)));
-}
-
 /**
- * Splits `items` into batches of at most `size`. In the user-local mode each batch holds one repo's items, so any user who may
- * take that repo can take the call (a mixed batch waits for a user who may take every repo in it), and only items the same
- * filtered users take (`refsOf`: the items a unit's call names; src/remote/takers.ts batchKey), so a runner that takes only
- * some items is never handed others and a chosen item never waits in a batch nobody takes; items keep their order within a
- * batch and batches are in the order of their first item. In the server-account mode batches are plain runs of `size`.
+ * Splits `items` into batches of at most `size`. Each batch holds one repo's items, so any user who may take that repo can take
+ * the call (a mixed batch waits for a user who may take every repo in it), and only items the same filtered users take
+ * (`refsOf`: the items a unit's call names; src/remote/takers.ts batchKey), so a runner that takes only some items is never
+ * handed others and a chosen item never waits in a batch nobody takes; items keep their order within a batch and batches are
+ * in the order of their first item.
  */
 export async function repoBatches<T>(db: Db, items: readonly T[], size: number, repoOf: (x: T) => string, refsOf: (x: T) => readonly ItemRefLike[]): Promise<T[][]> {
   const out: T[][] = [];
-  if (await inferenceMode(db) !== "user-local") {
-    for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
-    return out;
-  }
   const keyOf = await batchKey(db);
   const open = new Map<string, T[]>();
   for (const x of items) {
@@ -169,16 +154,12 @@ const callRepos = (repos: readonly string[] | undefined): readonly string[] | un
 };
 
 /**
- * How many more Claude calls a caller may start now: free slots, minus the fresh eligible waiters that rank ahead of a new waiter
- * of the current call's class. In the user-local mode: the free slots of the Task Runners that may take a call naming the repos
+ * How many more Claude calls a caller may start now: the free slots of the Task Runners that may take a call naming the repos
  * of the next call (`repos`: its items' repos; the job's repo param is added), minus the queued remote calls that rank at or
  * above the class and that those Task Runners may take (src/remote/room.ts).
  */
 export async function queueRoom(db: Db, cls: 0 | 1 | 2 = currentClass(), repos?: readonly string[]): Promise<number> {
-  if (await inferenceMode(db) === "user-local") return await remoteRoom(db, cls, Date.now(), callRepos(repos), context?.step);
-  const ahead = (await db.get(db.k.selectFrom("model_waits").select((eb) => eb.fn.countAll<number>().as("n"))
-    .where("provider", "=", "claude").where("eligible", "=", 1).where("seen_at", ">=", Date.now() - allocation.staleMs).where("class", ">=", cls)))!.n;
-  return Math.max(0, await freeSlots(db) - Number(ahead));
+  return await remoteRoom(db, cls, Date.now(), callRepos(repos), context?.step);
 }
 
 /**
@@ -189,11 +170,11 @@ export async function queueRoom(db: Db, cls: 0 | 1 | 2 = currentClass(), repos?:
 export type RoomPass = {
   /** `refs`: the items the calls name, for the runners that take only some items (src/remote/task-items.ts); left out, not known yet. */
   room(cls: 0 | 1 | 2, repos?: readonly string[], step?: string, refs?: readonly ItemRefLike[]): Promise<number>;
-  /** Whether a call naming `repos` (and `refs`, as for room) has a taker (src/remote/takers.ts; always in the server-account mode). A call naming no repo (none given and no job repo) has one only in an operator's Task Runner, as the sweep reads it. */
+  /** Whether a call naming `repos` (and `refs`, as for room) has a taker (src/remote/takers.ts). A call naming no repo (none given and no job repo) has one only in an operator's Task Runner, as the sweep reads it. */
   taker(repos?: readonly string[], step?: string, refs?: readonly ItemRefLike[]): Promise<boolean>;
-  /** Whether a runner whose user takes only some items takes the call (never in the server-account mode). */
+  /** Whether a runner whose user takes only some items takes the call. */
   filteredTaker(repos?: readonly string[], step?: string, refs?: readonly ItemRefLike[]): Promise<boolean>;
-  /** roomKey of `refs` at this pass's moment ("" in the server-account mode). */
+  /** roomKey of `refs` at this pass's moment. */
   key(refs: readonly ItemRefLike[]): Promise<string>;
 };
 
@@ -202,19 +183,19 @@ export type RoomPass = {
  * helpers, their permissions and repos are read once. `promptId`: the prompt of the calls asked about, whose step stands in
  * outside a job.
  */
-export async function queueRoomPass(db: Db, promptId?: string): Promise<RoomPass> {
-  if (await inferenceMode(db) !== "user-local") return { room: async (cls, repos) => await queueRoom(db, cls, repos), taker: async () => true, filteredTaker: async () => false, key: async () => "" };
+export async function queueRoomPass(db: Db, promptId?: string, read?: RoomState): Promise<RoomPass> {
   const nowMs = Date.now();
-  let st: RoomState | undefined;
+  let st = read;
   const state = async (): Promise<RoomState> => (st ??= await roomState(db, nowMs));
-  // The taker rule of src/remote/takers.ts, read once per pass.
-  const takes = takerTest(db, nowMs);
+  // The taker rule of src/remote/takers.ts and the room, over one reading per pass.
+  let takes: ((c: TakerCall) => boolean) | undefined;
+  const taker = async (c: TakerCall): Promise<boolean> => (takes ??= takerTestIn((await state()).v))(c);
   let keyOf: ((refs: readonly ItemRefLike[]) => string) | undefined;
   return {
-    room: async (cls, repos, step = askStep(promptId), refs) => await roomOf(db, await state(), cls, nowMs, callRepos(repos), step, refs),
-    taker: async (repos, step = askStep(promptId), refs) => await takes({ prompt_id: "", repos: callRepos(repos) ?? [], step, refs }),
-    filteredTaker: async (repos, step = askStep(promptId), refs) => await takes({ prompt_id: "", repos: callRepos(repos) ?? [], step, refs, filtered: true }),
-    key: async (refs) => (keyOf ??= await roomKey(db, nowMs))(refs),
+    room: async (cls, repos, step = askStep(promptId), refs) => roomOf(await state(), cls, callRepos(repos), step, refs),
+    taker: async (repos, step = askStep(promptId), refs) => await taker({ prompt_id: "", repos: callRepos(repos) ?? [], step, refs }),
+    filteredTaker: async (repos, step = askStep(promptId), refs) => await taker({ prompt_id: "", repos: callRepos(repos) ?? [], step, refs, filtered: true }),
+    key: async (refs) => (keyOf ??= roomKey((await state()).v))(refs),
   };
 }
 
@@ -226,7 +207,8 @@ export async function queueRoomPass(db: Db, promptId?: string): Promise<RoomPass
  */
 export async function takersFirst<T>(db: Db, items: readonly T[], reposOf: (t: T) => readonly string[] | undefined, refsOf: (t: T) => readonly ItemRefLike[], promptId?: string): Promise<T[]> {
   const pass = await queueRoomPass(db, promptId);
-  const rank = await mapSeq(items, async (t) => (await pass.filteredTaker(reposOf(t), undefined, refsOf(t)) ? 2 : await pass.taker(reposOf(t), undefined, refsOf(t)) ? 1 : 0));
+  const rank: number[] = [];
+  for (const t of items) rank.push(await pass.filteredTaker(reposOf(t), undefined, refsOf(t)) ? 2 : await pass.taker(reposOf(t), undefined, refsOf(t)) ? 1 : 0);
   return [...items.keys()].sort((a, b) => rank[b]! - rank[a]! || a - b).map((i) => items[i]!);
 }
 
@@ -240,7 +222,35 @@ export async function takersCut<T>(db: Db, items: readonly T[], limit: number | 
 }
 
 /** The model queue's room for a pool's units by index (classify/run.ts pool): answers are kept for one round of the pool's scheduling. */
-export type PoolRoom = { round(): void; room(i: number): Promise<number>; taker(i: number): Promise<boolean> };
+export type PoolRoom = {
+  round(): void; room(i: number): Promise<number>; taker(i: number): Promise<boolean>;
+  /** The units may finish without a model call (poolRoom's `mayNotCall`): the room does not hold them back, only the pool's `max`. */
+  mayNotCall?: boolean;
+  /** What unit `i`'s call names (its first item and how many more, or else its repos), for the skip record and log line of a unit the pool left for want of a taker. */
+  untaken?(i: number): string;
+  /**
+   * Resolves once the room may differ from the last reading: a change topic it reads moved, the moment the reading says it rises
+   * with time alone came (roomRisesAt), or ROOM_REFRESH_MS passed; never before one pause of at most `pollMs`. Reads only the
+   * topics' counters, every `pollMs`, until then or until `signal` aborts.
+   */
+  changed(pollMs: number, signal: AbortSignal): Promise<void>;
+};
+
+/**
+ * The change topics whose writes move the room: calls entering or leaving the queue, leases starting and ending, picks, Task Runners
+ * appearing, leaving or changing readiness, slots or idle claims (src/data/runners/triggers.ts); runner users' settings, cool-offs,
+ * credentials, roles and write permissions (remote-room); and the work people started or approved, for which a Manual only runner is room.
+ */
+const ROOM_TOPICS = ["remote-queue", "remote-helpers", "remote-room", "workflows", "preapprovals"];
+/** The longest a waiting pool goes without reading the room again, should a change escape ROOM_TOPICS and roomRisesAt. */
+export const ROOM_REFRESH_MS = SEEN_EVERY_MS;
+
+const pause = (ms: number, signal: AbortSignal): Promise<void> => new Promise((resolve) => {
+  if (signal.aborted) return resolve();
+  const t = setTimeout(done, ms);
+  function done(): void { clearTimeout(t); signal.removeEventListener("abort", done); resolve(); }
+  signal.addEventListener("abort", done, { once: true });
+});
 
 /**
  * PoolRoom for units whose calls name `reposOf(i)` (the job's repo param is added) and the items `refsOf(i)`, in the current call's
@@ -252,119 +262,64 @@ export type PoolRoom = { round(): void; room(i: number): Promise<number>; taker(
  */
 export function poolRoom(db: Db, reposOf: (i: number) => readonly string[] | undefined, refsOf: (i: number) => readonly ItemRefLike[], opts: { mayNotCall?: boolean; promptId?: string } = {}): PoolRoom {
   const cls = currentClass(opts.promptId);
-  let pass: RoomPass | null = null;
+  let pass: RoomPass | null = null, stamp = "", wakeAt = 0;
   const rooms = new Map<string, number>(), takers = new Map<string, boolean>();
+  const stampOf = async (): Promise<string> => { const s = await db.seqs(ROOM_TOPICS); return ROOM_TOPICS.map((t) => s[t] ?? 0).join(","); };
+  const passOf = async (): Promise<RoomPass> => {
+    if (pass) return pass;
+    // The counters are read before the room, so a write after the reading moves them. The runner snapshot may come from this
+    // process's 2 s cache: when the counters moved since the last reading, a cached one may miss the write that moved them.
+    const cached = cachedSnapshot(db, Date.now()) !== null;
+    const [s, read] = await db.together(() => Promise.all([stampOf(), roomState(db)]));
+    let st = read;
+    if (cached && stamp !== "" && s !== stamp) {
+      dropSnapshotCache(db);
+      st = await roomState(db);
+    }
+    stamp = s;
+    wakeAt = Math.min(Date.now() + ROOM_REFRESH_MS, roomRisesAt(st) ?? Infinity);
+    return (pass ??= await queueRoomPass(db, opts.promptId, st));
+  };
   // The answers depend on the items only through which filtered users take them, so units of one repo share them when nobody filters.
   const keyOf = async (i: number): Promise<string> => {
     const r = reposOf(i);
-    return `${r === undefined ? "\0" : [...r].sort().join("\n")}\t${await (pass ??= await queueRoomPass(db, opts.promptId)).key(refsOf(i))}`;
+    return `${r === undefined ? "\0" : [...r].sort().join("\n")}\t${await (await passOf()).key(refsOf(i))}`;
   };
   return {
+    ...(opts.mayNotCall && { mayNotCall: true }),
+    untaken: (i) => {
+      const refs = refsOf(i), repos = [...reposOf(i) ?? []];
+      const names = refs.length ? refs.map((r) => `${r.repo}#${r.number}`) : repos;
+      return names.length > 1 ? `${names[0]} and ${names.length - 1} more` : names[0] ?? "";
+    },
     round: () => { pass = null; rooms.clear(); takers.clear(); },
     room: async (i) => {
       const k = await keyOf(i);
       let n = rooms.get(k);
-      if (n === undefined) rooms.set(k, (n = await (pass ??= await queueRoomPass(db, opts.promptId)).room(cls, reposOf(i), undefined, refsOf(i))));
+      if (n === undefined) rooms.set(k, (n = await (await passOf()).room(cls, reposOf(i), undefined, refsOf(i))));
       return n;
     },
     taker: async (i) => {
       if (opts.mayNotCall) return true;
       const k = await keyOf(i);
       let t = takers.get(k);
-      if (t === undefined) takers.set(k, (t = await (pass ??= await queueRoomPass(db, opts.promptId)).taker(reposOf(i), undefined, refsOf(i))));
+      if (t === undefined) takers.set(k, (t = await (await passOf()).taker(reposOf(i), undefined, refsOf(i))));
       return t;
+    },
+    changed: async (pollMs, signal) => {
+      // Always one pause first: a pool that wakes at once and reads the room again from caches would otherwise loop on microtasks
+      // and starve the event loop its own jobs run on.
+      for (;;) {
+        await pause(Math.max(1, Math.min(pollMs, wakeAt - Date.now())), signal);
+        if (signal.aborted || Date.now() >= wakeAt || await stampOf() !== stamp) return;
+      }
     },
   };
 }
 
-export type Started = { runId: number; configDir: string; accountId: string };
-
-type RunInput = Omit<RunStart, "accountId" | "jobId" | "step" | "stage">;
-
-/**
- * One attempt to take a slot: picks the account and records the running agent run
- * in a single BEGIN IMMEDIATE transaction, so job processes that choose at the
- * same time cannot both take the last slot. Returns why it could not, if it could not.
- */
-export async function tryStartClaudeRun(db: Db, s: RunInput, minTokenMs?: number): Promise<Started | Exclude<Choice, { account: unknown }>> {
-  return await db.write(async () => {
-    const c = await chooseAccount(db, Date.now(), minTokenMs);
-    if (!("account" in c)) return c;
-    const runId = await insertRun(db, { ...s, ...stepOf(s.promptId), accountId: c.account.id });
-    return { runId, configDir: c.account.configDir, accountId: c.account.id };
-  });
-}
-
 export class WaitLimitError extends Error {}
 
-/**
- * One poll of a waiting call, in one BEGIN IMMEDIATE: refreshes the waiter row (re-inserting it when it was deleted),
- * works out whether an account could take the call, and claims only when the call ranks within the free slots.
- * The waiter row is deleted in the same transaction as the run insert.
- */
-async function pollClaude(db: Db, w: Waiter, s: RunInput, minTokenMs?: number): Promise<{ started: Started } | { wait: Exclude<Choice, { account: unknown }> }> {
-  return await db.write(async () => {
-    const nowMs = Date.now();
-    const c = await chooseAccount(db, nowMs, minTokenMs);
-    // Eligibility ignores full slots: a waiter that only lacks a slot still counts when ranking, one that lacks a fresh token does not.
-    const eligible = "account" in await chooseAccount(db, nowMs, minTokenMs, true) ? 1 : 0;
-    const up = await db.run(db.k.updateTable("model_waits").set({ seen_at: nowMs, eligible }).where("id", "=", w.id));
-    if (Number(up.changes) === 0) await db.run(db.k.insertInto("model_waits").values({ id: w.id, provider: "claude", class: w.cls, level: w.level, job_id: context?.jobId ?? null, step: w.step, repo: w.repo, since: w.since, seen_at: nowMs, eligible }));
-    if (!("account" in c)) return { wait: c };
-    const rank = (await waiterOrder(db, nowMs)).findIndex((x) => x.id === w.id);
-    if (rank < 0 || rank >= await freeSlots(db, nowMs)) return { wait: { wait: "other calls are ahead in the queue" } };
-    const runId = await insertRun(db, { ...s, ...stepOf(s.promptId), accountId: c.account.id });
-    await db.run(db.k.deleteFrom("model_waits").where("id", "=", w.id));
-    return { started: { runId, configDir: c.account.configDir, accountId: c.account.id } };
-  });
-}
-
-/** Waits for an enabled account with a free slot and headroom (at most `maxWaitMs` when given, else for ever), then records the running agent run on it. Waiting calls are ordered by class (security first), then by the running calls of their repo and step, then by age. With `minTokenMs`, accounts whose login token expires sooner are skipped and the call waits for a refresh. */
-export async function startClaudeRun(db: Db, s: RunInput, log: (line: string) => void = console.log, maxWaitMs?: number, minTokenMs?: number): Promise<Started> {
-  let lastLog = 0;
-  const began = Date.now();
-  const first = s.items[0];
-  const w: Waiter = { id: 0, cls: currentClass(s.promptId), level: await levelBand(db, first?.repo, first?.number), step: stepOf(s.promptId).step, repo: context?.repo ?? null, since: began };
-  // The row exists before the first poll returns, so queueRoom() is exact right after a call is made.
-  w.id = Number((await db.get(db.k.insertInto("model_waits")
-    .values({ provider: "claude", class: w.cls, level: w.level, job_id: context?.jobId ?? null, step: w.step, repo: w.repo, since: began, seen_at: began, eligible: 0 })
-    .returning("id")))!.id);
-  let claimed = false;
-  try {
-    for (;;) {
-      if (await context?.cancelled()) throw new CancelledError("cancelled while waiting for a Claude account");
-      if (await context?.stopping?.()) throw new StoppedError("the pipeline was switched off");
-      const r = await pollClaude(db, w, s, minTokenMs);
-      if ("started" in r) {
-        claimed = true; // the claim transaction deleted the row
-        return r.started;
-      }
-      const c = r.wait;
-      if ("none" in c) throw new NoAccountError("no Claude account is enabled; an operator enables one on the Accounts page or with `autocraft-server accounts set <id> --enabled yes`");
-      if (maxWaitMs !== undefined && Date.now() - began >= maxWaitMs) throw new WaitLimitError("no Claude account slot became free in time");
-      if (Date.now() - lastLog >= allocation.logEveryMs) {
-        lastLog = Date.now();
-        log(`waiting for a Claude account: ${await scrubError(c.wait)}`);
-      }
-      await sleepOrWake(allocation.pollMs);
-    }
-  } finally {
-    if (!claimed) await db.run(db.k.deleteFrom("model_waits").where("id", "=", w.id));
-  }
-}
-
 /** Records a Jev call (no account, no slot). */
-export async function startJevRun(db: Db, s: Omit<RunStart, "accountId" | "jobId" | "step" | "stage">): Promise<number> {
-  return await insertRun(db, { ...s, ...stepOf(s.promptId), accountId: null });
+export async function startJevRun(db: Db, s: Omit<RunStart, "jobId" | "step" | "stage">): Promise<number> {
+  return await insertRun(db, { ...s, ...stepOf(s.promptId) });
 }
-
-/** Records a follow-up run on the account of an earlier call (its session lives there), or returns null when that account is no longer enabled, has no headroom or no free slot. Same transaction rule as `tryStartClaudeRun`. */
-export async function tryStartFollowUp(db: Db, accountId: string, s: RunInput): Promise<number | null> {
-  return await db.write(async () => {
-    if (!await accountHasRoom(db, accountId)) return null;
-    return await insertRun(db, { ...s, ...stepOf(s.promptId), accountId });
-  });
-}
-
-/** The config directory of a box account, or null when the box no longer lists it. */
-export const accountConfigDir = async (db: Db, accountId: string): Promise<string | null> => (await boxAccounts(db)).find((b) => b.id === accountId)?.configDir ?? null;

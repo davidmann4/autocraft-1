@@ -7,11 +7,12 @@ import { setPushApproval } from "../src/fixup/approval.ts";
 import type { Exec, ExecResult } from "../src/fixup/git.ts";
 import { runFixup, type FixupDeps } from "../src/fixup/index.ts";
 import { CancelledError, StoppedError } from "../src/agents/call.ts";
+import { acting, appLane } from "./acting.ts";
+import { reportingTaskRunner } from "./fake-runner.ts";
 import { SCRATCH } from "./scratch.ts";
-import { useTestAccount } from "./accounts-fixture.ts";
 import { validating } from "./gql.ts";
-import type { Db } from "../src/db/index.ts";
-import { connectDb } from "../src/db/open.ts";
+import { insertWorkflow } from "../src/workflow/store.ts";
+import { connectDb, type Db } from "./helpers/raw-db.ts";
 
 mkdirSync(SCRATCH, { recursive: true });
 const dir = mkdtempSync(join(SCRATCH, "fixup-pool-"));
@@ -22,14 +23,15 @@ const head = (n: number) => String(n).repeat(40);
 
 async function setup(prs: number): Promise<Db> {
   const db = await connectDb(join(mkdtempSync(join(dir, "db-")), "t.db"));
-  await useTestAccount(db);
-  await db.run(db.k.updateTable("claude_accounts").set({ max_concurrent: 8 }));
+  await reportingTaskRunner(db);
   await db.run(db.k.insertInto("tracked_repos").values({ name: "app", added_by: "op", added_at: T0, pipeline: 1 }));
   await setPushApproval(db, "op", "app", true);
   for (let n = 1; n <= prs; n++) {
     await db.run(db.k.insertInto("items").values({ repo: "app", number: n, kind: "pr", state: "OPEN", title: "Fix a thing", author: "someone", additions: 5, deletions: 0, head_oid: head(n), head_ref: "fix", head_repo: "contrib/app", base_ref: "main",
       maintainer_can_modify: 1, mergeable: "MERGEABLE", created_at: T0, updated_at: T0 }));
     await db.run(db.k.insertInto("opus_reviews").values({ repo: "app", number: n, head_oid: head(n), run_id: "rv", at: T0, model: "m", verdict: "take-fix", reason: "nearly right", fixes: FIXES, sure: 1, mode: "full" }));
+    await insertWorkflow(db, { repo: "app", number: n, kind: "pr", entry: "fixup", state: "running", startedBy: "op", startedAt: T0, startedVia: "dashboard" });
+    await acting(db, ["op"]);
   }
   return db;
 }
@@ -59,7 +61,7 @@ async function run(limit: number | undefined, need: number, o: { prs?: number; m
   const gate = new Promise<void>((r) => (open = r));
   const failures = async () => (await db.get(db.k.selectFrom("fixups").select((eb) => eb.fn.countAll<number>().as("n")).where("state", "=", "failed")))!.n;
   const deps = {
-    querier, exec, now: () => new Date(T0), root: join(dir, "cache"),
+    querier, lane: appLane(querier), exec, now: () => new Date(T0), root: join(dir, "cache"),
     fetchDiff: async () => ({ ok: true, text: "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-x\n+y\n" }),
     ask: o.ask ?? (async () => { asked++; peak = Math.max(peak, ++waiting); if (waiting >= need) open(); await Promise.race([gate, new Promise((_, no) => setTimeout(() => no(new Error("model calls did not overlap")), 5000))]); waiting--; return null; }),
   } as unknown as FixupDeps;

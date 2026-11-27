@@ -1,39 +1,18 @@
 // Kind, state and title of mirrored items, for rows that show an item reference.
 import type { ItemRef, ItemShown, ItemState } from "../../../web/src/api/types.ts";
 import type { Db } from "../../db/index.ts";
-import { tupleIn } from "../../db/kx.ts";
+import { loadShown } from "../../data/mirror/index.ts";
 
 const NONE: ItemShown = { kind: null, state: null, title: null };
 
 const STATE: Record<string, ItemState> = { OPEN: "open", MERGED: "merged", CLOSED: "closed" };
 export const itemState = (s: string | null | undefined): ItemState => STATE[s ?? ""] ?? "open";
 
-/** One item's kind, state and title per call; the items of `preload` are read together, in one query, at the first call that needs one. */
-export function shownLookup(db: Db, preload: readonly { repo: string; number: number }[] = []): (repo: string, number: number) => Promise<ItemShown> {
-  const keys = new Set<string>();
-  for (const r of preload) keys.add(`${r.repo}#${r.number}`);
-  let known: Promise<Map<string, ItemShown>> | undefined;
-  return async (repo, number) => {
-    const key = `${repo}#${number}`;
-    if (keys.has(key)) {
-      known ??= shownMap(db, preload);
-      return { ...((await known).get(key) ?? NONE) };
-    }
-    const r = await db.get(db.k.selectFrom("items").select(["kind", "state", "title"]).where("repo", "=", repo).where("number", "=", number));
-    return r ? { kind: r.kind === "pr" ? "pr" : "issue", state: itemState(r.state), title: r.title } : { kind: null, state: null, title: null };
-  };
-}
-
 /** Kind, state and title of many items in one read, by `repo#number`; items not mirrored are left out. */
 export async function shownMap(db: Db, refs: Iterable<{ repo: string; number: number }>): Promise<Map<string, ItemShown>> {
-  const keys = new Map<string, [string, number]>();
-  for (const r of refs) keys.set(`${r.repo}#${r.number}`, [r.repo, r.number]);
-  const out = new Map<string, ItemShown>();
-  if (!keys.size) return out;
-  const rows = await db.all(db.k.selectFrom("items").select(["repo", "number", "kind", "state", "title"])
-    .where(tupleIn(db, ["repo", "number"], [...keys.values()], ["text", "bigint"])));
-  for (const r of rows) out.set(`${r.repo}#${r.number}`, { kind: r.kind === "pr" ? "pr" : "issue", state: itemState(r.state), title: r.title });
-  return out;
+  const keys = new Map<string, { repo: string; number: number }>();
+  for (const r of refs) keys.set(`${r.repo}#${r.number}`, { repo: r.repo, number: r.number });
+  return keys.size ? await loadShown(db, [...keys.values()]) : new Map();
 }
 
 /**

@@ -11,19 +11,22 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { SCRATCH } from "./scratch.ts";
 import { world } from "./world-db.ts";
+import { insertWorkflow } from "../src/workflow/store.ts";
 import { setFeature } from "../src/build/features.ts";
 import { exec as realExec, type Exec, type ExecResult } from "../src/fixup/git.ts";
 import { DIFF_FLAGS } from "../src/implement/diff.ts";
 import { lastPush, openImplementationPr } from "../src/implement/pr.ts";
 import { pushRevision, type ReviseDeps } from "../src/implement/revise.ts";
-import { implementationById, setImplementationState, startImplementation } from "../src/implement/store.ts";
+import { implementationById, setImplementationState, startImplementation } from "./implement-rows.ts";
 import type { Implementation, ReviseRound } from "../src/implement/types.ts";
 
+/** The live implement workflow of the PR's issue. */
+const ISSUES = { entry: "implement", approved: true, startedBy: "op", startedAt: "2026-11-04T09:00:00.000Z", own: false } as const;
 const kinds = (f: Parameters<typeof prFacts>[0]) =>
   decidePr(prFacts(f)).actions.filter((a) => a.kind !== "unassign").map((a) => `${a.kind}${a.params?.bucket ? `:${a.params.bucket}` : ""}${a.params?.issue ? `#${a.params.issue}` : ""}`);
 
 test("an implementation PR's review fixes and red CI go to its session; a conflict goes to the conflict step", () => {
-  const ours = { implementation: { issue: 7, state: "pr-opened", revisedHeads: [] as string[] } };
+  const ours = { workflow: ISSUES, implementation: { issue: 7, state: "pr-opened", revisedHeads: [] as string[], queuedBy: "op", standing: "yes" as const } };
   const takeFix = { review: { verdict: "take-fix" as const, fixes: 2 }, fixup: { fixes: 2, attempts: 0, recorded: [] as string[] } };
   const red = { ci: "failure" as const, cifix: { states: [] as string[], tries: 0, rerunAt: null, infraRuns: null, formattingTask: null, formatterEnded: true, totalPushes: 0, totalTries: 0, skipReason: null, checksAt: null } };
 
@@ -40,18 +43,18 @@ test("an implementation PR's review fixes and red CI go to its session; a confli
 
   // A head the session already revised waits for its push, a revision that started goes on from the PR (its issue may be
   // closed or held), and a stuck one plans nothing new.
-  assert.ok(!kinds({ ...takeFix, implementation: { ...ours.implementation, revisedHeads: ["h1"] } }).some((k) => /^(fixup|implement)/.test(k)));
-  assert.deepEqual(kinds({ ...takeFix, implementation: { ...ours.implementation, state: "revising", revisedHeads: ["h1"] } }).filter((k) => /^(fixup|implement)/.test(k)), ["implement:revise#7"]);
-  assert.ok(!kinds({ ...takeFix, implementation: { ...ours.implementation, state: "stuck" } }).some((k) => /^(fixup|implement)/.test(k)));
+  assert.ok(!kinds({ ...takeFix, ...ours, implementation: { ...ours.implementation, revisedHeads: ["h1"] } }).some((k) => /^(fixup|implement)/.test(k)));
+  assert.deepEqual(kinds({ ...takeFix, ...ours, implementation: { ...ours.implementation, state: "revising", revisedHeads: ["h1"] } }).filter((k) => /^(fixup|implement)/.test(k)), ["implement:revise#7"]);
+  assert.ok(!kinds({ ...takeFix, ...ours, implementation: { ...ours.implementation, state: "stuck" } }).some((k) => /^(fixup|implement)/.test(k)));
 });
 
 test("an implementation PR waits on the Implement switch while it is off, and on a revision in progress instead of merging", () => {
   const takeFix = { review: { verdict: "take-fix" as const, fixes: 2 }, fixup: { fixes: 2, attempts: 0, recorded: [] as string[] } };
-  const off = decidePr(prFacts({ ...takeFix, implementation: { issue: 7, state: "pr-opened", revisedHeads: [] }, repoFacts: { implementOn: false } }));
+  const off = decidePr(prFacts({ ...takeFix, workflow: ISSUES, implementation: { issue: 7, state: "pr-opened", revisedHeads: [], queuedBy: "op", standing: "yes" }, repoFacts: { implementOn: false } }));
   assert.ok(!off.actions.some((a) => a.kind === "implement"), JSON.stringify(off.actions));
   assert.equal(off.wait, implementOffWait("app"));
   // A ready PR whose session is revising it is not merged meanwhile: it waits on the revision.
-  const revising = decidePr(prFacts({ implementation: { issue: 7, state: "revising", revisedHeads: ["h1"] } }));
+  const revising = decidePr(prFacts({ workflow: ISSUES, implementation: { issue: 7, state: "revising", revisedHeads: ["h1"], queuedBy: "op", standing: "yes" } }));
   assert.ok(!revising.eligible && !revising.actions.some((a) => a.kind === "merge"), JSON.stringify(revising.actions));
   assert.match(revising.wait ?? "", /revision for #7/);
 });
@@ -86,9 +89,9 @@ test("a revision after a base merge keeps main's change, also in the revision af
     return execFileSync("git", ["diff", "--binary", "--no-ext-diff", "--no-textconv", ...DIFF_FLAGS.split(" "), base], { cwd: work, encoding: "utf8" });
   };
 
-  const w = await (await (await world()).repo()).issue(5, { title: "Crash on start" });
+  const w = await (await (await (await world()).repo()).acting()).issue(5, { title: "Crash on start" });
   const db = w.db;
-  await db.run(db.k.insertInto("fast_track").values({ repo: "app", number: 5, added_by: "op", added_at: "2026-01-01T00:00:00.000Z" }));
+  await insertWorkflow(db, { repo: "app", number: 5, kind: "issue", entry: "implement", state: "running", startedBy: "op", startedAt: "2026-01-01T00:00:00.000Z", startedVia: "dashboard" });
   await setFeature(db, "implement", true, "op", "app");
   const started = await startImplementation(db, { repo: "app", number: 5, queuedBy: "op", textHash: "h", baseSha: base });
   await setImplementationState(db, started.id, "opening", { plan: { kind: "bugfix", summary: "Return 1.", plan: "1. Return 1." } as Implementation["plan"] });
@@ -113,10 +116,10 @@ test("a revision after a base merge keeps main's change, also in the revision af
     }
     const at = args.findIndex((a) => a.startsWith("https://github.com/"));
     if (at < 0) return realExec(cmd, args, opt);
-    const target = args[at]!.includes("/storytold/") ? upstream : fork;
+    const target = args[at]!.includes("/storytold/") && !args.includes("push") && !args.some((a) => a.includes("refs/heads/autocraft/")) ? upstream : fork;
     return realExec(cmd, args.map((a, i) => (i === at ? target : a)).filter((a, i, all) => a !== "protocol.file.allow=never" && !(a === "-c" && all[i + 1] === "protocol.file.allow=never")), opt);
   };
-  const opened = await openImplementationPr(db, { implementation: (await implementationById(db, started.id))!, diff: diffFor("pub fn a() -> u8 { 1 }\n"), base, model: "claude-opus-5-5", checks: [], by: "pipeline" }, { exec, root: join(dir, "cache"), log: () => {} });
+  const opened = await openImplementationPr(db, { implementation: (await implementationById(db, started.id))!, diff: diffFor("pub fn a() -> u8 { 1 }\n"), base, model: "claude-opus-5-5", checks: [], by: "pipeline" }, { exec, root: join(dir, "cache"), log: () => {}, mint: async () => "installation-token" });
   assert.ok(opened.ok, opened.ok ? "" : opened.reason);
 
   // The conflict step merges main, which changed another file, into the PR's branch.
@@ -138,7 +141,7 @@ test("a revision after a base merge keeps main's change, also in the revision af
     await w.synced(12, head);
     await w.review(12, { verdict: "take-fix" });
     const req: ReviseRound = { prNumber: 12, head, from, review: true, ci: false, message: "fix" };
-    const r = await pushRevision(db, { exec, root, gh: (args: string[]) => exec("gh", args).then((x) => x.stdout) } as unknown as ReviseDeps, impl, req, diffFor(lib), "pipeline", () => {});
+    const r = await pushRevision(db, { exec, root, mint: async () => "installation-token", gh: (args: string[]) => exec("gh", args).then((x) => x.stdout) } as unknown as ReviseDeps, impl, req, diffFor(lib), "pipeline", () => {});
     assert.ok(r.ok, r.ok ? "" : r.reason);
     const at = (path: string) => git(fork, "show", `refs/heads/${branch}:${path}`);
     assert.equal(at("src/other.rs"), "pub fn b() -> u8 { 2 }", "main's change stays");

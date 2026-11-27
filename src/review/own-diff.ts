@@ -32,6 +32,9 @@ export function ownDiffKey(diff: string): string {
 /** True when the diff touches a binary file, whose content the added and removed lines do not show. */
 export const hasBinary = (diff: string): boolean => /^(Binary files |GIT binary patch)/m.test(diff);
 
+/** Two diffs of one PR make the same change: the same added and removed lines, and no binary file whose content they cannot show. */
+export const sameOwnDiff = (before: string, after: string): boolean => !hasBinary(before) && !hasBinary(after) && ownDiffKey(before) === ownDiffKey(after);
+
 /**
  * What the PR's diff changed from `before` to `after`, as diff text: the hunks of `after` that are not in `before` (with their file headers, which also
  * shows a mode or rename change), then a section of the PR's earlier hunks that `after` no longer has. Empty when nothing changed.
@@ -71,6 +74,22 @@ export function changedHunks(before: string, after: string, touched: readonly st
   }
   const out = [...blocks.values()].flat();
   return out.length ? `${out.join("\n")}\n` : "";
+}
+
+/** How many of the added and removed lines of two diffs of the same PR are in one of them only. */
+export function changedLines(before: string, after: string): number {
+  const was = parse(before), now = parse(after);
+  let n = 0;
+  for (const path of new Set([...was.keys(), ...now.keys()])) {
+    const left = new Map<string, number>();
+    const count = (hunks: string[] | undefined, by: 1 | -1): void => {
+      for (const l of (hunks ?? []).filter((h) => !h.startsWith("# ")).flatMap((h) => h.split("\n"))) left.set(l, (left.get(l) ?? 0) + by);
+    };
+    count(was.get(path), 1);
+    count(now.get(path), -1);
+    for (const d of left.values()) n += Math.abs(d);
+  }
+  return n;
 }
 
 /**

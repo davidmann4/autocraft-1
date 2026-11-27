@@ -2,15 +2,17 @@
 // Under the `box` identity nothing is added: the child inherits this process's environment and the box account's
 // login. Under `app` the child's whole environment is the inherited basics plus an installation token (never the
 // box account's credentials), and a failure to mint one is an error, not a fallback to the box account.
-// The setting is held in memory and read again whenever the `settings` change counter moves (refreshReadIdentity), so a
-// switch takes effect in every process without a restart.
+// The setting is held in memory (src/data/access/identity.ts) and read again after a switch, so a switch takes effect in
+// every process without a restart.
 import { existsSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { DEFAULT_OWNER, OWNER } from "../owners.ts";
 import { AppNotInstalledError, TOKEN_ENV, appChildEnv, installationToken } from "./install-token.ts";
-import type { Db } from "../db/index.ts";
+import type { Db, Subscription } from "../db/index.ts";
 import { dbFor, dbTarget, isPgUrl, openDb } from "../db/open.ts";
-import { setting } from "../settings-read.ts";
+import { loadTrackedRepos } from "../data/control/index.ts";
+import { noteIdentity, readsUseApp as accessReadsUseApp, watchIdentity } from "../data/access/index.ts";
+import { loadRepos } from "../data/mirror/index.ts";
 
 export type ReadEnv = Record<string, string>;
 export type ReadDeps = { db?: Db; mint?: (owner: string) => Promise<string>; defaultOwner?: () => Promise<string> };
@@ -50,67 +52,45 @@ async function openShared(path: string): Promise<Db> {
   throw new Error(`cannot read the GitHub identity setting: ${String((last as Error)?.message ?? last).slice(0, 120)}`);
 }
 
-async function retried<T>(fn: () => Promise<T>): Promise<T> {
-  let last: unknown;
-  for (let i = 0; i < 3; i++) {
-    try {
-      return await fn();
-    } catch (e) { last = e; }
-  }
-  throw new Error(`cannot read the GitHub identity setting: ${String((last as Error)?.message ?? last).slice(0, 120)}`);
-}
+/** The one handle the identity cache is watching, and its subscription. */
+let watching: { db: Db; sub: Subscription } | null = null;
+/** Watches `db`, unless another handle already does: on Postgres a process's handles are all on the instance database, so one that listens serves them all. */
+const watch = (db: Db): void => {
+  if (watching?.db === db) return;
+  if (watching && db.dialect === "postgres" && watching.db.dialect === "postgres" && watching.sub.listening()) return;
+  watching?.sub.off();
+  watching = { db, sub: watchIdentity(db) };
+};
 
-const settingOf = (db: Db): Promise<string | undefined> =>
-  retried(async () => (await setting(db, "github_identity")) ?? undefined);
-
-/** The identity setting as this process holds it, with the `settings` change counter it was read at (null: unknown). */
-let held: { app: boolean; seq: number | null } | null = null;
-/** Bumped by every switch this process notes, so a refresh that read the setting before the switch drops its reading. */
-let generation = 0;
-
-/**
- * Brings the held identity up to date when the `settings` change counter moved (`seq`: the counter as the caller already
- * read it). The counter is read before the value, so a write between the two only makes the next pass read again.
- */
-export async function refreshReadIdentity(db: Db, seq?: number): Promise<void> {
-  const gen = generation;
-  const at = seq ?? (await retried(async () => await db.get(db.k.selectFrom("main.change_seq").select("seq").where("topic", "=", "settings"))))?.seq ?? null;
-  if (at !== null && held?.seq === at) return;
-  const app = await settingOf(db) === "app";
-  // A switch noted while this pass awaited is newer than its reading.
-  if (gen !== generation) return;
-  // Another pass may have stored a later reading while this one awaited.
-  if (at !== null && held && held.seq !== null && held.seq > at) return;
-  held = { app, seq: at };
+/** Brings the held identity of a process that reads through `db` up to date (the cache listens for switches; this reads it now when it is stale). */
+export async function refreshReadIdentity(db: Db, _seq?: number): Promise<void> {
+  watch(db);
+  await accessReadsUseApp();
 }
 
 /** Records a switch this process just wrote, so its own next read uses it before any refresh. */
-export function noteReadIdentity(app: boolean): void {
-  generation++;
-  held = { app, seq: null };
-}
+export const noteReadIdentity = noteIdentity;
 
 /**
  * Whether reads go through the GitHub App right now. With `db`, that database's setting. Without, the instance
- * database's: every call reads its `settings` change counter (one query on the shared handle) and the setting itself
- * only when the counter moved, so a switch reaches every process, job children included. Throws when the setting exists
- * to be read but cannot be.
+ * database's, held in the process cache (see src/data/access/identity.ts). Throws when the setting exists to be read
+ * but cannot be.
  */
 export async function readsUseApp(db?: Db): Promise<boolean> {
-  if (db) return await settingOf(db) === "app";
+  if (db) return await accessReadsUseApp(db);
   const d = await sharedDb();
-  if (d === null) return held?.app ?? false;
-  await refreshReadIdentity(d);
-  return held?.app ?? false;
+  if (d === null) return await accessReadsUseApp();
+  watch(d);
+  return await accessReadsUseApp();
 }
 
 /** The owner of the tracked repos: the default owner when it has any, else the first tracked one. */
 export async function trackedOwner(db?: Db): Promise<string> {
   const d = db ?? await sharedDb();
   try {
-    const q = async () => d ? await d.all(d.k.selectFrom("main.tracked_repos as t").innerJoin("main.repos as r", "r.name", "t.name").select("r.owner").where("r.owner", "is not", null).orderBy("t.added_at", (o) => o.asc().nullsFirst())) : undefined;
-    const rows = db || !d ? await q() : await d.read(q);
-    const owners = (rows ?? []).map((r) => r.owner).filter((o) => OWNER.test(o));
+    const q = async () => d ? await Promise.all([loadTrackedRepos(d), loadRepos(d, { all: true })]) : undefined;
+    const loaded = db || !d ? await q() : await d.read(q);
+    const owners = loaded ? [...loaded[0].values()].sort((a, b) => (a.addedAt ?? "").localeCompare(b.addedAt ?? "")).flatMap((t) => { const o = loaded[1].get(t.name)?.owner; return o ? [o] : []; }).filter((o) => OWNER.test(o)) : [];
     if (owners.some((o) => o.toLowerCase() === DEFAULT_OWNER)) return DEFAULT_OWNER;
     if (owners[0]) return owners[0];
   } catch { /* fall through to the default owner */ }

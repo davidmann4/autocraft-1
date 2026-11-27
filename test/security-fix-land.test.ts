@@ -10,15 +10,17 @@ import { createEnv, hello } from "../src/build/envs.ts";
 import { claim, createTask } from "../src/build/tasks.ts";
 import { PIPELINE_LOGIN_KEY } from "../src/core/rules.ts";
 import { ownFixPrs } from "../src/core/facts.ts";
-import { inPilot, setPilot } from "../src/pilot.ts";
 import { fixOnMain, pollLanding, runAdvisory, stallReason, runLand, runPublish, type LandDeps } from "../src/security/land.ts";
 import { runFix, type FixDeps } from "../src/security/fix.ts";
 import { fixBranch, giveaway, parseFixReply, patchGiveaway, quietProblem } from "../src/security/rules.ts";
-import { isQuiet } from "../src/security/quiet.ts";
+import { loadQuiet } from "../src/data/security/index.ts";
+
+const isQuiet = async (db: Parameters<typeof loadQuiet>[0], repo: string, n: number): Promise<boolean> => (await loadQuiet(db, [`${repo}#${n}`])).has(`${repo}#${n}`);
 import { rawFinding } from "../src/security/store.ts";
 import { Git } from "../src/fixup/git.ts";
 import { SCRATCH } from "./scratch.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb } from "./helpers/raw-db.ts";
+
 import { excluded, like } from "../src/db/kx.ts";
 
 mkdirSync(SCRATCH, { recursive: true });
@@ -193,7 +195,7 @@ describe("private fix and landing", () => {
     assert.equal((await stateOf(n)).state, "awaiting-admin");
   });
 
-  test("the quiet pull request is the pipeline's own: counted as an own fix PR and in pilot scope; a stalled one shows why", async () => {
+  test("the quiet pull request is the pipeline's own: counted as an own fix PR; a stalled one shows why", async () => {
     await db.run(db.k.insertInto("settings").values({ key: PIPELINE_LOGIN_KEY, value: "pipeline-bot" }).onConflict((oc) => oc.column("key").doUpdateSet(excluded(["value"]))));
     await db.run(db.k.insertInto("tracked_repos").values({ name: "photocraft", pipeline: 1 }).onConflict((oc) => oc.column("name").doUpdateSet({ pipeline: 1 })));
     const n = await finding("landing", { fix_pr: 91 });
@@ -203,10 +205,6 @@ describe("private fix and landing", () => {
     assert.ok((await ownFixPrs(db, "photocraft")).quiet.has("photocraft#91"), "still quiet after the merge, until published");
     await db.run(db.k.updateTable("security_findings").set({ state: "landing" }).where("number", "=", n));
     await db.run(db.k.insertInto("items").values({ repo: "photocraft", number: 5, kind: "issue", state: "OPEN" }));
-    await setPilot(db, "boss", ["photocraft#5"]);
-    assert.equal(await inPilot(db, "photocraft", 91), true, "in scope although the pilot list names other items");
-    assert.equal(await inPilot(db, "photocraft", 92), false);
-    await setPilot(db, "boss", []);
     // The finding page shows why a stalled pull request waits.
     await db.run(db.k.insertInto("items").values({ repo: "photocraft", number: 91, kind: "pr", state: "OPEN", ci_state: "FAILURE" }));
     assert.match(await stallReason(db, "photocraft", 91), /checks failed/);

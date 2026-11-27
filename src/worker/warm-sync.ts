@@ -117,7 +117,10 @@ async function download(cfg: WorkerConfig, key: string, say: Say): Promise<void>
     // Entry kinds, paths, links and mode bits are checked by the extractor; the unpacked size is capped at the signed size plus slack.
     extracting = extractTar(zstd.stdout as AsyncIterable<Buffer>, stage, { maxBytes: cap + cap / 10 + 64 * 1024 ** 2, maxEntries: 2_000_000 }, 0);
     await extracting;
-    zstd.stdout!.resume();
+    // The extractor stops at the archive's end marker. What follows (tar's padding) is read to the end, or zstd blocks on a
+    // full pipe and its stdout never ends, so `exit` never comes. resume() would not read it: the extractor's iterator
+    // still listens for 'readable', which keeps the stream paused.
+    for await (const _ of zstd.stdout!) { /* padding */ }
     if ((await exit) !== 0) throw new Error("unpack failed");
     const swapped = await storeWarm(cfg, key, rec.commit, stage, { stored: rec.stored, replaceIf: newer });
     if (swapped) say(`warm store: downloaded snapshot of ${rec.commit.slice(0, 12)}`);

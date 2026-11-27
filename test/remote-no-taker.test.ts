@@ -10,17 +10,15 @@ import { computeChecks } from "../src/health-checks.ts";
 import { awaitCall, enqueueCall } from "../src/remote/calls.ts";
 import { parseStatus, STATUS_FRESH_MS, storeStatus } from "../src/remote/helpers.ts";
 import { setManualOnly } from "../src/remote/manual-only.ts";
-import { setInferenceMode } from "../src/remote/mode.ts";
 import { NO_TAKER_MS, sweepTakers } from "../src/remote/takers.ts";
 import { leaseSkips } from "../src/runner/leases.ts";
 import { SCRATCH } from "./scratch.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb } from "./helpers/raw-db.ts";
 
 mkdirSync(SCRATCH, { recursive: true });
 
 test("a call whose only taker went stale is withdrawn, its caller skips it, and the health check names the repo", async () => {
   const db = await connectDb(join(mkdtempSync(join(SCRATCH, "remote-no-taker-")), "t.db"));
-  await setInferenceMode(db, "user-local", "test");
   await db.run(db.k.insertInto("tracked_repos").values({ name: "photocraft", pipeline: 1 }).onConflict((oc) => oc.column("name").doUpdateSet({ pipeline: 1 })));
   await db.run(db.k.insertInto("access").values({ login: "dave", role: "maintainer" }));
   await db.run(db.k.insertInto("repo_permissions").values({ login: "dave", repo: "photocraft", permission: "write", checked_at: new Date().toISOString() }));

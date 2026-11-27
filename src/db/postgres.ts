@@ -11,6 +11,7 @@ import type { DB, DbRole, Row } from "./index.ts";
 import { bindParams, parseParams, rewriteForPostgres, rewriteScriptForPostgres, type ParsedParams } from "./params.ts";
 import { plainSchema, SCOPED_SCHEMA } from "./scoped.ts";
 import { fenceSql } from "./fence.ts";
+import { COLUMNS } from "./types.ts";
 
 /**
  * Connections per process role: the database allows 100 direct connections, shared by every process of the instance, and each
@@ -28,7 +29,7 @@ const EXCLUSIVE_LOCKS = 0x61636578; // "acex"
 
 const DEFAULT_LOCK_TIMEOUT_MS = 30_000;
 /** A transaction whose client sends nothing for this long is ended by the server, so a dead process cannot keep the writer lock. */
-const DEFAULT_IDLE_IN_TRANSACTION_MS = 60_000;
+const DEFAULT_IDLE_IN_TRANSACTION_MS = 10_000;
 
 /**
  * Server-side TCP settings of every connection: the server drops a client that went silent (a lost node) after about
@@ -36,6 +37,17 @@ const DEFAULT_IDLE_IN_TRANSACTION_MS = 60_000;
  */
 export const SERVER_KEEPALIVE = { tcp_keepalives_idle: 5, tcp_keepalives_interval: 2, tcp_keepalives_count: 3, tcp_user_timeout: 10_000 } as const;
 const DEFAULT_STATEMENT_TIMEOUT_MS = 120_000;
+/**
+ * How much longer than the statement timeout (at most twice it) a pool connection waits for the server's answer before it
+ * gives the connection up. The server ends every statement and lock wait within the statement timeout, so an answer still
+ * missing after it is lost: the server or a proxy between went away without closing the connection.
+ */
+const ANSWER_MARGIN_MS = 30_000;
+/**
+ * Idle time before the client's first TCP keepalive probe on a pool, lock or listening connection; the system default is two hours. With the
+ * system's probe interval and count, a connection whose server vanished fails within minutes instead of hours.
+ */
+const CLIENT_KEEPALIVE_MS = 10_000;
 /**
  * JIT compilation off (0 is a boolean's false). The planner's cost estimates for the facts loads' correlated subqueries pass
  * jit_above_cost while the queries run in milliseconds, and each compile costs 100 ms or more, up to seconds for the full load.
@@ -121,7 +133,8 @@ const LOCAL_HOSTS = new Set(["", "localhost", "[::1]"]);
  */
 export function pgConnectionString(url: string): string {
   const u = new URL(url);
-  if (LOCAL_HOSTS.has(u.hostname) || u.hostname.startsWith("127.") || u.searchParams.get("sslmode") === "disable") return url;
+  // A host that is a path (%2F...) names a Unix socket's directory.
+  if (LOCAL_HOSTS.has(u.hostname) || u.hostname.startsWith("127.") || /^%2f/i.test(u.hostname) || u.searchParams.get("sslmode") === "disable") return url;
   u.searchParams.set("sslmode", "verify-full");
   // libpq's "use the system CAs"; pg would read it as a file name. Node verifies against the system CAs by default.
   if (u.searchParams.get("sslrootcert") === "system") u.searchParams.delete("sslrootcert");
@@ -155,19 +168,56 @@ export function writesRows(text: string): boolean {
 /** `s` as an SQL string literal (standard_conforming_strings, the default: only quotes are doubled). */
 const quoteLiteral = (s: string): string => `'${s.replaceAll("'", "''")}'`;
 
-/** Emits a query event for every round trip on `client` while someone observes. */
+/** The error a statement fails with when its answer did not come within the limit (`answerWithin`). */
+export class AnswerTimeout extends Error {}
+
+/**
+ * Bounds every round trip on `client`: an answer missing after `ms` fails the statement with an AnswerTimeout and closes
+ * the connection, since a late answer would be read as the answer to the next statement. The pool drops the closed client
+ * once it is released. Nothing is bounded when `ms` is 0.
+ */
+function answerWithin(client: Pg.PoolClient, ms: number): void {
+  if (ms <= 0) return;
+  const query = client.query.bind(client) as (...a: unknown[]) => unknown;
+  (client as { query: unknown }).query = (...a: unknown[]): unknown => {
+    const r = query(...a);
+    if (!(r instanceof Promise)) return r;
+    let t: NodeJS.Timeout | undefined;
+    const late = new Promise<never>((_, reject) => {
+      t = setTimeout(() => {
+        // With a statement in flight, end() closes the socket at once, and the pool drops a client that is ending.
+        void client.end().catch(() => undefined);
+        reject(new AnswerTimeout(`db: no answer from the server within ${ms} ms; the connection is closed`));
+      }, ms);
+    });
+    // The statement's own failure once the connection is closed is not the one the caller sees.
+    void r.catch(() => undefined);
+    return Promise.race([r, late]).finally(() => clearTimeout(t));
+  };
+}
+
+/** Counts every round trip on `client` in the current meter, and emits a query event for it while someone observes. */
 function observeClient(client: Pg.PoolClient, ctx: EngineContext): void {
   const query = client.query.bind(client) as (...a: unknown[]) => unknown;
   (client as { query: unknown }).query = (...a: unknown[]): unknown => {
     const text = a[0];
-    if (!ctx.observed() || typeof text !== "string" || typeof a.at(-1) === "function") return query(...a);
-    const site = callSite(siteError());
+    const m = ctx.meter();
+    if (m) m.roundTrips++;
+    const observed = ctx.observed();
+    if ((!m && !observed) || typeof text !== "string" || typeof a.at(-1) === "function") return query(...a);
+    const site = observed ? (ctx.site() ?? callSite(siteError())) : "";
     const t0 = performance.now();
     return (query(...a) as Promise<Pg.QueryResult | Pg.QueryResult[]>).then((r) => {
+      const ms = performance.now() - t0;
+      if (m) m.ms += ms;
+      if (!observed) return r;
       // A script with several statements answers with one result per statement.
       const rows = (Array.isArray(r) ? r : [r]).flatMap((x) => x.rows ?? []);
-      ctx.emit({ kind: "query", sql: text, rows: rows.length, bytes: rows.length ? Buffer.byteLength(JSON.stringify(rows)) : 0, ms: performance.now() - t0, site });
+      ctx.emit({ kind: "query", sql: text, rows: rows.length, bytes: rows.length ? Buffer.byteLength(JSON.stringify(rows)) : 0, ms, site });
       return r;
+    }, (e: unknown) => {
+      if (m) m.ms += performance.now() - t0;
+      throw e;
     });
   };
 }
@@ -175,35 +225,39 @@ function observeClient(client: Pg.PoolClient, ctx: EngineContext): void {
 /**
  * Kysely's counterpart of the `main.`/`temp.` rewrite raw statements get (src/db/params.ts rewriteForPostgres): table
  * names `main.x` and `temp.x` (typed in src/db/types.ts for code that reads past the scoped views or writes a shadowed
- * table) lose the schema, or with `mainSchema` (a scoped handle) `main.x` names `<mainSchema>.x`, past the views.
+ * table) lose the schema, or with `mainSchema` (a scoped handle) `main.x` names `<mainSchema>.x`, past the views. Done
+ * while compiling: a plugin would copy every query's tree.
  */
-function schemaPlugin(k: typeof K, mainSchema: string | undefined): K.KyselyPlugin {
-  class Transformer extends k.OperationNodeTransformer {
-    protected override transformSchemableIdentifier(node: K.SchemableIdentifierNode, queryId?: K.QueryId): K.SchemableIdentifierNode {
-      const t = super.transformSchemableIdentifier(node, queryId);
-      const schema = t.schema?.name.toLowerCase();
-      if (schema !== "main" && schema !== "temp") return t;
-      return { ...t, schema: schema === "main" && mainSchema ? k.IdentifierNode.create(mainSchema) : undefined };
+function schemaCompiler(k: typeof K, mainSchema: string | undefined): K.QueryCompiler {
+  class Compiler extends k.PostgresQueryCompiler {
+    protected override visitSchemableIdentifier(node: K.SchemableIdentifierNode): void {
+      const schema = node.schema?.name.toLowerCase();
+      if (schema !== "main" && schema !== "temp") return super.visitSchemableIdentifier(node);
+      if (schema === "main" && mainSchema) {
+        this.append(`"${this.sanitizeIdentifier(mainSchema)}".`);
+      }
+      this.visitNode(node.identifier);
     }
   }
-  const transformer = new Transformer();
-  return {
-    transformQuery: (args) => transformer.transformNode(args.node, args.queryId),
-    transformResult: async (args) => args.result,
-  };
+  return new Compiler();
 }
 
 /** An engine on the Postgres database at `url`. `k` and `pg` are the modules src/db/open.ts loaded. */
 export function postgresEngine(k: typeof K, pg: typeof Pg.default, url: string, opts: PgOptions, ctx: EngineContext): Engine {
   const lockTimeout = (tx: Tx | undefined) => Math.max(1, Math.floor(tx?.lockTimeoutMs ?? opts.busyTimeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS));
+  const statementTimeout = opts.statementTimeoutMs ?? DEFAULT_STATEMENT_TIMEOUT_MS;
+  const answerMs = statementTimeout > 0 ? statementTimeout + Math.min(ANSWER_MARGIN_MS, statementTimeout) : 0;
   const pool = new pg.Pool({
     connectionString: pgConnectionString(opts.scope ? scopedUrl(url, opts.scope) : url),
     max: POOL_MAX[opts.role],
+    // Bounds both opening a connection and waiting for a free one: the holders' statements end within the statement timeout.
+    connectionTimeoutMillis: answerMs,
     keepAlive: true,
+    keepAliveInitialDelayMillis: CLIENT_KEEPALIVE_MS,
     allowExitOnIdle: true,
     application_name: `autocraft-${opts.role}`,
     // A startup parameter of every connection, so it also bounds statements outside transactions; no SET is sent.
-    statement_timeout: opts.statementTimeoutMs ?? DEFAULT_STATEMENT_TIMEOUT_MS,
+    statement_timeout: statementTimeout,
     // A lone write of a rowWrites handle waits for row locks no longer than a transaction waits for its lock.
     ...(opts.rowWrites && { lock_timeout: lockTimeout(undefined) }),
     types: typesFor(pg),
@@ -211,6 +265,7 @@ export function postgresEngine(k: typeof K, pg: typeof Pg.default, url: string, 
   // An idle connection that fails (server restart, network) is dropped by the pool; without a listener it would crash the process.
   pool.on("error", (e) => console.warn(`db: idle Postgres connection failed: ${e.message}`));
   pool.on("connect", (client) => {
+    answerWithin(client, answerMs);
     observeClient(client, ctx);
     // The pool listens only while a connection is idle. One the server ends while it is checked out (an idle transaction
     // past its limit, a terminated backend) must not crash the process: its next statement fails, and the pool drops it.
@@ -289,9 +344,13 @@ export function postgresEngine(k: typeof K, pg: typeof Pg.default, url: string, 
     override createDriver(): K.Driver {
       return new Driver({ pool, onCreateConnection: prepareConnection });
     }
+
+    override createQueryCompiler(): K.QueryCompiler {
+      return schemaCompiler(k, opts.scope);
+    }
   }
 
-  const kysely = new k.Kysely<DB>({ dialect: new Dialect({ pool }), plugins: [schemaPlugin(k, opts.scope)] });
+  const kysely = new k.Kysely<DB>({ dialect: new Dialect({ pool }) });
   const parsed = new Map<string, ParsedParams>();
   const parse = (text: string): ParsedParams => {
     let p = parsed.get(text);
@@ -318,7 +377,7 @@ export function postgresEngine(k: typeof K, pg: typeof Pg.default, url: string, 
       // A connection of its own, outside the pool (a job's pool has one connection), closed with the lock: closing the
       // session releases it, and so does the server when this process dies (SERVER_KEEPALIVE).
       const wait = Math.max(1, Math.floor(waitMs));
-      const c = new pg.Client({ connectionString: pgConnectionString(url), application_name: "autocraft-lock", keepAlive: true, connectionTimeoutMillis: 10_000, query_timeout: wait + 5_000 });
+      const c = new pg.Client({ connectionString: pgConnectionString(url), application_name: "autocraft-lock", keepAlive: true, keepAliveInitialDelayMillis: CLIENT_KEEPALIVE_MS, connectionTimeoutMillis: 10_000, query_timeout: wait + 5_000 });
       let held = false;
       c.on("error", () => (held = false));
       c.on("end", () => (held = false));
@@ -346,6 +405,14 @@ export function postgresEngine(k: typeof K, pg: typeof Pg.default, url: string, 
       return withoutInsertId(Number(r.numAffectedRows ?? 0n));
     },
     script: async (text, tx) => void (await on(tx, (conn) => conn.executeQuery(raw(rewriteScriptForPostgres(text, opts.scope))))),
+    // Each read becomes `(select coalesce(json_agg(agg), '[]') from (<read>) as agg) AS qN`, as Kysely's jsonArrayFrom
+    // helper writes it; the compiler puts the parentheses around a SELECT inside raw SQL. CTEs the reads share head the statement.
+    fuse: (kysely, nodes) => {
+      const { shared, reads } = hoistShared(nodes);
+      const parts = reads.map((n, i) => k.sql`(select coalesce(json_agg(agg), '[]') from ${{ toOperationNode: () => n }} as agg) as ${k.sql.ref(`q${i}`)}`);
+      const head = shared ? k.sql`${{ toOperationNode: () => shared }} ` : k.sql``;
+      return k.sql<Row>`${head}select ${k.sql.join(parts)}`.compile(kysely);
+    },
     configure: (b, mode) => (mode === "read" ? b.setIsolationLevel("repeatable read").setAccessMode("read only") : b.setIsolationLevel("read committed")),
     // A pool of its own: the search path is a startup parameter of each connection, never a session SET.
     scope: async () => {
@@ -356,6 +423,39 @@ export function postgresEngine(k: typeof K, pg: typeof Pg.default, url: string, 
     close: () => kysely.destroy(),
   };
   return engine;
+}
+
+/**
+ * The CTEs that two or more reads of a wave declare alike (same name, query and parameters), moved to one WITH at the head of the fused
+ * statement, so Postgres plans and runs each once; `reads` are the reads without them. A read gives up only a leading run of its CTEs: a
+ * later CTE may refer to an earlier one, and one left in place shadows a hoisted CTE of its name. Two different CTEs of one name are
+ * never both hoisted, nor one named as a table, which would shadow the table in every read.
+ */
+export function hoistShared(nodes: readonly K.OperationNode[]): { shared: K.WithNode | undefined; reads: K.OperationNode[] } {
+  const ctes = (n: K.OperationNode): readonly K.CommonTableExpressionNode[] => {
+    const w = n.kind === "SelectQueryNode" ? (n as K.SelectQueryNode).with : undefined;
+    return w && !w.recursive ? w.expressions : [];
+  };
+  const keyOf = (c: K.CommonTableExpressionNode): string => JSON.stringify(c, (_, v: unknown) => (typeof v === "bigint" ? `${v}n` : v));
+  const nameOf = (c: K.CommonTableExpressionNode): string => c.name.table.table.identifier.name;
+  const uses = new Map<string, number>();
+  for (const n of nodes) for (const key of new Set(ctes(n).map(keyOf))) uses.set(key, (uses.get(key) ?? 0) + 1);
+  const hoisted = new Map<string, K.CommonTableExpressionNode>();
+  const byName = new Map<string, string>();
+  const reads = nodes.map((n) => {
+    const list = ctes(n);
+    let i = 0;
+    for (; i < list.length; i++) {
+      const c = list[i]!, key = keyOf(c), name = nameOf(c);
+      if ((uses.get(key) ?? 0) < 2 || (byName.get(name) ?? key) !== key || Object.hasOwn(COLUMNS, name)) break;
+      byName.set(name, key);
+      hoisted.set(key, c);
+    }
+    if (i === 0) return n;
+    const s = n as K.SelectQueryNode;
+    return { ...s, with: i < list.length ? { ...s.with!, expressions: list.slice(i) } : undefined } as K.SelectQueryNode;
+  });
+  return { shared: hoisted.size ? ({ kind: "WithNode", expressions: [...hoisted.values()] } as K.WithNode) : undefined, reads };
 }
 
 /** Channel names a handle may listen on: plain lower-case identifiers, so LISTEN needs no quoting. */
@@ -379,10 +479,13 @@ export function pgListener(pg: typeof Pg.default, url: string): Listener {
   let closed = false, failures = 0, warned = false;
   let retry: NodeJS.Timeout | undefined;
 
-  // The connection keeps the process alive only while something listens, so a process can end once its waits are over.
+  /** Subscriptions that are not `background`. */
+  let waits = 0;
+  // The connection keeps the process alive only while something waits for a notification, so a process can end once its
+  // waits are over; a background subscription (a cache) never holds it.
   const hold = (): void => {
     const c = client as (Pg.Client & { ref?: () => void; unref?: () => void }) | null;
-    if (fns.size) c?.ref?.();
+    if (waits) c?.ref?.();
     else c?.unref?.();
   };
   const dispatch = (channel: string, payload: string | null): void => {
@@ -422,7 +525,7 @@ export function pgListener(pg: typeof Pg.default, url: string): Listener {
     if (client) return Promise.resolve(client);
     connecting ??= (async () => {
       const reconnect = failures > 0 || warned;
-      const c = new pg.Client({ connectionString: pgConnectionString(url), application_name: "autocraft-listen", keepAlive: true, connectionTimeoutMillis: LISTEN_CONNECT_MS });
+      const c = new pg.Client({ connectionString: pgConnectionString(url), application_name: "autocraft-listen", keepAlive: true, keepAliveInitialDelayMillis: CLIENT_KEEPALIVE_MS, connectionTimeoutMillis: LISTEN_CONNECT_MS });
       c.on("error", (e) => lost(c, e.message));
       c.on("end", () => lost(c, "closed"));
       try {
@@ -452,24 +555,27 @@ export function pgListener(pg: typeof Pg.default, url: string): Listener {
   };
 
   return {
-    listen(channel, fn) {
+    listen(channel, fn, o) {
       if (!CHANNEL.test(channel)) throw new Error(`db: bad channel name ${channel}`);
       if (closed) throw new Error("db: the handle is closed");
       let set = fns.get(channel);
       if (!set) fns.set(channel, set = new Set());
       set.add(fn);
+      const waiting = !o?.background;
+      if (waiting) waits++;
       hold();
       if (client) void sync(client);
       else void connect();
       return {
         listening: () => client !== null && active.has(channel),
         off: () => {
-          set.delete(fn);
+          if (!set.delete(fn)) return;
+          if (waiting) waits--;
+          hold();
           if (set.size || fns.get(channel) !== set) return;
           fns.delete(channel);
           active.delete(channel);
           if (client) void client.query(`UNLISTEN ${channel}`).catch(() => undefined);
-          hold();
         },
       };
     },

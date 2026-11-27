@@ -3,7 +3,7 @@ import type { NextItem, NextPage, NextStep } from "../types";
 import { REPOS, titleFor } from "./fixtures";
 
 const item = (repo: string, number: number, action: string, why: string, o: Partial<NextItem> = {}): NextItem => ({
-  repo, number, kind: "pr", state: "open", title: titleFor(repo, number), action, bucket: null, why, fast: false, rank: null, inFlight: false, next: true, blocked: null, ...o,
+  repo, number, kind: "pr", state: "open", title: titleFor(repo, number), action, bucket: null, why, rank: null, inFlight: false, next: true, blocked: null, ...o,
 });
 const [a, b, c] = REPOS;
 
@@ -13,13 +13,13 @@ const STEPS: NextStep[] = ([
     items: [item(a!, 412, "classify", "Needs a first classification", { kind: "issue" }), item(a!, 418, "classify", "Changed since its last classification", { kind: "issue" }), item(b!, 77, "classify", "Needs a first classification", { kind: "issue" })],
   },
   {
-    lane: "decide", title: "Ask scope decisions", stage: "Decide", steps: ["decide"], canRun: false, kind: "account", why: "No Claude account has headroom (Main: five-hour limit reached; resets 14:20 UTC)", note: null,
-    items: [item(a!, 390, "decide", "Scope decision without a recommendation", { kind: "issue", rank: 71 }), item(b!, 64, "decide", "Scope decision without a recommendation", { kind: "issue", rank: 52 })],
+    lane: "premerge", title: "Review before merging", stage: "Merge queue", steps: ["premerge"], canRun: false, kind: "backoff", why: "No Task Runner takes Opus calls now", note: null,
+    items: [item(a!, 390, "premerge", "Pre-merge review of the head", { rank: 71 }), item(b!, 64, "premerge", "Pre-merge review of the head", { rank: 52 })],
   },
   {
     lane: "review", title: "Review pull requests", stage: "Review", steps: ["checks", "opus-review"], canRun: true, kind: "ok", why: null, note: null,
     items: [
-      item(a!, 431, "review", "Review the new head", { fast: true, rank: 96, inFlight: true }),
+      item(a!, 431, "review", "Review the new head", { rank: 96, inFlight: true }),
       item(a!, 428, "review", "Review the new head", { rank: 88 }),
       item(b!, 102, "review", "First review", { rank: 64 }),
       item(c!, 15, "review", "First review", { rank: 40, next: false }),
@@ -27,7 +27,7 @@ const STEPS: NextStep[] = ([
   },
   {
     lane: "fixup", title: "Push fix-ups", stage: "Fix", steps: ["fixup"], canRun: false, kind: "limit", why: "The daily limit is 0", note: null,
-    items: [item(a!, 431, "fixup", "Review asked for 2 fixes", { bucket: "fix", rank: 96, fast: true })],
+    items: [item(a!, 431, "fixup", "Review asked for 2 fixes", { bucket: "fix", rank: 96 })],
   },
   {
     lane: "cifix", title: "Fix failing CI", stage: "Fix", steps: ["cifix"], canRun: false, kind: "breaker", why: "3 of the last 10 cifix pushes broke a required check, in 2 repos (deckcraft, designcraft); an operator resumes it", note: null,
@@ -48,7 +48,7 @@ export function nextPageFixture(): NextPage {
     { repo: a!, number: 433, wait: "Waiting for CI", why: "Waits for CI on the new head" },
     { repo: a!, number: 429, wait: "Waiting for CI", why: "Waits for CI on the new head" },
     { repo: b!, number: 101, wait: "Waiting for the author", why: "Review asked for changes" },
-    { repo: c!, number: 14, wait: "Waiting for a decision", why: "Scope decision open" },
+    { repo: c!, number: 14, wait: "Waiting for an answer", why: "Its recommendation is open" },
   ].map((w) => ({ ...w, kind: "pr" as const, state: "open" as const, title: titleFor(w.repo, w.number) }));
   return { steps: STEPS, waiting, waitingTotal: waiting.length };
 }

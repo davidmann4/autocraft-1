@@ -2,10 +2,10 @@
 // only at the last successful warm build's commit, stale nodes do not count, and keys of hidden repos are left out.
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { CACHE_REPORT_KEY, cacheReport, type StoredCaches } from "../src/build/caches.ts";
+import { cacheReport, type StoredCaches } from "../src/build/caches.ts";
 import { warmKeyOf } from "../src/build/tasks.ts";
-import { connectDb } from "../src/db/open.ts";
-import { writeSetting } from "../src/settings-read.ts";
+import { connectDb } from "./helpers/raw-db.ts";
+import { saveWarmReport } from "../src/data/build/index.ts";
 import type { HiddenRepos } from "../src/hidden-sql.ts";
 
 test("caches report: placement against the published version, stale nodes and hidden repos", async () => {
@@ -36,7 +36,7 @@ test("caches report: placement against the published version, stale nodes and hi
     ],
     placement: { version: 1, keys: [{ key: app, nodes: ["n1", "n2", "n4"] }, { key: secret, nodes: ["n1"] }] },
   };
-  await writeSetting(d, CACHE_REPORT_KEY, JSON.stringify(stored));
+  await saveWarmReport(d, JSON.stringify(stored));
 
   const all = await cacheReport(d, [], now);
   const placed = all.placement!.find((p) => p.key === app)!;

@@ -8,23 +8,24 @@
 // repos with no taker are recorded for the remote-no-taker health check. Follow-up turns and calls with a pick that counts
 // keep their own rules (calls.ts awaitCall, picks). A call bound to a user (a maintainer's conversation turn) has a taker only
 // in that user's runners.
-import { WRITE_PERMISSIONS } from "../dash/server/provider.ts";
-import { PERM_READ_TTL } from "../dash/server/sessions.ts";
-import { NO_TAKER_PREFIX, pickCounts, pickerLogins, queueSnapshot, roleFits, runnerTakes, withdrawCall } from "./calls.ts";
-import { heldForOwner, readStartedCalls } from "./started.ts";
-import { STATUS_FRESH_MS } from "./helpers.ts";
-import { acceptedModels, familyOf, inferenceMode, isTier } from "./mode.ts";
+import { NO_TAKER_PREFIX } from "./calls.ts";
+import { t, tk } from "../i18n/index.ts";
+import { orderedOf } from "./cands.ts";
+import { pickCounts } from "./picks-rules.ts";
+import { heldForOwner, startedOf } from "./started.ts";
+import { acceptedModels } from "./mode.ts";
 import type { Tier } from "./protocol.ts";
-import { claimRepos } from "./my-repos.ts";
-import { SKIP_TASKS_KEY, TASK_CHOICES, taskOfStep, userSkips } from "./my-tasks.ts";
-import { CALLER_STALE_MS, roomCanWrite } from "./room.ts";
-import { itemFilter, itemsFit, TASK_ITEMS, TASK_ITEMS_KEY, TASK_ITEMS_TITLE, userTaskItems, type ItemFilter, type TaskItems } from "./task-items.ts";
+import { roleFits, runnerTakes } from "./rules.ts";
+import { TASK_CHOICES, taskOfStep } from "./my-tasks.ts";
+import { CALLER_STALE_MS } from "./room.ts";
+import { itemsFit, TASK_ITEMS, TASK_ITEMS_TITLE, type TaskItems } from "./task-items.ts";
 import type { ItemRef } from "../../web/src/api/types.ts";
 import { scaled } from "./time-scale.ts";
-import { filterSeq, mapSeq } from "../async-seq.ts";
-import type { NotNull } from "kysely";
 import type { Db } from "../db/index.ts";
-import * as kx from "../db/kx.ts";
+import { loadSweepState, loadTakerSignature, loadUserSettings, pickerLoginsOf, saveTakerSweep, withdrawGoneCalls } from "../data/runners/index.ts";
+import { canWriteOf, itemFilterIn, loadView, settingsOf, takersIn, type RemoteView, type Runner } from "./view.ts";
+import { itemFilterOf } from "./task-items.ts";
+import { STATUS_FRESH_MS } from "./helpers.ts";
 
 /** How long a queued call may have no taker before it is withdrawn, and a pipeline-on repo before the health check warns. */
 export const NO_TAKER_MS = scaled(10 * 60_000);
@@ -43,83 +44,28 @@ export type TakerCall = {
 
 /**
  * Whether some taker may take a call now, for many questions at one moment (a pool's round, the runner's pass over queued
- * jobs, a sweep): the runners, their repos and permissions are read once, on the first question.
+ * jobs, a sweep): the runners are read once, on the first question.
  */
 export function takerTest(db: Db, nowMs: number): (c: TakerCall) => Promise<boolean> {
   let test: ((c: TakerCall) => boolean) | null = null;
-  return async (c) => (test ??= await readTakers(db, nowMs))(c);
+  return async (c) => (test ??= takerTestIn(await loadView(db, nowMs)))(c);
 }
 
-/** On a runner token `t` joined to its status `h`: the runner may be a taker (fresh, ready, its user not cooling off). */
-const takerExpr = (eb: kx.Eb, nowMs: number) => eb.and([
-  eb("t.kind", "=", "runner"), eb("t.expires_at", ">", new Date(nowMs).toISOString()), eb("h.readiness", "=", "ready"), eb("h.reported_at", ">=", nowMs - STATUS_FRESH_MS),
-  eb.not(eb.exists(kx.schemaEb(eb).selectFrom("main.remote_cooloffs as co").select(eb.lit(1).as("one")).where("co.login", "=", eb.ref("t.login")).where("co.until", ">", nowMs))),
-]);
-
 /**
- * The runners the taker rule reads, in a form that changes only when they or what decides their repos change: each one's
- * login, role, My repos and own repo list. The planner adds it to its input, so work left for want of a taker is planned
- * again when one connects or comes back, without every status report waking the planner. Of write permission it holds the
- * oldest check among their cached non-write permissions that still count (roomCanWrite), so it changes when that one expires.
+ * The runners the taker rule reads, in a form that changes only when they or what decides their repos change (the runners
+ * module's taker signature). The planner adds it to its input, so work left for want of a taker is planned again when one
+ * connects or comes back, without every status report waking the planner.
  */
 export async function takerSignature(db: Db, nowMs: number = Date.now()): Promise<string> {
-  const r = (await db.get(db.k.selectFrom((eb) => eb.selectFrom("main.mcp_tokens as t").innerJoin("main.remote_helpers as h", "h.token_id", "t.id")
-    .leftJoin("main.access as a", "a.login", "t.login")
-    .leftJoin("main.user_settings as us", (j) => j.onRef("us.login", "=", "t.login").on("us.key", "=", "repos"))
-    .leftJoin("main.user_settings as sk", (j) => j.onRef("sk.login", "=", "t.login").on("sk.key", "=", SKIP_TASKS_KEY))
-    .select((e) => [[e.fn<string>("lower", ["t.login"]), e.fn.coalesce("a.role", e.val("")), e.fn.coalesce("us.value", e.val("")), e.fn.coalesce("t.idle_repos", e.val("")), e.fn.coalesce("sk.value", e.val(""))]
-      .reduce((acc, part) => e(e(acc, "||", e.val(":")), "||", part)).as("k")])
-    .distinct().where((e) => takerExpr(e, nowMs)).as("ks"))
-    .select(kx.groupConcat(db, "k", ";", kx.bytewise(db, "k")).as("s"))))!;
-  if (!r.s) return "";
-  const denied = (await db.get(db.k.selectFrom("main.repo_permissions as p").select((eb) => eb.fn.min<string | null>("p.checked_at").as("at"))
-    .where(kx.inList(db, "p.permission", [...WRITE_PERMISSIONS], "text", true)).where("p.checked_at", ">", new Date(nowMs - PERM_READ_TTL).toISOString())
-    .where((eb) => eb("p.login", "in", eb.selectFrom("main.mcp_tokens as t").innerJoin("main.remote_helpers as h", "h.token_id", "t.id").select("t.login").where((e) => takerExpr(e, nowMs))))))!;
-  // A runner that takes only some items is a taker on the repos of those items, which change as items are fast-tracked.
-  const filtered = await mapSeq(await db.all(db.k.selectFrom("main.mcp_tokens as t").innerJoin("main.remote_helpers as h", "h.token_id", "t.id")
-    .innerJoin("main.user_settings as ti", (j) => j.onRef("ti.login", "=", "t.login").on("ti.key", "=", TASK_ITEMS_KEY))
-    .select("t.login").where((eb) => takerExpr(eb, nowMs)).groupBy("t.login").orderBy((eb) => eb.fn("lower", ["t.login"])).orderBy("t.login")),
-    async ({ login }) => `${login.toLowerCase()}=${[...(await itemFilter(db, login))?.repos ?? []].sort().join(",")}`);
-  const s = filtered.length ? `${r.s}|items:${filtered.join(";")}` : r.s;
-  return denied.at ? `${s}|${denied.at}` : s;
+  return await loadTakerSignature(db, nowMs);
 }
 
-type Runner = { tokenId: number; login: string; role: string; repos: ReadonlySet<string> | null; skip: ReadonlySet<string>; items: ItemFilter; /** The tiers its models offer (accepted families). */ tiers: ReadonlySet<Tier> };
-
-/** The takers as the taker rule reads them. */
-async function readRunners(db: Db, nowMs: number): Promise<{ runners: Runner[]; canWrite: (login: string, repo: string) => boolean }> {
-  const rows = await db.all(db.k.selectFrom("main.mcp_tokens as t").innerJoin("main.remote_helpers as h", "h.token_id", "t.id").innerJoin("main.access as a", "a.login", "t.login")
-    .select(["t.id", "t.login", "a.role", "t.idle_repos", "h.models"]).where((eb) => takerExpr(eb, nowMs)));
-  const canWrite = await roomCanWrite(db, rows.map((r) => r.login), nowMs);
-  const accepted = await acceptedModels(db);
-  const runners = await mapSeq(rows, async (h) => {
-    let own: string[] | undefined;
-    try { own = h.idle_repos ? JSON.parse(h.idle_repos) as string[] : undefined; } catch { /* every repo */ }
-    let models: Record<string, unknown> = {};
-    try { models = JSON.parse(h.models) as Record<string, unknown>; } catch { /* no models */ }
-    const tiers = new Set(Object.entries(models).flatMap(([t, m]) => (isTier(t) && typeof m === "string" && familyOf(m, accepted[t]) !== null ? [t] : [])));
-    return { tokenId: Number(h.id), login: h.login, role: h.role, repos: await claimRepos(db, h.login, own), skip: await userSkips(db, h.login), items: await itemFilter(db, h.login), tiers };
-  });
-  return { runners, canWrite };
-}
-
-async function readTakers(db: Db, nowMs: number): Promise<(c: TakerCall) => boolean> {
-  const [{ runners, canWrite }, owner] = await Promise.all([readRunners(db, nowMs), ownerTakes(db, nowMs)]);
+/** The taker rule over one reading of the runners. */
+export function takerTestIn(v: RemoteView): (c: TakerCall) => boolean {
+  const runners = takersIn(v), canWrite = canWriteOf(v.snapshot), owner = startedOf(v);
   return (c) => c.forLogin
     ? runners.some((r) => r.login.toLowerCase() === c.forLogin!.toLowerCase() && (c.tier === undefined || r.tiers.has(c.tier)) && roleFits(r.role, c) && c.repos.every((x) => canWrite(r.login, x)))
-    : runners.some((r) => !(c.someTask && r.skip.size >= TASK_CHOICES.length) && !(c.filtered && !r.items) && runnerTakes(r, c, canWrite)) || owner(c);
-}
-
-/**
- * The taker rule for work a person started or approved (started.ts): one of their Task Runners takes such a call (or a job of a
- * step their live workflow runs, on its repo; StartedCalls.waitersFor) under the role rules and write permission alone, whatever
- * their Manual only, My repos, My tasks and items. Their runner counts while it is offline, not ready or cooling off, so the
- * work waits for it instead of being skipped for want of a taker. It counts as a runner that takes only some items (`filtered`),
- * as the call waits for it.
- */
-async function ownerTakes(db: Db, nowMs: number): Promise<(c: TakerCall) => boolean> {
-  const s = await readStartedCalls(db, nowMs);
-  return (c) => s.waitersFor(c).size > 0;
+    : runners.some((r) => !(c.someTask && r.skip.size >= TASK_CHOICES.length) && !(c.filtered && !r.items) && runnerTakes(r, c, canWrite)) || owner.waitersFor(c).size > 0;
 }
 
 /** Why a person's Task Runner cannot claim now: no fresh report, held for its plan usage, cooling off, or another readiness. */
@@ -130,37 +76,70 @@ export type RunnerHold = "offline" | "usage-limit" | "cooling-off" | "not-ready"
  * people whose started work it is (StartedCalls.waitersFor), none of which may claim it now; with why each one cannot. Empty
  * when a runner may claim it now, or when it has no taker at all.
  */
-export async function waitingOn(db: Db, c: TakerCall, nowMs: number = Date.now()): Promise<{ login: string; hold: RunnerHold }[]> {
-  const [{ runners, canWrite }, s] = await Promise.all([readRunners(db, nowMs), readStartedCalls(db, nowMs)]);
+export async function waitingOn(db: Db, c: TakerCall, nowMs: number = Date.now()): Promise<RunnerWait[]> {
+  return waitingOnIn(await loadView(db, nowMs), c);
+}
+
+/** One person whose Task Runner a call waits for, and why; `until`: for a usage limit, the earliest time one of their runners reported it ends. */
+export type RunnerWait = { login: string; hold: RunnerHold; until: number | null };
+
+export function waitingOnIn(v: RemoteView, c: TakerCall): RunnerWait[] {
+  const runners = takersIn(v), canWrite = canWriteOf(v.snapshot), s = startedOf(v), nowMs = v.now;
   if (runners.some((r) => runnerTakes(r, c, canWrite)) || [...s.ownersFor(c)].some((o) => s.canTake(o, c))) return [];
   const logins = [...s.waitersFor(c)].sort();
-  if (!logins.length) return [];
-  const rows = await db.all(db.k.selectFrom("main.mcp_tokens as t").leftJoin("main.remote_helpers as h", "h.token_id", "t.id").select(["t.login", "h.readiness", "h.reported_at"])
-    .where("t.kind", "=", "runner").where("t.expires_at", ">", new Date(nowMs).toISOString()).where(kx.inList(db, "t.login", logins, "citext")));
-  const cooled = new Set((await db.all(db.k.selectFrom("main.remote_cooloffs").select("login").where("until", ">", nowMs).where(kx.inList(db, "login", logins, "citext")))).map((r) => r.login.toLowerCase()));
   return logins.map((login) => {
-    const fresh = rows.filter((r) => r.login.toLowerCase() === login && r.reported_at !== null && r.reported_at >= nowMs - STATUS_FRESH_MS);
-    const hold: RunnerHold = !fresh.length ? "offline" : fresh.some((r) => r.readiness === "quota-held") ? "usage-limit" : cooled.has(login) || fresh.some((r) => r.readiness === "cooled-off") ? "cooling-off" : "not-ready";
-    return { login, hold };
+    const fresh = v.snapshot.runners.filter((r) => r.login.toLowerCase() === login && r.reportedAt !== null && r.reportedAt >= nowMs - STATUS_FRESH_MS);
+    const hold: RunnerHold = !fresh.length ? "offline" : fresh.some((r) => r.readiness === "quota-held") ? "usage-limit" : v.snapshot.cooled.has(login) || fresh.some((r) => r.readiness === "cooled-off") ? "cooling-off" : "not-ready";
+    const ends = hold === "usage-limit" ? fresh.flatMap((r) => (r.readiness === "quota-held" && r.until !== null && Date.parse(r.until) > nowMs ? [Date.parse(r.until)] : [])) : [];
+    return { login, hold, until: ends.length ? Math.min(...ends) : null };
   });
+}
+
+const HOLD_TEXT: Record<RunnerHold, string> = { offline: tk("offline"), "usage-limit": tk("usage limit"), "cooling-off": tk("cooling off"), "not-ready": tk("not ready") };
+const hhmm = (ms: number): string => new Date(ms).toISOString().slice(11, 16);
+
+/**
+ * The line of work that waits for one person's Task Runner (waitingOnIn, or loginWaitIn's renewal), in the words of the item's state
+ * line (src/workflow/waits.ts). `shown`: the reader may see whose runner it is and why it cannot claim (operators and maintainers);
+ * others read only that it waits for a Task Runner.
+ */
+export function runnerWaitText(w: RunnerWait | { login: string; renewsAt: number }, shown: boolean): string {
+  if (!shown) return t("Waiting for a Task Runner");
+  if ("renewsAt" in w) return t("Waiting for {login}'s Task Runner (login renews at {time} UTC)", { login: w.login, time: hhmm(w.renewsAt) });
+  const why = w.until !== null ? t("{hold} until {time} UTC", { hold: t(HOLD_TEXT[w.hold]), time: hhmm(w.until) }) : t(HOLD_TEXT[w.hold]);
+  return t("Waiting for {login}'s Task Runner ({why})", { login: w.login, why });
+}
+
+/**
+ * The person whose Task Runner a call waits for while its harness login renews, and when it renews: every runner that may take
+ * the call now (a taker, or for started work a runner of its people) left calls at its latest claim for want of room on that login
+ * (RunnerRow.loginRenewsAt, src/remote/calls.ts LOGIN_CUT_MIN_MS); the earliest renewal. Null when some runner may take it
+ * without that wait, or none may.
+ */
+export function loginWaitIn(v: RemoteView, c: TakerCall): { login: string; at: number } | null {
+  const canWrite = canWriteOf(v.snapshot), s = startedOf(v), owners = s.ownersFor(c);
+  const now = takersIn(v).filter((r) => runnerTakes(r, c, canWrite) || (owners.has(r.login.toLowerCase()) && s.canTake(r.login, c)));
+  if (!now.length || now.some((r) => (r.row.loginRenewsAt ?? 0) <= v.now)) return null;
+  const first = now.reduce((a, b) => (b.row.loginRenewsAt! < a.row.loginRenewsAt! ? b : a));
+  return { login: first.login, at: first.row.loginRenewsAt! };
 }
 
 /**
  * Whether a taker other than the runner token `exceptToken` (null: any) may take `c` on `c.tier` now: where a call that a
  * model's safety filter declined can run once more (calls.ts submitCall). A bound call counts only its user's runners.
  */
-export async function tierTaker(db: Db, c: TakerCall & { tier: Tier }, exceptToken: number | null, nowMs: number): Promise<boolean> {
-  const { runners, canWrite } = await readRunners(db, nowMs);
-  return runners.some((r) => r.tokenId !== exceptToken && r.tiers.has(c.tier) && (c.forLogin
+export function tierTaker(v: RemoteView, c: TakerCall & { tier: Tier }, exceptToken: number | null): boolean {
+  const canWrite = canWriteOf(v.snapshot);
+  return takersIn(v).some((r) => r.tokenId !== exceptToken && r.tiers.has(c.tier) && (c.forLogin
     ? r.login.toLowerCase() === c.forLogin.toLowerCase() && roleFits(r.role, c) && c.repos.every((x) => canWrite(r.login, x))
     : runnerTakes(r, c, canWrite)));
 }
 
 /** A key equal for two units exactly when the same users of `logins` take them under their item choices (task-items.ts); "" when none does. */
-async function filterKey(db: Db, logins: readonly string[]): Promise<(refs: readonly { repo: string; number: number }[]) => string> {
-  const filters = (await mapSeq(logins, async (login) => ({ login: login.toLowerCase(), f: await itemFilter(db, login) }))).filter((x) => x.f !== null);
-  if (!filters.length) return () => "";
-  return (refs) => filters.filter(({ f }) => itemsFit(f, { repos: [], refs })).map((x) => x.login).join(",");
+function filterKey(filters: { login: string; f: ReturnType<typeof itemFilterIn> }[]): (refs: readonly { repo: string; number: number }[]) => string {
+  const some = filters.filter((x) => x.f !== null);
+  if (!some.length) return () => "";
+  return (refs) => some.filter(({ f }) => itemsFit(f, { repos: [], refs })).map((x) => x.login).join(",");
 }
 
 /**
@@ -170,18 +149,19 @@ async function filterKey(db: Db, logins: readonly string[]): Promise<(refs: read
  * its user does not take.
  */
 export async function batchKey(db: Db): Promise<(refs: readonly { repo: string; number: number }[]) => string> {
-  return await filterKey(db, (await db.all(db.k.selectFrom("main.user_settings").select("login").where("key", "=", TASK_ITEMS_KEY).orderBy((eb) => eb.fn("lower", ["login"])))).map((r) => r.login));
+  const [settings, v] = await db.together(() => Promise.all([loadUserSettings(db, "all"), loadView(db)]));
+  const logins = [...settings].filter(([, s]) => s.taskItems !== "all").map(([login]) => login).sort();
+  return filterKey(logins.map((login) => ({ login, f: itemFilterOf(v.snapshot.started, login, settings.get(login)!.taskItems) })));
 }
 
 /**
  * For caching room and taker answers by unit: as batchKey, over the users of the fresh, ready runners with an item choice (a
- * superset of the takers and the room's helpers at `nowMs`), so units of one repo share answers when no connected runner filters.
+ * superset of the takers and the room's helpers), so units of one repo share answers when no connected runner filters.
  */
-export async function roomKey(db: Db, nowMs: number = Date.now()): Promise<(refs: readonly { repo: string; number: number }[]) => string> {
-  return await filterKey(db, (await db.all(db.k.selectFrom("main.mcp_tokens as t").innerJoin("main.remote_helpers as h", "h.token_id", "t.id")
-    .innerJoin("main.user_settings as ti", (j) => j.onRef("ti.login", "=", "t.login").on("ti.key", "=", TASK_ITEMS_KEY))
-    .select("t.login").where("t.kind", "=", "runner").where("t.expires_at", ">", new Date(nowMs).toISOString()).where("h.readiness", "=", "ready").where("h.reported_at", ">=", nowMs - STATUS_FRESH_MS)
-    .groupBy("t.login").orderBy((eb) => eb.fn("lower", ["t.login"])).orderBy("t.login"))).map((r) => r.login));
+export function roomKey(v: RemoteView): (refs: readonly { repo: string; number: number }[]) => string {
+  const logins = [...new Set(v.snapshot.runners.filter((r) => r.readiness === "ready" && r.reportedAt !== null && r.reportedAt >= v.now - STATUS_FRESH_MS && settingsOf(v.snapshot, r.login).taskItems !== "all")
+    .map((r) => r.login.toLowerCase()))].sort();
+  return filterKey(logins.map((login) => ({ login, f: itemFilterIn(v.snapshot, login) })));
 }
 
 /**
@@ -196,64 +176,55 @@ export const noTakerReason = (repos: readonly string[], step?: string, items?: r
 
 /** Whether one of `login`'s own Task Runners is a taker for a call bound to them (NewCall.forLogin) on `repos` now. */
 export async function ownTaker(db: Db, login: string, c: { prompt_id: string; repos: readonly string[]; tier: Tier }, nowMs: number = Date.now()): Promise<boolean> {
-  return await takerTest(db, nowMs)({ ...c, forLogin: login });
+  return takerTestIn(await loadView(db, nowMs))({ ...c, forLogin: login });
 }
 
 /** The error of a bound call withdrawn because none of its user's Task Runners is ready: its caller skips the work (NoTakerError). */
 export const noOwnRunnerReason = (login: string): string => `${NO_TAKER_PREFIX} for ${login}: none of their Task Runners is connected and ready`;
 
 /** Why no taker takes a call `takes` says no to: its user's runners for a bound call; else its repos, else its task, else the item choices of the runners that take the rest. */
-async function whyNoTaker(db: Db, nowMs: number, takes: (c: TakerCall) => Promise<boolean>, c: { prompt_id: string; repos: readonly string[]; step: string; forLogin?: string | null }): Promise<string> {
+function whyNoTaker(v: RemoteView, takes: (c: TakerCall) => boolean, c: { prompt_id: string; repos: readonly string[]; step: string; forLogin?: string | null }): string {
   if (c.forLogin) return noOwnRunnerReason(c.forLogin);
-  if (!await takes({ prompt_id: c.prompt_id, repos: c.repos })) return noTakerReason(c.repos);
-  if (!await takes({ prompt_id: c.prompt_id, repos: c.repos, step: c.step })) return noTakerReason(c.repos, c.step);
-  const { runners, canWrite } = await readRunners(db, nowMs);
-  const choices = new Set(await mapSeq(runners.filter((r) => r.items && runnerTakes({ ...r, items: null }, { prompt_id: c.prompt_id, repos: c.repos, step: c.step }, canWrite)), async (r) => await userTaskItems(db, r.login)));
+  if (!takes({ prompt_id: c.prompt_id, repos: c.repos })) return noTakerReason(c.repos);
+  if (!takes({ prompt_id: c.prompt_id, repos: c.repos, step: c.step })) return noTakerReason(c.repos, c.step);
+  const canWrite = canWriteOf(v.snapshot);
+  const choices = new Set(takersIn(v).filter((r: Runner) => r.items && runnerTakes({ ...r, items: null }, { prompt_id: c.prompt_id, repos: c.repos, step: c.step }, canWrite)).map((r) => settingsOf(v.snapshot, r.login).taskItems));
   return noTakerReason(c.repos, c.step, TASK_ITEMS.filter((x): x is Exclude<TaskItems, "all"> => x !== "all" && choices.has(x)));
 }
 
 /**
- * Why no connected Task Runner may take a call of `step` on `repo` now, or null when one may (always null outside the user-local
- * mode). For a request that would otherwise queue work nothing takes.
+ * Why no connected Task Runner may take a call of `step` on `repo` now, or null when one may. For a request that would
+ * otherwise queue work nothing takes.
  */
 export async function noTakerFor(db: Db, repo: string, step: string, nowMs: number = Date.now()): Promise<string | null> {
-  if (await inferenceMode(db) !== "user-local") return null;
-  const takes = takerTest(db, nowMs);
-  if (await takes({ prompt_id: "", repos: [repo], step })) return null;
-  return await whyNoTaker(db, nowMs, takes, { prompt_id: "", repos: [repo], step });
+  const v = await loadView(db, nowMs);
+  const takes = takerTestIn(v);
+  if (takes({ prompt_id: "", repos: [repo], step })) return null;
+  return whyNoTaker(v, takes, { prompt_id: "", repos: [repo], step });
 }
 
 /**
  * One maintenance pass at `nowMs`. Each pipeline-on repo with no taker whose user takes some task keeps the time it was first seen so
  * (remote_no_taker); one with a taker loses it. Each queued call with a live caller that is no follow-up, has no pick
- * that counts and is not held for the user who started its work (started.ts) gets the same mark (no_taker_since), and is withdrawn once the mark is NO_TAKER_MS old. Returns the number of
- * calls withdrawn. Outside the user-local mode the repo marks are cleared.
+ * that counts and is not held for the user who started its work (started.ts) gets the same mark (no_taker_since), and is withdrawn once
+ * the mark is NO_TAKER_MS old. Before that, queued calls whose items all merged or closed are withdrawn (withdrawGoneCalls), so one the sync
+ * did not see close (queued before that rule, say) ends here; their jobs skip the item. One statement, one read wave and one write transaction.
+ * Returns the number of calls withdrawn.
  */
 export async function sweepTakers(db: Db, nowMs: number = Date.now()): Promise<number> {
-  if (await inferenceMode(db) !== "user-local") {
-    await db.run(db.k.deleteFrom("main.remote_no_taker"));
-    return 0;
+  const gone = (await withdrawGoneCalls(db, nowMs)).length;
+  const [st, accepted] = await db.together(() => Promise.all([loadSweepState(db, nowMs), acceptedModels(db)]));
+  const v: RemoteView = { now: nowMs, snapshot: st.snapshot, accepted };
+  const takes = takerTestIn(v), started = startedOf(v), pickers = pickerLoginsOf(st.snapshot, nowMs);
+  const untaken = st.pipelineRepos.filter((repo) => !takes({ prompt_id: "", repos: [repo], someTask: true }));
+  const plan = { insertRepos: untaken, deleteRepos: [...st.noTakerRepos.keys()].filter((r) => !untaken.includes(r)), mark: [] as number[], clear: [] as number[], withdraw: [] as { id: number; reason: string }[] };
+  for (const c of orderedOf(st.queue, nowMs).all) {
+    const since = st.marked.get(c.id);
+    const own = c.parent_id !== null || c.seen_at < nowMs - CALLER_STALE_MS || heldForOwner(started, c, null, nowMs) || pickCounts(c, nowMs, (who) => pickers.has(who));
+    if (own || takes(c)) {
+      if (since !== undefined) plan.clear.push(c.id);
+    } else if (since === undefined) plan.mark.push(c.id);
+    else if (since <= nowMs - NO_TAKER_MS) plan.withdraw.push({ id: c.id, reason: whyNoTaker(v, takes, c) });
   }
-  const takes = takerTest(db, nowMs);
-  const repos = (await db.all(db.k.selectFrom("main.tracked_repos").select("name").where("pipeline", "=", 1))).map((r) => r.name);
-  const untaken = await filterSeq(repos, async (repo) => !await takes({ prompt_id: "", repos: [repo], someTask: true }));
-  await db.run(db.k.deleteFrom("main.remote_no_taker").where(kx.inList(db, "repo", untaken, "text", true)));
-  for (const repo of untaken) await db.run(db.k.insertInto("main.remote_no_taker").values({ repo, since: nowMs }).onConflict((oc) => oc.doNothing()));
-
-  const marked = new Map((await db.all(db.k.selectFrom("main.remote_calls").select(["id", "no_taker_since"]).where("state", "=", "queued").where("no_taker_since", "is not", null)
-    .$narrowType<{ no_taker_since: NotNull }>())).map((r) => [r.id, r.no_taker_since]));
-  const set = async (since: number | null, id: number): Promise<unknown> => await db.run(db.k.updateTable("main.remote_calls").set({ no_taker_since: since }).where("id", "=", id).where("state", "=", "queued"));
-  let pickers: Set<string> | null = null;
-  let withdrawn = 0;
-  const started = await readStartedCalls(db, nowMs);
-  for (const c of await queueSnapshot(db, nowMs)) {
-    const since = marked.get(c.id);
-    const own = c.parent_id !== null || c.seen_at < nowMs - CALLER_STALE_MS || heldForOwner(started, c, null, nowMs)
-      || await pickCounts(c, nowMs, async (who) => (pickers ??= await pickerLogins(db, nowMs)).has(who));
-    if (own || await takes(c)) {
-      if (since !== undefined) await set(null, c.id);
-    } else if (since === undefined) await set(nowMs, c.id);
-    else if (since <= nowMs - NO_TAKER_MS && await withdrawCall(db, c.id, await whyNoTaker(db, nowMs, takes, c), ["queued"], nowMs)) withdrawn++;
-  }
-  return withdrawn;
+  return gone + await saveTakerSweep(db, plan, nowMs);
 }

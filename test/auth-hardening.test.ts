@@ -12,7 +12,7 @@ import { FakeProvider } from "../src/dash/server/provider.ts";
 import { OPERATOR_SESSION_MAX, SESSION_MAX, loadSession } from "../src/dash/server/sessions.ts";
 import { safeReturnTo } from "../src/dash/server/util.ts";
 import { SCRATCH } from "./scratch.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb } from "./helpers/raw-db.ts";
 
 mkdirSync(SCRATCH, { recursive: true });
 const dir = mkdtempSync(join(SCRATCH, "hardening-test-"));

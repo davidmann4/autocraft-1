@@ -5,7 +5,7 @@ import { Link, useNavigate } from "react-router-dom";
 import { Dialog } from "radix-ui";
 import { CheckIcon, CopyIcon, DownloadSimpleIcon, PencilSimpleIcon, PlusIcon, XIcon } from "@phosphor-icons/react";
 import { useApi, usePagedQuery, useQuery } from "../../api/client";
-import type { BuildEnv, EnvTask, BuildSummary, BuildTask, BuildTaskDetail, Capabilities, EnvKind, Requires, TaskBatch, TaskFilter, TaskState } from "../../api/types";
+import type { BuildEnv, EnvTask, BuildTask, BuildTaskDetail, Capabilities, EnvKind, Requires, TaskBatch, TaskFilter, TaskState } from "../../api/types";
 import type { ViewProps } from "../../registry/types";
 import { memSize, nowMs, num, span, eventTime } from "../../lib/format";
 import { TimeAgo } from "../../ui/atoms/TimeAgo";
@@ -665,31 +665,3 @@ export function PhoneEnvs(props: ViewProps) {
 }
 
 /** Queued and running tasks and free slots in the Verify stage's panel (slot flow.panel). */
-export function FlowVerify({ params }: ViewProps) {
-  const q = useQuery<BuildSummary>("build-summary", (a) => a.tasks.summary(), { pollMs: 30_000 });
-  if (params.node !== "verify") return null;
-  const s = q.data;
-  return (
-    <section className="border-t border-line px-4 py-3">
-      <div className="mb-1.5 flex flex-wrap items-baseline gap-x-2">
-        <h3 className="text-xs font-semibold text-ink/60">Build environments</h3>
-        <Link to="/envs" className="ml-auto text-xs text-accent-ink hover:underline">
-          Build environments page
-        </Link>
-      </div>
-      <ErrorLine error={q.error?.message} />
-      {s && (
-        <dl className="num grid grid-cols-[max-content_1fr] gap-x-4 gap-y-1 text-sm">
-          <dt className="text-ink/55">Queued</dt>
-          <dd>{num(s.queued)} tasks</dd>
-          <dt className="text-ink/55">Running</dt>
-          <dd>{num(s.running)} tasks</dd>
-          <dt className="text-ink/55">Free slots</dt>
-          <dd>{s.online === 0 ? "no environment is online" : `${num(s.free)} of ${num(s.slots)} on ${s.online} online`}</dd>
-        </dl>
-      )}
-      <p className="mt-2 text-xs text-ink/50">Verify itself is planned; no step queues tasks yet.</p>
-    </section>
-  );
-}
-

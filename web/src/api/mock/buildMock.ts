@@ -251,11 +251,6 @@ export function createBuildMock(me: User, changed: () => void): Pick<Api, "envs"
         changed();
         return wait(t, 30);
       },
-      summary() {
-        const online = envs.filter((e) => e.enabled && e.online);
-        const slots = online.reduce((s, e) => s + e.slots, 0);
-        return wait({ queued: TASKS.filter((t) => t.state === "queued").length, running: TASKS.filter((t) => t.state === "running" || t.state === "claimed").length, slots, free: slots - online.reduce((s, e) => s + e.running, 0), online: online.length });
-      },
     },
   };
 }

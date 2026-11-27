@@ -9,6 +9,7 @@
 // neither starts a second session in the workspace nor repeats a settled turn or checks.
 import { createHash } from "node:crypto";
 import type { Db } from "../db/index.ts";
+import { loadEnvs } from "../data/build/index.ts";
 import { createWorkspace, getWorkspace, LIVE_STATES, resumeWorkspace, type WorkspaceStateName } from "../build/workspaces.ts";
 import { READY_LIMIT_MS } from "../build/workspace-launch.ts";
 import { guardedApi, inClusterApi, type KubeApi } from "../build/kube-api.ts";
@@ -24,8 +25,8 @@ import {
   settleOrphan, summaryFixTurn, type CallDeps, type TurnRequest, type TurnRound,
 } from "./session.ts";
 import { applyStuckAnswer, markStuck, opensAsDraft, type DiffCheck, type StuckCause } from "./stuck.ts";
-import { addRound, currentImplementation, implementationById, roundsOf, setImplementationState, updateImplementation } from "./store.ts";
-import { BUILD_STATES, type Implementation, type ImplementationRound, type SessionReport } from "./types.ts";
+import { attemptNow, currentAttempt, roundOf, writeStep, type Attempt, type NewRound } from "./attempt.ts";
+import { BUILD_STATES, type Implementation, type ImplementationPatch, type ImplementationRound, type ImplementationState, type SessionReport } from "./types.ts";
 
 /** Follow-up turns with the checks' findings before the attempt is stuck (D6). */
 export const FOLLOW_UP_ROUNDS = 3;
@@ -64,7 +65,7 @@ export type OpenPr = (run: BuildRun, impl: Implementation, o: { draft: boolean; 
 export type BuildDeps = {
   calls: CallDeps;
   pod(db: Db, workspaceId: number, cancelled: () => Promise<boolean>): Pod;
-  /** Whether the change passes the PR step's diff check, for the stuck decision's Open as draft PR. */
+  /** Whether the change passes the PR step's diff check, for the stuck blocker's Open as draft PR. */
   diffCheck: DiffCheck;
   /** Opens the PR (the PR step). Absent: a clean attempt waits in `opening`. */
   openPr?: OpenPr;
@@ -137,21 +138,20 @@ class Stuck extends Error {
  * attempt's changes: the same write moves the attempt back to `planned` and adds the `workspace` round that ends the turns
  * and checks of the lost one.
  */
-async function readyWorkspace(run: BuildRun, impl: Implementation): Promise<{ wsId: number; base: string }> {
+async function readyWorkspace(run: BuildRun, impl: Implementation): Promise<{ wsId: number; base: string; impl: Implementation }> {
   const db = run.db;
   const make = async (envId: string, why: string): Promise<number> => {
     if (!impl.baseSha) throw new Stuck("workspace-lost", "the attempt has no base commit");
     const id = await db.write(async () => {
       const id = await createWorkspace(db, { repo: impl.repo, baseSha: impl.baseSha!, envId, limits: { deadlineSec: WORKSPACE_DEADLINE_SEC }, owner: `implementation ${impl.id}` });
-      await addRound(db, impl.id, "workspace", { result: { workspaceId: id, reason: why } });
-      await setImplementationState(db, impl.id, "planned", { workspaceId: id, sessionCallId: null });
+      impl = (await step(db, impl, { to: "planned", patch: { workspaceId: id, sessionCallId: null }, rounds: [{ kind: "workspace", result: { workspaceId: id, reason: why } }] })).impl;
       return id;
     });
     run.log(`${ref(impl)}: workspace ${id} requested (${why}); the session starts over from the plan`);
     return id;
   };
   const envOf = async (wsId: number | null): Promise<string> => (wsId !== null ? (await getWorkspace(db, wsId))?.env_id : undefined)
-    ?? (await db.get(db.k.selectFrom("build_envs").select("id").where("kind", "=", "kubernetes").where("enabled", "=", 1).orderBy("id").limit(1)))?.id
+    ?? (await loadEnvs(db, { kind: "kubernetes", enabled: true })).map((e) => e.id).sort()[0]
     ?? (() => { throw new Stuck("workspace-lost", "no kubernetes environment is set up for workspaces"); })();
   let wsId = impl.workspaceId, remade = false;
   const live = async (id: number | null) => id !== null && LIVE_STATES.includes((await getWorkspace(db, id))?.state as WorkspaceStateName);
@@ -163,7 +163,7 @@ async function readyWorkspace(run: BuildRun, impl: Implementation): Promise<{ ws
     const w = await getWorkspace(db, wsId!);
     let gone: string | null = null;
     if (!w) gone = "is gone";
-    else if (w.state === "ready") return { wsId: wsId!, base: w.base_commit && SHA.test(w.base_commit) ? w.base_commit : impl.baseSha ?? w.base_sha };
+    else if (w.state === "ready") return { wsId: wsId!, base: w.base_commit && SHA.test(w.base_commit) ? w.base_commit : impl.baseSha ?? w.base_sha, impl };
     else if (w.state === "parked" && !await resumeWorkspace(db, wsId!)) gone = `is parked and could not be resumed${w.error ? `: ${w.error}` : ""}`;
     else if (!LIVE_STATES.includes(w.state as WorkspaceStateName)) gone = `is ${w.state}${w.error ? `: ${w.error}` : ""}`;
     else if (Date.now() - from > READY_LIMIT_MS) gone = `was not ready within ${Math.round(READY_LIMIT_MS / 60_000)} min`;
@@ -236,7 +236,7 @@ async function nextTurn(run: BuildRun, impl: Implementation, ws: { base: string 
 async function turnPhase(run: BuildRun, deps: BuildDeps, impl: Implementation, ws: { wsId: number; base: string }, pod: Pod): Promise<Implementation> {
   const db = run.db;
   for (let n = 0;;) {
-    const rounds = epochOf(await roundsOf(db, impl.id));
+    const rounds = epochOf(await roundsNow(db, impl));
     const turns = turnsOf(rounds);
     const last = turns.at(-1);
     let round: ImplementationRound;
@@ -250,11 +250,10 @@ async function turnPhase(run: BuildRun, deps: BuildDeps, impl: Implementation, w
       if ("finish" in next) {
         const { report, callId } = next.finish;
         if (report.status === "blocked") {
-          await updateImplementation(db, impl.id, { report, sessionCallId: callId });
+          impl = (await step(db, impl, { patch: { report, sessionCallId: callId } })).impl;
           throw needsDependency(report) ? new Stuck("needs-dependency", report.blocked_reason ?? "") : new Stuck("blocked", report.blocked_reason ?? "");
         }
-        await setImplementationState(db, impl.id, "checking", { report, sessionCallId: callId });
-        return (await implementationById(db, impl.id))!;
+        return (await step(db, impl, { to: "checking", patch: { report, sessionCallId: callId } })).impl;
       }
       if (n >= TURNS_PER_JOB) {
         run.log(`${ref(impl)}: ${TURNS_PER_JOB} turns in this job; the next job goes on`);
@@ -264,10 +263,9 @@ async function turnPhase(run: BuildRun, deps: BuildDeps, impl: Implementation, w
       const t = next.turn;
       round = await db.write(async () => {
         const q = await queueTurn(db, deps.calls, { impl, workspaceId: ws.wsId, ...t });
-        await setImplementationState(db, impl.id, impl.state === "fixing" ? "fixing" : "implementing", { sessionCallId: q.callId });
+        impl = (await step(db, impl, { to: impl.state === "fixing" ? "fixing" : "implementing", patch: { sessionCallId: q.callId } })).impl;
         return q;
       });
-      impl = (await implementationById(db, impl.id))!;
       run.log(`${ref(impl)}: turn ${round.callId} (${t.purpose}) queued for ${impl.queuedBy}'s Task Runner${t.parentId !== undefined ? `, on the session of call ${t.parentId}` : ""}`);
     }
     n++;
@@ -279,7 +277,7 @@ async function turnPhase(run: BuildRun, deps: BuildDeps, impl: Implementation, w
 /** Runs the checks and moves the attempt on: to opening when clean, fixing with findings, or stuck. */
 async function checksPhase(run: BuildRun, impl: Implementation, ws: { base: string }, pod: Pod): Promise<{ impl: Implementation; line: string }> {
   const db = run.db;
-  const all = await roundsOf(db, impl.id);
+  const all = await roundsNow(db, impl);
   const rounds = epochOf(all);
   const lastTurn = turnsOf(rounds).at(-1);
   // Checks a restart cut off after they were stored count once: their rounds are the turn's result.
@@ -294,10 +292,10 @@ async function checksPhase(run: BuildRun, impl: Implementation, ws: { base: stri
     round++;
     await run.progress(`${ref(impl)}: checks, round ${round}`);
     const r = await runChecks(pod, { dir: roundDir(impl.id, round), base: ws.base, round });
-    await db.write(async () => {
-      await addRound(db, impl.id, "checks", { result: r });
-      await updateImplementation(db, impl.id, { diffStat: r.diffStat });
-    });
+    const at = new Date().toISOString();
+    const w = await step(db, impl, { patch: { diffStat: r.diffStat }, rounds: [{ kind: "checks", result: r }], at });
+    impl = w.impl;
+    all.push(roundOf(impl.id, w.roundIds[0]!, { kind: "checks", result: r }, at));
     since.push(r);
     c = r;
     run.log(`${ref(impl)}: checks round ${round}: ${c.diffStat}; ${c.findings.length} findings${c.notes.length ? `; ${c.notes.join("; ")}` : ""}`);
@@ -306,13 +304,11 @@ async function checksPhase(run: BuildRun, impl: Implementation, ws: { base: stri
   if (c.needsDependency) throw new Stuck("needs-dependency", "cargo could not resolve a dependency offline");
   if (c.clean) {
     if (c.diffStat === "no changes") throw new Stuck("no-change", "");
-    await setImplementationState(db, impl.id, "opening");
-    return { impl: (await implementationById(db, impl.id))!, line: `checks clean (${c.diffStat})` };
+    return { impl: (await step(db, impl, { to: "opening" })).impl, line: `checks clean (${c.diffStat})` };
   }
-  const failing = checksOf(epochOf(await roundsOf(db, impl.id))).filter((x) => !x.clean && !(x.noVerdict ?? []).length).length;
+  const failing = checksOf(epochOf(all)).filter((x) => !x.clean && !(x.noVerdict ?? []).length).length;
   if (failing > FOLLOW_UP_ROUNDS) throw new Stuck("checks-failing", `${c.findings.length} findings, first: ${c.findings[0]?.message ?? ""}`);
-  await setImplementationState(db, impl.id, "fixing");
-  return { impl: (await implementationById(db, impl.id))!, line: `checks round ${round}: ${c.findings.length} findings; a follow-up turn is next` };
+  return { impl: (await step(db, impl, { to: "fixing" })).impl, line: `checks round ${round}: ${c.findings.length} findings; a follow-up turn is next` };
 }
 
 /** Hands a clean attempt to the PR step. */
@@ -320,35 +316,38 @@ async function openingPhase(run: BuildRun, deps: BuildDeps, impl: Implementation
   const db = run.db;
   if (run.noPr) return "ready for its PR; not opened (--no-pr)";
   if (!deps.openPr) return "ready for its PR; opening it is not available, so it waits";
-  const rounds = epochOf(await roundsOf(db, impl.id));
+  const all = await roundsNow(db, impl);
+  const rounds = epochOf(all);
   const checks = checksOf(rounds).at(-1) ?? null;
-  // A draft is the stuck decision's answer: it opens the change as it is, whatever the checks found.
-  const draft = await opensAsDraft(db, impl);
+  // A draft is the answer to the stuck blocker: it opens the change as it is, whatever the checks found.
+  const draft = opensAsDraft(all);
   if (!draft && !checks?.clean) throw new Stuck("checks-failing", "the attempt reached the PR step without clean checks");
   const r = await deps.openPr(run, impl, { draft, checks });
   if (r.ok) return `PR ${r.url}`;
-  // The attempt left opening while the PR step ran (a cancel or a stuck decision): that state stands.
+  // The attempt left opening while the PR step ran (a cancel or a stuck blocker): that state stands.
   if (r.stale) return r.reason;
   if (r.recheck) {
-    await setImplementationState(db, impl.id, "checking");
+    await step(db, impl, { to: "checking" });
     return `${r.reason}; the checks run again`;
   }
   if (r.problems?.length) {
     // One turn to undo what the diff check refused (D7); a second refusal is stuck.
     if (rounds.some(isDiffRefusal)) throw new Stuck("diff-refused", r.problems.slice(0, 3).join("; "));
-    await addRound(db, impl.id, "refusal", { result: { kind: "diff", reason: r.reason, problems: r.problems } });
-    await setImplementationState(db, impl.id, "fixing");
+    await step(db, impl, { to: "fixing", rounds: [{ kind: "refusal", result: { kind: "diff", reason: r.reason, problems: r.problems } }] });
     return `the diff check refused the change (${r.reason}); an undo turn is next`;
   }
   if (r.retry) {
-    await addRound(db, impl.id, "refusal", { result: { kind: "push", reason: r.reason } });
-    const tail = [...(await roundsOf(db, impl.id))].reverse();
+    // Unguarded, as the attempt may have left opening: the refusal is on record either way.
+    const refusal: NewRound = { kind: "refusal", result: { kind: "push", reason: r.reason } };
+    const at = new Date().toISOString();
+    const w = await writeStep(db, impl, { rounds: [refusal], at });
+    const tail = [...all, roundOf(impl.id, w!.roundIds[0]!, refusal, at)].reverse();
     const streak = tail.findIndex((x) => !(x.kind === "refusal" && (x.result as { kind?: string })?.kind === "push"));
     if ((streak < 0 ? tail.length : streak) >= PUSH_FAILURES_MAX) throw new Stuck("push-failed", r.reason);
     return `the PR was not opened (${r.reason}); the next run tries again`;
   }
   if (/issue is closed/.test(r.reason)) {
-    await setImplementationState(db, impl.id, "closed", { reason: r.reason });
+    await step(db, impl, { to: "closed", patch: { reason: r.reason } });
     return r.reason;
   }
   throw new Stuck("push-failed", r.reason);
@@ -356,27 +355,27 @@ async function openingPhase(run: BuildRun, deps: BuildDeps, impl: Implementation
 
 /** One unit of the build bucket for the issue's current attempt: the job's summary line, and whether anything moved. */
 export async function runBuild(run: BuildRun, repo: string, number: number, deps: BuildDeps = defaultBuildDeps()): Promise<{ summary: string; moved: boolean }> {
-  const before = await currentImplementation(run.db, repo, number);
-  const summary = await buildUnit(run, repo, number, deps);
-  const after = before ? await implementationById(run.db, before.id) : null;
-  const moved = !!before && (after?.state !== before.state || after?.updatedAt !== before.updatedAt);
+  const before = await currentAttempt(run.db, repo, number);
+  const summary = await buildUnit(run, before, deps);
+  const after = before ? (await attemptNow(run.db, before.impl))?.impl : null;
+  const moved = !!before && (after?.state !== before.impl.state || after?.updatedAt !== before.impl.updatedAt);
   return { summary, moved };
 }
 
-async function buildUnit(run: BuildRun, repo: string, number: number, deps: BuildDeps): Promise<string> {
+async function buildUnit(run: BuildRun, cur: Attempt | null, deps: BuildDeps): Promise<string> {
   const db = run.db;
-  let impl = await currentImplementation(db, repo, number);
-  if (!impl) return `${repo}#${number}: no current implementation`;
+  if (!cur) return "no current implementation";
+  let impl = cur.impl;
   try {
     if (impl.state === "stuck") {
-      const o = await applyStuckAnswer(db, impl);
+      const o = await applyStuckAnswer(db, cur);
       return `${ref(impl)}: ${o ? o.did : "stuck; no answer to carry out"}`;
     }
     if (!BUILD_STATES.has(impl.state)) return `${ref(impl)}: ${impl.state}; nothing to build`;
     if (!impl.plan) throw new Stuck("plan-unparseable", "the attempt has no stored plan");
     // The PR step reads the change out of the workspace, so it waits for the workspace like a turn does.
     const ws = await readyWorkspace(run, impl);
-    impl = (await implementationById(db, impl.id))!;
+    impl = ws.impl;
     if (impl.state === "opening") return `${ref(impl)}: ${await openingPhase(run, deps, impl)}`;
     const pod = deps.pod(db, ws.wsId, run.cancelled);
     if (impl.state !== "checking") {
@@ -388,9 +387,30 @@ async function buildUnit(run: BuildRun, repo: string, number: number, deps: Buil
     if (c.impl.state !== "opening") return `${ref(impl)}: ${c.line}`;
     return `${ref(impl)}: ${c.line}; ${await openingPhase(run, deps, c.impl)}`;
   } catch (e) {
+    if (e instanceof Left) return `${ref(impl)}: ${e.message}`;
     if (!(e instanceof Stuck)) throw e;
-    const now = (await implementationById(db, impl.id))!;
-    const id = await markStuck(db, now, e.cause_, e.message || null, { diffCheck: deps.diffCheck });
-    return `${ref(impl)}: stuck (${e.cause_}${e.message ? `: ${e.message}` : ""}); decision ${id}`;
+    const now = (await attemptNow(db, impl))?.impl ?? impl;
+    await markStuck(db, now, e.cause_, e.message || null, { diffCheck: deps.diffCheck });
+    return `${ref(impl)}: stuck (${e.cause_}${e.message ? `: ${e.message}` : ""})`;
   }
+}
+
+/** The attempt left the build states meanwhile: nothing more is written. */
+class Left extends Error {}
+
+/**
+ * Writes a step of the attempt while it is in a build state; one that left them meanwhile (a cancel) stops the unit, as a
+ * re-read of the row did.
+ */
+async function step(db: Db, impl: Implementation, o: { to?: ImplementationState; patch?: ImplementationPatch; rounds?: NewRound[]; at?: string }): Promise<{ impl: Implementation; roundIds: number[] }> {
+  const w = await writeStep(db, impl, { ...o, expect: [...BUILD_STATES] });
+  if (!w) throw new Left(`it left ${impl.state} meanwhile; nothing more is written`);
+  return w;
+}
+
+/** The attempt's rounds as stored now. */
+async function roundsNow(db: Db, impl: Implementation): Promise<ImplementationRound[]> {
+  const a = await attemptNow(db, impl);
+  if (!a) throw new Left("a newer attempt started meanwhile");
+  return a.rounds;
 }

@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { audit } from "./dash/audit.ts";
 import { dataDir } from "./db.ts";
 import { isTracked } from "./repos.ts";
-import { buildReferenceIndex, referenceSearch } from "./reference-search.ts";
+import { buildReferenceIndex, referenceSearch } from "./data/external/index.ts";
 import { isInstructionPath } from "./sandbox/instruction-paths.ts";
 import type { Db } from "./db/index.ts";
 import { openDb } from "./db/open.ts";

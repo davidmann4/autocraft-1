@@ -1,6 +1,5 @@
-// The runner's helper thread: runs `plan` (autopilot detection) and `flow` (flowchart summary
-// refresh) off the runner's polling loop. One worker, started on first use and kept, so its
-// connection and caches stay warm; tasks queue in it one at a time.
+// The runner's helper thread: runs `plan` (autopilot detection) off the runner's polling loop. One worker,
+// started on first use and kept, so its connection and caches stay warm; tasks queue in it one at a time.
 import { Worker } from "node:worker_threads";
 import type { Detected } from "./autopilot.ts";
 import type { WorkerReply, WorkerTask } from "./worker.ts";
@@ -50,10 +49,6 @@ export class OffThread {
 
   plan(nowMs?: number): Promise<Detected> {
     return this.call<Detected>({ task: "plan", ...(nowMs === undefined ? {} : { nowMs }) });
-  }
-
-  flow(budgetMs?: number): Promise<string[]> {
-    return this.call<string[]>({ task: "flow", ...(budgetMs === undefined ? {} : { budgetMs }) });
   }
 
   async close(): Promise<void> {

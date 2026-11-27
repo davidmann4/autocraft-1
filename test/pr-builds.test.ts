@@ -3,11 +3,10 @@ import { test } from "node:test";
 import { claim } from "../src/build/tasks.ts";
 import { createEnv, hello } from "../src/build/envs.ts";
 import { setFeature } from "../src/build/features.ts";
-import { collectPrBuilds, prBuildDue, runPrBuilds } from "../src/prbuild/index.ts";
+import { collectPrBuilds, prBuildsDue, runPrBuilds } from "../src/prbuild/index.ts";
 import { selectPrBuilds, setPerDay, setScope } from "../src/prbuild/select.ts";
 import { prBuildView } from "../src/prbuild/view.ts";
-import type { Db } from "../src/db/index.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb, type Db } from "./helpers/raw-db.ts";
 import { cols } from "../src/db/kx.ts";
 
 const sha = (c: string) => c.repeat(40);
@@ -31,14 +30,14 @@ async function setup() {
 
 test("nothing is queued while the switch is off; on, only the outside PR of a public repo is built, and scope all adds the insider's", async () => {
   const { db, tasks } = await setup();
-  assert.equal(await prBuildDue(db, "app"), false);
+  assert.deepEqual(await prBuildsDue(db, ["app"]), []);
   assert.equal((await runPrBuilds(db, "app", () => {}, noFetch)).queued, 0);
   assert.equal((await tasks()).length, 0);
   assert.equal((await db.get(db.k.selectFrom("pr_builds").select((eb) => eb.fn.countAll<number>().as("n"))))!.n, 0);
 
   await setFeature(db, "pr-builds", true, "op", "app");
   await setFeature(db, "pr-builds", true, "op", "vault");
-  assert.equal(await prBuildDue(db, "app"), true);
+  assert.deepEqual(await prBuildsDue(db, ["app"]), ["app"]);
   assert.equal((await runPrBuilds(db, "vault", () => {}, noFetch)).queued, 0, "private repo");
   assert.equal((await runPrBuilds(db, "app", () => {}, noFetch)).queued, 1);
   const [t, ...rest] = await tasks();
@@ -133,7 +132,7 @@ test("a failure that CI later contradicts is noted once, when CI turns green", a
   await db.run(db.k.updateTable("build_tasks").set({ state: "failed", results: JSON.stringify([{ step: "fetch deps", exitCode: 0, durationMs: 1, timedOut: false }, { step: "build", exitCode: 1, durationMs: 1, timedOut: false }]) }));
   assert.equal((await collectPrBuilds(db, "app", () => {})).disagreements, 0);
   await db.run(db.k.insertInto("pr_checks").values({ repo: "app", number: 1, head_oid: sha("a"), overall: "success", checks: "[]", fetched_at: "2099-01-01T00:00:00Z" }));
-  assert.equal(await prBuildDue(db, "app"), true);
+  assert.deepEqual(await prBuildsDue(db, ["app"]), ["app"]);
   assert.equal((await collectPrBuilds(db, "app", () => {})).disagreements, 1);
   assert.equal((await collectPrBuilds(db, "app", () => {})).disagreements, 0);
   assert.equal((await prBuildView(db, "app", 1, sha("a"), true))?.disagree, true);

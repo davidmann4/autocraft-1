@@ -3,57 +3,52 @@
 // maintainers also see override notes. The access list and every write here
 // are for operators. The server has already checked the Origin, the CSRF
 // header and the body size on POSTs.
-import { filtered, isHiddenRepo, type HiddenRepos } from "../../hidden-sql.ts";
+import { filtered, isHiddenRepo, listAuditPage, loadStepApprovals, loadTrackedRepos, setPipelineFlags, type HiddenRepos } from "../../data/control/index.ts";
+import { endSessionById, listSessions, loadOverrides } from "../../data/access/index.ts";
 import { mayRunRepo } from "../repo-access.ts";
 import type {
-  AccessOverview, AuditEntry, AuditPage, Contributor, ContributorList, ContributorSort, RulePreview, RepoApproval, RepoLabels, Tier, TrackedRepo, WhitelistRule,
+  AccessOverview, AuditEntry, AuditPage, Contributor, ContributorList, ContributorSort, RulePreview, RepoApproval, Tier, TrackedRepo, WhitelistRule,
 } from "../../../web/src/api/types.ts";
 import { AccessError, addLogin, getAccess, isRole, LOGIN, listAccess, removeLogin, ROLES, setRole } from "../../access.ts";
-import { approvalOf, setApproval } from "../../labels/approval.ts";
-import { commentApprovalOf, setCommentApproval } from "../../act/approval.ts";
-import { pushApprovalOf, setPushApproval } from "../../fixup/approval.ts";
-import { fixIssueApprovalOf, setFixIssueApproval } from "../../implement/approval.ts";
-import { mergeApprovalOf, setMergeApproval } from "../../merge/approval.ts";
-import { ciApprovalOf, setCiApproval } from "../../merge/ci-approval.ts";
-import { optionalChecks, seenChecks, setOptionalCheck } from "../../optional-checks.ts";
-import { mainFixApprovalOf, setMainFixApproval } from "../../mainfix/approval.ts";
-import { setStatusApproval, statusApprovalOf } from "../../prstatus/approval.ts";
+import { setApproval } from "../../labels/approval.ts";
+import { setCommentApproval } from "../../act/approval.ts";
+import { setPushApproval } from "../../fixup/approval.ts";
+import { setFixIssueApproval } from "../../implement/approval.ts";
+import { setMergeApproval } from "../../merge/approval.ts";
+import { setCiApproval } from "../../merge/ci-approval.ts";
+import { optionalChecksOf, seenChecksOf, setOptionalCheck } from "../../optional-checks.ts";
+import { setMainFixApproval } from "../../mainfix/approval.ts";
+import { setStatusApproval } from "../../prstatus/approval.ts";
 import { setWorkspaceExcluded, workspaceExcluded } from "../../sandbox/workspace.ts";
 import { setSingleMergeMax, singleMergeMax } from "../../merge/single.ts";
-import { setRepoPipeline } from "../../pilot.ts";
-import { featureOn, isFeature, shownFeatures, type BuildFeature } from "../../build/features.ts";
+import { isFeature, repoSwitches, shownFeatures } from "../../build/features.ts";
 import { switchFeature } from "./build.ts";
-import { countPlan, planLabels } from "../../labels/plan.ts";
-import { listAll, RepoError, type RepoRow, trackRepoChecked, untrackRepo } from "../../repos.ts";
+import { countPlan, planLabelsOf } from "../../labels/plan.ts";
+import { listAll, RepoError, trackRepoChecked, untrackRepo } from "../../repos.ts";
 import { contributors, getRule, OVERRIDE_LOGIN, setOverride, setRule, tierOf, type Contributor as Row, type Rule } from "../../whitelist.ts";
 import { audit } from "../audit.ts";
 import { dropSessionTokens } from "../server/user-tokens.ts";
-import { sessionEndsAt } from "../server/sessions.ts";
 import { endTokens, listAllTokens, revokeAnyToken } from "../mcp/tokens.ts";
 import { HttpError } from "../server/util.ts";
-import type { Req, Role } from "../types.ts";
+import type { Req } from "../types.ts";
+import type { Step } from "../../data/control/types.ts";
 import { hiddenRepos, visibleRepos } from "./visible.ts";
-import { pipelineState } from "../../runner/autopilot.ts";
-import { PilotError, setPilot } from "../../pilot.ts";
 import { canSeeInternals } from "./staff.ts";
-import { mapLimit, mapSeq } from "../../async-seq.ts";
 import type { Db } from "../../db/index.ts";
-import * as kx from "../../db/kx.ts";
-import type { Expression, SqlBool } from "kysely";
-import { setting } from "../../settings-read.ts";
+import { setting } from "../../data/control/index.ts";
 
 const NOTE_MAX = 300;
 const ACCESS_NOTE_MAX = 500;
 const AUDIT_PAGE = 50;
-// Accounts and access (who can sign in, sessions, the Claude accounts) are audited for operators only.
-export const operatorOnly = (a: string) => a.startsWith("access-") || a.startsWith("github-app-") || a.startsWith("github-mention-") || a.startsWith("app-") || a.startsWith("account-") || a.startsWith("mcp-token-") || a.startsWith("runner-") || ["session-revoke", "sign-in", "sign-in-refused", "usage-reserve", "my-repos", "max-calls", "interactive-slots", "manual-only"].includes(a);
+// Accounts and access (who can sign in, sessions) are audited for operators only.
+export const operatorOnly = (a: string) => a.startsWith("access-") || a.startsWith("github-app-") || a.startsWith("github-mention-") || a.startsWith("app-") || a.startsWith("account-") || a.startsWith("mcp-token-") || a.startsWith("runner-") || ["session-revoke", "sign-in", "sign-in-refused", "usage-reserve", "my-repos", "max-calls", "interactive-slots", "manual-only", "transcript-store"].includes(a);
 export const AUDIT_ACTIONS = [
   "answer", "undo", "dispute", "dispute-resolve", "answer-sweep", "adopt", "opinion", "opinion-retract", "comment", "override", "rule", "access-add", "access-remove", "access-role",
-  "session-revoke", "mcp-token-create", "mcp-token-revoke", "app-owner-allow", "app-owner-remove", "app-install-removed", "app-foreign-install-ack", "runner-migrate", "runner-approve", "runner-deny", "runner-revoke", "runner-scopes", "usage-reserve", "my-repos", "max-calls", "interactive-slots", "manual-only", "runner-private", "remote-pick", "remote-unpick", "remote-pick-minutes", "sign-in", "sign-in-refused", "account-add", "account-change", "account-login-start", "account-login-code", "account-login-cancel", "account-token-start", "account-token-code", "account-token-cancel", "account-token-set", "account-token-remove", "account-sign-out", "account-refresh", "repo-track", "repo-untrack", "reference-import", "labels-approve", "labels-revoke", "labels-apply", "merge-approve", "merge-revoke", "comment-approve", "comment-revoke", "act-comment", "act-close", "act-reopen", "act-open-issue", "discord-issue-open", "discord-issue-bot", "discord-issue-label", "act-unlabel", "act-transfer", "act-request-reviewers", "act-skip", "push-approve", "push-revoke", "fixup-push", "fixup-comment", "fixup-comment-edit", "fixissue-approve", "fixissue-revoke", "prstatus-approve", "prstatus-revoke", "pr-status-comment", "pr-status-comment-edit", "mainfix-approve", "mainfix-revoke", "optional-check-add", "optional-check-remove", "fixissue-push", "fixissue-pr", "fixissue-comment", "implement-push", "implement-pr", "implement-comment",
+  "session-revoke", "mcp-token-create", "mcp-token-revoke", "app-owner-allow", "app-owner-remove", "app-install-removed", "webhook-redeliver", "app-foreign-install-ack", "runner-migrate", "runner-approve", "runner-deny", "runner-revoke", "runner-scopes", "usage-reserve", "my-repos", "max-calls", "interactive-slots", "manual-only", "runner-private", "remote-pick", "remote-unpick", "remote-pick-minutes", "sign-in", "sign-in-refused", "account-add", "account-change", "account-login-start", "account-login-code", "account-login-cancel", "account-token-start", "account-token-code", "account-token-cancel", "account-token-set", "account-token-remove", "account-sign-out", "account-refresh", "repo-track", "repo-untrack", "reference-import", "labels-approve", "labels-revoke", "labels-apply", "merge-approve", "merge-revoke", "comment-approve", "comment-revoke", "act-comment", "act-close", "act-reopen", "act-open-issue", "discord-issue-open", "discord-issue-bot", "discord-issue-label", "act-unlabel", "act-transfer", "act-request-reviewers", "act-skip", "push-approve", "push-revoke", "fixup-push", "fixup-comment", "fixup-comment-edit", "fixissue-approve", "fixissue-revoke", "prstatus-approve", "prstatus-revoke", "pr-status-comment", "pr-status-comment-edit", "mainfix-approve", "mainfix-revoke", "optional-check-add", "optional-check-remove", "fixissue-push", "fixissue-pr", "fixissue-comment", "implement-push", "implement-pr", "implement-comment",
   "job-request", "job-cancel", "security-scan-start", "security-scan-stop", "security-finding-dismiss", "security-finding-backlog", "security-finding-reopen", "security-finding-fix", "security-finding-land", "security-finding-advisory", "security-finding-publish", "security-land-push", "security-land", "security-land-opened", "security-landed", "security-advisory", "security-advisory-fork", "security-advisory-push", "security-advisory-pr", "security-advisory-ready", "security-publish", "security-published", "security-cve", "pipeline-switch", "stage-limit", "limit-reset", "pilot-set", "pilot-clear", "repo-pipeline", "github-identity", "review-post", "review-edit", "batch-again", "reopen", "backlog-bulk", "withdraw",
   "single-merge-max", "label-create", "batch-pr-close", "fork-create", "assign", "unassign", "merge", "batch-push", "batch-pr", "shared-repos",
-  "fasttrack-add", "fasttrack-remove", "fasttrack-weight", "abuse-limits", "outside-release", "outside-release-author", "merge-hold", "merge-release", "batch-remove", "batch-stop", "areas-edit", "areas-accept", "ci-approve", "ci-revoke", "ci-run-approve", "ci-rerun", "cifix-push", "cifix-comment", "cifix-check", "postmerge-file", "postmerge-file-one", "postmerge-review", "postmerge-backfill",
-  "act-group-applied", "answer-used", "base-changed", "batch-end-too-late", "batch-hold", "batch-blame", "batch-rerun", "batch-merged-after-end", "batch-start", "carry-queued", "classify-run", "compare-again", "conflict-comment", "conflict-comment-edit", "conflict-push", "conversation-card", "conversation-card-dismiss", "conversation-card-edit", "decision-withdrawn", "duplicate-answer", "duplicate-group-ended", "duplicate-member-released", "duplicate-superseded", "env-change", "env-create", "env-rotate-key", "fix-again", "fixissue-check", "fixissue-claim", "fixissue-unclaim", "fixup-check", "item-gone", "merge-answer-superseded", "merge-held-for-discussion", "merge-question-withdrawn", "merge-refused", "preapproval", "github-app-register", "github-app-register-failed", "github-app-remove", "github-app-login-mode", "github-mention-set", "github-mention-clear", "github-app-link-create", "github-app-link-revoke", "github-app-link-use", "github-app-manager", "operator-fixup", "review-again", "scope-answer-lapsed", "task-cancel", "verify-again", "workspace-exclude",
+  "fasttrack-add", "fasttrack-remove", "fasttrack-weight", "abuse-limits", "outside-release", "outside-release-author", "merge-hold", "merge-release", "batch-remove", "batch-stop", "areas-edit", "areas-accept", "ci-approve", "ci-revoke", "ci-run-approve", "ci-rerun", "cifix-push", "cifix-comment", "cifix-check", "postmerge-file", "eval-issue", "eval-comment", "eval-repo", "postmerge-file-one", "nightly-issue", "nightly-select", "postmerge-review", "postmerge-backfill",
+  "act-group-applied", "answer-used", "base-changed", "batch-end-too-late", "batch-hold", "batch-blame", "batch-rerun", "batch-merged-after-end", "batch-start", "carry-queued", "classify-run", "compare-again", "conflict-comment", "conflict-comment-edit", "conflict-push", "conversation-card", "conversation-card-dismiss", "conversation-card-edit", "decision-withdrawn", "duplicate-answer", "duplicate-group-ended", "duplicate-member-released", "duplicate-superseded", "env-change", "env-create", "env-rotate-key", "fix-again", "fixissue-check", "fixissue-claim", "fixissue-unclaim", "fixup-check", "item-gone", "merge-answer-superseded", "merge-held-for-discussion", "merge-question-withdrawn", "merge-refused", "preapproval", "github-app-register", "github-app-register-failed", "github-app-remove", "github-app-login-mode", "github-mention-set", "github-mention-clear", "github-app-link-create", "github-app-link-revoke", "github-app-link-use", "github-app-manager", "operator-fixup", "review-again", "scope-answer-lapsed", "task-cancel", "verify-again", "workspace-exclude", "transcript-store",
 ];
 
 const isOperator = (req: Req): boolean => req.user.role === "operator";
@@ -248,7 +243,7 @@ export async function override(db: Db, req: Req, lookup: GithubUserLookup): Prom
   if (status !== "allow" && status !== "deny" && status !== null) throw new HttpError(400, "status must be allow, deny or null");
   if (!OVERRIDE_LOGIN.test(login)) throw new HttpError(400, `not a GitHub login: ${login}`);
   // Without a note field the override keeps the note it has.
-  const kept = async () => (await db.get(db.k.selectFrom("whitelist_overrides").select("note").where((eb) => kx.ciEq(db, "login", eb.val(login)))))?.note ?? null;
+  const kept = async () => (await loadOverrides(db, [login])).get(login.toLowerCase())?.note ?? null;
   const note = status === null ? null : b.note === undefined ? await kept() : text(b.note, NOTE_MAX, "note");
   // An allow belongs to the account that holds the login now; a deny holds for any account, so it does not wait for GitHub.
   let id: number | null = null;
@@ -278,52 +273,40 @@ export async function override(db: Db, req: Req, lookup: GithubUserLookup): Prom
 
 export async function allRepos(db: Db, req: Req): Promise<TrackedRepo[]> {
   if (!canSeeInternals(req)) throw new HttpError(403, "only operators and maintainers read the repo settings");
-  // A few repos at a time: each reads about a dozen rows sets at once, and the pool serves other requests meanwhile.
-  const shown = await shownFeatures(db);
-  return await mapLimit(await listAll(db), 4, async (r) => await toTrackedRepo(db, r, req, shown));
+  return await repoRows(db, req);
 }
 
-async function toTrackedRepo(db: Db, r: RepoRow, req: Req, shown: BuildFeature[]): Promise<TrackedRepo> {
-  const t = !!r.tracked;
-  const approval = async (of: (db: Db, repo: string) => Promise<{ by: string; at: string } | null>) => (t ? approvalInfo(await of(db, r.name)) : null);
-  // The parts read independently, so they run together.
-  const [canSwitch, labels, merging, pushing, commenting, fixing, mainFixing, ciApproving, statusComments, optional, seen] = await Promise.all([
-    t && maySwitch(req, r.name),
-    t ? labelsInfo(db, r.name) : null, t ? mergeInfo(db, r.name) : null,
-    approval(pushApprovalOf), approval(commentApprovalOf), approval(fixIssueApprovalOf), approval(mainFixApprovalOf), approval(ciApprovalOf), approval(statusApprovalOf),
-    t ? optionalChecks(db, r.name) : [], t ? seenChecks(db, r.name) : [],
-  ]);
-  return {
-    name: r.name, owner: r.owner, tracked: t, openPrs: r.open_prs, openIssues: r.open_issues, mirrored: r.rows, syncedAt: r.synced_at,
-    labels, merging, pushing, commenting, fixing, mainFixing, ciApproving, statusComments,
-    optionalChecks: optional, seenChecks: seen,
-    pipeline: t && !!r.pipeline,
-    canSwitch,
-    canManage: canSwitch,
-    buildFeatures: r.tracked ? await mapSeq(shown, async (feature) => ({ feature, on: await featureOn(db, feature, r.name) })) : [],
-  };
+/** Every known repo, or the named one, with its settings: one wave whatever the number of repos (and one before it for the tracked names outside a read request, which shares them). */
+async function repoRows(db: Db, req: Req, only?: string): Promise<TrackedRepo[]> {
+  const tracked = [...(await loadTrackedRepos(db, only === undefined ? undefined : [only])).keys()];
+  const [rows, approvals, plans, optional, seen, shown, switches] = await db.together(() => Promise.all([
+    listAll(db), loadStepApprovals(db, tracked), planLabelsOf(db, tracked), optionalChecksOf(db), seenChecksOf(db, tracked), shownFeatures(db), repoSwitches(db),
+  ]));
+  return await Promise.all(rows.filter((r) => only === undefined || r.name === only).map(async (r): Promise<TrackedRepo> => {
+    const t = !!r.tracked;
+    const of = approvals.get(r.name) ?? {};
+    const approval = (step: Step): RepoApproval | null => t ? { approved: !!of[step], approvedBy: of[step]?.by ?? null, approvedAt: of[step]?.at ?? null } : null;
+    const c = countPlan(plans.get(r.name) ?? []);
+    const labels = approval("labels");
+    const canSwitch = t && await maySwitch(req, r.name);
+    return {
+      name: r.name, owner: r.owner, tracked: t, openPrs: r.open_prs, openIssues: r.open_issues, mirrored: r.rows, syncedAt: r.synced_at,
+      labels: labels && { ...labels, toAdd: c.toAdd, skipped: c.already + c.unsettled, conflicts: c.conflicts },
+      merging: approval("merge"), pushing: approval("push"), commenting: approval("comment"), fixing: approval("fixissue"), mainFixing: approval("mainfix"), ciApproving: approval("ci"), statusComments: approval("prstatus"),
+      optionalChecks: t ? optional(r.name) : [], seenChecks: t ? seen.get(r.name) ?? [] : [],
+      pipeline: t && !!r.pipeline,
+      canSwitch,
+      canManage: canSwitch,
+      buildFeatures: t ? shown.map((feature) => ({ feature, on: switches(feature, r.name) })) : [],
+    };
+  }));
 }
 
 // One repo, for the endpoints that change a single repo's settings: the web patches it into its list, so the answer skips every other repo's label plan.
 async function oneRepo(db: Db, req: Req, name: string): Promise<TrackedRepo> {
-  const r = (await listAll(db)).find((x) => x.name === name);
+  const [r] = await repoRows(db, req, name);
   if (!r) throw new HttpError(404, `${name} is not a known repo`);
-  return await toTrackedRepo(db, r, req, await shownFeatures(db));
-}
-
-function approvalInfo(a: { by: string; at: string } | null): RepoApproval {
-  return { approved: !!a, approvedBy: a?.by ?? null, approvedAt: a?.at ?? null };
-}
-
-async function mergeInfo(db: Db, repo: string): Promise<RepoApproval> {
-  const a = await mergeApprovalOf(db, repo);
-  return { approved: !!a, approvedBy: a?.by ?? null, approvedAt: a?.at ?? null };
-}
-
-async function labelsInfo(db: Db, repo: string): Promise<RepoLabels> {
-  const [a, plan] = await Promise.all([approvalOf(db, repo), planLabels(db, repo)]);
-  const c = countPlan(plan);
-  return { approved: !!a, approvedBy: a?.by ?? null, approvedAt: a?.at ?? null, toAdd: c.toAdd, skipped: c.already + c.unsettled, conflicts: c.conflicts };
+  return r;
 }
 
 // An operator, or a maintainer with write access to the repo, lets the Label stage write to a repo on GitHub.
@@ -461,7 +444,7 @@ export async function pipelineSwitch(db: Db, req: Req, on: boolean): Promise<Tra
   if (!await maySwitch(req, name)) throw new HttpError(403, "only an operator, or a maintainer with write access to the repo, switches its pipeline");
   const changed = await refused(async () => {
     try {
-      return await setRepoPipeline(db, req.user.login, name, on);
+      return (await setPipelineFlags(db, [{ repo: name, on }], req.user.login)).changed.length > 0;
     } catch (e) {
       throw new RepoError((e as Error).message);
     }
@@ -484,11 +467,7 @@ export async function track(db: Db, req: Req, on: boolean): Promise<TrackedRepo[
 export async function accessOverview(db: Db, req: Req): Promise<AccessOverview> {
   requireOperator(req, "manage access");
   const nowMs = Date.now();
-  const sessions = (await db.all(db.k.selectFrom("sessions as s").innerJoin("access as a", "a.login", "s.login")
-    .select([kx.rowid("sessions", "s").as("id"), "s.login", "s.csrf", "s.created_at", "s.last_seen", "s.expires_at", "s.user_agent", "a.role"])
-    .$narrowType<{ role: Role }>()
-    .where("s.expires_at", ">", new Date(nowMs).toISOString()).orderBy("s.last_seen", "desc")))
-    .filter((s) => nowMs < sessionEndsAt(s.created_at, s.role));
+  const sessions = await listSessions(db, nowMs);
   const perLogin = new Map<string, number>();
   for (const s of sessions) perLogin.set(s.login.toLowerCase(), (perLogin.get(s.login.toLowerCase()) ?? 0) + 1);
   return {
@@ -496,7 +475,7 @@ export async function accessOverview(db: Db, req: Req): Promise<AccessOverview> 
       login: r.login, role: r.role, addedBy: r.added_by, addedAt: r.added_at, note: r.note, sessions: perLogin.get(r.login.toLowerCase()) ?? 0,
     })),
     sessions: sessions.map((s) => ({
-      id: s.id, login: s.login, createdAt: s.created_at, lastSeen: s.last_seen, expiresAt: s.expires_at,
+      id: s.rowid, login: s.login, createdAt: s.created_at, lastSeen: s.last_seen, expiresAt: s.expires_at,
       userAgent: s.user_agent ? s.user_agent.slice(0, 200) : null, current: s.csrf === req.csrf,
     })),
     tokens: await listAllTokens(db),
@@ -552,13 +531,13 @@ export async function revokeSession(db: Db, req: Req): Promise<AccessOverview> {
   requireOperator(req, "manage access");
   const id = body(req).id;
   if (!Number.isInteger(id)) throw new HttpError(400, "id must be a session id");
-  const s = await db.get(db.k.deleteFrom("sessions").where(kx.rowid("sessions"), "=", id as number).returning(["id_hash", "login", "created_at", "token_enc"]));
+  const s = await endSessionById(db, id as number);
   if (!s) throw new HttpError(404, "that session has already ended");
   // Revoking a session cuts off the login's agent tokens too: they act with that login's permissions.
   const mcpTokens = await endTokens(db, s.login);
   // ...and the GitHub App token this session signed in with, but not the login's authorization: its other sign-ins keep working.
-  const userTokens = await dropSessionTokens(db, s.login, s.id_hash, s.token_enc);
-  await audit(db, req.user.login, "session-revoke", s.login, { created_at: s.created_at, ...(mcpTokens ? { mcpTokens } : {}), ...(userTokens ? { userTokens } : {}) });
+  const userTokens = await dropSessionTokens(db, s.login, s.idHash, s.sealed);
+  await audit(db, req.user.login, "session-revoke", s.login, { created_at: s.createdAt, ...(mcpTokens ? { mcpTokens } : {}), ...(userTokens ? { userTokens } : {}) });
   return await accessOverview(db, req);
 }
 
@@ -585,44 +564,9 @@ export async function auditLog(db: Db, req: Req): Promise<AuditPage> {
   const offset = int(q.get("offset"), 0, 0, 1e9, "offset");
   // Security rows name their repo first in the target (`<repo>:scan:<id>`, `<repo>:finding:<n>`); a maintainer sees those of repos they can see.
   const visible = operator ? [] : await visibleRepos(db, req);
-  const filter = (eb: kx.Eb) => {
-    const c: Expression<SqlBool>[] = [];
-    if (login) c.push(eb.or([kx.ciEq(db, "login", eb.val(login)), kx.ciEq(db, "target", eb.val(login))]));
-    if (action) c.push(eb("action", "=", action));
-    if (!operator) {
-      c.push(kx.inList(db, "action", actions));
-      const colon = eb.fn<number>("instr", ["target", eb.val(":")]);
-      const repoOf = eb.case().when(colon, ">", 0).then(eb.fn<string>("substr", ["target", eb.lit(1), eb(colon, "-", eb.lit(1))])).else(eb.ref("target")).end();
-      c.push(eb.or([eb.not(kx.like(db, "action", eb.val("security-%"))), kx.inList(db, repoOf, ["", ...visible])]));
-    }
-    return eb.and(c);
-  };
-  const total = (await db.get(db.k.selectFrom("audit").select((eb) => eb.fn.countAll<number>().as("n")).where(filter)))!.n;
-  const rows = await db.all(db.k.selectFrom("audit").select(["at", "login", "action", "target", "details"]).where(filter)
-    .orderBy("at", "desc").orderBy(kx.rowid("audit"), "desc").limit(limit).offset(offset));
-  const entries: AuditEntry[] = rows.map((r) => {
-    let details: Record<string, unknown> | null = null;
-    try {
-      const d = JSON.parse(r.details ?? "null") as unknown;
-      if (d && typeof d === "object" && !Array.isArray(d)) details = d as Record<string, unknown>;
-    } catch { /* not JSON: shown without details */ }
-    return { at: r.at, login: r.login, action: r.action, target: r.target, details };
-  });
+  const { total, rows } = await listAuditPage(db, { login: login || undefined, action: action || undefined, limit, offset, ...(operator ? {} : { visible, actions }) });
+  const entries: AuditEntry[] = rows.map((r) => ({ at: r.at, login: r.login, action: r.action, target: r.target, details: r.details }));
   return { entries, total, actions };
-}
-
-// Only an operator limits the pipeline to a list of items. An empty list clears the pilot.
-export async function putPilot(db: Db, req: Req) {
-  requireOperator(req, "set the pilot");
-  const items = body(req).items;
-  if (!Array.isArray(items)) throw new HttpError(400, "items must be a list of repo#number");
-  try {
-    await setPilot(db, req.user.login, items);
-  } catch (e) {
-    if (e instanceof PilotError) throw new HttpError(e.status, e.message);
-    throw e;
-  }
-  return pipelineState(db);
 }
 
 // An operator, or a maintainer with write access to the repo, sets the checks whose failure does not stop a merge.

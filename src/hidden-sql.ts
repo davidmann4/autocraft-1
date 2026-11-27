@@ -1,29 +1,3 @@
-import type { AliasableExpression, SqlBool } from "kysely";
-import type { Dialect } from "./db/index.ts";
-import { inList as inListExpr, type Ex } from "./db/kx.ts";
-import { inList } from "./db/portable.ts";
-
-// Repo filters for viewers who may not see every repo. A list from the dashboard's `hiddenRepos` carries the repos the viewer
-// may see in `visible`; the filters then allow only those. A plain list of names is a denylist.
-export type HiddenRepos = string[] & { visible?: string[] };
-
-/** Whether any filter applies (operators get an empty list without `visible`). */
-export const filtered = (h: HiddenRepos): boolean => !!h.visible || h.length > 0;
-
-/** SQL true when the repo in `col` is hidden, with its `?` arguments. */
-export function hiddenTest(col: string, h: HiddenRepos): { sql: string; args: string[] } {
-  if (h.visible) return h.visible.length ? { sql: `${col} NOT IN (${h.visible.map(() => "?").join(",")})`, args: h.visible } : { sql: "1", args: [] };
-  return { sql: `${col} IN (${h.map(() => "?").join(",")})`, args: [...h] };
-}
-
-/** `hiddenTest` (and `hiddenJsonTest`) as an expression on the repo in `col`. */
-export function hiddenTestExpr(d: Dialect | { readonly dialect: Dialect }, col: Ex, h: HiddenRepos): AliasableExpression<SqlBool> {
-  return h.visible ? inListExpr(d, col, h.visible, "text", true) : inListExpr(d, col, [...h]);
-}
-
-export const isHiddenRepo = (h: HiddenRepos, repo: string): boolean => (h.visible ? !h.visible.includes(repo) : h.includes(repo));
-
-/** `hiddenTest` with one JSON list argument bound at `param` (`?` or a named one), for queries that bind by name or keep one argument per filter. */
-export function hiddenJsonTest(d: Dialect | { readonly dialect: Dialect }, col: string, h: HiddenRepos, param = "?"): { sql: string; arg: string } {
-  return h.visible ? { sql: inList(d, col, param, "text", true), arg: JSON.stringify(h.visible) } : { sql: inList(d, col, param), arg: JSON.stringify([...h]) };
-}
+// Repo filters for viewers who may not see every repo; the module owns them.
+export { filtered, hiddenTestExpr, isHiddenRepo } from "./data/control/index.ts";
+export type { HiddenRepos } from "./data/control/index.ts";

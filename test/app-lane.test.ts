@@ -11,7 +11,7 @@ import { ghComment, pushOwnBranch } from "../src/github/write.ts";
 import type { GuardedItem, GuardedRepo } from "../src/core/guard.ts";
 import type { ExecOpts } from "../src/fixup/git.ts";
 import { SCRATCH } from "./scratch.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb } from "./helpers/raw-db.ts";
 import * as kx from "../src/db/kx.ts";
 
 const BOX = "ghp_box_account_token";

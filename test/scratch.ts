@@ -9,6 +9,8 @@ import "./db-template.ts";
 const BASE = join(homedir(), ".cache/autocraft-scratch");
 mkdirSync(BASE, { recursive: true });
 export const SCRATCH = mkdtempSync(join(BASE, "test-"));
+// Artifacts are keyed by task id, which every test database counts from 1: their files stay apart from other processes'.
+process.env.AUTOCRAFT_ARTIFACT_DIR ??= join(SCRATCH, "artifacts");
 process.on("exit", () => rmSync(SCRATCH, { recursive: true, force: true }));
 // The diff cache defaults to one shared directory under the home: test processes running at once would read, write and
 // drop (dropCachedDiff) each other's diffs for the same fixture heads (app#3@sha3). A test may still point it elsewhere.

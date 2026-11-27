@@ -1,54 +1,78 @@
 #!/usr/bin/env bash
-# A throwaway Postgres for tests, in Docker (rootless works): data on tmpfs, fsync off, a free loopback port.
+# A throwaway Postgres for tests, in Docker (rootless works): data on tmpfs, fsync off, reached over a Unix socket in a
+# directory of its own, or a free loopback port where a container's socket does not reach the host (Docker Desktop).
 #
-#   scripts/pg-test.sh start                      prints "<container id> <url>"
+#   scripts/pg-test.sh start [--tcp]              prints "<container id> <url>" (--tcp: the loopback port)
 #   scripts/pg-test.sh stop <container id>        removes it
 #   scripts/pg-test.sh run [--latency MS] [test files...]
 #       starts one, runs the test files (default: the Postgres tests) with AUTOCRAFT_TEST_PG_URL set, removes it.
 #       --latency routes the connections through scripts/latency-proxy.ts with MS each way (10 if no number follows).
-#   scripts/pg-test.sh suite [--concurrency N] [test files...]
-#       starts one, runs the test files (default: the whole suite) on it with test/pg-suite-preload.ts loaded, so every
-#       connectDb on a SQLite path opens a Postgres database (test/pg-suite.ts); prints the totals and the failures per
-#       file (scripts/pg-suite-report.ts), writes the spec output to a log, removes the container.
+#   scripts/pg-test.sh suite [--concurrency N] [--slowest N] [--file-timeout MIN] [test files...]
+#       starts one and runs the test files (default: the whole suite, see scripts/test.ts) on it, with every connectDb on a
+#       SQLite path opening a Postgres database (test/pg-suite.ts); removes the container.
 #
 # `pnpm test:pg` is `run`; `pnpm test:pg:suite` is `suite`.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 IMAGE="${AUTOCRAFT_TEST_PG_IMAGE:-postgres:18}"
-# Size of the tmpfs the data lives on; a copy of a production database needs more than tests do.
-TMPFS_SIZE="${AUTOCRAFT_TEST_PG_TMPFS:-2g}"
-DEFAULT_TESTS=(test/pg-db.test.ts test/itemtools-pg.test.ts test/pg-copy.test.ts test/kx.test.ts test/portable.test.ts)
+# Size limit of the tmpfs the data lives on. The suite's databases, 20 MB each, are dropped when their test file ends.
+TMPFS_SIZE="${AUTOCRAFT_TEST_PG_TMPFS:-12g}"
+DEFAULT_TESTS=(test/pg-db.test.ts test/itemtools-pg.test.ts test/pg-copy.test.ts test/kx.test.ts test/portable.test.ts test/pg-upgrade.test.ts)
 
 # Rootless Docker listens on a per-user socket; use it when DOCKER_HOST is unset and it exists.
 if [[ -z "${DOCKER_HOST:-}" && -S "/run/user/$(id -u)/docker.sock" ]]; then
   export DOCKER_HOST="unix:///run/user/$(id -u)/docker.sock"
 fi
 
+LABEL=autocraft.test.socket
+
+# Whether a Postgres answers on the Unix socket in directory $1.
+reachable() {
+  node -e 'require("node:net").connect(process.argv[1]).on("connect", () => process.exit(0)).on("error", () => process.exit(1))' "$1/.s.PGSQL.5432"
+}
+
 start() {
-  local id hostport
-  # The suite runs one test file per CPU, each opening pools of up to 8 connections plus those of the processes it
-  # spawns: about 10 to 15 a file at their peak, so 16 CPUs need more than the default 100 and than 200.
+  local id hostport dir
+  # The container's user is another one on the host: the directory inside is open to it, the one around it to this user only.
+  # /tmp, not TMPDIR: a socket's path may not be longer than about 100 characters.
+  dir=$(mktemp -d /tmp/autocraft-pg-XXXXXX)
+  mkdir "$dir/s"
+  chmod 777 "$dir/s"
+  # A test file opens pools of up to 8 connections plus those of the processes it spawns: about 10 to 15 at its peak. The data
+  # is thrown away, so nothing is written for a crash, a replica or a vacuum.
   id=$(docker run -d --rm -e POSTGRES_PASSWORD=test -p 127.0.0.1::5432 \
+    -v "$dir/s:/socket" --label "$LABEL=$dir" \
     --tmpfs "/var/lib/postgresql:rw,size=${TMPFS_SIZE}" "$IMAGE" \
-    -c fsync=off -c synchronous_commit=off -c full_page_writes=off -c max_connections=300)
+    -c unix_socket_directories=/var/run/postgresql,/socket \
+    -c fsync=off -c synchronous_commit=off -c full_page_writes=off -c wal_level=minimal -c max_wal_senders=0 \
+    -c autovacuum=off -c jit=off -c checkpoint_timeout=1d -c max_wal_size=2GB -c shared_buffers=512MB -c max_connections=400)
   # The image's init runs a server on the Unix socket only, then restarts it on TCP: ready means ready over TCP.
   for _ in $(seq 1 120); do
     if docker exec "$id" pg_isready -q -h 127.0.0.1 -U postgres 2>/dev/null; then
-      hostport=$(docker port "$id" 5432/tcp | head -n 1)
-      echo "$id postgres://postgres:test@${hostport}/postgres"
+      if [[ "${1:-}" != --tcp ]] && reachable "$dir/s"; then
+        echo "$id postgres://postgres:test@${dir//\//%2F}%2Fs/postgres"
+      else
+        hostport=$(docker port "$id" 5432/tcp | head -n 1)
+        echo "$id postgres://postgres:test@${hostport}/postgres"
+      fi
       return 0
     fi
     sleep 0.5
   done
   docker logs "$id" 2>&1 | tail -20 >&2
-  docker rm -f "$id" >/dev/null
+  stop "$id"
   echo "pg-test: Postgres did not become ready" >&2
   return 1
 }
 
 stop() {
+  local dir
+  dir=$(docker inspect -f "{{index .Config.Labels \"$LABEL\"}}" "$1" 2>/dev/null || true)
+  # The socket files belong to the container's user.
+  docker exec -u root "$1" find /socket -mindepth 1 -delete 2>/dev/null || true
   docker rm -f "$1" >/dev/null
+  [[ -z "$dir" ]] || rmdir "$dir/s" "$dir" 2>/dev/null || true
 }
 
 run() {
@@ -65,7 +89,7 @@ run() {
   # Globals, not locals: the EXIT trap runs after this function has returned.
   local out url
   proxy_pid=""
-  out=$(start)
+  out=$(start ${latency:+--tcp})
   id=${out%% *}
   url=${out#* }
   proxy_out=$(mktemp)
@@ -83,33 +107,19 @@ run() {
 }
 
 suite() {
-  local conc="" files=()
-  while (($#)); do
-    case "$1" in
-      --concurrency) conc="${2:?--concurrency needs a number}"; shift ;;
-      *) files+=("$1") ;;
-    esac
-    shift
-  done
-  local out url log
+  local out url
   out=$(start)
   id=${out%% *}
   url=${out#* }
   trap 'stop "$id"' EXIT
-  log=$(mktemp "${TMPDIR:-/tmp}/pg-suite-XXXXXX.log")
-  echo "pg-test: container ${id:0:12}, spec output in $log" >&2
-  # NODE_OPTIONS, not a node flag: processes the tests spawn (the CLI, workers' children) redirect too.
-  AUTOCRAFT_TEST_PG_URL="$url" NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--import=$PWD/test/pg-suite-preload.ts" \
-    node --test --no-warnings ${conc:+--test-concurrency="$conc"} \
-      --test-reporter=spec --test-reporter-destination="$log" \
-      --test-reporter="$PWD/scripts/pg-suite-report.ts" --test-reporter-destination=stdout \
-      "${files[@]}"
+  echo "pg-test: container ${id:0:12}" >&2
+  AUTOCRAFT_TEST_PG_URL="$url" node --no-warnings scripts/test.ts "$@"
 }
 
 case "${1:-}" in
-  start) start ;;
+  start) start "${2:-}" ;;
   suite) shift; suite "$@" ;;
   stop) stop "${2:?container id}" ;;
   run) shift; run "$@" ;;
-  *) sed -n "2,14p" "$0" >&2; exit 2 ;;
+  *) sed -n "2,15p" "$0" >&2; exit 2 ;;
 esac

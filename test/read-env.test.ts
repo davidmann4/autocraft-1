@@ -2,8 +2,7 @@ import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
 import { ownerOfArgs, ownerOfVariables, readEnv, readEnvFor } from "../src/github/read.ts";
-import type { Db } from "../src/db/index.ts";
-import { dbFor } from "../src/db/open.ts";
+import { dbFor, type Db } from "./helpers/raw-db.ts";
 import { sqliteOnly } from "./test-db.ts";
 
 const dbWith = async (identity?: string): Promise<Db> => {

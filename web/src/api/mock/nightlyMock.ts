@@ -1,6 +1,6 @@
-// Nightly checks on fake data: three repos, 14 nights, a failing Miri streak, a warn, a skipped check and a slowing benchmark.
+// Nightly checks on fake data: three repos, 14 nights, a failing Miri streak with its issue, a failing Windows streak without one, a warn, a skipped check and a slowing benchmark.
 import type { Api } from "../client";
-import type { NightlyCell, NightlyGrid, NightlyRepo, NightlySeries, NightlyState, User } from "../types";
+import type { NightlyCell, NightlyCheckRow, NightlyGrid, NightlyRepo, NightlySeries, NightlyState, User } from "../types";
 import { NOW } from "./fixtures";
 import { mayRunMock } from "./adminMock";
 
@@ -13,6 +13,14 @@ const steady = (state: NightlyState, base: number, mixed: Record<number, Nightly
   Array.from({ length: NIGHTS }, (_, i) => mixed[i] ?? cell(state, base + i));
 
 const series = (n: number, f: (i: number) => number) => Array.from({ length: n }, (_, i) => f(i));
+
+/** The issue of the check's failing streak, or whether one may be opened. */
+function streakOf(c: { cells: (NightlyCell | null)[]; experimental: boolean }, may: boolean): Pick<NightlyCheckRow, "issue" | "canOpenIssue"> {
+  const end = c.cells.findIndex((x) => x?.state !== "fail");
+  const streak = end < 0 ? c.cells : c.cells.slice(0, end);
+  const issue = streak.find((x) => x?.issueNumber)?.issueNumber ?? null;
+  return { issue, canOpenIssue: may && !c.experimental && streak.length >= 2 && issue === null };
+}
 
 function build(me: User): NightlyRepo[] {
   const nights = (repo: string) => Array.from({ length: NIGHTS }, (_, i) => ({ runId: 900 - i, startedAt: new Date(NOW - (i * DAY + 5 * 3_600_000)).toISOString(), sha: `${repo.charCodeAt(0)}e1c${(97 - i).toString(16)}0b44aa21` }));
@@ -27,7 +35,7 @@ function build(me: User): NightlyRepo[] {
       checks: [
         { ...base, id: "audit", label: "Dependency audit", enabled: true, takes: null, cells: steady("pass", 5000, { 0: cell("warn", 5000, "1 advisory: RUSTSEC-2026-0012 (unmaintained)"), 1: cell("warn", 5001, "1 advisory: RUSTSEC-2026-0012 (unmaintained)") }) },
         { ...base, id: "wasm", label: "WebAssembly build", enabled: true, takes: "crates", crates: ["bundle-core"], cells: steady("pass", 5100) },
-        { ...base, id: "windows", label: "Windows build", enabled: true, takes: "crates", cells: steady("pass", 5200, { 6: cell("fail", 5206, "linking with x86_64-w64-mingw32-gcc failed") }) },
+        { ...base, id: "windows", label: "Windows build", enabled: true, takes: "crates", cells: steady("pass", 5200, { 0: cell("fail", 5200, "linking with x86_64-w64-mingw32-gcc failed"), 1: cell("fail", 5201, "linking with x86_64-w64-mingw32-gcc failed"), 2: cell("fail", 5202, "linking with x86_64-w64-mingw32-gcc failed"), 6: cell("fail", 5206, "linking with x86_64-w64-mingw32-gcc failed") }) },
         { ...base, id: "miri", label: "Miri", enabled: true, takes: "crates", crates: ["bundle-core", "bundle-ffi"], cells: steady("pass", 5300, { 0: cell("fail", 5300, "Undefined Behavior: out-of-bounds pointer use", 31), 1: cell("fail", 5301, "Undefined Behavior: out-of-bounds pointer use", 31), 2: cell("pass", 5302) }) },
         { ...base, id: "bench", label: "Benchmarks", enabled: true, takes: "crates", needs: "benches", cells: steady("pass", 5400, { 0: cell("warn", 5400, "parse::small 14% slower than the last 7 nights") }) },
         { ...base, id: "fuzz", label: "Fuzzing (5 min per target)", enabled: false, takes: "targets", experimental: true, needs: "fuzz-dir", cells: Array(NIGHTS).fill(null) },
@@ -52,7 +60,7 @@ function build(me: User): NightlyRepo[] {
         ...base, id, label: id, enabled: false, takes: id === "audit" ? null : id === "fuzz" ? "targets" : "crates", cells: [],
       })),
     },
-  ].map((r) => ({ ...r, checks: r.checks.map((c) => ({ ...c, label: c.label === c.id ? ({ audit: "Dependency audit", wasm: "WebAssembly build", windows: "Windows build", miri: "Miri", bench: "Benchmarks", fuzz: "Fuzzing (5 min per target)", asan: "AddressSanitizer tests" } as Record<string, string>)[c.id]! : c.label })) })) as NightlyRepo[];
+  ].map((r) => ({ ...r, checks: r.checks.map((c) => ({ ...c, ...streakOf(c, r.canSelect), label: c.label === c.id ? ({ audit: "Dependency audit", wasm: "WebAssembly build", windows: "Windows build", miri: "Miri", bench: "Benchmarks", fuzz: "Fuzzing (5 min per target)", asan: "AddressSanitizer tests" } as Record<string, string>)[c.id]! : c.label })) })) as NightlyRepo[];
 }
 
 export function createNightlyMock(me: User, changed: () => void): Pick<Api, "nightly"> {
@@ -75,6 +83,15 @@ export function createNightlyMock(me: User, changed: () => void): Pick<Api, "nig
         if (input.targets) c.targets = input.targets;
         changed();
         return wait(grid());
+      },
+      async openIssue(input) {
+        if (!mayRunMock(me, input.repo)) throw new Error("only an operator, or a maintainer with write access to the repo, opens an issue for its nightly checks");
+        const c = repos.find((r) => r.repo === input.repo)?.checks.find((x) => x.id === input.check);
+        if (!c?.canOpenIssue) throw new Error("the check is not failing 2 nights in a row");
+        c.issue = 412;
+        c.canOpenIssue = false;
+        changed();
+        return wait(grid(), 600);
       },
     },
   };

@@ -1,6 +1,7 @@
 // Fake pipeline steps for the runner and API tests (AUTOCRAFT_EXTRA_STEPS).
 // They call no model and touch nothing outside the test database.
 import { setTimeout as sleep } from "node:timers/promises";
+import { queryDb } from "../src/db/query-db.ts";
 import type { StepDef } from "../src/runner/steps.ts";
 
 export const FAKE_TOKEN = "ghp_" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8";
@@ -24,7 +25,7 @@ export const steps: StepDef[] = [
       if (ctx.params.mode === "fail") throw new Error("echo failed on purpose");
       ctx.usageRun("test-run");
       const t = new Date().toISOString();
-      await ctx.db.prepare(`INSERT INTO token_usage (run_id, agent, stage, model, items, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, started_at, ended_at, cost_usd)
+      await queryDb(ctx.db).prepare(`INSERT INTO token_usage (run_id, agent, stage, model, items, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, started_at, ended_at, cost_usd)
         VALUES ('test-run', ?, 'test', 'fake', 1, 100, 10, 0, 0, ?, ?, 0.01)`).run(`echo-${ctx.job.id}`, t, t);
       return `echo ${ctx.params.n}`;
     },
@@ -44,6 +45,25 @@ export const steps: StepDef[] = [
         await sleep(50);
       }
       return `slept ${ms} ms`;
+    },
+  },
+  {
+    name: "test-notes",
+    title: "Notes",
+    description: "Test step: records an item, counts and progress side by side, then sleeps.",
+    stage: 2,
+    requires: "operator",
+    params: [],
+    run: async (ctx) => {
+      const { jobItem } = await import("../src/runner/job-items.ts");
+      await ctx.handled(1);
+      await sleep(300);
+      // The first count was written at once; these wait in memory.
+      await ctx.handled(3);
+      await ctx.acted(2);
+      await jobItem(ctx.db, "app", 3, "handled before the stop", ctx.log);
+      await sleep(600_000);
+      return "slept";
     },
   },
   {
@@ -93,6 +113,18 @@ export const steps: StepDef[] = [
     priority: 2,
     params: [{ name: "repo", label: "Repo", kind: "repo", required: true }, { name: "ms", label: "Milliseconds", kind: "int", min: 0, max: 600000, default: 300 }],
     run: async (ctx) => { await sleep(Number(ctx.params.ms)); return "urgent done"; },
+  },
+  {
+    name: "test-lane",
+    title: "Lane repo work",
+    description: "Test step with per-item lanes: a job per pull request, approved or item, and a job without a lane per repo.",
+    stage: 6,
+    requires: "operator",
+    params: [
+      { name: "repo", label: "Repo", kind: "repo", required: true }, { name: "ms", label: "Milliseconds", kind: "int", min: 0, max: 600000, default: 300 },
+      { name: "lane", label: "Lane", kind: "enum", options: ["approved", "item"] }, { name: "number", label: "Pull request", kind: "int", min: 1, max: 1_000_000_000 },
+    ],
+    run: async (ctx) => { await sleep(Number(ctx.params.ms)); return "lane done"; },
   },
   {
     name: "test-model",

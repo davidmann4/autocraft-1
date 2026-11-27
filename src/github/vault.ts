@@ -12,6 +12,7 @@ import { openAppKeys } from "./app-keys.ts";
 import { GitHubProvider, RevokeRefused, type Provider, type Tokens } from "../dash/server/provider.ts";
 import { readUserTokens, revocationAad } from "../dash/server/user-tokens.ts";
 import { lockOf, readCopies, refreshShared, sessionMayHeal, usableAccess, type Copy } from "../dash/server/token-refresh.ts";
+import * as access from "../data/access/index.ts";
 import { githubIdentity } from "./identity.ts";
 import type { Db } from "../db/index.ts";
 
@@ -75,13 +76,10 @@ export class Vault {
     if (this.#sweeping) return 0;
     this.#sweeping = true;
     try {
-      const rows = await this.#db.all(this.#db.k.selectFrom("user_token_revocations")
-        .select(["id", "login", "token_enc", "kind", "aad", "attempts"])
-        .$if(fresh, (q) => q.where("attempts", "=", 0)).orderBy("id"));
+      const rows = await access.loadRevocations(this.#db, { freshOnly: fresh });
       for (const r of rows) {
         // Claim the attempt first: a concurrent sweep (another process) that read the same row changes nothing here and skips it.
-        if ((await this.#db.run(this.#db.k.updateTable("user_token_revocations").set((eb) => ({ attempts: eb("attempts", "+", 1) }))
-          .where("id", "=", r.id).where("attempts", "=", r.attempts))).changes !== 1) continue;
+        if (!await access.claimRevocation(this.#db, r.id, r.attempts)) continue;
         let done = false;
         try {
           done = await this.#revokeRow(r);
@@ -89,10 +87,10 @@ export class Vault {
           console.error(`revocation for ${r.login}: ${(e as Error).message}`);
         }
         if (done) {
-          await this.#db.run(this.#db.k.deleteFrom("user_token_revocations").where("id", "=", r.id));
+          await access.finishRevocations(this.#db, [r.id]);
         } else if (r.attempts + 1 >= MAX_REVOKE_ATTEMPTS) {
           console.error(`revocation for ${r.login}: given up after ${r.attempts + 1} failed attempts`);
-          await this.#db.run(this.#db.k.deleteFrom("user_token_revocations").where("id", "=", r.id));
+          await access.finishRevocations(this.#db, [r.id]);
         }
       }
       return rows.length;
@@ -145,7 +143,7 @@ export class Vault {
         if ("refused" in next) return false;
         await revoke(next.access);
       }
-      if (sameSignIn && own?.kind === "user") await this.#db.run(this.#db.k.deleteFrom("user_tokens").where("login", "=", r.login).where("version", "=", own.version));
+      if (sameSignIn && own?.kind === "user") await access.deleteUserTokenIf(this.#db, r.login, own.version);
       return true;
     });
   }

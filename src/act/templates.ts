@@ -47,16 +47,10 @@ export function refText(from: string, ref: string): string {
   return m[1] === from ? `#${m[2]}` : `${slugOf(m[1])}#${m[2]}`;
 }
 
-export function scopeCloseComment(reason: string | null): string {
-  const r = cleanReason(reason);
-  return `Closing this as out of scope for the project.${r ? `\nReason: ${r}` : ""}`;
-}
-
-export function prCloseComment(o: { repo: string; reason: string | null; duplicateOf: string | null }): string {
-  const dup = o.duplicateOf ? refText(o.repo, o.duplicateOf) : "";
-  if (dup) return `Closing this pull request. Duplicate of ${dup}.`;
-  const r = cleanReason(o.reason);
-  return `Closing this pull request.${r ? `\nReason: ${r}` : ""}`;
+/** The comment before a person's close; `as` is the action's `close_as` (completed, not-planned, or none given). */
+export function closeComment(o: { pr: boolean; as: string | null }): string {
+  const how = o.as === "completed" ? " as completed" : o.as === "not-planned" ? " as not planned" : "";
+  return `Closing this ${o.pr ? "pull request" : "issue"}${how}.`;
 }
 
 /** `original` is the canonical item's reference (`repo#n`); `closed` when it is no longer open. */
@@ -64,79 +58,26 @@ export function duplicateComment(o: { repo: string; original: string; closed: bo
   return `Duplicate of ${refText(o.repo, o.original)}${o.closed ? ", which is closed" : ""}.`;
 }
 
-
-/** The comment on a member closed in a duplicate group: the kept item, and for a PR the parts carried over. Carried points are model-written from untrusted text, so they are cleaned like a reason. */
-export function dupeGroupCloseComment(o: { kept: number; carry: string[] }): string {
-  const c = cleanReason(o.carry.slice(0, 2).join("; "));
-  return `Closing as a duplicate of #${o.kept}.${c ? `\nParts to carry over to #${o.kept}: ${c}` : ""}`;
-}
-
-export const DETAILS_MAX_BULLETS = 6;
-
-/** The comment on the kept issue listing what the closed reports add: one bullet per point, each crediting its source, the first point of every report before any second one. Null when no report adds anything. */
-export function dupeGroupDetailsComment(adds: { number: number; points: string[] }[]): string | null {
-  const bullets: string[] = [];
-  for (let round = 0; bullets.length < DETAILS_MAX_BULLETS; round++) {
-    let any = false;
-    for (const a of adds) {
-      const p = a.points[round];
-      if (p === undefined) continue;
-      any = true;
-      const t = cleanReason(p);
-      if (t && bullets.length < DETAILS_MAX_BULLETS) bullets.push(`- #${a.number}: ${t}`);
-    }
-    if (!any) break;
-  }
-  return bullets.length ? `Details from the closed duplicates:\n${bullets.join("\n")}` : null;
-}
-
 export const COMMENT_TEMPLATES: CommentTemplate[] = [
   {
-    id: "act.scope-close", stage: "Act",
-    purpose: "Posted when an operator answers a scope decision with Out of scope, just before the item is closed.",
-    text: scopeCloseComment("{{reason}}"),
-    placeholders: [{ name: "reason", meaning: "The reason of the conversation card that answered Out of scope (one sentence), else the decision's public text; cleaned to one line of at most 200 characters, cut at a sentence or word end; the Reason line is left out when there is none" }],
-    example: scopeCloseComment("The reference application does not do this."),
-  },
-  {
-    id: "act.pr-close", stage: "Act",
-    purpose: "Posted when an operator answers Close on a \"Close this PR?\" decision, just before the pull request is closed.",
-    text: prCloseComment({ repo: "app", reason: "{{reason}}", duplicateOf: null }),
+    id: "act.close", stage: "Act",
+    purpose: "Posted when a maintainer tells AutoCraft to close an issue or a pull request, just before the close, which is made as that maintainer.",
+    text: "Closing this {{kind}}{{reason}}.",
     placeholders: [
-      { name: "reason", meaning: "The reason of the conversation card that answered Close, else the review's reason; cleaned to one line of at most 200 characters, cut at a sentence or word end" },
-      { name: "duplicate", meaning: "When the review names a duplicate, the comment is \"Closing this pull request. Duplicate of #N.\" instead" },
+      { name: "kind", meaning: "issue or pull request" },
+      { name: "reason", meaning: "\" as completed\" or \" as not planned\" when the command gave that reason, else nothing" },
     ],
-    example: prCloseComment({ repo: "app", reason: null, duplicateOf: "app#12" }),
+    example: closeComment({ pr: false, as: "not-planned" }),
   },
   {
     id: "act.duplicate", stage: "Act",
-    purpose: "Posted when an operator answers a \"Close as a duplicate?\" decision with Close as duplicate, just before the item is closed.",
+    purpose: "Posted when a maintainer tells AutoCraft to close an item as a duplicate, just before the close, which is made as that maintainer.",
     text: duplicateComment({ repo: "app", original: "app#{{original}}", closed: false }),
     placeholders: [
       { name: "original", meaning: "The number of the item that stays, in the same repo; another repo's item is written as org/repo#N" },
       { name: "closed", meaning: "When the original is no longer open on GitHub at the time of the comment, \", which is closed\" follows the number" },
     ],
     example: duplicateComment({ repo: "app", original: "app#12", closed: true }),
-  },
-  {
-    id: "act.duplicate-group-close", stage: "Act",
-    purpose: "Posted on each member of a duplicate group closed after an operator accepted (or changed) the group's answer. The exact text is written when the comparison runs and shown in the decision.",
-    text: dupeGroupCloseComment({ kept: 0, carry: ["{{carried}}"] }).replaceAll("#0", "#{{kept}}"),
-    placeholders: [
-      { name: "kept", meaning: "The number of the item that stays" },
-      { name: "carried", meaning: "For a pull request with parts carried over: the first two carry-over points of the comparison, cleaned to one line of at most 200 characters; the second line, \"Parts to carry over to #{{kept}}: ...\", is left out when there are none" },
-    ],
-    example: dupeGroupCloseComment({ kept: 12, carry: ["master-page handling in src/pages.rs"] }),
-  },
-  {
-    id: "act.duplicate-group-details", stage: "Act",
-    purpose: "Posted once on the kept issue of a duplicate group, listing what the closed reports add.",
-    text: dupeGroupDetailsComment([{ number: 0, points: ["{{point}}"] }])!.replace("#0", "#{{source}}"),
-    placeholders: [
-      { name: "point", meaning: "A detail the closed report adds (steps, versions, logs), taken from the comparison and cleaned to one line of at most 200 characters; at most 6 bullets" },
-      { name: "source", meaning: "The number of the closed report the point comes from" },
-    ],
-    example: dupeGroupDetailsComment([{ number: 15, points: ["Happens on macOS 14 only."] }, { number: 18, points: ["Started after version 2.3."] }])!,
   },
   {
     id: "review.post", stage: "Review",

@@ -15,7 +15,9 @@ import { Segmented } from "../../ui/molecules/Segmented";
 import { useUser } from "../../shell/UserContext";
 import { Facts } from "../../ui/molecules/Facts";
 import { Page } from "../../ui/organisms/Page";
-import { authorizeHref } from "../decisions/ExecLine";
+
+/** Starts the GitHub App user authorization for the signed-in operator and returns to this page. The session is not touched. */
+const authorizeHref = (): string => `/auth/authorize-app?${new URLSearchParams({ return_to: window.location.pathname + window.location.search })}`;
 
 const IDENTITY_LABEL = { box: "Box account", app: "GitHub App" } as const;
 const IDENTITY_LINE = {

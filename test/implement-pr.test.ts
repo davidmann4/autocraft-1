@@ -6,12 +6,14 @@ import { chmodSync, mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "n
 import { join } from "node:path";
 import { test } from "node:test";
 import { SCRATCH } from "./scratch.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb } from "./helpers/raw-db.ts";
 import { compileTimeChanges, DIFF_FLAGS, MAX_IMPLEMENTATION_FILES, MAX_IMPLEMENTATION_LINES, validateImplementation } from "../src/implement/diff.ts";
 import { implBranch, implPrBody, implTitle } from "../src/implement/template.ts";
 import { openImplementationPr } from "../src/implement/pr.ts";
-import { implementationById, setImplementationState, startImplementation } from "../src/implement/store.ts";
+import { implementationById, setImplementationState, startImplementation } from "./implement-rows.ts";
 import type { Implementation } from "../src/implement/types.ts";
+import { insertWorkflow } from "../src/workflow/store.ts";
+import { listWorkflows, loadLinks } from "../src/data/workflow/index.ts";
 import { setFeature } from "../src/build/features.ts";
 import { exec as realExec, type Exec, type ExecResult } from "../src/fixup/git.ts";
 import { ghOpenPr, pushOwnBranch } from "../src/github/write.ts";
@@ -121,6 +123,18 @@ test("an implement grant opens the pipeline's own PR: the push is audited and co
   assert.equal(rows.length, 2);
   assert.ok(rows.every((r) => JSON.parse(r.details!).state === "done"));
 
+  // A revision of the open PR is recorded right before git runs, and as done once it has: a push that failed stays recorded, not done.
+  const pr = { scope: "pr", action: { kind: "implement", bucket: "revise" }, repo: "app", number: 8, head: "c".repeat(40), as: "app" } as unknown as GuardedItem;
+  const made = () => db.all(db.k.selectFrom("own_pushes").select(["number", "from_oid", "to_oid", "action", "lines", "landed_at"]).orderBy("to_oid"));
+  const edge = { number: 8, from_oid: "c".repeat(40), action: "implement-push", lines: 4 };
+  for (const [oid, code] of [["d".repeat(40), 0], ["e".repeat(40), 1]] as const) {
+    const seen: unknown[] = [];
+    const g2 = { git: async () => { seen.push(...(await made()).filter((r) => r.to_oid === oid)); return { code, stdout: "", stderr: code ? "stale info" : "" }; } };
+    await pushOwnBranch(w, pr, g2 as never, "implement-push", { repo: "app", number: 7, remote: "bot/app", branch: "autocraft/impl-7-x", sha: oid }, { from: "c".repeat(40), changed: 4 });
+    assert.deepEqual(seen, [{ ...edge, to_oid: oid, landed_at: null }]);
+  }
+  assert.deepEqual((await made()).map((r) => [r.to_oid.slice(0, 1), r.landed_at !== null]), [["d", true], ["e", false]]);
+
   // Other item grants still cannot push to a new branch.
   assert.throws(() => pushOwnBranch(w, grant("act"), git as never, "implement-push", { repo: "app", number: 7, remote: "bot/app", branch: "b", sha }), /does not allow a push/);
 });
@@ -142,9 +156,9 @@ test("opening an implementation's PR survives reruns: the stored branch is reuse
   writeFileSync(join(work, "src/lib.rs"), "pub fn a() -> u8 { 1 }\n");
   const diff = execFileSync("git", ["diff", "--binary", "--no-ext-diff", "--no-textconv", ...DIFF_FLAGS.split(" "), base], { cwd: work, encoding: "utf8" });
 
-  const w = await (await (await world()).repo()).issue(5, { title: "Crash on start" });
+  const w = await (await (await (await world()).repo()).acting()).issue(5, { title: "Crash on start" });
   const db = w.db;
-  await db.run(db.k.insertInto("fast_track").values({ repo: "app", number: 5, added_by: "op", added_at: "2026-01-01T00:00:00.000Z" }));
+  await insertWorkflow(db, { repo: "app", number: 5, kind: "issue", entry: "implement", state: "running", startedBy: "op", startedAt: "2026-01-01T00:00:00.000Z", startedVia: "dashboard" });
   await setFeature(db, "implement", true, "op", "app");
   const started = await startImplementation(db, { repo: "app", number: 5, queuedBy: "op", textHash: "h", baseSha: base });
   await setImplementationState(db, started.id, "opening", { plan: { kind: "bugfix", summary: "Return 1.", plan: "1. Return 1." } as Implementation["plan"] });
@@ -180,10 +194,10 @@ test("opening an implementation's PR survives reruns: the stored branch is reuse
     const at = args.findIndex((a) => a.startsWith("https://github.com/"));
     if (at < 0) return realExec(cmd, args, opt);
     if (args.includes("push")) gh.pushes.push(args.at(-1)!.split(":refs/heads/")[1]!);
-    const target = args[at]!.includes("/storytold/") ? upstream : fork;
+    const target = args[at]!.includes("/storytold/") && !args.includes("push") ? upstream : fork;
     return realExec(cmd, args.map((a, i) => (i === at ? target : a)).filter((a, i, all) => a !== "protocol.file.allow=never" && !(a === "-c" && all[i + 1] === "protocol.file.allow=never")), opt);
   };
-  const deps = { exec, root: join(dir, "cache"), log: () => {} };
+  const deps = { exec, root: join(dir, "cache"), log: () => {}, mint: async () => "installation-token" };
   const open = async () => openImplementationPr(db, { implementation: (await implementationById(db, started.id))!, diff, base, model: "claude-opus-5-5", checks: [], by: "pipeline" }, deps);
 
   // GitHub makes the PR but its response is lost; the issue is renamed before the rerun.
@@ -200,6 +214,8 @@ test("opening an implementation's PR survives reruns: the stored branch is reuse
   assert.equal(gh.creates, 1, "no second PR");
   assert.equal(gh.comments, 1);
   assert.equal((await implementationById(db, started.id))!.state, "pr-opened");
+  assert.deepEqual((await loadLinks(db, { issues: [{ repo: "app", number: 5 }] })).map((l) => l.pr), [again.number], "the issue's workflow is linked to the PR");
+  assert.equal((await listWorkflows(db, { live: true }))[0]!.prNumber, again.number);
 
   // A run that stopped after the PR was stored adopts the stored PR, at the commit this implementation pushed.
   await setImplementationState(db, started.id, "opening");

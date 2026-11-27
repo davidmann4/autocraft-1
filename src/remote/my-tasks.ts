@@ -2,11 +2,10 @@
 // in `user_settings` under `skip_tasks` as a JSON list of the tasks the user unticked, so no row means every task, and a task
 // added later starts ticked. Picks ("Run on my Task Runner") and follow-ups of the user's own sessions do not go by it, as with
 // My repos (my-repos.ts).
-import { audit } from "../dash/audit.ts";
 import { CLAUDE_PROMPTS } from "../prompts/index.ts";
 import { STAGES, stageOfStep } from "../stages/registry.ts";
 import type { Db } from "../db/index.ts";
-import { excluded } from "../db/kx.ts";
+import { loadUserSettings, saveUserSettings } from "../data/runners/index.ts";
 
 export const SKIP_TASKS_KEY = "skip_tasks";
 /** The task of a call whose step belongs to no stage that makes model calls (security scans, Discord, and a step not known). */
@@ -44,8 +43,11 @@ export function taskOfStep(step: string): string {
 
 /** The tasks the user unticked; empty when they take every task. Ids no longer offered are dropped. */
 export async function userSkips(db: Db, login: string): Promise<Set<string>> {
-  return skipsOf((await db.get(db.k.selectFrom("main.user_settings").select("value").where("login", "=", login).where("key", "=", SKIP_TASKS_KEY)))?.value);
+  return skipsIn((await loadUserSettings(db, [login])).get(login.toLowerCase())!.skipTasks);
 }
+
+/** The offered tasks among stored skipped ids. */
+export const skipsIn = (ids: readonly string[]): Set<string> => new Set(ids.filter((x) => TASK_IDS.has(x)));
 
 /** The unticked tasks of a stored `skip_tasks` value (undefined: no row). */
 export function skipsOf(value: string | undefined): Set<string> {
@@ -74,13 +76,7 @@ export function parseTasks(raw: unknown): string[] {
 
 /** Stores the ticked tasks as the unticked rest (every task ticked removes the row); a change is audited. */
 export async function setUserTasks(db: Db, login: string, tasks: readonly string[]): Promise<string[]> {
-  const was = await userTasks(db, login);
   const on = new Set(tasks);
-  const skip = TASK_CHOICES.map((t) => t.id).filter((id) => !on.has(id));
-  if (!skip.length) await db.run(db.k.deleteFrom("main.user_settings").where("login", "=", login).where("key", "=", SKIP_TASKS_KEY));
-  else await db.run(db.k.insertInto("main.user_settings").values({ login, key: SKIP_TASKS_KEY, value: JSON.stringify(skip), updated_at: new Date().toISOString() })
-    .onConflict((oc) => oc.columns(["login", "key"]).doUpdateSet(excluded(["value", "updated_at"]))));
-  const now = await userTasks(db, login);
-  if (was.join("\n") !== now.join("\n")) await audit(db, login, "my-tasks", login, { tasks: now, was });
-  return now;
+  const skip = skipsIn((await saveUserSettings(db, login, { skipTasks: TASK_CHOICES.map((t) => t.id).filter((id) => !on.has(id)) }, login)).skipTasks);
+  return TASK_CHOICES.map((t) => t.id).filter((id) => !skip.has(id));
 }

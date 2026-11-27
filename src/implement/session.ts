@@ -8,6 +8,10 @@ import { mkdirSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { crc32 } from "node:zlib";
 import type { Db } from "../db/index.ts";
+import { addSession, loadEnvs, loadSessions, patchSessions } from "../data/build/index.ts";
+import { loadImplementationView } from "../data/implement/index.ts";
+import { loadItems } from "../data/mirror/index.ts";
+import { loadCalls } from "../data/runners/index.ts";
 import { artifactDir } from "../build/artifacts.ts";
 import { settingsOf } from "../build/pods.ts";
 import { queueWorkspaceCall, resumePrompt, type WorkspaceCallRequest } from "../build/workspace-call.ts";
@@ -24,8 +28,8 @@ import { defaultSemanticDeps, referenceProblems } from "../reference-lint.ts";
 import { fixTurnMessage, mergeFixFields, needsFixTurn, type LintProblem } from "../replylint.ts";
 import type { Pod } from "./checks.ts";
 import { FOLLOW_UP_CALL, REPORT_LIST_MAX, REPORT_SHOTS_MAX, REPORT_TEXT_MAX, SESSION_CALL, SAMPLE_SESSION, SESSION_SERVER, type SessionFinding, type SessionInput } from "./session-input.ts";
-import { guidanceOf } from "./stuck.ts";
-import { addRound, updateRound } from "./store.ts";
+import { addRounds, setRound } from "./attempt.ts";
+import { attemptGuidance } from "./stuck.ts";
 import type { Implementation, ImplementationRound, SessionReport } from "./types.ts";
 
 // The prompt names the tool server; this fails to compile when the two differ.
@@ -84,6 +88,8 @@ export type TurnRound = {
   shots: StoredShot[];
   /** Why a named screenshot was not copied. */
   shotErrors: string[];
+  /** The turn's workspace_sessions row. */
+  session?: number;
 };
 
 export type TurnRequest = {
@@ -103,13 +109,15 @@ export type TurnRequest = {
 /** The session's task for the attempt, from its stored plan. */
 export async function sessionInput(db: Db, impl: Implementation, sha: string, earlier?: SessionInput["earlier"]): Promise<SessionInput> {
   if (!impl.plan) throw new Error(`implementation ${impl.id} has no plan`);
-  const it = await db.get(db.k.selectFrom("items").select(["title", "body", "author"]).where("repo", "=", impl.repo).where("number", "=", impl.number));
+  const ref = `${impl.repo}#${impl.number}` as const;
+  const [items, view] = await db.together(() => Promise.all([loadItems(db, [impl], "text"), loadImplementationView(db, ref)]));
+  const it = items.get(ref);
   const p = impl.plan;
   return {
     ref: `${impl.repo}#${impl.number}`, repo: impl.repo, sha,
     issue: { title: it?.title ?? "", body: (it?.body ?? "").slice(0, ISSUE_BODY_MAX), author: it?.author ?? null },
     plan: { kind: p.kind, summary: p.summary, plan: impl.planMd ?? p.plan, acceptance: p.acceptance, tests: p.verification.tests, app: p.verification.app, risks: p.risks },
-    guidance: await guidanceOf(db, impl.id),
+    guidance: view?.impl.id === impl.id ? attemptGuidance(view.rounds).map((g) => g.text) : [],
     ...(earlier && { earlier }),
   };
 }
@@ -125,8 +133,9 @@ const SYSTEM = { mirror: renderSession({ ...SAMPLE_SESSION[0]!, fetch_dependenci
 /** Whether environment `envId` has a crate mirror, so its session may fetch dependencies. */
 async function hasCrateMirror(db: Db, envId: string | undefined): Promise<boolean> {
   if (!envId) return false;
-  const env = await db.get(db.k.selectFrom("build_envs").select(["settings"]).where("id", "=", envId));
-  return settingsOf(env?.settings ?? null).crateMirror !== null;
+  const [env] = await loadEnvs(db, { ids: [envId] });
+  // The loader parses the settings column; settingsOf reads it as stored.
+  return settingsOf(env?.settings == null ? null : typeof env.settings === "string" ? env.settings : JSON.stringify(env.settings)).crateMirror !== null;
 }
 
 const findingsJson = (f: SessionFinding[]): string => JSON.stringify(f, null, 1).replace(/</g, "\\u003c");
@@ -245,17 +254,17 @@ export async function queueTurn(db: Db, calls: CallDeps, t: TurnRequest): Promis
     });
     // A workspace_sessions row per turn, kept with the workspace: the attempt's workspace outlives each job.
     const at = new Date().toISOString();
-    await db.run(db.k.insertInto("workspace_sessions").values({
+    const session = await addSession(db, {
       kind: "implement", repo: t.impl.repo, base_sha: w?.base_sha ?? t.impl.baseSha ?? "", item: t.impl.number, prompt: null, env_id: w?.env_id ?? "", keep: 1,
       deadline_sec: limits.timeoutSeconds, state: "running", workspace_id: t.workspaceId, remote_call_id: callId, requested_by: t.impl.queuedBy, created_at: at, updated_at: at,
-    }));
+    });
     const result: TurnRound = {
       purpose: t.purpose, outcome: "queued", report: null, turns: null, costUsd: null, calls: 0, shellMs: 0, shots: [], shotErrors: [],
-      ...(follow && { parentId: t.parentId }), ...(t.base && { base: t.base, problems: t.problems ?? [] }),
+      ...(follow && { parentId: t.parentId }), ...(t.base && { base: t.base, problems: t.problems ?? [] }), session,
     };
     const kind = follow ? "follow-up" : "session";
-    const id = await addRound(db, t.impl.id, kind, { callId, result }, at);
-    return { id, implementationId: t.impl.id, kind, callId, result, at };
+    const [id] = await addRounds(db, t.impl.id, [{ kind, callId, result }], at);
+    return { id: id!, implementationId: t.impl.id, kind, callId, result, at };
   });
 }
 
@@ -264,8 +273,9 @@ export const retryStdin = async (db: Db, failedCallId: number, stdin: string): P
 
 const endSession = async (db: Db, callId: number, r: TurnRound): Promise<void> => {
   const at = new Date().toISOString();
-  await db.run(db.k.updateTable("workspace_sessions").set({ state: r.outcome === "done" ? "done" : "failed", outcome: `${r.purpose}: ${r.outcome}${r.report ? ` (${r.report.status})` : ""}`.slice(0, 300), ended_at: at, updated_at: at })
-    .where("kind", "=", "implement").where("remote_call_id", "=", callId));
+  // Turns queued before the round named its session row find it by the call.
+  const ids = r.session !== undefined ? [r.session] : [...(await loadSessions(db, { remoteCallId: callId })).values()].flat().filter((x) => x.kind === "implement").map((x) => Number(x.id));
+  await patchSessions(db, ids.map((id) => ({ id, set: { state: r.outcome === "done" ? "done" : "failed", outcome: `${r.purpose}: ${r.outcome}${r.report ? ` (${r.report.status})` : ""}`.slice(0, 300), ended_at: at } })));
 };
 
 /**
@@ -276,12 +286,12 @@ const endSession = async (db: Db, callId: number, r: TurnRound): Promise<void> =
  */
 export async function settleOrphan(db: Db, round: ImplementationRound, log: (line: string) => void): Promise<TurnRound | null> {
   const queued = round.result as TurnRound;
-  const c = round.callId === null ? undefined : await db.get(db.k.selectFrom("main.remote_calls").select(["state", "consumed_at"]).where("id", "=", round.callId));
-  if (c && (c.state === "queued" || c.state === "leased" || (c.state === "done" && c.consumed_at === null))) return null;
+  const c = round.callId === null ? undefined : (await loadCalls(db, [round.callId])).get(round.callId);
+  if (c && (c.state === "queued" || c.state === "leased" || (c.state === "done" && c.consumedAt === null))) return null;
   const r: TurnRound = c?.state === "done"
     ? { ...queued, outcome: "done", lost: true, parseError: "the reply was read before a restart and not stored" }
     : { ...queued, outcome: "withdrawn", error: c ? "the call ended without a reader" : "the call is gone" };
-  await updateRound(db, round.id, r);
+  await setRound(db, round.implementationId, round.id, r);
   if (round.callId !== null) await endSession(db, round.callId, r);
   log(`turn ${round.callId} (${r.purpose}): ${r.lost ? "its reply was lost in a restart" : "withdrawn while no job read it"}`);
   return r;
@@ -299,10 +309,10 @@ export async function awaitTurn(db: Db, calls: CallDeps, pod: Pod | null, o: { i
   try {
     out = await calls.await(db, callId, { log: o.log, maxWaitMs: QUEUE_WAIT_MS });
   } catch (e) {
-    const c = await db.get(db.k.selectFrom("main.remote_calls").select("state").where("id", "=", callId));
+    const c = (await loadCalls(db, [callId])).get(callId);
     if (c?.state === "failed") {
       const r: TurnRound = { ...queued, outcome: "withdrawn", error: cleanOutput(Buffer.from((e as Error).message)).slice(0, 300) };
-      await updateRound(db, o.round.id, r);
+      await setRound(db, o.round.implementationId, o.round.id, r);
       await endSession(db, callId, r);
     }
     throw e;
@@ -317,7 +327,7 @@ export async function awaitTurn(db: Db, calls: CallDeps, pod: Pod | null, o: { i
     if ("error" in p) r.parseError = p.error;
     else r.report = p.report;
   }
-  await updateRound(db, o.round.id, r);
+  await setRound(db, o.round.implementationId, o.round.id, r);
   const stats = await sessionStats(db, o.workspaceId, callId);
   r.calls = stats.calls;
   r.shellMs = stats.shellMs;
@@ -327,7 +337,7 @@ export async function awaitTurn(db: Db, calls: CallDeps, pod: Pod | null, o: { i
     r.shots = c.shots;
     r.shotErrors = c.errors;
   }
-  await updateRound(db, o.round.id, r);
+  await setRound(db, o.round.implementationId, o.round.id, r);
   await endSession(db, callId, r);
   o.log(`turn ${callId} (${r.purpose}): ${r.outcome}${r.error ? `: ${r.error}` : ""}${r.parseError ? `; not the report: ${r.parseError}` : ""}${r.report ? `; ${r.report.status}` : ""}; ${r.calls} tool calls`);
   return r;

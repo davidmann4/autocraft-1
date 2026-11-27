@@ -1,10 +1,11 @@
 // `autocraft-server security`: drive the security deep scan from a session. Starting and stopping scans and acting on findings
-// are refused unless the repo is a test repo and --as names an operator, like `decisions answer`; list and show only read.
+// are refused unless the repo is a test repo and --as names an operator, as any person-started write; list and show only read.
 import type { FindingAction } from "../../web/src/api/types.ts";
-import { isTestRepo, operators } from "../decisions.ts";
+import { loginsWithRole } from "../data/access/index.ts";
+import { isTestRepo } from "../data/control/index.ts";
 import { scopeToTracked } from "../repos.ts";
 import { actOnFindingAs, continueScanAs, SecurityError, startScanAs, stopScanAs, type AuditExtra } from "./actions.ts";
-import { activeScan, findingRow, overview, reconcileFindings, reconcileScans, scanRow, toFinding } from "./store.ts";
+import { activeScan, findingRow, overview, reconcileFindings, scanRow, toFinding } from "./store.ts";
 import type { Db } from "../db/index.ts";
 import { openDb } from "../db/open.ts";
 
@@ -48,8 +49,8 @@ function posInt(v: string | undefined, what: string): number {
 /** The login of an operator acting on a test repo; throws a refusal otherwise. */
 export async function requireSessionOperator(db: Db, repo: string, login: string | undefined): Promise<string> {
   if (!login) fail(`--as LOGIN is required\n${USAGE}`);
-  if (!await isTestRepo(db, repo)) fail(`refused: ${repo} is not marked as a test repo (decisions test-repo REPO on)`);
-  if (!(await operators(db)).has(login)) fail(`refused: ${login} is not an operator`);
+  if (!await isTestRepo(db, repo)) fail(`refused: ${repo} is not marked as a test repo (repos test-repo ${repo} on)`);
+  if (!(await loginsWithRole(db, ["operator"])).some((l) => l.toLowerCase() === login.toLowerCase())) fail(`refused: ${login} is not an operator`);
   return login;
 }
 
@@ -111,8 +112,6 @@ async function list(args: string[]): Promise<void> {
   const { pos } = parse(args, [], []);
   const repo = pos[0] ?? fail(USAGE);
   const db = await open();
-  await reconcileScans(db, repo);
-  await reconcileFindings(db, repo);
   const o = await overview(db, repo);
   console.log(`scans${await activeScan(db, repo) ? " (one running)" : ""}`);
   for (const s of o.scans) console.log(`${s.id}\t${s.state}\tareas ${s.areasDone}/${s.areasTotal}\tcost ${money(s.costUsd)}\tcap ${money(s.capUsd)}\testimate ${money(s.estimateUsd)}\tfindings ${s.findingCount}`);

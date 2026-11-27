@@ -10,17 +10,17 @@ import { VectorIndex } from "../src/embed/vectors.ts";
 import { dispatcher } from "../src/discord/index.ts";
 import { Interactions } from "../src/discord/interactions.ts";
 import { DiscordKeys } from "../src/discord/keys.ts";
-import { installAccountCommands } from "../src/discord/commands.ts";
+import { addSentAlerts } from "../src/data/discord/index.ts";
+import { CONTENT_CHARS, V2_TEXT_CHARS, helpReply, installAccountCommands } from "../src/discord/commands.ts";
 import { createLinkCode, loginOf } from "../src/discord/links.ts";
 import { Pings } from "../src/discord/pings.ts";
 import { RestClient, RestError, callbackPayload, type CommandDef, type DiscordRest, type EditBody, type MessageBody } from "../src/discord/rest.ts";
 import { deliver, renderMatches } from "../src/discord/reply.ts";
 import { Search } from "../src/discord/search.ts";
 import { installSearchCommands } from "../src/discord/search-commands.ts";
-import { useTestAccount } from "./accounts-fixture.ts";
 import { SCRATCH } from "./scratch.ts";
 import { mapSeq } from "../src/async-seq.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb } from "./helpers/raw-db.ts";
 import { excluded } from "../src/db/kx.ts";
 import { sqliteOnly } from "./test-db.ts";
 
@@ -28,7 +28,6 @@ mkdirSync(SCRATCH, { recursive: true });
 const dir = mkdtempSync(join(SCRATCH, "discord-search-"));
 const db = await connectDb(join(dir, "d.db"));
 const keys = new DiscordKeys("k".repeat(40));
-await useTestAccount(db);
 after(async () => {
   await db.close();
   rmSync(dir, { recursive: true, force: true });
@@ -118,6 +117,8 @@ type V2 = { type: number; content?: string; components?: V2[]; accessory?: V2; l
 const v2text = (b: { components?: unknown[] }): string => ((b.components ?? []) as V2[]).flatMap((c) => (c.type === 9 ? c.components! : [c])).filter((c) => c.type === 10).map((c) => c.content).join("\n");
 /** Every button of a Components V2 body in order: section accessories, then the action row. */
 const v2buttons = (b: { components?: unknown[] }): V2[] => ((b.components ?? []) as V2[]).flatMap((c) => (c.type === 9 ? [c.accessory!] : c.type === 1 ? c.components! : []));
+
+const ACCOUNT = ["link", "unlink", "alerts", "optout", "optin"];
 
 describe("ping replies", () => {
   test("a reply-ping searches the quoted text and replies once, publicly, with link buttons and no mentions", async () => {
@@ -212,7 +213,7 @@ describe("commands", () => {
     let seen = 0;
     const call = (id: string, sub: string, options: unknown[], user = "u50") => {
       seen = rest.edits.length;
-      ix.dispatch("INTERACTION_CREATE", { id, token: "t", type: 2, application_id: "app1", channel_id: "c1", member: { user: { id: user } }, data: { name: "autocraft", type: 1, options: [{ name: sub, type: 1, options }] } });
+      ix.dispatch("INTERACTION_CREATE", { id, token: "t", type: 2, application_id: "app1", channel_id: "c1", member: { user: { id: user } }, data: { name: "autocraft", type: 1, options: [ACCOUNT.includes(sub) ? { name: "account", type: 1, options: [{ name: "action", type: 3, value: sub }, ...options] } : { name: sub, type: 1, options }] } });
     };
     const settle = () => editAfter(seen);
     const { code } = await createLinkCode(db, keys, "mira");
@@ -226,7 +227,7 @@ describe("commands", () => {
     call("i4", "status", [{ name: "item", type: 3, value: "photocraft#2" }]);
     await settle();
     assert.match(rest.edits.at(-1)!.content!, /photocraft#2 Dark mode for the layers panel\nNew/);
-    ix.dispatch("INTERACTION_CREATE", { id: "i5", token: "t", type: 4, application_id: "app1", data: { name: "autocraft", options: [{ name: "stats", type: 1, options: [{ name: "repo", type: 3, value: "ph", focused: true }] }] } });
+    ix.dispatch("INTERACTION_CREATE", { id: "i5", token: "t", type: 4, application_id: "app1", data: { name: "autocraft", options: [{ name: "status", type: 1, options: [{ name: "repo", type: 3, value: "ph", focused: true }] }] } });
     await until(() => rest.callbacks.at(-1)?.type === 8);
     assert.deepEqual(rest.callbacks.at(-1), { type: 8, ephemeral: undefined, choices: [{ name: "photocraft", value: "photocraft" }] });
     call("i6", "unlink", []);
@@ -236,7 +237,7 @@ describe("commands", () => {
 });
 
 describe("/autocraft do", () => {
-  test("an unlinked user, a linked user without write access and a repo not switched on are refused; write access runs it", async () => {
+  test("an unlinked user and a linked user without write access are refused; write access runs it", async () => {
     const ix = new Interactions(rest, (l) => assert.fail(l));
     installAccountCommands(ix, { db, keys });
     const run = async (id: string, user: string, text: string) => {
@@ -248,17 +249,24 @@ describe("/autocraft do", () => {
     assert.match(await run("d1", "u70", "review: photocraft#4"), /Link your account/);
     const { code } = await createLinkCode(db, keys, "nora");
     const linked = rest.edits.length;
-    ix.dispatch("INTERACTION_CREATE", { id: "d2", token: "t", type: 2, application_id: "app1", channel_id: "c1", member: { user: { id: "u70" } }, data: { name: "autocraft", type: 1, options: [{ name: "link", type: 1, options: [{ name: "code", type: 3, value: code }] }] } });
+    ix.dispatch("INTERACTION_CREATE", { id: "d2", token: "t", type: 2, application_id: "app1", channel_id: "c1", member: { user: { id: "u70" } }, data: { name: "autocraft", type: 1, options: [{ name: "account", type: 1, options: [{ name: "action", type: 3, value: "link" }, { name: "code", type: 3, value: code }] }] } });
     await editAfter(linked);
     await db.run(db.k.insertInto("main.access").values({ login: "nora", role: "maintainer" }).onConflict((oc) => oc.doNothing()));
-    assert.match(await run("d3", "u70", "review: photocraft#4"), /not switched on/);
-    await db.run(db.k.updateTable("main.tracked_repos").set({ workflow: "new" }).where("name", "=", "photocraft"));
     await db.run(db.k.insertInto("main.settings").values({ key: "github_identity", value: "app" }).onConflict((oc) => oc.column("key").doUpdateSet({ value: "app" })));
     assert.match(await run("d4", "u70", "review: photocraft#4"), /no write access/);
     assert.equal(await workflows(), 0);
     await db.run(db.k.insertInto("main.repo_permissions").values({ login: "nora", repo: "photocraft", permission: "write", checked_at: new Date().toISOString() }));
     await run("d5", "u70", "review: photocraft#4");
     assert.equal(await workflows(), 1);
+
+    // An answer is for the question the person's alert showed; the refusal shows the one that took its place, as an alert does.
+    const rec = JSON.stringify({ text: "Review it again.", parts: { fix: [], drop: [] }, merges: false, again: "review" });
+    await db.run(db.k.updateTable("main.item_workflows").set({ state: "recommending", rec, rec_at: "2026-11-02T00:00:00.000Z" }));
+    const id = Number((await db.get(db.k.selectFrom("main.item_workflows").select("id")))!.id);
+    await addSentAlerts(db, [{ userHash: keys.hash("author", "u70"), workflowId: id, recAt: "2026-11-01T00:00:00.000Z", sentAt: "2026-11-01T00:00:01.000Z" }]);
+    assert.match(await run("d6", "u70", "yes: photocraft#4"), /A new question follows\. Recommendation: Review it again\./);
+    assert.doesNotMatch(await run("d7", "u70", "yes: photocraft#4"), /new question/);
+    assert.equal((await db.get(db.k.selectFrom("main.item_workflows").select("state")))!.state, "running");
   });
 });
 
@@ -356,4 +364,18 @@ describe("pull requests", () => {
     assert.deepEqual(v2buttons(bodies[1]!).slice(0, 2).map((b) => b.label), ["1 · photocraft#7", "2 · photocraft#8"]);
     assert.equal(logs.length, 1);
   });
+});
+
+test("/autocraft help fits Discord's limits with a long base URL, in both layouts, and keeps the privacy links", () => {
+  const base = `https://${"a".repeat(380)}.example`;
+  const r = helpReply(base);
+  const texts = r.components.filter((c) => (c as { type: number }).type === 10).map((c) => (c as { content: string }).content);
+  assert.ok(texts.join("").length <= V2_TEXT_CHARS);
+  assert.ok(r.legacy.content!.length <= CONTENT_CHARS);
+  assert.ok(texts.some((x) => x.includes("Verify")) && texts.at(-1)!.includes("Privacy"), "every section is in the message");
+  for (const body of [r, r.legacy]) {
+    const urls = (body.components as { type: number; components?: { url?: string }[] }[]).filter((c) => c.type === 1).flatMap((c) => c.components!.map((b) => b.url!));
+    assert.equal(urls.length, 2);
+    assert.ok(urls.every((u) => u.startsWith(base) && u.length <= 512));
+  }
 });

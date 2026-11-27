@@ -45,10 +45,12 @@ export function acceptedFailures(v: PrView, allowFailed: string[]): string[] {
   });
 }
 
+export const DRAFT_REFUSAL = "PR is a draft";
+
 /** The reason the PR may not merge on its own state and checks, or null. */
 export function refuseView(v: PrView, allow: string[] = [], allowFailed: string[] = []): string | null {
   if (v.state !== "OPEN") return `state is ${v.state}`;
-  if (v.isDraft !== false) return "PR is a draft";
+  if (v.isDraft !== false) return DRAFT_REFUSAL;
   if (v.mergeable !== "MERGEABLE") return `mergeable is ${v.mergeable}`;
   const allowed = allow.filter((a) => a !== "");
   const failOk = failureAllowance(v, allowFailed);

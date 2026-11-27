@@ -1,9 +1,11 @@
 // autocraft-server classify | classify current | classify-sample | classify-referee | classify-compare
-import { readFileSync, writeFileSync } from "node:fs";
+import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { band, compareReport, itemUrl, loadReference, loadRows, pairUp, ref, type Pair } from "./report.ts";
 import { markSpotCheck, pickDisagreements, runReferee } from "./referee.ts";
-import { latestRun, runExists, setCurrentRun } from "./settled.ts";
+import { loadOpenNumbers } from "../data/mirror/index.ts";
+import { loadUsageByModel } from "../data/inference/index.ts";
+import { classifyRunInfo, countVerdicts, loadRunRows, runHasVerdicts, setClassifyRun } from "../data/triage/index.ts";
 import { loadItems, loadRefs, runHaiku, runJev } from "./run.ts";
 import { rng, shuffle } from "./sample.ts";
 import type { Db } from "../db/index.ts";
@@ -39,15 +41,15 @@ async function current(args: string[]): Promise<void> {
     process.exit(1);
   }
   if (run === undefined) {
-    const set = (await db.get(db.k.selectFrom("settings").select("value").where("key", "=", "classify_run")))?.value;
-    console.log(set ? `current run: ${set}` : `no current run is set; the run with the newest Jev (or Haiku-alone) verdict is used: ${await latestRun(db) ?? "none"}`);
+    const { set, derived } = await classifyRunInfo(db);
+    console.log(set ? `current run: ${set}` : `no current run is set; the run with the newest Jev (or Haiku-alone) verdict is used: ${derived ?? "none"}`);
     return;
   }
-  if (!await runExists(db, run)) {
+  if (!await runHasVerdicts(db, run)) {
     console.error(`run ${run} has no Jev or Haiku-alone verdicts`);
     process.exit(1);
   }
-  await setCurrentRun(db, run, "cli");
+  await setClassifyRun(db, run, "cli");
   console.log(`current run: ${run}`);
 }
 
@@ -64,7 +66,7 @@ async function classify(args: string[]): Promise<void> {
   const t0 = Date.now();
   if (which === "jev") await runJev(db, runId, items);
   else await runHaiku(db, runId, items);
-  const n = (await db.get(db.k.selectFrom("classifications").select((eb) => eb.fn.countAll<number>().as("n")).where("run_id", "=", runId).where("classifier", "=", which)))!.n;
+  const n = await countVerdicts(db, { run: runId, classifier: which });
   console.log(`${which}: ${n}/${items.length} items classified in ${((Date.now() - t0) / 1000).toFixed(0)} s`);
 }
 
@@ -76,12 +78,12 @@ async function sample(args: string[]): Promise<void> {
   const outDir = need(f, "out-dir");
   const prRepo = need(f, "pr-repo");
   const reference = loadReference(need(f, "reference"), prRepo);
-  const open = (repo: string, kind: "pr" | "issue") => db.all(db.k.selectFrom("items").select("number").where("repo", "=", repo).where("kind", "=", kind).where("state", "=", "OPEN").orderBy("number"));
-  const prs = (await open(prRepo, "pr")).map((r) => `${prRepo}#${r.number}`).filter((r) => reference.has(r));
+  const open = async (repo: string, kind: "pr" | "issue") => (await loadOpenNumbers(db, [repo], kind)).get(repo) ?? [];
+  const prs = (await open(prRepo, "pr")).map((n) => `${prRepo}#${n}`).filter((r) => reference.has(r));
   const a = shuffle(prs, rand).slice(0, Number(f.prs ?? 200)).sort();
   const b: string[] = [];
   for (const repo of (f["issue-repos"] ?? "").split(",").filter(Boolean)) {
-    const issues = (await open(repo, "issue")).map((r) => `${repo}#${r.number}`);
+    const issues = (await open(repo, "issue")).map((n) => `${repo}#${n}`);
     b.push(...shuffle(issues, rand).slice(0, Number(f["issues-each"] ?? 50)).sort());
   }
   writeFileSync(join(outDir, "items-a.txt"), a.join("\n") + "\n");
@@ -106,27 +108,20 @@ async function referee(args: string[]): Promise<void> {
 }
 
 async function costSection(db: Db, runId: string, pairs: Pair[]): Promise<string> {
-  const rows = await db.all(db.k.selectFrom("token_usage").select((eb) => [
-    "model", eb.fn.countAll<number>().as("agents"), eb.fn.sum<number>("items").as("items"), eb.fn.sum<number>("input_tokens").as("input"),
-    eb.fn.sum<number>("output_tokens").as("output"), eb.fn.sum<number>("cache_read_tokens").as("cache_read"), eb.fn.sum<number>("cache_write_tokens").as("cache_write"),
-    eb.fn.sum<number | null>("cost_usd").as("cost"), eb.fn.min<string>("started_at").as("first"), eb.fn.max<string>("ended_at").as("last"),
-    eb.fn.sum<number>(eb(eb(eb.fn<number>("julianday", ["ended_at"]), "-", eb.fn<number>("julianday", ["started_at"])), "*", 86400)).as("busy"),
-  ]).where("run_id", "=", runId).groupBy("model"));
+  const rows = await loadUsageByModel(db, runId);
   const n = pairs.length;
   const head = ["Model", "Calls", "Items", "Input", "Output", "Cache read", "Cache write", "USD", "Wall time", "Summed call time", "Per 100 items (in / out / USD)"];
   const body = rows.map((r) => {
-    const wall = (Date.parse(r.last) - Date.parse(r.first)) / 1000;
     const per = r.items ? 100 / r.items : 0;
-    return [r.model, r.agents, r.items, r.input, r.output, r.cache_read, r.cache_write, r.cost === null ? "-" : r.cost.toFixed(2),
-      `${wall.toFixed(0)} s`, `${r.busy.toFixed(0)} s`, `${(r.input * per).toFixed(0)} / ${(r.output * per).toFixed(0)} / ${r.cost === null ? "-" : (r.cost * per).toFixed(2)}`];
+    return [r.model, r.calls, r.items, r.input, r.output, r.cacheRead, r.cacheWrite, r.costUsd === null ? "-" : r.costUsd.toFixed(2),
+      `${r.wallSeconds.toFixed(0)} s`, `${r.busySeconds.toFixed(0)} s`, `${(r.input * per).toFixed(0)} / ${(r.output * per).toFixed(0)} / ${r.costUsd === null ? "-" : (r.costUsd * per).toFixed(2)}`];
   });
   return `Items in the comparison: ${n}. Jev usage is the \`usage\` object it returns (input_tokens, output_tokens); its cost is the input tokens at TypeSafe's published price (output tokens are free). Wall time is first start to last end of that model's calls (calls run in parallel: Jev 8, Haiku 4, Sonnet 3).\n\n` +
     `| ${head.join(" | ")} |\n|${head.map(() => "---").join("|")}|\n${body.map((r) => `| ${r.join(" | ")} |`).join("\n")}`;
 }
 
 async function refereeSection(db: Db, runId: string, pairs: Pair[]): Promise<{ text: string; spot: string; stats: { n: number; jev: number; haiku: number; neither: number } }> {
-  const sonnet = new Map((await db.all(db.k.selectFrom("classifications").select(["repo", "number", "type_label", "flags", "reason"])
-    .where("classifier", "=", "sonnet").where("run_id", "=", runId))).map((r) => [ref(r), r]));
+  const sonnet = new Map((await loadRunRows(db, runId)).filter((r) => r.classifier === "sonnet").map((r) => [ref(r), r]));
   const ps = pairs.filter((p) => sonnet.has(ref(p.r)));
   const side = (p: Pair) => { const v = sonnet.get(ref(p.r))!.type_label ?? ""; return v === p.jev.type_label ? "jev" : v === p.haiku.type_label ? "haiku" : "neither"; };
   const stats = { n: ps.length, jev: ps.filter((p) => side(p) === "jev").length, haiku: ps.filter((p) => side(p) === "haiku").length, neither: ps.filter((p) => side(p) === "neither").length };

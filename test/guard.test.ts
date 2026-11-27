@@ -8,11 +8,11 @@ import { guard, guardBatchMerge, guardItem, guardRepo, type Live, type LiveRead 
 import { slugOf } from "../src/owners.ts";
 import { closeItem, mergeViaCommand } from "../src/github/write.ts";
 import { G } from "./guarded.ts";
-import { mergeDecisionId } from "../src/merge/queue.ts";
 import { parseSafeMergeArgs, safeMerge } from "../src/merge/safe-merge.ts";
+import { insertWorkflow } from "../src/workflow/store.ts";
 import { world } from "./world-db.ts";
 import { prFacts } from "./world.ts";
-import type { Db } from "../src/db/index.ts";
+import type { Db } from "./helpers/raw-db.ts";
 
 const ref = { repo: "app", number: 1 };
 const open: LiveRead = { state: "OPEN", head: "sha1", draft: false, mergeable: "MERGEABLE" };
@@ -47,11 +47,10 @@ test("refuses a merge without a live read, and when GitHub's head moved", async 
   assert.match(why(await guard(db, ref, MERGE, OP, live({ state: "CLOSED" }))), /no longer open/);
 });
 
-test("refuses when an operator's Hold answer arrived", async () => {
+test("refuses when the PR's workflow ended in the backlog", async () => {
   const db = await fresh([{ n: 1 }]);
-  const id = mergeDecisionId("app", 1, "sha1");
-  await db.run(db.k.insertInto("decisions").values({ id, kind: "merge", repo: "app", number: 1, items: "[]", question: "q", options: "[]", facts: JSON.stringify(["head commit sha1"]), asked_at: T, answer: "hold", answered_by: "op", answered_at: T }));
-  assert.match(why(await guard(db, ref, MERGE, OP, live())), /plan no longer has merge/);
+  await insertWorkflow(db, { repo: "app", number: 1, kind: "pr", entry: "review", state: "backlog", startedBy: "op", startedAt: T, startedVia: "dashboard" });
+  assert.match(why(await guard(db, ref, MERGE, OP, live())), /sent this to the backlog/);
 });
 
 test("refuses when a maintainer's changes-requested review blocks the PR", async () => {
@@ -77,14 +76,15 @@ test("the global pipeline switch gates the pipeline's writes, not an operator's"
 });
 
 test("gates: each action kind needs its approval", () => {
-  const off = (k: "mergeApproved" | "pushApproved" | "commentApproved" | "ciApproved") => prFacts({ repoFacts: { [k]: false } });
-  assert.match(gates(off("mergeApproved"), { kind: "merge" }, OP) ?? "", /Merges/);
-  assert.match(gates(off("pushApproved"), { kind: "conflict", bucket: "merge" }, OP) ?? "", /Pushes/);
+  const off = (k: "commentApproved" | "ciApproved") => prFacts({ repoFacts: { [k]: false } });
+  const unstarted = (may: { repoMerge?: null; repoPush?: null }) => prFacts({ workflow: null, may });
+  assert.match(gates(unstarted({ repoMerge: null }), { kind: "merge" }, OP) ?? "", /Merges/);
+  assert.match(gates(unstarted({ repoPush: null }), { kind: "conflict", bucket: "merge" }, OP) ?? "", /Pushes/);
   assert.match(gates(off("commentApproved"), { kind: "fixup", bucket: "ask" }, OP) ?? "", /Comments/);
   assert.match(gates(off("commentApproved"), { kind: "post-review" }, OP) ?? "", /Comments/);
   assert.match(gates(off("ciApproved"), { kind: "approve-ci" }, OP) ?? "", /CI run approvals/);
   assert.match(gates(off("ciApproved"), { kind: "cifix", bucket: "rerun" }, OP) ?? "", /CI run approvals/);
-  assert.equal(gates(off("pushApproved"), { kind: "merge" }, OP), null);
+  assert.equal(gates(unstarted({ repoPush: null }), { kind: "merge" }, OP), null);
 });
 
 test("gates: a tripped stage writes nothing, asks and other stages stay open", () => {
@@ -109,23 +109,6 @@ test("the merge command gets the reviewed head, and the built-in command refuses
   assert.deepEqual(r, { merged: false, reason: "REFUSED o/r#1: head is other00, not the reviewed sha1" });
 });
 
-/** Item 1 with an operator's close answer to a scope decision. */
-async function closeAnswered(): Promise<Db> {
-  const db = await fresh([{ n: 1 }]);
-  await db.run(db.k.insertInto("decisions").values({ id: "d1", kind: "scope", repo: "app", number: 1, items: JSON.stringify([{ repo: "app", number: 1 }]), question: "q", options: "[]", facts: "[]", asked_at: T, answer: "close", answered_by: "op", answered_at: T }));
-  return db;
-}
-const CLOSE = { kind: "act", bucket: "scope", decisionId: "d1" } as const;
-
-test("an item write needs the comment approval and an answer that still closes the item", async () => {
-  const db = await closeAnswered();
-  assert.match(why(await guardItem(db, ref, CLOSE, OP)), /Comments in app are not approved/);
-  await setCommentApproval(db, "op", "app", true);
-  assert.ok(ok(await guardItem(db, ref, CLOSE, OP)));
-  await db.run(db.k.updateTable("decisions").set({ answer: "hold" }).where("id", "=", "d1"));
-  assert.match(why(await guardItem(db, ref, CLOSE, OP)), /plan no longer has act:scope/);
-});
-
 test("a repo write needs the repo's approval and, for the pipeline, the global switch", async () => {
   const db = await fresh([{ n: 1 }]);
   assert.match(why(await guardRepo(db, "app", "comment", OP)), /Comments in app are not approved/);
@@ -139,17 +122,18 @@ test("a write function refuses a guard that was made for another repo", async ()
   await assert.rejects(closeItem({ db: await fresh([{ n: 1 }]), login: "t" }, G("other"), q, { repo: "app", number: 1, id: "N1", pr: false }), /guard covers other/);
 });
 
-test("a batch member passes the batch guard only with a passed verification, also while GitHub's mergeable state is still unknown", async () => {
+test("a batch member passes the batch guard only with a passed verification and not as a draft, also while GitHub's mergeable state is still unknown", async () => {
   const batch = async (verification: string): Promise<Db> => {
     const db = (await (await (await (await (await (await (await world()).repo(["comment"])).pr(1)).review(1)).verified(1, verification)).premerge(1, "clean")).pipeline(false)).db;
     await db.prepare("INSERT INTO merge_batches (id, repo, branch, state, base_sha, commit_sha, pr_number, created_at, updated_at) VALUES (1, 'app', 'integration-app-1', 'open', 'base', 'tip', 900, ?, ?)").run(T, T);
     await db.prepare("INSERT INTO merge_batch_prs (batch_id, number, head_oid, position) VALUES (1, 1, 'sha1', 0)").run();
     return db;
   };
-  const batchLive: Live = async (_r, n) => (n === 900 ? { ...open, head: "tip" } : { ...open, mergeable: "UNKNOWN" });
-  const run = (db: Db) => guardBatchMerge(db, { repo: "app", number: 900, head: "tip" }, [{ number: 1, head: "sha1" }], OP, batchLive);
+  const batchLive = (draft: boolean): Live => async (_r, n) => (n === 900 ? { ...open, head: "tip" } : { ...open, mergeable: "UNKNOWN", draft });
+  const run = (db: Db, draft = false) => guardBatchMerge(db, { repo: "app", number: 900, head: "tip" }, [{ number: 1, head: "sha1" }], OP, batchLive(draft));
   assert.ok(ok(await run(await batch("passed"))), why(await run(await batch("passed"))));
   assert.ok(!ok(await run(await batch("failed"))));
+  assert.match(why(await run(await batch("passed"), true)), /it is a draft/);
 });
 
 test("a fix-up grant is for the Plan action's source", async () => {

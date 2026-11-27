@@ -9,6 +9,7 @@ import type { MessageBody } from "./rest.ts";
 import { fileRepoUrl } from "./reply.ts";
 import { showSearchForm } from "./search-commands.ts";
 import type { Db } from "../db/index.ts";
+import { loadPanelMessages, setPanelMessage } from "../data/discord/index.ts";
 
 export const PANEL_TEXT = "**Found a problem or have an idea?**\nAutoCraft looks for an existing issue first, then helps you write a new one.";
 
@@ -37,19 +38,19 @@ export type PostResult = { messageId: string; created: boolean; pinError?: strin
  * gone (deleted in Discord) is replaced by a new one. A new panel is pinned; a failed pin keeps the panel and says why.
  */
 export async function postPanel(db: Db, rest: PanelRest, channelId: string): Promise<PostResult | null> {
-  const row = await db.get(db.k.selectFrom("discord_channels").select("panel_message").where("channel_id", "=", channelId));
+  const row = (await loadPanelMessages(db, [channelId])).get(channelId);
   if (!row) return null;
   const body = panelMessage();
-  if (row.panel_message) {
+  if (row.panelMessage) {
     try {
-      await rest.editMessage(channelId, row.panel_message, body);
-      return { messageId: row.panel_message, created: false };
+      await rest.editMessage(channelId, row.panelMessage, body);
+      return { messageId: row.panelMessage, created: false };
     } catch (e) {
       if ((e as { status?: number }).status !== 404) throw e;
     }
   }
   const { id } = await rest.createMessage(channelId, body);
-  await db.run(db.k.updateTable("discord_channels").set({ panel_message: id }).where("channel_id", "=", channelId));
+  await setPanelMessage(db, channelId, id);
   try {
     await rest.pinMessage(channelId, id);
     return { messageId: id, created: true };

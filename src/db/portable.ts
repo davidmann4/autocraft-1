@@ -15,7 +15,6 @@
  * | `json_extract(c, '$.n')` (a number)           | `jsonNum(db, "c", "$.n")`                 |
  * | `json_extract(c, '$.ok')` (true/false → 1/0)  | `jsonBool(db, "c", "$.ok")`               |
  * | `json_type(c, '$.a')`                         | `jsonType(db, "c", "$.a")`                |
- * | `json_array_length(c)`                        | `jsonArrayLength(db, "c")`                |
  * | `json_valid(c)`                               | `jsonValid(db, "c")` (a predicate)        |
  * | `json_remove(c, '$.k')` (an object)           | `jsonRemoveKey(db, "c", "k")`             |
  * | `FROM t, json_each(t.c) j` (an array)         | `` `FROM t, ${jsonEach(db, "t.c", "j")}` ``|
@@ -121,11 +120,6 @@ export function jsonType(d: D, expr: string, path?: string): string {
   return `(SELECT CASE json_typeof(v) WHEN 'string' THEN 'text' WHEN 'boolean' THEN v::text`
     + ` WHEN 'number' THEN CASE WHEN v::text ~ '^-?[0-9]+$' THEN 'integer' ELSE 'real' END ELSE json_typeof(v) END`
     + ` FROM (SELECT ${v} AS v) AS jt)`;
-}
-
-/** The number of elements of the JSON array `expr`; NULL for NULL. */
-export function jsonArrayLength(d: D, expr: string): string {
-  return pgOf(d) ? `json_array_length((${expr})::json)` : `json_array_length(${expr})`;
 }
 
 /** Whether `expr` is valid JSON, as a predicate: use it bare (`WHERE ${jsonValid(...)}`), never compare it with 1. */

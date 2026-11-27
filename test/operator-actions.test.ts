@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb } from "./helpers/raw-db.ts";
 import { ActionError, actionsOf, batchAgain, reviewAgain, verifyAgain } from "../src/operator-actions.ts";
 import { optionalChecks, optionalChecksOf, seenChecks, setOptionalCheck } from "../src/optional-checks.ts";
 

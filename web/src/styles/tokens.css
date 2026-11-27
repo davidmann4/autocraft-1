@@ -9,6 +9,7 @@
   --st-panel: #141518; /* content panels */
   --st-raised: #1e1f22; /* menus, popovers, hover rows (ArtCraft controls) */
   --st-sunken: #0b0b0d; /* inputs */
+  --st-bubble: #26282d; /* a person's chat message */
   --st-fg-rgb: 242 241 238;
   --st-inv-rgb: 255 255 255;
   --st-line: rgba(255, 255, 255, 0.08);
@@ -41,6 +42,7 @@
   --st-panel: #fbfaf8;
   --st-raised: #ffffff;
   --st-sunken: #ffffff;
+  --st-bubble: #ecebe6;
   --st-fg-rgb: 16 16 20;
   --st-inv-rgb: 255 255 255;
   --st-line: rgba(16, 16, 20, 0.1);

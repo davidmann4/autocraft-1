@@ -891,10 +891,8 @@ CREATE TABLE IF NOT EXISTS agent_runs (
   harness TEXT,                       -- user-local mode: claude | codex
   reported_model TEXT                 -- user-local mode: the model the harness reported
 );
-CREATE INDEX IF NOT EXISTS agent_runs_running ON agent_runs(account_id) WHERE state = 'running';
 CREATE INDEX IF NOT EXISTS agent_runs_state ON agent_runs(state, id);
 CREATE INDEX IF NOT EXISTS agent_runs_step ON agent_runs(step, id);
-CREATE INDEX IF NOT EXISTS agent_runs_account ON agent_runs(account_id, id);
 CREATE INDEX IF NOT EXISTS agent_runs_job ON agent_runs(job_id, id);
 CREATE INDEX IF NOT EXISTS agent_runs_started ON agent_runs(started_at);
 
@@ -954,6 +952,8 @@ CREATE TABLE IF NOT EXISTS remote_calls (
   own_lane INTEGER NOT NULL DEFAULT 0, -- 1 while leased on the Task Runner's own lane (Claim.ownLane): counts toward no slot or Max calls at once
   bound_slot INTEGER NOT NULL DEFAULT 0, -- 1: a call bound to for_login that runs in one of that user's Task Runner slots (counts toward Max calls at once), never in the own lane
   released_by TEXT COLLATE NOCASE, released_at INTEGER, -- the last helper that gave the lease back: not offered that login again for a while
+  release_wait_ms INTEGER,            -- how long that give-back keeps the call from released_by's runners; NULL: RELEASE_SKIP_MS (src/remote/calls.ts)
+  setup_retries INTEGER NOT NULL DEFAULT 0, -- give-backs after a local setup failure that got the short wait (SETUP_RETRY_MS): at most max_attempts
   progress TEXT,                      -- the helper's last progress line
   reply TEXT, usage TEXT, turns INTEGER, session_id TEXT, duration_ms INTEGER,
   error TEXT,
@@ -965,7 +965,7 @@ CREATE TABLE IF NOT EXISTS remote_calls (
   picked_at INTEGER,
   pick_until INTEGER,                 -- the pick counts until then
   no_taker_since INTEGER,             -- while queued: since when no Task Runner may take it (src/remote/takers.ts); withdrawn after a while
-  bundle_hash TEXT,                   -- sha256 of the canonical bundle JSON: a resumed job adopts its earlier run's call with the same bundle
+  bundle_hash TEXT,                   -- the reuse key (src/remote/reuse-key.ts): a resumed job adopts its earlier run's call with the same key
   consumed_at INTEGER,                -- when the caller read the done reply; a done call not yet read can still be adopted
   base_stdin TEXT,                    -- the bundle's stdin as queued, once a lease rewrote it (a workspace session's resume note)
   refusals INTEGER NOT NULL DEFAULT 0, -- retries after a model's safety filter declined the call (submitCall): at most one, and none uses an attempt
@@ -1041,6 +1041,40 @@ CREATE TABLE IF NOT EXISTS agent_run_tools (
   ended_at TEXT,
   check_id INTEGER,                   -- model_checks row, for the check tool
   PRIMARY KEY (run_id, seq)
+) WITHOUT ROWID;
+
+-- Full transcripts of model calls (every model message, tool call and tool result), one row per Task Runner attempt.
+-- The gzip JSONL object lives in the transcript store (src/transcripts: an S3-compatible bucket or a local directory);
+-- the row is its pointer and summary. Kept ten years, like agent_run_texts.
+CREATE TABLE IF NOT EXISTS agent_run_transcripts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id INTEGER NOT NULL,
+  call_id INTEGER,                    -- remote_calls.id
+  attempt INTEGER NOT NULL DEFAULT 0, -- the call's attempt the transcript is of
+  outcome TEXT NOT NULL,              -- done | failed | refused
+  store TEXT NOT NULL,                -- local | s3
+  bucket TEXT,                        -- s3: the bucket the object is in
+  object_key TEXT NOT NULL,
+  bytes INTEGER NOT NULL,             -- size of the stored (gzip) object
+  raw_bytes INTEGER NOT NULL,         -- size of the JSONL
+  sha256 TEXT NOT NULL,               -- of the stored object
+  lines INTEGER NOT NULL,             -- events in the transcript
+  tool_count INTEGER NOT NULL,
+  last_tool TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS agent_run_transcripts_run ON agent_run_transcripts(run_id, id);
+
+-- Transcripts a Task Runner may still send (ROUTES.transcript) for an attempt it has just submitted, by the lease secret's
+-- hash: the upload takes its row, and rows past `until_ms` are dropped on the next insert.
+CREATE TABLE IF NOT EXISTS transcript_waits (
+  secret_hash TEXT PRIMARY KEY,
+  run_id INTEGER NOT NULL,
+  call_id INTEGER NOT NULL,
+  attempt INTEGER NOT NULL,
+  outcome TEXT NOT NULL,              -- done | failed | refused
+  root TEXT,                          -- the claim's path root
+  until_ms INTEGER NOT NULL
 ) WITHOUT ROWID;
 
 CREATE INDEX IF NOT EXISTS jobs_started ON jobs(started_at);
@@ -1268,7 +1302,7 @@ CREATE INDEX IF NOT EXISTS actions_item ON actions(repo, number);
 -- comment-unsent (that comment never reached GitHub: asked again after a backoff, src/core/rules.ts unsentAsk; a carry-over's row has source 'carry'), pushing (written before the push, to_head is the commit about to be
 -- pushed; replaced by the push's outcome; one left behind by a crash counts as a try). Only the first
 -- three count against the two tries per PR. superseded: a row whose reason no longer applies (kept for the record, ignored).
--- source: NULL = the review's fix list, 'premerge' = the pre-merge review's fix list (one round per PR).
+-- source: NULL = the review's fix list, 'premerge' = the pre-merge review's fix list (up to PREMERGE_FIX_ROUNDS rounds per PR).
 CREATE TABLE IF NOT EXISTS fixups (
   repo TEXT NOT NULL, number INTEGER NOT NULL,
   from_head TEXT NOT NULL,            -- the reviewed head commit the fix was made on
@@ -1283,7 +1317,7 @@ CREATE INDEX IF NOT EXISTS fixups_item ON fixups(repo, number, created_at);
 -- CI fix tries (src/cifix): one row per try at a head whose gate check failed. kind: format | code | infra.
 -- state: infra (waiting for the one rerun) | rerun | formatting (formatter task queued, task_id) | pushed | asked (patch posted as a comment) |
 -- linting (a model patch is stored, patch/lint_task/lint_round/lint_state, and waits for its lint task) | failed | refused | rejected | cannot-push | push-denied | pushing (written before the push, to_head is the commit about to be pushed) |
--- skipped (final: nothing to fix here, not a try) | capped (final: the PR's limit of 2 pushed fixes or 4 tries is used; not a try) | rerunning (rerun requested, written before the gh calls) | comment-failed (final: the patch comment failed) | comment-unsent (the comment never reached GitHub, not a try: the stored patch or formatter result is posted again after a backoff, src/core/rules.ts unsentAsk; a patch without a lint task is kept as a linting row with no lint_task) | superseded (a row whose reason no longer applies; ignored). Tries are the rows in formatting, pushing, pushed, failed, refused and rejected.
+-- skipped (final: nothing to fix here, not a try) | capped (final: the PR's limit of 2 pushed fixes or 4 tries is used; not a try) | rerunning (rerun requested, written before the gh calls) | comment-failed (final: the patch comment failed) | comment-unsent (the comment never reached GitHub, not a try: the stored patch or formatter result is posted again after a backoff, src/core/rules.ts unsentAsk; a patch without a lint task is kept as a linting row with no lint_task) | superseded (a row whose reason no longer applies; ignored) | unread (the failure log could not be read yet, not a try: read again after a backoff, src/core/rules.ts CIFIX_UNREAD_DELAYS_MS). Tries are the rows in formatting, pushing, pushed, failed, refused and rejected.
 CREATE TABLE IF NOT EXISTS ci_fixes (
   repo TEXT NOT NULL, number INTEGER NOT NULL,
   head TEXT NOT NULL,                 -- the head commit whose check failed
@@ -1680,7 +1714,7 @@ CREATE TABLE IF NOT EXISTS fast_track (
   UNIQUE (repo, number)
 );
 
--- Merge holds (src/merge/controls.ts): a PR held here is reviewed and fixed as usual but does not merge, alone or in a batch, until released.
+-- Retired (src/db/retired-names.ts): merge holds, which are held items (src/db/holds-to-items.ts). A release before that reads them.
 CREATE TABLE IF NOT EXISTS merge_holds (
   repo TEXT NOT NULL,
   number INTEGER NOT NULL,
@@ -1767,7 +1801,9 @@ CREATE TABLE IF NOT EXISTS held_followups (
   url TEXT,
   reason TEXT,                        -- dropped or failed: why; held: why the last try did not file it
   attempts INTEGER NOT NULL DEFAULT 0,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  workflow_id INTEGER,                -- the maintainer workflow the follow-up was held for; NULL on rows held before workflows
+  approved_at TEXT                    -- the workflow's merge approval as it stood when the follow-up was held
 );
 CREATE INDEX IF NOT EXISTS held_followups_item ON held_followups(repo, number);
 CREATE INDEX IF NOT EXISTS held_followups_state ON held_followups(state);
@@ -1802,6 +1838,44 @@ CREATE INDEX IF NOT EXISTS decision_choices_item ON decision_choices(repo, numbe
 CREATE INDEX IF NOT EXISTS decision_choices_decision ON decision_choices(decision_id, state);
 CREATE INDEX IF NOT EXISTS conversation_cards_turn ON conversation_cards(turn_id);
 CREATE INDEX IF NOT EXISTS conversation_cards_item ON conversation_cards(repo, number);
+-- The chat of an item (src/data/chat). A conversation refers to an item (repo, number), or to none (both null). An item has one main
+-- conversation (is_main = 1). title: the entry of the workflow the item had when the conversation started ("Review", ...), or "Conversation".
+CREATE TABLE IF NOT EXISTS chat_conversations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  repo TEXT,
+  number INTEGER,
+  is_main INTEGER NOT NULL DEFAULT 0,
+  title TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  created_by TEXT NOT NULL            -- the login whose message or workflow started it, or 'autocraft'
+);
+CREATE UNIQUE INDEX IF NOT EXISTS chat_conversations_main ON chat_conversations(repo, number) WHERE is_main = 1;
+CREATE INDEX IF NOT EXISTS chat_conversations_item ON chat_conversations(repo, number, id);
+-- What people wrote in a conversation, on any surface, as written; and AutoCraft's recommendations and end lines.
+-- kind: said | recommended | finished. via: dashboard | github | discord | agent | cli | autocraft. payload: JSON, by kind
+-- (said: {url?, reconstructed?}; recommended: {workflowId, rec, parts, asked}; finished: {workflowId, state, merged, base}).
+-- workflow_event_id: the workflow_events row a said message produced; turn_id: the conversation_turns row of a question to Opus;
+-- workflow_id: the workflow a recommendation or end line is about; github_comment_id: GitHub's numeric id of the comment a said message copies.
+CREATE TABLE IF NOT EXISTS chat_messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  conversation_id INTEGER NOT NULL,
+  author TEXT NOT NULL,               -- a login, or 'autocraft'
+  via TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  body TEXT NOT NULL,
+  payload TEXT,
+  workflow_event_id INTEGER,
+  turn_id INTEGER,
+  workflow_id INTEGER,
+  github_comment_id INTEGER,
+  at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS chat_messages_conversation ON chat_messages(conversation_id, id);
+CREATE INDEX IF NOT EXISTS chat_messages_author ON chat_messages(author, at);
+CREATE INDEX IF NOT EXISTS chat_messages_event ON chat_messages(workflow_event_id) WHERE workflow_event_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS chat_messages_turn ON chat_messages(turn_id) WHERE turn_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS chat_messages_workflow ON chat_messages(workflow_id, kind) WHERE workflow_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS chat_messages_comment ON chat_messages(github_comment_id) WHERE github_comment_id IS NOT NULL;
 
 -- A repo's area list, one row per saved version; the current version is the highest.
 CREATE TABLE IF NOT EXISTS area_lists (
@@ -1912,6 +1986,8 @@ CREATE TABLE IF NOT EXISTS postmerge_followups (
 CREATE INDEX IF NOT EXISTS postmerge_followups_issue ON postmerge_followups(repo, issue_number);
 -- Only merges from this moment on are reviewed unless `postmerge backfill` moves it back.
 INSERT OR IGNORE INTO settings (key, value) VALUES ('postmerge_since', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+-- Merges outside the pipeline's scope, such as those a person approved in a repo whose Pipeline switch is off, from this moment on.
+INSERT OR IGNORE INTO settings (key, value) VALUES ('postmerge_unscoped_since', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
 
 -- CI on the default branch of every synced repo, one row per head commit seen. Written by the main-ci step.
 -- state: green | red | optional | running | none (src/mainci/classify.ts).
@@ -1934,7 +2010,8 @@ CREATE INDEX IF NOT EXISTS main_ci_repo_time ON main_ci(repo, committed_at);
 -- Red default branches (src/mainfix): one row per (repo, head, failing gate check), written once the check is sorted.
 -- verdict: flaky | infra | code (Haiku, from the failed step's log).
 -- state: rerun-requested (flaky: the failed jobs were rerun, written before the call) | rerun-passed (the head turned green) |
---   asked (infra: an operator decision asks whether to open an issue) | issue-opened | declined (infra: the answers to that decision) |
+--   issue-opening (infra: written before the issue is created) | issue-opened (issue_number; later red heads of the streak share it) |
+--   issue-failed (infra: GitHub refused the issue) | asked, declined (infra: rows of an earlier question) |
 --   needs-fix (code, or red again after a rerun: waits for the fix PR step) | nothing-to-do (nothing readable to act on, or main is
 --   green again, or an open PR already covers the failure: `#N` in the reason) | pr-opened (our fix PR: pr_number, pr_url) |
 --   fix-failed (no fix PR could be made: reason; a person takes over). One attempt per row.
@@ -1971,6 +2048,36 @@ CREATE TABLE IF NOT EXISTS premerge_reviews (
   searched TEXT,
   error TEXT,
   tries INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (repo, number, head_oid)
+);
+
+-- The follow-up issue of a PR a maintainer approved for merge (src/premerge/followups.ts): one row per PR head whose pre-merge
+-- review found defects that do not stop the merge. The first row's write opens the PR's one issue (issue_number, url); a later
+-- head's row comments on it. state: filing (written before the write), filed, failed (note: why GitHub refused it, or that it was
+-- never sent), or unsent (the write sent nothing: tried again after a backoff, src/core/rules.ts unsentAsk; note: the JSON list of
+-- the times of those tries, kept while the retry is filing).
+CREATE TABLE IF NOT EXISTS premerge_followups (
+  repo TEXT NOT NULL, number INTEGER NOT NULL,
+  head_oid TEXT NOT NULL,
+  issue_number INTEGER,
+  url TEXT,
+  state TEXT NOT NULL,
+  at TEXT NOT NULL,
+  note TEXT,
+  PRIMARY KEY (repo, number, head_oid)
+);
+
+-- The review side of the same follow-up issue (src/premerge/followups.ts): one row per reviewed head of a PR approved for merge
+-- whose Opus review had fixes, or a hold, that do not block the merge (src/core/review-blocking.ts). The issue is the one of
+-- premerge_followups or this table, whichever opened it; a later row comments on it. state as in premerge_followups.
+CREATE TABLE IF NOT EXISTS review_followups (
+  repo TEXT NOT NULL, number INTEGER NOT NULL,
+  head_oid TEXT NOT NULL,
+  issue_number INTEGER,
+  url TEXT,
+  state TEXT NOT NULL,
+  at TEXT NOT NULL,
+  note TEXT,
   PRIMARY KEY (repo, number, head_oid)
 );
 
@@ -2088,6 +2195,18 @@ CREATE TABLE IF NOT EXISTS push_outcomes (
 );
 CREATE INDEX IF NOT EXISTS push_outcomes_to ON push_outcomes(repo, to_oid);
 CREATE INDEX IF NOT EXISTS push_outcomes_stage ON push_outcomes(stage, id);
+
+-- The pushes AutoCraft makes to pull requests, each written right before its push and never overwritten by another: the head it was made
+-- on, the commit, and when. A push that never landed left a commit no head is.
+CREATE TABLE IF NOT EXISTS own_pushes (
+  repo TEXT NOT NULL, number INTEGER NOT NULL,
+  from_oid TEXT NOT NULL, to_oid TEXT NOT NULL,
+  action TEXT NOT NULL,               -- the audit action of the push (fixup-push, cifix-push, conflict-push, implement-push, autorepin-push)
+  at TEXT NOT NULL,                   -- right before the push
+  lines INTEGER,                      -- how many of the pull request's lines it changed; NULL when unknown
+  landed_at TEXT,                     -- when git reported it done; NULL until then, and when a crash came first
+  PRIMARY KEY (repo, number, to_oid)
+) WITHOUT ROWID;
 
 -- Circuit breaker: a stage that stopped itself. One row per push stage and repo (stage `<stage>:<repo>`, stage one of fixup,
 -- cifix, fixissue, merge), one per push stage for its trip on every repo (`<stage>`), and `outside-surge` for the outside-author
@@ -2261,7 +2380,9 @@ CREATE TABLE IF NOT EXISTS preapprovals (
   reason TEXT,
   updated_at TEXT NOT NULL,
   fix_id INTEGER,
-  workflow_id INTEGER                 -- the item_workflows row whose merge leg this is; null outside the maintainer workflow
+  workflow_id INTEGER,                -- the item_workflows row whose merge leg this is; null outside the maintainer workflow
+  reason_code TEXT,                   -- what reason is (src/core/codes.ts StopCode); NULL: read from its text
+  reason_params TEXT                  -- JSON: what the reason names
 );
 CREATE INDEX IF NOT EXISTS preapprovals_item ON preapprovals(repo, number, id);
 
@@ -2288,12 +2409,18 @@ CREATE TABLE IF NOT EXISTS item_workflows (
   plan TEXT NOT NULL DEFAULT '[]',
   legacy_preapproval_id INTEGER,
   updated_at TEXT NOT NULL,
-  step TEXT                           -- the step it is at (src/workflow/status.ts StepName), written by the advance pass
+  step TEXT,                          -- the step it is at (src/workflow/status.ts StepName), written by the advance pass
+  pr_number INTEGER,                  -- an implement workflow: the PR it works on, the newest an attempt of its issue opened for it; null before that (src/data/workflow/link.ts)
+  version INTEGER NOT NULL DEFAULT 0, -- how often the row was written, for a write that must not pass another by
+  accepted_head TEXT,                 -- the PR head a person accepted; NULL: base_head and the merge legs say it (src/core/evidence.ts acceptedHeads)
+  review_asked_at TEXT,               -- a merge entry: a person asked for a model review of the head, newer than this; null when it merges without one
+  taken_by TEXT                       -- a row the automatic merge rule started: the person whose answer last ran on it, who its questions go to (src/workflow/asked.ts)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS item_workflows_live ON item_workflows(repo, number) WHERE state IN ('running', 'waiting', 'blocked', 'recommending');
 CREATE INDEX IF NOT EXISTS item_workflows_item ON item_workflows(repo, number, id);
 -- What people did to an item's workflow, with the parsed command (never the raw text): started, approved, answered,
--- ambiguous, blocked, stopped, weighted. workflow_id is null for an ambiguous answer on an item with no workflow.
+-- ambiguous, blocked, stopped, weighted; and, archived, people's answers, the questions left open and the actions of the decision system before it. workflow_id is
+-- null for an ambiguous answer on an item with no workflow and for an archived row.
 CREATE TABLE IF NOT EXISTS workflow_events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   workflow_id INTEGER,
@@ -2304,10 +2431,31 @@ CREATE TABLE IF NOT EXISTS workflow_events (
   kind TEXT NOT NULL,
   parsed TEXT,                        -- JSON Parsed (src/workflow/types.ts)
   line TEXT,                          -- the confirmation line given
-  at TEXT NOT NULL
+  at TEXT NOT NULL,
+  seen_at TEXT                        -- an answer: when its question was asked, the last moment of which the person had been shown anything
 );
 CREATE INDEX IF NOT EXISTS workflow_events_item ON workflow_events(repo, number, id);
 CREATE INDEX IF NOT EXISTS workflow_events_login ON workflow_events(login, via, at);
+-- The readers of what happened last leave the archived rows out: they are written later than what they record.
+CREATE INDEX IF NOT EXISTS workflow_events_live ON workflow_events(repo, number, id) WHERE kind <> 'archived';
+CREATE INDEX IF NOT EXISTS workflow_events_live_at ON workflow_events(at) WHERE kind <> 'archived';
+-- A person's Task Runner taken onto one item's live workflow (take / release): it may claim that workflow's calls while no runner of
+-- the starter or approver is ready with room (src/remote/started.ts, src/data/runners/cross.ts startedWorkAllows). The grant ends
+-- with the workflow (a new start has another id) or with released_at.
+CREATE TABLE IF NOT EXISTS item_runners (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  repo TEXT NOT NULL,
+  number INTEGER NOT NULL,
+  workflow_id INTEGER NOT NULL,
+  login TEXT NOT NULL,
+  at TEXT NOT NULL,
+  released_at TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS item_runners_live ON item_runners(workflow_id, login) WHERE released_at IS NULL;
+CREATE INDEX IF NOT EXISTS item_runners_item ON item_runners(repo, number, id);
+CREATE INDEX IF NOT EXISTS workflow_events_workflow ON workflow_events(workflow_id) WHERE workflow_id IS NOT NULL;
+-- An archived row (src/db/switch-over.ts) names the answer, open question or action it records in parsed: {"kind": "archived", "legacy": "decision:<id>"}.
+CREATE UNIQUE INDEX IF NOT EXISTS workflow_events_archived ON workflow_events(repo, number, parsed) WHERE kind = 'archived';
 -- The last "link your account" reply to a GitHub commenter with no AutoCraft login; one a week per login. Bookkeeping: no live topic.
 CREATE TABLE IF NOT EXISTS github_link_nudges (
   login TEXT PRIMARY KEY COLLATE NOCASE,
@@ -2511,9 +2659,45 @@ CREATE TABLE IF NOT EXISTS discord_replies (
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS discord_replies_quoted ON discord_replies (quoted_hash) WHERE quoted_hash IS NOT NULL;
 CREATE INDEX IF NOT EXISTS discord_replies_channel ON discord_replies (channel_hash);
+-- What the bot's threads and command replies follow (src/discord/threads.ts): one row per target and item. `target_hash` is the keyed
+-- hash of the thread's channel id (`kind` thread), or of the bot's reply when it could not start a thread (`kind` reply); `channel_hash`
+-- the keyed hash of the channel the command was sent in. `sealed` holds the guild, the thread's or channel's id, the message id (the
+-- thread's first message, or the bot's reply) and a keyed hash of the sender. `command` is the command as the parser writes it,
+-- `login` the AutoCraft login it ran as, `at` the last command that added the item. No message text.
+CREATE TABLE IF NOT EXISTS discord_follows (
+  target_hash TEXT NOT NULL,
+  repo TEXT NOT NULL,
+  number INTEGER NOT NULL,
+  kind TEXT NOT NULL,
+  channel_hash TEXT NOT NULL,
+  sealed TEXT NOT NULL,
+  command TEXT NOT NULL,
+  login TEXT NOT NULL,
+  at TEXT NOT NULL,
+  PRIMARY KEY (target_hash, repo, number)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS discord_follows_item ON discord_follows (repo, number);
+CREATE INDEX IF NOT EXISTS discord_follows_channel ON discord_follows (channel_hash);
+-- What the bot last posted about each item a target follows (src/discord/results.ts), so a restart posts nothing twice. `status_hash` is a
+-- hash of the status line last posted; `result_key` the workflow id and recommendation time of the result last posted, `result_hash`
+-- a hash of its text and `link_hash` of its GitHub link; `sealed` the result message's id sealed with the target and item (keys.ts),
+-- '' when none. No message text. A row goes once its (target, item) row in `discord_follows` is gone.
+CREATE TABLE IF NOT EXISTS discord_follow_posts (
+  target_hash TEXT NOT NULL,
+  repo TEXT NOT NULL,
+  number INTEGER NOT NULL,
+  status_hash TEXT NOT NULL,
+  result_key TEXT NOT NULL DEFAULT '',
+  result_hash TEXT NOT NULL DEFAULT '',
+  link_hash TEXT NOT NULL DEFAULT '',
+  sealed TEXT NOT NULL DEFAULT '',
+  at TEXT NOT NULL,
+  PRIMARY KEY (target_hash, repo, number)
+) WITHOUT ROWID;
 
 -- Discord accounts linked to dashboard logins (src/discord/links.ts). `user_hash` is a keyed hash of the Discord user id; the id
--- itself is never stored. `discord_link_codes` holds the keyed hash of each unused link code (one per login) until it is used or expires.
+-- itself is never stored. `source` says how the link was made: code (a dashboard user's `/autocraft account action:link` code; only these run
+-- commands) or verify (the public /verify pages, which prove the GitHub account but give no AutoCraft login). `discord_link_codes` holds the keyed hash of each unused link code (one per login) until it is used or expires.
 CREATE TABLE IF NOT EXISTS discord_links (
   user_hash TEXT PRIMARY KEY,
   login TEXT NOT NULL,
@@ -2524,6 +2708,12 @@ CREATE TABLE IF NOT EXISTS discord_link_codes (
   code_hash TEXT PRIMARY KEY,
   login TEXT NOT NULL,
   expires_at TEXT NOT NULL
+) WITHOUT ROWID;
+-- Discord users who asked the bot to stop tracking their messages (`/autocraft optout`, src/discord/store.ts). `user_hash` is a keyed
+-- hash of the Discord user id. Their messages record no mentions; what they send to the bot still runs. Bookkeeping: not a change topic.
+CREATE TABLE IF NOT EXISTS discord_optouts (
+  user_hash TEXT PRIMARY KEY,
+  opted_out_at TEXT NOT NULL
 ) WITHOUT ROWID;
 
 -- Decision alerts by direct message (src/discord/alerts.ts). A row of `discord_alerts` is an opted-in linked account: `sealed` holds the
@@ -2543,6 +2733,36 @@ CREATE TABLE IF NOT EXISTS discord_alert_msgs (
   PRIMARY KEY (decision_id, user_hash)
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS discord_alert_msgs_user ON discord_alert_msgs (user_hash, sent_at);
+
+-- The public contributor verification at /verify (src/dash/server/verify.ts). A row of `discord_verify_flows` is one browser's
+-- sign-in, keyed by the hash of the random flow id in its cookie; `state_hash` is the hash of the current step's OAuth state, spent
+-- when its callback arrives. `step` is discord (waiting for Discord), github (waiting for GitHub), then the outcome: requested (a role
+-- request was made), no-merge or unchecked (GitHub could not be asked). `user_sealed` holds the Discord user id proven by the Discord
+-- step, sealed with the Discord key, and `user_hash` its keyed hash (to delete the rows on unlink); `login` is the GitHub login
+-- proven by the GitHub step. Unfinished flows go at their expiry. A row of `discord_role_grants` asks the runner to give
+-- the contributor role to a Discord user whose GitHub login has a merged pull request; the runner writes `result` (granted, already,
+-- not-member, forbidden, failed, off). The flow row names its grant so the result page can show it. Rows go after a day.
+CREATE TABLE IF NOT EXISTS discord_verify_flows (
+  flow_hash TEXT PRIMARY KEY,
+  step TEXT NOT NULL,
+  state_hash TEXT,
+  verifier TEXT,
+  user_sealed TEXT,
+  user_hash TEXT,
+  login TEXT,
+  grant_id TEXT,
+  expires_at TEXT NOT NULL
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS discord_role_grants (
+  id TEXT PRIMARY KEY,
+  user_sealed TEXT NOT NULL,
+  user_hash TEXT NOT NULL,
+  login TEXT NOT NULL,
+  requested_at TEXT NOT NULL,
+  result TEXT,
+  done_at TEXT
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS discord_role_grants_open ON discord_role_grants (requested_at) WHERE result IS NULL;
 CREATE TRIGGER IF NOT EXISTS discord_links_alerts AFTER DELETE ON discord_links BEGIN
   DELETE FROM discord_alerts WHERE user_hash = old.user_hash;
   DELETE FROM discord_alert_msgs WHERE user_hash = old.user_hash;
@@ -2724,3 +2944,260 @@ CREATE TRIGGER IF NOT EXISTS classifications_settled_d AFTER DELETE ON classific
   INSERT INTO item_settled_dirty (run_id, repo, number) VALUES (OLD.run_id, OLD.repo, OLD.number)
     ON CONFLICT (run_id, repo, number) DO UPDATE SET n = n + 1;
 END;
+
+-- State that code writes for its own use, one table per owning module (src/data/<module>). The values once lived in settings
+-- rows; src/db/state-copy.ts copies those rows here once and leaves them in place for older processes.
+
+-- Sync bookkeeping (mirror): one row.
+CREATE TABLE IF NOT EXISTS sync_state (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  org_high_water TEXT,                -- start of the last org-wide incremental sync that finished without failures
+  full_sync_cursor TEXT,              -- `<scope>|<name>`: where a resumable full sync carries on
+  search_catchup_at TEXT,
+  repos_refreshed_at TEXT,
+  main_ci_polled_at TEXT,
+  releases_polled_at TEXT,
+  releases_offset INTEGER,            -- where the next release poll starts in the repo list
+  rate_remaining INTEGER,             -- GitHub GraphQL points left after the last sync, and when they reset
+  rate_reset_at TEXT,
+  points_last_run INTEGER,            -- GraphQL points the last incremental sync and the last full sync spent
+  full_points_last_run INTEGER,
+  author_ids_backfilled_at TEXT,
+  author_ids_error TEXT,              -- `<time> <message>` of the last failed account-id pass
+  app_install_sweep_at TEXT,
+  webhook_at TEXT,                    -- the newest verified GitHub App webhook delivery
+  webhook_started_at TEXT,            -- start of the newest webhook receiver process that has taken a delivery
+  polled_at TEXT,                     -- start of the last finished org-wide poll
+  poll_missed_at TEXT,                -- start of the last poll that found changes no webhook had brought
+  poll_missed TEXT,                   -- that poll's count and first items: `<n> <repo#number> ...`
+  deliveries_checked_at TEXT          -- GitHub's list of the app's webhook deliveries was checked up to here
+);
+
+-- Webhook deliveries the delivery check asked GitHub to send again (src/github/deliveries.ts), by delivery GUID. GitHub keeps
+-- deliveries three days; rows older than that are pruned.
+CREATE TABLE IF NOT EXISTS webhook_redeliveries (
+  guid TEXT PRIMARY KEY,
+  asked INTEGER NOT NULL,             -- redelivery requests made, failed requests included
+  asked_at TEXT,                      -- the last request GitHub accepted; an attempt before it is answered by the redelivery
+  updated_at TEXT NOT NULL
+) WITHOUT ROWID;
+
+-- Per-repo step approvals (control): the repo lets AutoCraft run the step where no person asked for it.
+CREATE TABLE IF NOT EXISTS repo_step_approvals (
+  repo TEXT NOT NULL,
+  step TEXT NOT NULL,                 -- merge | push | comment | fixissue | labels | mainfix | prstatus | ci
+  by TEXT NOT NULL,
+  at TEXT NOT NULL,
+  PRIMARY KEY (repo, step)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS audit_action_at ON audit(action, at);
+
+-- Lane bookkeeping (jobs): fingerprints of a lane's inputs at its last job (fp, per step and repo), daily-limit resets
+-- (reset, per step), round-robin cursors (cursor: review, verify) and planner marks (mark: planned_at, seqs_seen, wake_at,
+-- status, heartbeat, security_poll_at). value is the fingerprint, time, cursor or mark; job_id the job an fp row belongs to.
+CREATE TABLE IF NOT EXISTS lane_state (
+  kind TEXT NOT NULL,
+  step TEXT NOT NULL,
+  repo TEXT NOT NULL DEFAULT '',
+  value TEXT NOT NULL,
+  job_id INTEGER,
+  at TEXT NOT NULL,
+  PRIMARY KEY (kind, step, repo)
+) WITHOUT ROWID;
+-- Database statements, round trips and time per process scope (runner-tick, claim, dashboard, planner-pass) and UTC minute
+-- (`YYYY-MM-DDTHH:MM`), added up by each process's flush.
+CREATE TABLE IF NOT EXISTS db_stats (
+  scope TEXT NOT NULL,
+  minute TEXT NOT NULL,
+  statements INTEGER NOT NULL DEFAULT 0,
+  round_trips INTEGER NOT NULL DEFAULT 0,
+  ms INTEGER NOT NULL DEFAULT 0,
+  calls INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (scope, minute)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS db_stats_minute ON db_stats(minute);
+
+-- Classify state (triage): kind jev_failed is the class_hash at which an item's Jev request gave no valid verdict; kind
+-- current_run (repo '', number 0) is the classify run the pipeline reads.
+CREATE TABLE IF NOT EXISTS classify_state (
+  kind TEXT NOT NULL,
+  repo TEXT NOT NULL,
+  number INTEGER NOT NULL,
+  value TEXT,
+  at TEXT,
+  PRIMARY KEY (kind, repo, number)
+) WITHOUT ROWID;
+-- A duplicate set that changed on GitHub since the sync (triage): the set's hash and when it was dropped, so it is not tried
+-- again for a while.
+CREATE TABLE IF NOT EXISTS dupe_drops (
+  repo TEXT NOT NULL,
+  key TEXT NOT NULL,
+  hash TEXT NOT NULL,
+  at TEXT NOT NULL,
+  PRIMARY KEY (repo, key)
+) WITHOUT ROWID;
+
+-- What a person told AutoCraft to do on GitHub (workflow): a close, comment-close or merge made as that person.
+-- state: pending | waiting-token | waiting-permission | done | failed | stopped | skipped. head is the head the person saw:
+-- a push after the command stops a close or merge.
+CREATE TABLE IF NOT EXISTS workflow_actions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  workflow_id INTEGER NOT NULL,
+  repo TEXT NOT NULL,
+  number INTEGER NOT NULL,
+  kind TEXT NOT NULL,                 -- close | comment-close | merge
+  by TEXT NOT NULL,
+  head TEXT,
+  state TEXT NOT NULL,
+  reason TEXT,
+  comment_url TEXT,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  done_at TEXT,
+  close_as TEXT,                      -- a close: completed | not-planned | duplicate <repo>#<n>; null: no reason given
+  UNIQUE (workflow_id, kind, repo, number)
+);
+CREATE INDEX IF NOT EXISTS workflow_actions_state ON workflow_actions(state, created_at);
+CREATE INDEX IF NOT EXISTS workflow_actions_item ON workflow_actions(repo, number);
+
+-- Review marks per PR (review): when an operator marked the reviews stale, today's count of discussion re-reviews, and the
+-- failed review calls at one head.
+CREATE TABLE IF NOT EXISTS review_state (
+  repo TEXT NOT NULL,
+  number INTEGER NOT NULL,
+  stale_at TEXT,
+  rerun_day TEXT,                     -- UTC day (YYYY-MM-DD) rerun_count counts
+  rerun_count INTEGER NOT NULL DEFAULT 0,
+  fail_head TEXT,
+  fail_count INTEGER NOT NULL DEFAULT 0,
+  fail_at TEXT,
+  PRIMARY KEY (repo, number)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS opus_reviews_item_at ON opus_reviews(repo, number, at);
+CREATE INDEX IF NOT EXISTS opus_review_history_item_at ON opus_review_history(repo, number, at);
+
+-- PRs whose mergeable state GitHub keeps reporting as unknown (merge): checks reads in a row that showed it, REST rereads,
+-- and whether it is stuck.
+CREATE TABLE IF NOT EXISTS merge_state (
+  repo TEXT NOT NULL,
+  number INTEGER NOT NULL,
+  head TEXT NOT NULL,
+  since TEXT NOT NULL,
+  reads INTEGER NOT NULL DEFAULT 0,
+  rereads INTEGER NOT NULL DEFAULT 0,
+  stuck INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (repo, number)
+) WITHOUT ROWID;
+-- The most PRs a repo's next integration batch takes (merge): grows after a passing batch, halves after a failed one.
+CREATE TABLE IF NOT EXISTS merge_repo_state (
+  repo TEXT PRIMARY KEY,
+  batch_size INTEGER NOT NULL,
+  updated_at TEXT NOT NULL
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS merge_batches_pr ON merge_batches(repo, pr_number);
+CREATE INDEX IF NOT EXISTS pr_builds_created ON pr_builds(repo, created_at);
+
+-- The liveness check's last run (planner): one row.
+CREATE TABLE IF NOT EXISTS liveness_state (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  checked_at TEXT,
+  open INTEGER                        -- open items the check found
+);
+-- Planner passes per kind (full, changed, ...) and UTC hour (`YYYY-MM-DDTHH`): count, refs, time and the database work the
+-- pass did, a series for the query-growth check. Kept 14 days.
+CREATE TABLE IF NOT EXISTS plan_pass_hours (
+  kind TEXT NOT NULL,
+  hour TEXT NOT NULL,
+  passes INTEGER NOT NULL DEFAULT 0,
+  refs INTEGER NOT NULL DEFAULT 0,
+  last_at TEXT NOT NULL,
+  ms INTEGER NOT NULL DEFAULT 0,
+  max_ms INTEGER NOT NULL DEFAULT 0,
+  db_statements INTEGER NOT NULL DEFAULT 0,
+  db_round_trips INTEGER NOT NULL DEFAULT 0,
+  db_ms INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (kind, hour)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS plan_pass_hours_hour ON plan_pass_hours(hour);
+
+CREATE INDEX IF NOT EXISTS agent_runs_step_model ON agent_runs(step, model, id);
+
+-- The items of a Task Runner call (runners), in the order of remote_calls.items, written with the call.
+CREATE TABLE IF NOT EXISTS remote_call_items (
+  call_id INTEGER NOT NULL,
+  pos INTEGER NOT NULL,
+  repo TEXT NOT NULL,
+  number INTEGER NOT NULL,
+  PRIMARY KEY (call_id, pos)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS remote_call_items_item ON remote_call_items(repo, number);
+
+-- Build bookkeeping (build): warm_report, warm_bytes:<key>, warm_gc_at, warm_trimmed_publish, warm_rebuild:<repo>,
+-- worker_update_pending, worker_update_failures and the runner endpoint (leader:runner:endpoint), with their settings values.
+CREATE TABLE IF NOT EXISTS build_state (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+) WITHOUT ROWID;
+
+-- Lookups of the patches AutoCraft writes (changes).
+CREATE INDEX IF NOT EXISTS fixups_linting ON fixups(state) WHERE state = 'linting';
+CREATE INDEX IF NOT EXISTS fixups_to_head ON fixups(to_head) WHERE state = 'pushed';
+CREATE INDEX IF NOT EXISTS ci_fixes_to_head ON ci_fixes(to_head) WHERE to_head IS NOT NULL;
+CREATE INDEX IF NOT EXISTS conflict_merges_to_head ON conflict_merges(to_head) WHERE to_head IS NOT NULL;
+
+-- The causes the hourly self-evaluation found (eval, src/eval): one row per cause key, with its evidence, the model's
+-- investigation and the issue filed for it on the eval repo.
+CREATE TABLE IF NOT EXISTS eval_causes (
+  cause_key TEXT PRIMARY KEY,
+  detector TEXT NOT NULL,
+  summary TEXT NOT NULL,              -- one line from the detector
+  state TEXT NOT NULL,                -- new | investigated | filing | filed | declined
+  first_seen TEXT NOT NULL,
+  last_seen TEXT NOT NULL,
+  evidence TEXT NOT NULL DEFAULT '[]', -- JSON [{id, at, note, ref?}], newest kept
+  seen INTEGER NOT NULL DEFAULT 0,    -- distinct evidence ids seen in all
+  investigated_at TEXT,
+  investigated_seen INTEGER NOT NULL DEFAULT 0, -- seen when the last investigation was asked
+  verdict TEXT,                       -- defect | not-defect | failed
+  failures INTEGER NOT NULL DEFAULT 0, -- investigations in a row without a valid reply; 3 stop the retries until new evidence
+  finding TEXT,                       -- JSON: the investigation's reply as kept
+  model TEXT,
+  run_id TEXT,
+  issue_number INTEGER,
+  filed_at TEXT,
+  reported_seen INTEGER NOT NULL DEFAULT 0, -- seen when the issue or its last comment was posted
+  commented_at TEXT,
+  attempts INTEGER NOT NULL DEFAULT 0, -- creates of the issue tried
+  note TEXT
+) WITHOUT ROWID;
+
+-- The issue reviews a maintainer asked for (`review` on an issue, src/issuereview): one row per review of an issue's workflow.
+-- state: queued (due), posting (the review is stored, its comment waits to be posted), done (the comment is posted, or its tries are
+-- final), failed (no valid review after ISSUE_REVIEW_TRIES calls), ask (the reporter's question waits to be posted), reporter (the
+-- question is posted; the review runs again on this row once the reporter answers).
+CREATE TABLE IF NOT EXISTS issue_reviews (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  workflow_id INTEGER NOT NULL,
+  repo TEXT NOT NULL,
+  number INTEGER NOT NULL,
+  requested_by TEXT NOT NULL,         -- who asked for the review: who started it, or answered the question that asked for it
+  requested_at TEXT NOT NULL,
+  then_implement INTEGER NOT NULL DEFAULT 0, -- `review and implement`: an implement recommendation starts the implementation without a question
+  state TEXT NOT NULL,
+  tries INTEGER NOT NULL DEFAULT 0,   -- review calls without a valid review since the row was last due
+  tried_at TEXT,
+  error TEXT,
+  commit_sha TEXT,                    -- the default branch commit the review read
+  model TEXT,
+  review TEXT,                        -- JSON IssueReview (src/issuereview/prompt.ts)
+  reviewed_at TEXT,
+  comment_url TEXT,
+  post_tries TEXT,                    -- JSON [ISO]: posts of the comment or the question that sent nothing (src/core/rules.ts unsentAsk)
+  question TEXT,                      -- state ask or reporter: the question for the reporter
+  asked_at TEXT,                      -- when that question was posted
+  job_id INTEGER
+);
+CREATE INDEX IF NOT EXISTS issue_reviews_item ON issue_reviews(repo, number, id);
+CREATE INDEX IF NOT EXISTS issue_reviews_workflow ON issue_reviews(workflow_id, id);

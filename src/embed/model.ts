@@ -1,9 +1,10 @@
 // Sentence-embedding models run locally on the CPU through ONNX Runtime
-// (@huggingface/transformers). Model files are downloaded from Hugging Face
-// once into the model cache and read from there afterwards.
+// (@huggingface/transformers), in a worker thread (src/embed/model-worker.ts). Model files are downloaded from
+// Hugging Face once into the model cache and read from there afterwards.
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { envVar } from "../env.ts";
+import { ThreadCall } from "../thread-call.ts";
 
 export type Role = "item" | "query";
 
@@ -15,7 +16,7 @@ export interface Embedder {
   embed(texts: string[], role: Role): Promise<Float32Array[]>;
 }
 
-type ModelSpec = {
+export type ModelSpec = {
   repo: string;
   // Commit of the model repo; the loader fetches and caches exactly this revision.
   revision: string;
@@ -56,63 +57,29 @@ export function modelName(env: NodeJS.ProcessEnv = process.env): string {
   return name;
 }
 
-type Tensor = { data: Float32Array; dims: number[] };
-type Tokenized = Record<string, unknown> & { attention_mask: { data: BigInt64Array; dims: number[] } };
-
 export const embedderId = (name: string): string => `${name}:q8:${MAX_TOKENS}`;
 
-type Runner = (texts: string[]) => Promise<{ data: Float32Array; dims: number[]; mask: BigInt64Array }>;
+/** What the model thread is started with (src/embed/model-worker.ts). */
+export type ModelThreadData = { name: string; threads: number; cacheDir: string };
+/** One call to the model thread: texts with their role's prefix already applied. */
+export type ModelThreadCall = { texts: string[] };
 
-async function loadRunner(spec: ModelSpec, threads: number, cacheDir: string): Promise<Runner> {
-  const tf = await import("@huggingface/transformers");
-  tf.env.cacheDir = cacheDir;
-  const session_options = { intraOpNumThreads: threads, interOpNumThreads: 1 };
-  const tokenizer = await tf.AutoTokenizer.from_pretrained(spec.repo, { revision: spec.revision });
-  const model = await tf.AutoModel.from_pretrained(spec.repo, { revision: spec.revision, dtype: "q8", device: "cpu", session_options });
-  return async (texts) => {
-    const enc = tokenizer(texts, { padding: true, truncation: true, max_length: MAX_TOKENS }) as unknown as Tokenized;
-    const h = ((await model(enc)) as { last_hidden_state: Tensor }).last_hidden_state;
-    return { data: h.data, dims: h.dims, mask: enc.attention_mask.data };
-  };
-}
-
-// The model loads on the first embed() call, so a server that never embeds
-// never loads it. `threads` caps ONNX Runtime's intra-op threads.
+// The model loads in a worker thread on the first embed() call, so a server that never embeds never loads it, and
+// neither the model load nor a run holds the caller's event loop: ONNX Runtime's session load and runs are synchronous
+// native calls. `threads` caps ONNX Runtime's intra-op threads.
 export function localEmbedder(opts: { name?: string; threads?: number; cacheDir?: string } = {}): Embedder {
   const name = opts.name ?? modelName();
   const spec = MODELS[name];
   if (!spec) throw new Error(`unknown embedding model ${name}`);
-  const dim = spec.dim;
-  let runner: Promise<Runner> | null = null;
+  let thread: ThreadCall<ModelThreadCall, Float32Array[]> | null = null;
   return {
     id: embedderId(name),
-    dim,
+    dim: spec.dim,
     async embed(texts, role) {
       if (!texts.length) return [];
-      if (!runner) {
-        runner = loadRunner(spec, opts.threads ?? 4, opts.cacheDir ?? modelCacheDir());
-        runner.catch(() => { runner = null; });
-      }
-      const h = await (await runner)(texts.map((t) => spec.prefix[role] + t));
-      const [n, len] = [h.dims[0]!, h.dims[1]!];
-      const vecs: Float32Array[] = [];
-      for (let i = 0; i < n; i++) {
-        const v = new Float32Array(dim);
-        if (spec.pooling === "cls") {
-          v.set(h.data.subarray(i * len * dim, i * len * dim + dim));
-        } else {
-          let count = 0;
-          for (let t = 0; t < len; t++) {
-            if (!h.mask[i * len + t]) continue;
-            count++;
-            const off = (i * len + t) * dim;
-            for (let d = 0; d < dim; d++) v[d]! += h.data[off + d]!;
-          }
-          if (count) for (let d = 0; d < dim; d++) v[d]! /= count;
-        }
-        vecs.push(normalize(v));
-      }
-      return vecs;
+      thread ??= new ThreadCall(new URL("./model-worker.ts", import.meta.url), "embedding model",
+        { name, threads: opts.threads ?? 4, cacheDir: opts.cacheDir ?? modelCacheDir() } satisfies ModelThreadData);
+      return await thread.call({ texts: texts.map((t) => spec.prefix[role] + t) });
     },
   };
 }

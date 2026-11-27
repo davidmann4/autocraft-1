@@ -9,9 +9,8 @@ import { createToken } from "../src/dash/mcp/tokens.ts";
 import { parseStatus, storeStatus } from "../src/remote/helpers.ts";
 import { setUserRepos } from "../src/remote/my-repos.ts";
 import { noTakerFor } from "../src/remote/takers.ts";
-import { setInferenceMode } from "../src/remote/mode.ts";
 import { world } from "./world-db.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb } from "./helpers/raw-db.ts";
 import { SCRATCH } from "./scratch.ts";
 
 mkdirSync(SCRATCH, { recursive: true });
@@ -49,20 +48,14 @@ test("sessions of ended jobs fail and end their workspace unless kept; resuming 
 
 test("a try on a repo no Task Runner takes is refused, and records no session", async () => {
   const w = await (await (await world()).repo()).issue(1, { title: "crash on open" });
-  await setInferenceMode(w.db, "user-local", "test");
   const req = { repo: "app", baseSha: "a".repeat(40), item: 1, prompt: "try it", envId: "k", keep: false, workspaceId: null, forLogin: "alice", by: "cli" };
   await assert.rejects(requestTrySession(w.db, req), /no Task Runner can take calls for alice/);
   assert.equal((await w.db.all(w.db.k.selectFrom("workspace_sessions").select("id"))).length, 0);
-  await setInferenceMode(w.db, "server", "test");
-  const id = await requestTrySession(w.db, req);
-  assert.ok(id > 0, "outside the user-local mode the server's accounts take the call");
-  assert.equal((await w.db.get(w.db.k.selectFrom("workspace_sessions").select("for_login").where("id", "=", id)))!.for_login, "alice", "the session records whose runners run its call");
   await assert.rejects(requestTrySession(w.db, { ...req, forLogin: "not a login" }), /GitHub login/);
 });
 
 test("a try for a user whose runner leaves the repo out of My repos is accepted and its call is bound to them", async () => {
   const w = await (await (await world()).repo()).issue(1, { title: "crash on open" });
-  await setInferenceMode(w.db, "user-local", "test");
   await w.db.run(w.db.k.insertInto("access").values({ login: "alice", role: "operator" }));
   await setUserRepos(w.db, "alice", ["other"]);
   const token = (await createToken(w.db, "alice", "helper", { kind: "runner" })).row.id;

@@ -108,24 +108,7 @@ Steps marked **admin** need a person with access to the secrets or to DNS and th
    ```
 
    The two hashes must match. The watched channels and Discord status are in the database and carry over with it.
-7. **Place the accounts. admin.** Accounts come from two places (`src/agents/box.ts`): the entries of `accounts.json`, each with an absolute `configDir` of the old host, and the accounts added on the Accounts page, whose directories are `<accounts root>/<id>` (`/config/claude` in the image, from `AUTOCRAFT_ACCOUNTS_ROOT`). Copy every directory, owned by uid 10001, keeping the modes (credentials are 0600), and rewrite `accounts.json` so that no `configDir` names an old path:
-
-   1. Accounts of the file: copy each account's directory to `/config/accounts/<id>`, by id, and write `accounts.json` with that path as its `configDir`. `/config/accounts` is not under the accounts root, so the two groups cannot collide:
-
-      ```
-      jq -r '.[] | "\(.id) \(.configDir)"' accounts.json | while read -r id dir; do
-        tar -C "$dir" -cf - . | docker run -i --rm -v CONFIG:/config --entrypoint sh IMAGE -c "mkdir -p /config/accounts/$id && tar -C /config/accounts/$id -xpf -"
-      done
-      jq 'map(.configDir = "/config/accounts/" + .id)' accounts.json | docker run -i --rm -v CONFIG:/config --entrypoint sh IMAGE -c 'umask 077; cat > /config/accounts.json'
-      ```
-   2. Accounts added on the Accounts page: copy the old accounts root (`<root>/config/claude`, one subdirectory per id; the code finds each at `<accounts root>/<id>`) to `/config/claude`:
-
-      ```
-      tar -C <root>/config/claude -cf - . | docker run -i --rm -v CONFIG:/config --entrypoint sh IMAGE -c 'mkdir -p /config/claude && tar -C /config/claude -xpf -'
-      ```
-   3. Each directory carries its login (`.credentials.json`) and, if the operator set one, its long-lived token (`oauth-token`). Usage readings and sign-in state are read again by the app. Look for absolute host paths in each directory's `settings.json` and remove them.
-
-   The systemd install used a logged-in `gh`; the container uses a token instead. The admin creates a GitHub token for `gh` (classic personal access token with the `repo`, `read:org` and `workflow` scopes; keep `workflow`, which lets the pipeline push to branches that change workflow files) and sets it as `GH_TOKEN` for the dashboard, the runner and the sync and backup containers (with Docker, `GH_TOKEN=...` in a `container.env` file of mode 0600 passed with `--env-file`; in Kubernetes, the Secret `autocraft-github`). The dashboard needs it for the image proxy and for adding a repository. If a login does not carry over, sign in again with the account's Claude CLI inside the container.
+7. **Place the GitHub token. admin.** The systemd install used a logged-in `gh`; the container uses a token instead. The admin creates a GitHub token for `gh` (classic personal access token with the `repo`, `read:org` and `workflow` scopes; keep `workflow`, which lets the pipeline push to branches that change workflow files) and sets it as `GH_TOKEN` for the dashboard, the runner and the sync and backup containers (with Docker, `GH_TOKEN=...` in a `container.env` file of mode 0600 passed with `--env-file`; in Kubernetes, the Secret `autocraft-github`). The dashboard needs it for the image proxy and for adding a repository.
 8. **Disable the old local build environments**, then **start the dashboard** and the runner (the runner needs the sandbox options from Sandbox (bubblewrap) in operations.md). The restored database still lists the old host's `local-sandbox` environments as enabled, and nothing in the new install connects as one, so their `worker:<id>` health checks would fail and `GET /healthz/checks` would answer 503. Disable each environment that `IMAGE envs list` shows before the first start: `docker run --rm $RUN IMAGE envs set <id> --enabled no`. Afterwards the checks expect no worker failure from them (a build worker you register later adds its own check). Both processes start with the pipeline off, because the restored database says so:
 
    ```
@@ -142,7 +125,6 @@ Steps marked **admin** need a person with access to the secrets or to DNS and th
    - `IMAGE pipeline status` prints `pipeline OFF`.
    - The runner started no job: the highest job id does not change.
    - `bwrap --unshare-all --ro-bind / / --proc /proc --dev /dev true` exits 0 inside the runner container (`docker exec autocraft-runner bwrap ...`). If it fails on rootful Docker with an AppArmor profile that restricts user namespaces, add `--security-opt apparmor=unconfined` to the runner next.
-   - **admin**: open the Accounts page after signing in. Each account shows its state and usage. Do the same check on the old host's Accounts page before step 11 (see Rollback).
    - `IMAGE backup daily 7` (with `$RUN`) writes a snapshot to `/data/backups`: the schedule of the periodic container then counts from it. `ls /data/item-snapshot/items.db` (in the runner container) exists once the runner leader's first build has finished.
 10. **Switch the traffic. admin.** Point DNS or the proxy at the new dashboard. If the origin changed, update the GitHub App's callback and setup URLs and the OAuth app's callback URL (Moving to a new domain in [deploy-checklist.md](deploy-checklist.md)). Point the workers at the new runner's worker API (see Running a worker); keep that port off the public network.
 11. **Pipeline on.** `docker exec autocraft-runner node --no-warnings src/cli.ts pipeline on`, or `docker run --rm $RUN IMAGE pipeline on` (the database is shared through the volume). Watch the first jobs finish on the dashboard.
@@ -153,7 +135,7 @@ Do this if a check in step 9 or the first jobs after step 11 fail.
 
 1. Pipeline off on the new instance, then stop and keep (do not remove) its containers and volumes: the new instance stays off from now on, so only one runner ever writes a database.
 2. Point DNS and the proxy back, and revert the OAuth app's callback URL and, if you changed them, the GitHub App's callback and setup URLs to the old origin.
-3. Start the old services on the old database: the dashboard, then the runner, then the timers. The old database is the state of step 2; the new instance's changes since then are not carried back. Users whose GitHub tokens were refreshed on the new instance sign in again, and so do Claude accounts without a long-lived `oauth-token` (a refreshed login on the new instance can invalidate the old one). Check the Accounts page on the old host before turning the pipeline on. If the pipeline made changes on GitHub in between, the next sync reads them.
+3. Start the old services on the old database: the dashboard, then the runner, then the timers. The old database is the state of step 2; the new instance's changes since then are not carried back. Users whose GitHub tokens were refreshed on the new instance sign in again. If the pipeline made changes on GitHub in between, the next sync reads them.
 4. `autocraft-server pipeline on` on the old host when the checks pass there.
 
 A second attempt starts from the cut-over again with a fresh final backup (the old host's pipeline off, the new volumes emptied).
@@ -172,17 +154,17 @@ Rehearsed with rootless Docker on a copy of the newest production snapshot (1.2 
 | `pipeline status` | `OFF` |
 | Runner with the pipeline off | one planner pass of about 4 s at start, then idle (a wake time that had passed no longer repeats the pass); no job is queued or started |
 | `backup predeploy` in the container | 12.7 s, snapshot written to `/data/backups` |
-| Runner stop (SIGTERM) | under 1 s; the flowchart summary's duplicate-pairs query uses the pairs index first, so no helper thread sits in a long statement. If a stop still exceeds `AUTOCRAFT_STOP_TIMEOUT` the runner kills itself. The next start worked every time (stale lock recognised, no recovery needed with no job running). The dashboard stops in under 0.1 s. |
+| Runner stop (SIGTERM) | under 1 s; the duplicate-pairs summary query uses the pairs index first, so no helper thread sits in a long statement. If a stop still exceeds `AUTOCRAFT_STOP_TIMEOUT` the runner kills itself. The next start worked every time (stale lock recognised, no recovery needed with no job running). The dashboard stops in under 0.1 s. |
 | Sealed GitHub tokens read with another `session_key` | `null` (unavailable), no error |
 
-Not covered: the Accounts page (it needs a signed-in session and the GitHub App), Claude and GitHub calls, and a runner with a running job.
+Not covered: the dashboard pages that need a signed-in session and the GitHub App, Claude and GitHub calls, and a runner with a running job.
 
 ## Kubernetes variant
 
 A StatefulSet pod holds the ReadWriteOnce claims, so nothing else can mount them while it runs. Place the data and secrets before the first start:
 
 1. Set `replicas: 0` in `deploy/k8s/autocraft.yaml` and apply it. The claims `data-autocraft-0` and `config-autocraft-0` exist and no pod runs.
-2. Start a helper pod that mounts both claims (uid 10001, `fsGroup` 10001, the same image, `command: [sleep, 3600]`). Do cut-over steps 5 to 7 in it with `kubectl exec -i` and `kubectl cp`: restore the database (including the deletion of stale `-wal` and `-shm` files), then place `secrets.json` (mode 0600), `accounts.json` and the Claude directories.
+2. Start a helper pod that mounts both claims (uid 10001, `fsGroup` 10001, the same image, `command: [sleep, 3600]`). Do cut-over steps 5 to 7 in it with `kubectl exec -i` and `kubectl cp`: restore the database (including the deletion of stale `-wal` and `-shm` files), then place `secrets.json` (mode 0600).
 3. Delete the helper pod and wait until it is gone.
 4. Create the Secret `autocraft-github` (key `token`), then scale up: `kubectl scale statefulset autocraft --replicas=1`.
 
@@ -273,4 +255,4 @@ The `periodic` container keeps 7 daily snapshots in the `autocraft-data` volume 
 ssh vps 'docker run --rm -v autocraft-data:/data --entrypoint sh IMAGE -c "cat \$(ls -1t /data/backups/daily-*.db.zst | head -n 1)"' > daily-latest.db.zst
 ```
 
-Also keep a copy of `autocraft-config` (`secrets.json`, `accounts.json`, the Claude directories, the Discord files): the database alone cannot sign anyone in. Archive it with `docker run --rm -v autocraft-config:/config --entrypoint tar IMAGE -cf - -C /config .` and encrypt the archive before it leaves the VPS. Test a restore (steps 5 and 6) on another machine.
+Also keep a copy of `autocraft-config` (`secrets.json`, the Discord files): the database alone cannot sign anyone in. Archive it with `docker run --rm -v autocraft-config:/config --entrypoint tar IMAGE -cf - -C /config .` and encrypt the archive before it leaves the VPS. Test a restore (steps 5 and 6) on another machine.

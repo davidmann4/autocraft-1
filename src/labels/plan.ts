@@ -1,14 +1,12 @@
 // Which labels each open item should get. Reads the mirror and classifications only.
-import { backlogHeldExpr, notOwnIntegrationExpr } from "../dupes/held.ts";
 import { forRun, settleRows, type ClsRow } from "./settled.ts";
-import { scopeAnswers } from "../review/candidates.ts";
 import { isTypeLabel, sameLabel } from "./set.ts";
-import { pilotExpr } from "../pilot.ts";
-import { quietFixPrs } from "../core/facts.ts";
+import { listItems } from "../data/mirror/index.ts";
+import type { ItemOf } from "../data/mirror/types.ts";
+import { loadOwnIntegration } from "../data/merge/index.ts";
+import { listQuietPrs } from "../data/security/index.ts";
+import { loadLabelVerdicts } from "../data/triage/index.ts";
 import type { Db } from "../db/index.ts";
-
-/** The type label an operator's `plugin` scope answer asks for. */
-export const PLUGIN_LABEL = "plugin candidate";
 
 export type PlanStatus = "add" | "already" | "unsettled" | "conflict";
 export type PlanRow = {
@@ -17,37 +15,36 @@ export type PlanRow = {
 };
 export type PlanCounts = { toAdd: number; already: number; unsettled: number; conflicts: number };
 
-export async function planLabels(db: Db, repo: string, runId?: string): Promise<PlanRow[]> {
-  const [items, cls, answers, quiet] = await Promise.all([db.all(db.k.selectFrom("main.items as i").select(["i.number", "i.kind", "i.url", "i.labels"])
-    .where("i.repo", "=", repo).where("i.state", "=", "OPEN")
-    .where((eb) => notOwnIntegrationExpr(db, eb, "i")).where((eb) => pilotExpr(db, eb, "i")).where((eb) => eb.not(backlogHeldExpr(db, eb, "i")))
-    .orderBy("i.number")),
-  db.all(db.k.selectFrom("main.classifications")
-    .select(["number", "classifier", "run_id", "at", "type_label", "flags", "probs", "input_hash"]).where("repo", "=", repo)
-    .$if(!!runId, (q) => q.where("run_id", "=", runId!)).orderBy("at", "desc")) as Promise<(ClsRow & { number: number })[]>,
-  scopeAnswers(db, true), quietFixPrs(db, repo)]);
-  const byItem = new Map<number, ClsRow[]>();
-  for (const c of cls) (byItem.get(c.number) ?? byItem.set(c.number, []).get(c.number)!).push(c);
+export const planLabels = async (db: Db, repo: string, runId?: string): Promise<PlanRow[]> => (await planLabelsOf(db, [repo], runId)).get(repo) ?? [];
 
-  return items.map((it) => {
-    let existing: string[] = [];
-    try {
-      existing = (JSON.parse(it.labels ?? "[]") as unknown[]).map(String);
-    } catch { /* unreadable labels count as none */ }
-    const row = { number: it.number, kind: it.kind, url: it.url ?? "", settled: "", existing, add: [] as string[], note: "" };
-    const settled = settleRows(forRun(byItem.get(it.number) ?? [], runId));
-    // An operator's plugin answer decides the type, also where the classifiers disagreed about it.
-    const plugin = answers.get(`${repo}#${it.number}`) === "plugin";
-    const s0 = plugin ? { type: PLUGIN_LABEL, security: settled?.security ?? false, needsDecision: false } : settled;
-    const s = s0 && quiet.has(`${repo}#${it.number}`) ? { ...s0, security: false } : s0;
-    if (!s) return { ...row, status: "unsettled" as const };
-    row.settled = s.type;
-    const other = existing.filter((l) => isTypeLabel(l) && !sameLabel(l, s.type));
-    if (other.length) return { ...row, status: "conflict" as const, note: `has ${other.join(", ")}` };
-    const want = [s.type, ...(s.security ? ["security"] : []), ...(s.needsDecision ? ["needs decision"] : [])];
-    const add = want.filter((w) => !existing.some((e) => sameLabel(e, w)));
-    return { ...row, add, status: add.length ? ("add" as const) : ("already" as const) };
-  });
+/** The plan of each repo, in one wave. */
+export async function planLabelsOf(db: Db, repos: string[], runId?: string): Promise<Map<string, PlanRow[]>> {
+  const [listed, own, quiet, cls] = await db.together(() => Promise.all([
+    listItems(db, { repos, states: ["OPEN"], inScope: true }, "labels"), loadOwnIntegration(db, repos), listQuietPrs(db), loadLabelVerdicts(db, repos, runId),
+  ]));
+  const out = new Map<string, PlanRow[]>();
+  for (const it of listed) {
+    if (own.has(`${it.repo}#${it.number}`)) continue;
+    (out.get(it.repo) ?? out.set(it.repo, []).get(it.repo)!).push(planOf(it, cls.get(`${it.repo}#${it.number}`) ?? [], quiet, runId));
+  }
+  return out;
+}
+
+function planOf(it: ItemOf<"labels">, rows: ClsRow[], quiet: ReadonlySet<string>, runId: string | undefined): PlanRow {
+  let existing: string[] = [];
+  try {
+    existing = (JSON.parse(it.labels ?? "[]") as unknown[]).map(String);
+  } catch { /* unreadable labels count as none */ }
+  const row = { number: it.number, kind: it.kind, url: it.url ?? "", settled: "", existing, add: [] as string[], note: "" };
+  const settled = settleRows(forRun(rows, runId));
+  const s = settled && quiet.has(`${it.repo}#${it.number}`) ? { ...settled, security: false } : settled;
+  if (!s) return { ...row, status: "unsettled" as const };
+  row.settled = s.type;
+  const other = existing.filter((l) => isTypeLabel(l) && !sameLabel(l, s.type));
+  if (other.length) return { ...row, status: "conflict" as const, note: `has ${other.join(", ")}` };
+  const want = [s.type, ...(s.security ? ["security"] : []), ...(s.needsDecision ? ["needs decision"] : [])];
+  const add = want.filter((w) => !existing.some((e) => sameLabel(e, w)));
+  return { ...row, add, status: add.length ? ("add" as const) : ("already" as const) };
 }
 
 export function countPlan(rows: PlanRow[]): PlanCounts {

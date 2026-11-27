@@ -8,14 +8,14 @@ import { decidePr } from "../src/core/decide.ts";
 import { authorWrites, ensureAuthorWrites } from "../src/fixup/author-permission.ts";
 import { prFacts } from "./world.ts";
 import { SCRATCH } from "./scratch.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb } from "./helpers/raw-db.ts";
 
 mkdirSync(SCRATCH, { recursive: true });
 const dir = mkdtempSync(join(SCRATCH, "base-binding-"));
 process.env.AUTOCRAFT_DIFF_CACHE = join(dir, "diffs");
 const HEAD = "a".repeat(40);
 
-test("a merge is refused when the base is not the one the review read", async () => {
+test("a merge goes only into the default branch, when the review read the diff against it", async () => {
   const db = await connectDb(join(dir, "t.db"));
   await db.run(db.k.insertInto("repos").values({ name: "app", default_branch: "main" }));
   await db.run(db.k.insertInto("opus_reviews").values({ repo: "app", number: 7, head_oid: HEAD, at: "t", mode: "full", verdict: "take", base_ref: "main" }));
@@ -25,6 +25,8 @@ test("a merge is refused when the base is not the one the review read", async ()
   await db.run(db.k.insertInto("opus_reviews").values({ repo: "app", number: 8, head_oid: HEAD, at: "t", mode: "full", verdict: "take" }));
   assert.equal(await baseRefusal(db, "app", HEAD, 8, "main"), null);
   assert.ok(await baseRefusal(db, "app", HEAD, 8, "release"));
+  await db.run(db.k.insertInto("opus_reviews").values({ repo: "app", number: 9, head_oid: HEAD, at: "t", mode: "full", verdict: "take", base_ref: "release" }));
+  for (const base of ["main", "release"]) assert.match((await baseRefusal(db, "app", HEAD, 9, base))!, /release.*main|main.*release/);
 });
 
 test("a diff is stored only for the head it was fetched at, and read again for another base", async () => {
@@ -60,16 +62,7 @@ test("a private-org member's PR is pushable once the author's permission is read
   for (const want of ["unknown", "unknown", "no"]) assert.equal(await ensureAuthorWrites(db, "app", 10, "storytold/app", async () => null), want);
 });
 
-test("a PR aimed at a non-default branch is planned as a single merge only", () => {
-  const plan = decidePr(prFacts({ baseOffDefault: true }));
-  const merge = plan.actions.find((a) => a.kind === "merge");
-  assert.ok(merge);
-  assert.equal(merge.params?.singleOnly, true);
-  assert.equal(merge.params?.batchable, false);
-});
-
-test("a PR stacked on another open PR's branch needs a decision", () => {
-  const plan = decidePr(prFacts({ stackedOn: 4, baseOffDefault: true }));
-  assert.equal(plan.state, "needs-decision");
-  assert.ok(plan.reasons.some((r) => /targets the branch of open #4/.test(r)));
+test("a PR aimed at a non-default branch does not merge", () => {
+  const plan = decidePr(prFacts({ workflow: null, baseOffDefault: true }));
+  assert.deepEqual([plan.state, plan.actions.filter((a) => a.kind === "merge"), plan.waitCode], ["needs-decision", [], "base-off-default"]);
 });

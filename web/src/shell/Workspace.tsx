@@ -26,7 +26,7 @@ export function Workspace({ view, props }: { view: ViewDef; props: ViewProps }) 
         {view.panels
           .filter((p) => !p.hideOnPhone)
           .map((p) => (
-            <section key={p.id} aria-label={p.title} className="border-b border-line">
+            <section key={p.id} aria-label={p.title} className="border-b border-line last:border-b-0">
               <Suspense fallback={null}><p.component {...props} /></Suspense>
             </section>
           ))}

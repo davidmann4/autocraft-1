@@ -17,12 +17,15 @@ Key directories:
 `package.json` declares Node >=24 and the project’s pnpm version. These commands are available:
 
 ```sh
-pnpm test        # Run the test suite
-pnpm test:pg     # Run the Postgres tests against a throwaway Postgres in Docker (scripts/pg-test.sh)
-pnpm check       # TypeScript and generated-document checks
-pnpm docs        # Regenerate marked documentation blocks
-pnpm -C web dev  # Frontend development server with mock data; no backend integration
+pnpm test           # Run the test suite on SQLite (scripts/test.ts); file names after it run only those
+pnpm test:pg:suite  # Run the suite on a throwaway Postgres in Docker (scripts/pg-test.sh)
+pnpm test:pg        # Run only the Postgres tests
+pnpm check          # TypeScript and generated-document checks
+pnpm docs           # Regenerate marked documentation blocks
+pnpm -C web dev     # Frontend development server with mock data; no backend integration
 ```
+
+Both suites end with the slowest files and tests (`--slowest N` sets how many) and write the full output to a log file. `--concurrency N` sets how many test files run at once (default: the CPUs less two). A test file still running after `--file-timeout MIN` minutes (default 10, 0 for none) is killed with the processes it started, and the run reports it as failed and goes on. One file also runs on its own with `node --test test/<name>.test.ts`. The Postgres suite leaves out the files in `test/no-database.txt`, which open no database; a listed file that opens one fails.
 
 To test backend integration, build the frontend without `VITE_MOCK=1` and follow the [dashboard setup](README.md#start-the-dashboard-and-add-the-first-operator). The [operations guide](docs/operations.md) explains how the backend serves the frontend build.
 

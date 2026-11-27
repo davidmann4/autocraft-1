@@ -1,5 +1,5 @@
 // The GitHub App slugs ever seen, kept in settings so the bot stays ours after the app is replaced or its secrets cannot be read.
-import { setting, writeSetting } from "../settings-read.ts";
+import { setting, writeSetting } from "../data/control/index.ts";
 import type { Db } from "../db/index.ts";
 
 export const SLUGS_KEY = "app_slugs";
@@ -39,16 +39,20 @@ export const knownSlugs = async (db: Db): Promise<string[]> => parseSlugs(await 
 
 /** Records `slug` in the persisted list when it is new. */
 export async function rememberSlug(db: Db, slug: string): Promise<void> {
+  const recorded = remembered.get(db) ?? new Set<string>();
+  // A recorded slug stays recorded, so this process asks the table once.
+  if (recorded.has(slug)) return;
   // Read from the table, not a pass snapshot: another connection may have recorded a slug since the pass began.
   const known = parseSlugs((await setting(db, SLUGS_KEY)) ?? undefined);
-  if (known.includes(slug)) return;
-  await writeSetting(db, SLUGS_KEY, JSON.stringify([...known, slug]));
+  if (!known.includes(slug)) await writeSetting(db, SLUGS_KEY, JSON.stringify([...known, slug]));
+  remembered.set(db, recorded.add(slug));
 }
+const remembered = new WeakMap<Db, Set<string>>();
 
 /** The names a comment can address the pipeline by: the pipeline login (when recorded) every known app slug and the mention name. Mentioning `@<slug>` also covers `@<slug>[bot]`. */
 export async function mentionNames(db: Db, extra: string | null = null): Promise<string[]> {
-  const box = await setting(db, "pipeline_login");
-  return namesOf(box, await knownSlugs(db), extra, await mentionName(db));
+  const [box, slugs, mention] = await db.together(() => Promise.all([setting(db, "pipeline_login"), knownSlugs(db), mentionName(db)]));
+  return namesOf(box, slugs, extra, mention);
 }
 
 /** mentionNames() from the stored pipeline login and the known slugs. */

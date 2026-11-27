@@ -9,7 +9,7 @@ import { storeArtifact, tempPath } from "../src/build/artifacts.ts";
 import { FORMAT_ARTIFACT, gitFormatDiff, runCifix, type CifixDeps } from "../src/cifix/index.ts";
 import { formattingOnly, guardPatch } from "../src/cifix/guard.ts";
 import { parseFailedLog } from "../src/cifix/logs.ts";
-import { triage } from "../src/cifix/triage.ts";
+import { triage, unrelatedTests } from "../src/cifix/triage.ts";
 import type { CifixPr, CiFailure } from "../src/cifix/types.ts";
 import { REPO_PATH } from "../src/sandbox/command.ts";
 import { setPushApproval } from "../src/fixup/approval.ts";
@@ -18,10 +18,12 @@ import { setCiApproval } from "../src/merge/ci-approval.ts";
 import { CLIPPY_ARTIFACT } from "../src/prepush/index.ts";
 import type { Querier } from "../src/mirror.ts";
 import { saveOpus } from "../src/review/opus.ts";
+import { acting, appLane } from "./acting.ts";
 import { validating } from "./gql.ts";
+import { reportingTaskRunner } from "./fake-runner.ts";
 import { SCRATCH } from "./scratch.ts";
-import type { Db } from "../src/db/index.ts";
-import { connectDb } from "../src/db/open.ts";
+import { insertWorkflow } from "../src/workflow/store.ts";
+import { connectDb, type Db } from "./helpers/raw-db.ts";
 import { rowid } from "../src/db/kx.ts";
 
 mkdirSync(SCRATCH, { recursive: true });
@@ -40,7 +42,7 @@ function git(cwd: string, ...args: string[]): string {
 
 type Opts = { canModify?: boolean; push?: boolean; comment?: boolean; ci?: boolean; verdict?: string; overall?: string; head?: string };
 
-/** One PR (#7) at `head` whose gate check failed. */
+/** One PR (#7) at `head`, started with fix-up, whose gate check failed. */
 async function fresh(head: string, o: Opts = {}): Promise<Db> {
   const db = await connectDb(join(mkdtempSync(join(dir, "db-")), "t.db"));
   await db.run(db.k.insertInto("items").values({ repo: "app", number: 7, kind: "pr", state: "OPEN", title: "Rename a to b", author: "someone", additions: 5, deletions: 0, head_oid: head, created_at: T0, updated_at: T0 }));
@@ -50,6 +52,9 @@ async function fresh(head: string, o: Opts = {}): Promise<Db> {
   if (o.push !== false) await setPushApproval(db, "op", "app", true);
   if (o.comment) await setCommentApproval(db, "op", "app", true);
   if (o.ci) await setCiApproval(db, "op", "app", true);
+  await insertWorkflow(db, { repo: "app", number: 7, kind: "pr", entry: "fixup", state: "running", startedBy: "op", startedAt: T0, startedVia: "dashboard" });
+  await acting(db, ["op"]);
+  await reportingTaskRunner(db);
   return db;
 }
 
@@ -95,6 +100,31 @@ describe("triage", () => {
     const steps = parseFailedLog(text);
     assert.deepEqual(steps.map((s) => [s.job, s.step, s.tail]), [["test", "cargo test", "error: boom\nmore\n"], ["fmt", "check", "Diff in x:1:\n"]]);
     assert.equal(parseFailedLog(`j\ts\t${"x".repeat(9000)}\n`)[0]!.tail.length, 4000);
+  });
+
+  test("a job log gh cannot split into steps is cut to its failed step, and failed tests outside the PR's files look flaky", () => {
+    const job = "gate / gate (ubuntu-24.04)";
+    const lines = [
+      "##[start-action display=Gate;id=run]", "##[group]Run sh gate.sh", "test result: ok. 3 passed; 0 failed",
+      "test frame_gizmo::warp_toolbar::tests::keeps_a_warp ... FAILED", "", "failures:", "", "---- frame_gizmo::warp_toolbar::tests::keeps_a_warp stdout ----",
+      "thread 'frame_gizmo::warp_toolbar::tests::keeps_a_warp' panicked at /home/runner/.cargo/git/checkouts/libs/crates/ui/src/frame.rs:435:5:",
+      "   13: keeps_a_warp", "             at ./src/frame_gizmo/warp_toolbar/mod.rs:256:77", "", "failures:", "    frame_gizmo::warp_toolbar::tests::keeps_a_warp", "",
+      "test result: FAILED. 487 passed; 1 failed", "\u001b[1merror\u001b[0m: test failed, to rerun pass `-p ui-egui --lib`", "error: ci failed at `test`",
+      "##[error]Process completed with exit code 1.", "Post job cleanup.", ...Array.from({ length: 300 }, (_, i) => `[command]/usr/bin/git config --local cleanup ${i}`),
+    ];
+    const text = lines.map((l, i) => `${job}\tUNKNOWN STEP\t2026-11-26T07:50:${String(i % 60).padStart(2, "0")}.0000000Z ${l}`).join("\n");
+    const steps = parseFailedLog(text);
+    assert.equal(steps.length, 1);
+    assert.equal(steps[0]!.step, "Gate");
+    assert.ok(steps[0]!.tail.includes("panicked at") && steps[0]!.tail.trimEnd().endsWith("exit code 1.") && !steps[0]!.tail.includes("cleanup"));
+    const f: CiFailure = { head: "h", checks: [{ name: job, conclusion: "failure", runId: 1, steps }] };
+    assert.equal(triage(f).kind, "code");
+    assert.deepEqual(unrelatedTests(f, ["crates/ui-egui/src/autosave_name.rs"]), ["frame_gizmo::warp_toolbar::tests::keeps_a_warp"]);
+    // The failing test's module, or a backtrace line in a changed file, ties it to the change; so does a compiler error next to it.
+    assert.equal(unrelatedTests(f, ["crates/ui-egui/src/frame_gizmo/warp_toolbar/mod.rs"]), null);
+    assert.equal(unrelatedTests(f, ["crates/ui/src/frame.rs"]), null);
+    const built: CiFailure = { head: "h", checks: [{ name: job, conclusion: "failure", runId: 1, steps: [{ ...steps[0]!, tail: `error[E0425]: cannot find value\n${steps[0]!.tail}` }] }] };
+    assert.equal(unrelatedTests(built, ["crates/ui-egui/src/autosave_name.rs"]), null);
   });
 });
 
@@ -187,7 +217,7 @@ function world(opts: { log?: string; reply?: string | null; check?: string | nul
     return exec("git", net >= 0 ? sub2 : args, { ...o });
   };
   const deps: CifixDeps = {
-    querier, exec: run, now: () => new Date(T2), root: join(root, "cache"),
+    querier, lane: appLane(querier), exec: run, now: () => new Date(T2), root: join(root, "cache"),
     fetchDiff: async () => ({ ok: true, text: "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-x\n+fn a() {}\n" }),
     gh: async (args) => {
       if (args[0] === "api" && args[1]!.includes("/pulls/")) return `${BASE}\n`;
@@ -355,11 +385,13 @@ test("a stored patch whose comment did not reach GitHub is posted again after th
     assert.deepEqual(await states(), ["linting", "comment-unsent"], "the stored patch keeps its row, a try");
 
     mock.timers.setTime(at + 5 * 60_000);
+    await reportingTaskRunner(db);
     await run();
     assert.equal(comments(), 1, "not before the backoff ends");
     assert.deepEqual(await states(), ["linting", "comment-unsent"]);
 
     mock.timers.setTime(at + 11 * 60_000);
+    await reportingTaskRunner(db);
     opts.commentUnsent = false;
     await run();
     assert.equal(comments(), 2);
@@ -368,5 +400,22 @@ test("a stored patch whose comment did not reach GitHub is posted again after th
     assert.equal((await db.all(db.k.selectFrom("build_tasks").select("id"))).length, 1);
   } finally {
     mock.timers.reset();
+  }
+});
+
+test("nothing is posted on a quiet pull request: no ask, and no patch as a comment", async () => {
+  for (const tries of [0, 2]) {
+    const w = world({ canModify: false });
+    const db = await fresh(w.head, { canModify: false, comment: true });
+    await db.run(db.k.insertInto("security_scans").values({ id: 1, repo: "app", state: "done", started_by: "op", started_at: T0 }));
+    await db.run(db.k.insertInto("security_findings").values({ repo: "app", number: 50, scan_id: 1, area: "a", title: "t", severity: "high", urgent: 0, state: "landing", refs: "[]", reach: "r", impact: "i", fingerprint: "fp", created_at: T0, updated_at: T0, fix_pr: 7 }));
+    for (let i = 1; i <= tries; i++) await db.run(db.k.insertInto("ci_fixes").values({ repo: "app", number: 7, head: w.head, attempt: i, kind: "code", state: "failed", created_at: T0 }));
+    const run = () => runCifix(db, { repo: "app", dryRun: false }, () => {}, w.deps);
+    await run();
+    assert.deepEqual(w.log.filter((l) => l.startsWith("comment:") || l === "model"), [], `${tries} tries`);
+    // The finding is dismissed, and the same PR gets its comment.
+    await db.run(db.k.updateTable("security_findings").set({ state: "dismissed" }));
+    await run();
+    assert.ok(w.log.some((l) => l.startsWith("comment:") || l === "model"), `${tries} tries, no longer quiet`);
   }
 });

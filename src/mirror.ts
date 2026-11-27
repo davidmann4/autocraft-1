@@ -6,38 +6,33 @@ import { closeSync, mkdirSync, openSync, readFileSync, statSync, unlinkSync, wri
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { reloadRepoOwners, trackedNames } from "./repos.ts";
-import { audit } from "./dash/audit.ts";
 import { hashColumns } from "./itemhash.ts";
 import { textRefs } from "./core/open-prs.ts";
 import { syncActivity } from "./activity.ts";
 import { mentionNames, rememberSlug } from "./github/slugs.ts";
 import { appSlug } from "./github/identity.ts";
 import { envVar } from "./env.ts";
+import { markUnsent } from "./github/unsent.ts";
 import { AppReadError, ownerOfVariables, readEnv, resolveOwner } from "./github/read.ts";
 import { DEFAULT_OWNER, ownerOf, slugOf } from "./owners.ts";
 import { classifyFailure, clearRepoFailure, recordRepoFailure } from "./sync-errors.ts";
 import { exclusive } from "./async-seq.ts";
 import { isFenced } from "./db/fence.ts";
-import type { Expression, Insertable } from "kysely";
 import type { Db } from "./db/index.ts";
-import * as kx from "./db/kx.ts";
-import type { Comments, Items } from "./db/types.ts";
-import { dbLockName, openDb, setDbRole } from "./db/open.ts";
+import { closeDb, dbLockName, openDb, setDbRole } from "./db/open.ts";
+import { loadTrackedRepos, readSettingsSnapshot, withSettingsSnapshot } from "./data/control/index.ts";
+import { effect } from "./db/effects.ts";
+import {
+  advanceOrgHighWater, advanceRepoHighWater, applyLocal, clearRepoFailures, closeGoneItems, countItemsByRepo, finishSyncRun, listItems, loadItemReads, loadRepos, loadSyncPlan,
+  markReposReconciled, markReposRead, markReposSyncedByError, saveItems, saveRepoList, saveSyncState, startSyncRun,
+  type CommentInsert, type ItemEntry, type ItemRowInput, type SyncPlan, type SyncState,
+} from "./data/mirror/index.ts";
+
 
 const OVERLAP_MS = 10 * 60 * 1000;
 const FULL_PAGE = 30;
 const LIGHT_PAGE = 100;
 const MIN_PAGE = 10;
-
-const COLUMNS = [
-  "repo", "number", "kind", "state", "title", "body", "url", "author", "author_type", "author_id", "author_association",
-  "created_at", "updated_at", "closed_at", "merged_at", "merged_by", "state_reason", "is_draft",
-  "labels", "assignees", "comments_count", "reactions_count", "additions", "deletions", "changed_files",
-  "head_ref", "head_oid", "head_repo", "base_ref", "maintainer_can_modify", "mergeable",
-  "review_decision", "ci_state", "closing_issues", "detail_level", "embed_hash", "class_hash", "class_scheme",
-] as const;
-
-type ItemRow = Pick<Items, (typeof COLUMNS)[number]>;
 
 type Kind = "issue" | "pr";
 type Detail = "full" | "light";
@@ -173,8 +168,10 @@ export class Client {
     } catch {
       // gh prints errors on stderr when there is no JSON body
     }
-    const text = `${p.stdout.length < 5000 ? p.stdout : ""}${p.stderr}`.toLowerCase();
-    return { data: json.data, errors: json.errors ?? [], text, failed: p.status !== 0, stderr: p.stderr };
+    // Never the data: it holds text people wrote. gh writes GitHub's error message to stderr.
+    const errors: Node[] = json.errors ?? [];
+    const text = `${p.stderr}${errors.length ? JSON.stringify(errors) : ""}`.toLowerCase();
+    return { data: json.data, errors, text, failed: p.status !== 0, stderr: p.stderr };
   }
 
   /** The `owner/name` GitHub's REST endpoint redirects a moved repo to, or null when it does not answer with another name. */
@@ -186,13 +183,15 @@ export class Client {
   }
 
   async query(query: string, variables: object): Promise<Node> {
-    const { env, key } = await this.childEnv(ownerOfVariables(variables));
+    // Mutations are counted where they are recorded (src/github/write.ts).
+    if (!/^\s*mutation\b/.test(query)) effect("github-read");
+    const { env, key } = await this.childEnv(ownerOfVariables(variables)).catch((e) => { throw markUnsent(e); });
     this.useRate(key);
     if (this.remaining !== null && this.remaining < this.reserve) {
       await this.sleepUntilReset(`${this.remaining} points left, reserve ${this.reserve}`);
     }
     const r = await this.run(query, variables, env);
-    if (r.text.includes("secondary rate limit") || r.text.includes("abuse")) {
+    if ((r.failed || r.errors.length > 0) && (r.text.includes("secondary rate limit") || r.text.includes("abuse"))) {
       console.log("  secondary rate limit: sleeping 90s");
       await sleep(90_000);
       throw new Transient("secondary");
@@ -271,17 +270,20 @@ export async function* untilCutoff(pages: AsyncIterable<Node[]>, cutoff: string 
 
 const login = (n: Node): string | null => n?.login ?? null;
 
-function toRow(repo: string, kind: Kind, n: Node, detail: Detail): ItemRow {
+function toRow(repo: string, kind: Kind, n: Node, detail: Detail): ItemRowInput {
   const r = baseRow(repo, kind, n, detail);
-  return Object.assign(r, hashColumns(r));
+  Object.assign(r, hashColumns(r));
+  // Numbers a pull request's text closes or mentions; the writer stores them with the row.
+  if (kind === "pr") r.text_refs = textRefs(r.title, r.body);
+  return r;
 }
 
 /** True when `nameWithOwner` is the repo of the item at `url` (https://github.com/<owner>/<repo>/...). */
 const sameRepo = (nameWithOwner: unknown, url: unknown): boolean =>
   typeof nameWithOwner === "string" && typeof url === "string" && url.toLowerCase().startsWith(`https://github.com/${nameWithOwner.toLowerCase()}/`);
 
-function baseRow(repo: string, kind: Kind, n: Node, detail: Detail): ItemRow {
-  const r = Object.fromEntries(COLUMNS.map((c) => [c, null])) as unknown as ItemRow;
+function baseRow(repo: string, kind: Kind, n: Node, detail: Detail): ItemRowInput {
+  const r = {} as Record<string, unknown> as ItemRowInput;
   Object.assign(r, {
     repo, number: n.number, kind, state: n.state, title: n.title, body: n.body, url: n.url,
     author: login(n.author), author_type: n.author?.__typename ?? null, author_id: typeof n.author?.databaseId === "number" ? n.author.databaseId : null, author_association: n.authorAssociation,
@@ -318,10 +320,10 @@ const mentions = (body: unknown, names: string[]): number => {
   return names.some((n) => n && b.includes(`@${n.toLowerCase()}`)) ? 1 : 0;
 };
 
-function commentRows(repo: string, kind: Kind, n: Node, own: string[]): Insertable<Comments>[] {
+function commentRows(repo: string, kind: Kind, n: Node, own: string[]): CommentInsert[] {
   // `counted`: whether the entry counts as new discussion for the review stage (src/review/discussion.ts).
   const counted = (c: Node) => Number(isCounted({ author: login(c.author), association: c.authorAssociation, bot: c.author?.__typename === "Bot", prAuthor: login(n.author), state: c.state, body: c.body, inline: c.comments?.totalCount }));
-  const rows: Insertable<Comments>[] = (n.comments?.nodes ?? []).filter(Boolean).map((c: Node) =>
+  const rows: CommentInsert[] = (n.comments?.nodes ?? []).filter(Boolean).map((c: Node) =>
     ({ repo, number: n.number, id: c.id, kind: "comment", author: login(c.author), created_at: c.createdAt, body: c.body, review_state: null, commit_oid: null, counted: counted(c), author_association: c.authorAssociation ?? null, mentions_pipeline: mentions(c.body, own), url: c.url ?? null }));
   if (kind === "pr") {
     for (const c of (n.reviews?.nodes ?? []).filter(Boolean)) {
@@ -332,17 +334,8 @@ function commentRows(repo: string, kind: Kind, n: Node, own: string[]): Insertab
   return rows;
 }
 
-/** An upsert's mergeable value: GitHub reports UNKNOWN while it recomputes, which must not replace a known value at the same head. */
-export const keepKnownMergeableExpr = (eb: kx.AnyEb, table: string): Expression<string | null> =>
-  eb.case().when(eb.and([
-    eb(eb.ref(`${table}.head_oid`), "is not distinct from", eb.ref("excluded.head_oid")),
-    eb(eb.ref(`${table}.mergeable`), "in", ["CONFLICTING", "MERGEABLE"]),
-    eb(eb.ref("excluded.mergeable"), "is distinct from", "CONFLICTING"),
-    eb(eb.ref("excluded.mergeable"), "is distinct from", "MERGEABLE"),
-  ])).then(eb.ref(`${table}.mergeable`)).else(eb.ref("excluded.mergeable")).end();
-
 /** One item read: its repo, kind and detail level, and the node GitHub returned. */
-type NodeWrite = { repo: string; kind: Kind; detail: Detail; n: Node };
+type NodeWrite = { repo: string; kind: Kind; detail: Detail; n: Node; /** When this node's own read started, if not the call's. */ readAt?: string };
 
 /** `force` rewrites an item and its comments even when the row is unchanged (a comment edit leaves the item row as it was). */
 /**
@@ -358,81 +351,19 @@ async function writePage(db: Db, repo: string, kind: Kind, detail: Detail, nodes
  * when nothing needed writing, so what it records commits with the items or not at all.
  */
 async function writeNodes(db: Db, nodes: readonly NodeWrite[], opts: { force?: boolean; readAt?: string; inside?: () => Promise<void> } = {}): Promise<void> {
-  const force = opts.force ?? false;
   const readAt = opts.readAt ?? iso(new Date());
-  // Upserts keep each row's rowid, which the full-text index (schema.sql) is keyed on.
-  const itemUpsert = COLUMNS.filter((c) => c !== "repo" && c !== "number" && c !== "mergeable");
-  const commentUpsert = ["repo", "number", "kind", "author", "created_at", "body", "review_state", "commit_oid", "counted", "author_association", "mentions_pipeline", "url"] as const;
   const live = appSlug();
   if (live) { try { await rememberSlug(db, live); } catch { /* read-only connection */ } }
   const own = await mentionNames(db, live);
-  // Rows are built before the write lock, and the lock covers a fixed number of statements per call (multi-row, in
-  // batches), not statements per item: on Postgres each one is a network round trip. An item read twice keeps its last read.
-  const key = (repo: string, number: number) => `${repo}#${number}`;
-  const page = [...new Map(nodes.map((w) => [key(w.repo, Number(w.n.number)), w])).values()].map((w) => ({
-    n: w.n, kind: w.kind, detail: w.detail, row: toRow(w.repo, w.kind, w.n, w.detail), comments: w.detail === "full" ? commentRows(w.repo, w.kind, w.n, own) : [],
+  // Rows are built before the write lock. An item read twice keeps its last read (the writer also keeps one entry per item).
+  const entries: ItemEntry[] = nodes.map((w) => ({
+    repo: w.repo, kind: w.kind, detail: w.detail, row: toRow(w.repo, w.kind, w.n, w.detail), comments: w.detail === "full" ? commentRows(w.repo, w.kind, w.n, own) : [], ...(w.readAt !== undefined && { readAt: w.readAt }),
   }));
-  if (!page.length) {
-    if (opts.inside) await db.write(opts.inside);
-    return;
-  }
-  type Entry = (typeof page)[number];
-  const pairsOf = (xs: readonly Entry[]) => xs.map((x) => [x.row.repo, x.row.number] as const);
-  const isRef = (xs: readonly Entry[]) => kx.tupleIn(db, ["repo", "number"], pairsOf(xs), ["text", "bigint"]);
+  if (!entries.length && !opts.inside) return;
   await db.write(async () => {
-    // A read never replaces what a later-started read stored: the item, its comments and its read time stay the newer read's.
-    const reads = new Map<string, string>();
-    for (const b of kx.batches(page)) {
-      for (const r of await db.all(db.k.selectFrom("main.item_reads").select(["repo", "number", "synced_at"]).where(isRef(b)))) reads.set(key(r.repo, Number(r.number)), r.synced_at);
-    }
-    const current = page.filter((x) => { const last = reads.get(key(x.row.repo, x.row.number)); return last === undefined || !(Date.parse(last) > Date.parse(readAt)); });
-    if (current.length) await writeCurrent(current);
+    if (entries.length) await saveItems(db, entries, { readAt, force: opts.force });
     if (opts.inside) await opts.inside();
   });
-
-  async function writeCurrent(current: Entry[]): Promise<void> {
-    // A row identical to the stored one (overlapping reads re-fetch many) writes nothing.
-    const stored = new Map<string, Record<string, unknown>>();
-    for (const b of kx.batches(current)) {
-      for (const r of await db.all(db.k.selectFrom("items").select(COLUMNS).where(isRef(b)))) stored.set(key(r.repo, Number(r.number)), r);
-    }
-    const changed = force ? current : current.filter((x) => { const old = stored.get(key(x.row.repo, x.row.number)); return !old || !COLUMNS.every((c) => old[c] === x.row[c]); });
-    for (const b of kx.batches(changed)) {
-      await db.run(db.k.insertInto("main.items").values(b.map((x) => x.row)).onConflict((oc) => oc.columns(["repo", "number"]).doUpdateSet((eb) => ({
-        ...kx.excluded(itemUpsert)(eb),
-        mergeable: keepKnownMergeableExpr(eb, "items"),
-      }))));
-      // After the upsert, which clears the stored refs when the text changed (schema trigger items_text_refs_stale).
-      const prs = b.filter((x) => x.kind === "pr");
-      if (prs.length) {
-        const refs = kx.refCase(prs.map((x) => [x.row.repo, x.row.number, textRefs(x.row.title, x.row.body)] as const));
-        await db.run(db.k.updateTable("main.items").set({ text_refs: refs }).where(isRef(prs)));
-      }
-    }
-    // The account seen under a login string owns its id-less history for the whitelist; a later account with the same login does not inherit it.
-    // A login with merged or closed PRs mirrored without an id is left to the backfill, which binds the author of that history, not the login's current holder.
-    const ids = new Map<string, number>();
-    for (const { row } of changed) if (typeof row.author === "string" && typeof row.author_id === "number" && !ids.has(row.author)) ids.set(row.author, row.author_id);
-    if (ids.size) {
-      const unbound = new Set((await db.all(db.k.selectFrom("main.items").select("author").distinct().where(kx.inList(db, "author", [...ids.keys()]))
-        .where("kind", "=", "pr").where("state", "in", ["MERGED", "CLOSED"]).where("author_id", "is", null))).map((r) => r.author));
-      const bind = [...ids].filter(([login]) => !unbound.has(login)).map(([login, id]) => ({ login, id }));
-      for (const b of kx.batches(bind)) await db.run(db.k.insertInto("main.author_ids").values(b).onConflict((oc) => oc.doNothing()));
-    }
-    const full = changed.filter((x) => x.detail === "full");
-    if (full.length) {
-      // A forced re-read of an unchanged item upserts in place: an identical comment bumps no topic. Comments past the newest 20 go.
-      if (!force) for (const b of kx.batches(full)) await db.run(db.k.deleteFrom("main.comments").where(isRef(b)));
-      const comments = [...new Map(full.flatMap((x) => x.comments).map((c) => [c.id, c])).values()];
-      for (const b of kx.batches(comments)) await db.run(db.k.insertInto("main.comments").values(b).onConflict((oc) => oc.column("id").doUpdateSet(kx.excluded(commentUpsert))));
-      if (force) for (const x of full) await db.run(db.k.deleteFrom("main.comments").where("repo", "=", x.row.repo).where("number", "=", x.row.number).where(kx.inList(db, "id", x.comments.map((r) => r.id), "text", true)));
-    }
-    for (const b of kx.batches(current)) {
-      await db.run(db.k.insertInto("main.item_reads").values(b.map((x) => ({ repo: x.row.repo, number: x.row.number, synced_at: readAt })))
-        .onConflict((oc) => oc.columns(["repo", "number"]).doUpdateSet(kx.excluded(["synced_at"]))
-          .where((eb) => eb(eb.fn<number>("julianday", [eb.ref("excluded.synced_at")]), ">=", eb.fn<number>("julianday", [eb.ref("main.item_reads.synced_at")])))));
-    }
-  }
 }
 
 // `repositoryOwner` serves organizations and users alike.
@@ -465,6 +396,7 @@ async function readRepoSince(db: Db, client: Querier, name: string, cutoff: stri
     const passes: [Detail, string[]][] = [["full", ["OPEN"]], ["light", kind === "issue" ? ["CLOSED"] : ["CLOSED", "MERGED"]]];
     for (const [detail, states] of passes) {
       for await (const nodes of untilCutoff(fetchPages(client, kind, detail, name, states), cutoff)) {
+        await noteMissed(db, nodes.map((n: Node) => ({ repo: name, n })));
         await writePage(db, name, kind, detail, nodes, false, startedAt);
         count += nodes.length;
         for (const n of nodes) if (n.updatedAt > newest) newest = n.updatedAt;
@@ -474,23 +406,20 @@ async function readRepoSince(db: Db, client: Querier, name: string, cutoff: stri
   return { count, newest };
 }
 
-// high_water is written only when the whole repo finished, so a crash leaves the repo incomplete.
-async function syncRepo(db: Db, client: Querier, name: string, full: boolean): Promise<number> {
+// high_water (`high` as the run began) is written only when the whole repo finished, so a crash leaves the repo incomplete.
+// `inside` runs in that write.
+async function syncRepo(db: Db, client: Querier, name: string, full: boolean, high: string | null, inside: () => Promise<void>): Promise<number> {
   // synced_at is the start of the sync: every item the sync read is at least as new as it (the pre-approved merge compares it with a push).
   const startedAt = iso(new Date());
-  const row = await db.get(db.k.selectFrom("repos").select("high_water").where("name", "=", name));
-  const high = row?.high_water ?? null;
   const cutoff = high && !full ? iso(new Date(new Date(high).getTime() - OVERLAP_MS)) : null;
   const read = await readRepoSince(db, client, name, cutoff);
   const count = read.count;
   const newest = read.newest > (high ?? "") ? read.newest : (high ?? "");
-  // max(): an incremental sync may have moved the high water further while a full pass ran.
-  const hw = newest || null;
-  await db.run(db.k.updateTable("main.repos").set((eb) => ({
-    synced_at: startedAt,
-    high_water: hw === null ? eb.ref("high_water")
-      : eb.case().when(eb.or([eb("high_water", "is", null), eb("high_water", "<", hw)])).then(hw).else(eb.ref("high_water")).end(),
-  })).where("name", "=", name));
+  // The writer moves the high water only forward: an incremental sync may have moved it further while a full pass ran.
+  await db.write(async () => {
+    await markReposRead(db, [{ name, syncedAt: startedAt, highWater: newest || null }]);
+    await inside();
+  });
   return count;
 }
 
@@ -518,6 +447,53 @@ const SEARCH_CAP = 1000;
 const FULL_KEEP = 2500;
 const META_REFRESH_MS = 15 * 60 * 1000;
 const LOCK_STALE_MS = 6 * 3600 * 1000;
+
+// Webhooks first: GitHub App webhooks queue a re-read of each item they name (src/github/webhooks.ts), so the org-wide poll is
+// a backstop. A sync run polls when pollReason gives a reason, and otherwise runs only its chores.
+/** Longest time between two polls while the webhooks bring the changes. */
+export const BACKSTOP_MS = 15 * 60_000;
+/** After a poll found changes that no webhook brought, every run polls for this long. */
+const MISS_HOLD_MS = 30 * 60_000;
+/** A change younger than this when the poll starts may still be on its way through the webhook and its re-read. */
+const MISS_GRACE_MS = 2 * 60_000;
+
+/** What the webhooks look like to a sync run. `deliveries` is GitHub's delivery list check (src/github/deliveries.ts), "error" when it failed. */
+export type PollInputs = { webhooks: boolean; unread: boolean; deliveries: { failed: number; covered: boolean } | "error" | null };
+
+/** Why this run polls GitHub, or null when the webhooks bring the changes and the backstop is not due. */
+export function pollReason(state: Pick<SyncState, "webhook_at" | "webhook_started_at" | "polled_at" | "poll_missed_at" | "poll_missed">, now: number, o: PollInputs): string | null {
+  if (!o.webhooks) return "webhooks are not set up";
+  if (o.unread) return "a tracked repo was never read in full";
+  if (!state.webhook_at) return "no webhook delivery yet";
+  if (!state.polled_at) return "first poll";
+  if (now - Date.parse(state.polled_at) >= BACKSTOP_MS - 5_000) return "backstop";
+  // Deliveries sent while the receiver was down are lost unless GitHub's list shows them failed.
+  if (state.webhook_started_at && state.webhook_started_at > state.polled_at) return "the webhook receiver restarted";
+  if (state.poll_missed_at && now - Date.parse(state.poll_missed_at) < MISS_HOLD_MS) return `a poll found changes no webhook brought (${(state.poll_missed ?? "").slice(0, 120)})`;
+  if (o.deliveries === "error") return "GitHub's list of webhook deliveries could not be read";
+  if (o.deliveries?.failed) return `${o.deliveries.failed} webhook deliveries failed`;
+  if (o.deliveries && !o.deliveries.covered) return "more webhook deliveries than one check reads";
+  return null;
+}
+
+/** The poll in progress counts the changes its reads find that no read since them had brought (noteMissed). */
+let pollSeen: { before: string; count: number; refs: string[] } | null = null;
+
+/** Counts the items of a page that changed before the grace time and were last read before that change. */
+async function noteMissed(db: Db, nodes: { repo: string; n: Node }[]): Promise<void> {
+  const seen = pollSeen;
+  if (!seen) return;
+  const old = nodes.filter((w) => typeof w.n?.updatedAt === "string" && w.n.updatedAt < seen.before);
+  if (!old.length) return;
+  const reads = await loadItemReads(db, old.map((w) => ({ repo: w.repo, number: w.n.number })));
+  for (const w of old) {
+    const key = `${w.repo}#${w.n.number}`;
+    const at = reads.get(key);
+    if (at && at >= w.n.updatedAt) continue;
+    seen.count++;
+    if (seen.refs.length < 10) seen.refs.push(key);
+  }
+}
 
 /** Indexes of search results GitHub refused for lack of access, when every error of the answer is one; else null. */
 export function refusedSearchNodes(errors: Node[]): Set<number> | null {
@@ -563,12 +539,6 @@ async function failRepo(db: Db, client: Querier, name: string, e: unknown): Prom
   console.warn(`${slugOf(name)}: not synced: ${(e as Error).message}${moved ? ` (moved to ${moved})` : ""}`);
 }
 
-const getSetting = async (db: Db, key: string): Promise<string | null> =>
-  (await db.get(db.k.selectFrom("settings").select("value").where("key", "=", key)))?.value ?? null;
-const setSetting = async (db: Db, key: string, value: string): Promise<void> => {
-  await db.run(db.k.insertInto("settings").values({ key, value }).onConflict((oc) => oc.column("key").doUpdateSet(kx.excluded(["value"]))));
-};
-
 /**
  * How far a page of a slice `..to` searched in updatedAt order lets the org high water move once it is stored, or null.
  * A finished slice is stored up to its newest item (at most `to`: later slices are unread). Mid-slice, search sorts on
@@ -587,23 +557,41 @@ export function pageMark(nodes: readonly { updatedAt: string }[], o: { to: strin
 
 const settledTimes = (nodes: readonly { updatedAt: string }[], before: string): string[] => nodes.map((n) => n.updatedAt).filter((t) => t < before);
 
-/** Moves `org_high_water` to `t` unless it is already there or later. */
-const advanceHighWater = async (db: Db, t: string): Promise<void> => {
-  await db.run(db.k.insertInto("main.settings").values({ key: "org_high_water", value: t })
-    .onConflict((oc) => oc.column("key").doUpdateSet(kx.excluded(["value"])).where((eb) => eb("main.settings.value", "<", eb.ref("excluded.value")))));
-};
-
 // Search returns at most SEARCH_CAP results per query. A window with more matches is cut in half
 // (`updated:A..B` is inclusive, in whole seconds) until every slice fits. A one-second slice with
 // more matches than the cap cannot be read by search; the tracked repos are listed for that
 // second instead.
-export type SearchResult = { count: number; newest: string | null; slices: number; fallbacks: number };
+/** `mark`: how far pages without items settled the window past the last mark recorded; the caller records it. */
+export type SearchResult = { count: number; newest: string | null; slices: number; fallbacks: number; mark: string | null };
+
+/**
+ * Writes the items in one transaction. When it fails for another reason than the fence, they are written one by one, so every item that
+ * can be stored is, and the first error is thrown after.
+ */
+async function writeEach(db: Db, items: NodeWrite[], o: { readAt?: string; inside?: () => Promise<void> } = {}): Promise<void> {
+  try {
+    await writeNodes(db, items, o);
+  } catch (e) {
+    if (isFenced(e) || items.length < 2) throw e;
+    console.warn(`  ${items.length} items failed to write in one transaction (${(e as Error).message}): writing them one by one`);
+    let first: unknown = null;
+    for (const w of items) {
+      try { await writeNodes(db, [w], { readAt: o.readAt }); } catch (e1) {
+        if (isFenced(e1)) throw e1;
+        first ??= e1;
+        console.warn(`  ${w.repo}#${w.n.number}: not stored: ${(e1 as Error).message}`);
+      }
+    }
+    if (first) throw first;
+    if (o.inside) await db.write(o.inside);
+  }
+}
 
 // Everything updated from `since` to `until`, oldest slice first, each slice in updatedAt order. `newest` is the largest
 // updatedAt returned (tracked repos or not), the next sync's starting point; null when nothing matched.
 // `progress(t)` runs in the write transaction of a page once every item updated before `t` is stored (see pageMark), so
 // a stopped run keeps what it finished.
-export async function syncBySearch(db: Db, client: Querier, tracked: string[], since: string, until: string, progress?: (t: string) => Promise<void>): Promise<SearchResult> {
+export async function syncBySearch(db: Db, client: Querier, tracked: string[], since: string, until: string, closing: (() => Promise<void>)[], progress?: (t: string) => Promise<void>): Promise<SearchResult> {
   const trackedSet = new Set(tracked);
   // Before the first request: the read start every page of this run is stored with (see writePage).
   const startedAt = iso(new Date());
@@ -613,7 +601,7 @@ export async function syncBySearch(db: Db, client: Querier, tracked: string[], s
   const repoNewest = new Map<string, string>();
   let size = SEARCH_PAGE;
   let failures = 0;
-  const out: SearchResult = { count: 0, newest: null, slices: 0, fallbacks: 0 };
+  const out: SearchResult = { count: 0, newest: null, slices: 0, fallbacks: 0, mark: null };
 
   async function page(q: string, cursor: string | null): Promise<Node> {
     for (;;) {
@@ -628,8 +616,7 @@ export async function syncBySearch(db: Db, client: Querier, tracked: string[], s
     }
   }
 
-  // One write transaction per page. When it fails for another reason than the fence, the items are written one by one,
-  // so every item that can be stored is, and the run then fails with the first error, the page's mark unrecorded.
+  // One write transaction per page; when an item cannot be stored the run fails with the page's mark unrecorded (writeEach).
   async function write(nodes: Node[], mark: string | null): Promise<void> {
     const items: NodeWrite[] = [];
     for (const n of nodes) {
@@ -638,23 +625,14 @@ export async function syncBySearch(db: Db, client: Querier, tracked: string[], s
       if (!n?.repository || !trackedSet.has(n.repository.name) || !ownedBy(n, n.repository.name)) continue;
       items.push({ repo: n.repository.name, kind: n.__typename === "PullRequest" ? "pr" : "issue", detail: n.state === "OPEN" ? "full" : "light", n });
     }
-    const inside = mark && progress ? () => progress(mark) : undefined;
-    try {
-      await writeNodes(db, items, { readAt: startedAt, inside });
-    } catch (e) {
-      if (isFenced(e) || items.length < 2) throw e;
-      console.warn(`  a page of ${items.length} items failed to write (${(e as Error).message}): writing them one by one`);
-      let first: unknown = null;
-      for (const w of items) {
-        try { await writeNodes(db, [w], { readAt: startedAt }); } catch (e1) {
-          if (isFenced(e1)) throw e1;
-          first ??= e1;
-          console.warn(`  ${w.repo}#${w.n.number}: not stored: ${(e1 as Error).message}`);
-        }
-      }
-      if (first) throw first;
-      if (inside) await db.write(inside);
-    }
+    // A page with nothing to store writes nothing: its mark goes with the next page's items, or to the caller.
+    const settled = mark ?? out.mark;
+    out.mark = settled;
+    if (!items.length) return;
+    out.mark = null;
+    const inside = settled && progress ? () => progress(settled) : undefined;
+    await noteMissed(db, items);
+    await writeEach(db, items, { readAt: startedAt, inside });
     out.count += items.length;
     for (const w of items) if (w.n.updatedAt > (repoNewest.get(w.repo) ?? "")) repoNewest.set(w.repo, w.n.updatedAt);
   }
@@ -705,10 +683,12 @@ export async function syncBySearch(db: Db, client: Querier, tracked: string[], s
 
   const from = new Date(since);
   await window(from, new Date(Math.max(from.getTime(), new Date(until).getTime())));
-  for (const name of tracked.filter((n) => ownerOf(n) !== DEFAULT_OWNER)) {
+  const others = tracked.filter((n) => ownerOf(n) !== DEFAULT_OWNER);
+  const rows = await loadRepos(db, { names: others });
+  for (const name of others) {
     try {
       // A repo that failed for a while has its own high water behind the window: read from there.
-      const hw = (await db.get(db.k.selectFrom("repos").select("high_water").where("name", "=", name)))?.high_water;
+      const hw = rows.get(name)?.high_water;
       const own = hw ? new Date(new Date(hw).getTime() - OVERLAP_MS) : null;
       const r = await readRepoSince(db, client, name, iso(own && own < from ? own : from));
       await clearRepoFailure(db, name);
@@ -718,10 +698,7 @@ export async function syncBySearch(db: Db, client: Querier, tracked: string[], s
       await failRepo(db, client, name, e);
     }
   }
-  for (const [repo, t] of repoNewest) {
-    await db.run(db.k.updateTable("main.repos").set({ high_water: t }).where("name", "=", repo)
-      .where((eb) => eb.or([eb("high_water", "is", null), eb("high_water", "<", t)])));
-  }
+  if (repoNewest.size) closing.push(() => advanceRepoHighWater(db, [...repoNewest].map(([name, t]) => ({ name, t }))));
   return out;
 }
 
@@ -823,53 +800,53 @@ query($owner: String!, $name: String!) {
 
 // Lists the default org's repos. Repos of other owners are tracked one by one by name, never listed;
 // a failure reading one is logged and leaves the rest of the sync alone.
-async function refreshRepoList(db: Db, client: Querier): Promise<string[]> {
+async function refreshRepoList(db: Db, client: Querier, tracked: string[], failing: Set<string>): Promise<string[]> {
+  const fail = async (name: string, e: unknown): Promise<void> => {
+    failing.add(name);
+    await failRepo(db, client, name, e);
+  };
   const repos: (Node & { owner: string })[] = [];
   for (const r of await listRepos(client, DEFAULT_OWNER)) repos.push({ ...r, owner: DEFAULT_OWNER });
-  for (const name of (await trackedNames(db)).filter((n) => ownerOf(n) !== DEFAULT_OWNER)) {
+  for (const name of tracked.filter((n) => ownerOf(n) !== DEFAULT_OWNER)) {
     const owner = ownerOf(name);
     try {
       const r = (await client.query(REPO_QUERY, { owner, name })).repository;
       if (r && r.owner?.login?.toLowerCase() === owner.toLowerCase()) repos.push({ ...r, owner });
-      else await failRepo(db, client, name, new GithubError("graphql error: repository not found under this owner", 0, "NOT_FOUND"));
+      else await fail(name, new GithubError("graphql error: repository not found under this owner", 0, "NOT_FOUND"));
     } catch (e) {
-      await failRepo(db, client, name, e);
+      await fail(name, e);
     }
   }
   // A tracked repo of the default org missing from the listing is archived, or moved or deleted: only the last two are errors.
   const listedNames = new Set(repos.map((r) => r.name as string));
-  for (const name of (await trackedNames(db)).filter((n) => ownerOf(n) === DEFAULT_OWNER && !listedNames.has(n))) {
+  for (const name of tracked.filter((n) => ownerOf(n) === DEFAULT_OWNER && !listedNames.has(n))) {
     try {
       const r = (await client.query(REPO_QUERY, { owner: DEFAULT_OWNER, name })).repository;
       if (!r || r.owner?.login?.toLowerCase() !== DEFAULT_OWNER.toLowerCase()) throw new GithubError("graphql error: repository not found under this owner", 0, "NOT_FOUND");
     } catch (e) {
-      if (e instanceof GithubError && e.type === "NOT_FOUND") await failRepo(db, client, name, e);
+      if (e instanceof GithubError && e.type === "NOT_FOUND") await fail(name, e);
       else console.warn(`  ${slugOf(name)}: ${(e as Error).message}`);
     }
   }
-  // Names are unique across owners: a repo already known under another owner is left alone.
+  // Names are unique across owners: a repo already known under another owner is left alone. The writer also clears the not-found record of every repo it wrote.
+  const written = new Set(await db.write(async () => {
+    await saveSyncState(db, { repos_refreshed_at: iso(new Date()) });
+    return await saveRepoList(db, repos.map((r) => ({
+      name: r.name, owner: r.owner, visibility: r.visibility.toLowerCase(), default_branch: r.defaultBranchRef?.name ?? null, open_prs: r.pullRequests.totalCount, open_issues: r.issues.totalCount,
+    })));
+  }));
   for (const r of repos) {
-    const res = await db.run(db.k.insertInto("main.repos")
-      .values({ name: r.name, owner: r.owner, visibility: r.visibility.toLowerCase(), default_branch: r.defaultBranchRef?.name ?? null, open_prs: r.pullRequests.totalCount, open_issues: r.issues.totalCount })
-      .onConflict((oc) => oc.column("name").doUpdateSet(kx.excluded(["visibility", "default_branch", "open_prs", "open_issues"]))
-        .whereRef("main.repos.owner", "=", "excluded.owner")));
-    if (!res.changes) {
-      await failRepo(db, client, r.name, new GithubError(`the name is known under another owner than ${r.owner}`, 0, "NOT_FOUND"));
-    }
+    if (!written.has(r.name)) await fail(r.name, new GithubError(`the name is known under another owner than ${r.owner}`, 0, "NOT_FOUND"));
   }
   await reloadRepoOwners(db);
-  // A repo the listing shows exists again: its not-found record is stale.
-  for (const r of repos) await db.run(db.k.deleteFrom("sync_repo_errors").where("repo", "=", r.name).where("kind", "=", "not-found"));
-  await setSetting(db, "repos_refreshed_at", iso(new Date()));
   return [...new Set(repos.map((r: Node) => r.name as string))];
 }
 
 /** Repos the last per-repo pass skipped; the org high water waits for them. */
 let syncFailures = 0;
 
-async function syncPerRepo(db: Db, client: Querier, opts: SyncOpts): Promise<number> {
-  const listed = await refreshRepoList(db, client);
-  const tracked = await trackedNames(db);
+async function syncPerRepo(db: Db, client: Querier, opts: SyncOpts, tracked: string[], plan: SyncPlan): Promise<number> {
+  const listed = await refreshRepoList(db, client, tracked, plan.failing);
   const names = selectSyncRepos(listed, tracked, opts);
   const gone = opts.only.length || opts.all ? [] : tracked.filter((n) => !listed.includes(n));
   if (gone.length) console.log(`tracked but not in the org (archived or renamed): ${gone.join(", ")}`);
@@ -877,7 +854,7 @@ async function syncPerRepo(db: Db, client: Querier, opts: SyncOpts): Promise<num
   // so a stopped run continues after it. The cursor belongs to one scope (tracked repos or all).
   const resumable = opts.full && !opts.only.length;
   const scope = opts.all ? "all" : "tracked";
-  const saved = resumable ? await getSetting(db, "full_sync_cursor") : null;
+  const saved = resumable ? plan.state.full_sync_cursor : null;
   const after = saved?.startsWith(`${scope}|`) ? saved.slice(scope.length + 1) : null;
   const todo = after === null ? names : names.filter((n) => n > after);
   if (after !== null) console.log(`resuming the full re-sync after ${after}: ${todo.length} of ${names.length} repos left`);
@@ -889,7 +866,11 @@ async function syncPerRepo(db: Db, client: Querier, opts: SyncOpts): Promise<num
     const before = client.spent;
     let count: number;
     try {
-      count = await syncRepo(db, client, name, opts.full);
+      count = await syncRepo(db, client, name, opts.full, plan.repos.get(name)?.high_water ?? null, async () => {
+        if (plan.failing.has(name)) await clearRepoFailure(db, name);
+        // The cursor stops at the first failure so the next full run redoes that repo.
+        if (resumable && !failed) await saveSyncState(db, { full_sync_cursor: `${scope}|${name}` });
+      });
     } catch (e) {
       await failRepo(db, client, name, e);
       failed++;
@@ -900,13 +881,10 @@ async function syncPerRepo(db: Db, client: Querier, opts: SyncOpts): Promise<num
       continue;
     }
     transientRun = 0;
-    await clearRepoFailure(db, name);
     total += count;
-    // The cursor stops at the first failure so the next full run redoes that repo.
-    if (resumable && !failed) await setSetting(db, "full_sync_cursor", `${scope}|${name}`);
     console.log(`${name}: ${count} items, ${client.spent - before} points used, ${client.remaining} left`);
   }
-  if (resumable && !failed) await db.run(db.k.deleteFrom("settings").where("key", "=", "full_sync_cursor"));
+  if (resumable && !failed) await saveSyncState(db, { full_sync_cursor: null });
   // One broken repo does not fail the run; all of them failing does.
   if (failed > 0 && failed === todo.length) throw lastError;
   syncFailures = failed;
@@ -947,31 +925,42 @@ export async function reconcileRepo(db: Db, client: Querier, name: string, now: 
       for (const n of nodes) listed.add(`${kind}\t${n.number}`);
     }
   }
-  const stale = (await db.all(db.k.selectFrom("items").select(["kind", "number"]).where("repo", "=", name).where("state", "=", "OPEN")
-    .orderBy("number").$narrowType<{ kind: Kind }>()))
-    .filter((r) => !listed.has(`${r.kind}\t${r.number}`));
+  const stale = (await listItems(db, { repos: [name], states: ["OPEN"] }, "ref")).filter((r) => !listed.has(`${r.kind}\t${r.number}`)).sort((a, b) => a.number - b.number);
   let updated = 0;
-  let gone = 0;
-  for (const r of stale) {
-    const sentAt = iso(new Date());
-    const n: Node = (await client.query(ONE_QUERY, { owner: ownerOf(name), name, number: r.number })).repository?.issueOrPullRequest;
-    if (n && n.repository?.name === name && ownedBy(n, name)) {
-      await writePage(db, name, n.__typename === "PullRequest" ? "pr" : "issue", n.state === "OPEN" ? "full" : "light", [n], false, sentAt);
-      updated++;
-    } else {
-      await db.run(db.k.updateTable("main.items").set((eb) => ({ state: "CLOSED", closed_at: eb.fn.coalesce("closed_at", eb.val(iso(now))) }))
-        .where("repo", "=", name).where("number", "=", r.number).where("state", "=", "OPEN"));
-      await audit(db, "sync", "item-gone", `${name}#${r.number}`, { reason: "not found or transferred on GitHub; marked CLOSED" });
-      gone++;
+  const goneRefs: string[] = [];
+  // Every item is stored with the time its own request was sent; a page's worth shares one write.
+  const read: (NodeWrite & { readAt: string })[] = [];
+  const store = async (): Promise<void> => { if (read.length) await writeEach(db, read.splice(0)); };
+  let failed: unknown = null;
+  const attempt = async (f: () => Promise<void>): Promise<void> => {
+    try { await f(); } catch (e) {
+      if (isFenced(e)) throw e;
+      failed ??= e;
     }
-  }
-  await db.run(db.k.updateTable("main.repos").set({ reconciled_at: iso(now) }).where("name", "=", name));
+  };
+  // A read that fails ends the reading; what the reads before it found is stored all the same, and the caller then gets the first failure.
+  await attempt(async () => {
+    for (const r of stale) {
+      const sentAt = iso(new Date());
+      const n: Node = (await client.query(ONE_QUERY, { owner: ownerOf(name), name, number: r.number })).repository?.issueOrPullRequest;
+      if (n && n.repository?.name === name && ownedBy(n, name)) {
+        read.push({ repo: name, kind: n.__typename === "PullRequest" ? "pr" : "issue", detail: n.state === "OPEN" ? "full" : "light", n, readAt: sentAt });
+        updated++;
+        if (read.length >= FULL_PAGE) await attempt(store);
+      } else goneRefs.push(`${name}#${r.number}`);
+    }
+  });
+  await attempt(store);
+  // Deleted or transferred items are marked CLOSED (no consumer reads a state other than OPEN, CLOSED and MERGED) and audited.
+  const gone = await closeGoneItems(db, goneRefs, iso(now));
+  if (failed) throw failed;
+  await markReposReconciled(db, [{ name, at: iso(now) }]);
   return { open: listed.size, updated, gone };
 }
 
 // Of the tracked repos the sync has read in full, the one whose last reconcile is oldest, when it is over a day old (never: first).
 export async function reconcileDue(db: Db, tracked: string[], now: Date): Promise<string | null> {
-  const at = new Map((await db.all(db.k.selectFrom("repos").select(["name", "reconciled_at"]).where("synced_at", "is not", null).where("high_water", "is not", null))).map((r) => [r.name, r.reconciled_at ?? ""]));
+  const at = new Map([...(await loadRepos(db, { names: tracked })).values()].filter((r) => r.synced_at !== null && r.high_water !== null).map((r) => [r.name, r.reconciled_at ?? ""]));
   const oldest = [...tracked].filter((n) => at.has(n)).sort((a, b) => at.get(a)!.localeCompare(at.get(b)!))[0];
   if (oldest === undefined) return null;
   const last = at.get(oldest)!;
@@ -988,7 +977,7 @@ export async function reconcileNext(db: Db, client: Querier, now: Date = new Dat
     log(`reconcile ${due}: ${c.open} open, ${c.updated} re-read, ${c.gone} gone`);
   } catch (e) {
     await failRepo(db, client, due, e);
-    await db.run(db.k.updateTable("main.repos").set({ reconciled_at: iso(now) }).where("name", "=", due));
+    await markReposReconciled(db, [{ name: due, at: iso(now) }]);
   }
   return due;
 }
@@ -997,77 +986,123 @@ export async function reconcileNext(db: Db, client: Querier, now: Date = new Dat
 // minutes before it; a search run moves it page by page as it stores them (syncBySearch). It does not move for --repo
 // runs, and a full re-sync leaves an existing one alone.
 export async function runSync(db: Db, client: Querier, opts: SyncOpts, now: Date = new Date()): Promise<{ mode: string; items: number }> {
+  const [tracked, plan, settings] = await db.together(() => Promise.all([trackedNames(db), loadSyncPlan(db), readSettingsSnapshot(db)]));
+  // The run reads its settings (the names comments address the app by, for every page) once.
+  return await withSettingsSnapshot(db, () => syncWith(db, client, opts, now, tracked, plan), Promise.resolve(settings));
+}
+
+async function syncWith(db: Db, client: Querier, opts: SyncOpts, now: Date, tracked: string[], plan: SyncPlan): Promise<{ mode: string; items: number }> {
   const started = iso(now);
-  const orgHigh = await getSetting(db, "org_high_water");
-  const tracked = await trackedNames(db);
-  const synced = new Set((await db.all(db.k.selectFrom("repos").select("name").where("synced_at", "is not", null))).map((r) => r.name));
+  const orgHigh = plan.state.org_high_water;
   // A repo that cannot be read has no synced_at and would keep every run per-repo.
   // Only a repo that cannot be read at all (not found, no access) is passed over; others are retried per repo for their first full read.
-  const broken = new Set((await db.all(db.k.selectFrom("sync_repo_errors").select("repo").where("kind", "in", ["not-found", "forbidden"]))).map((r) => r.repo));
+  const { synced, broken } = plan;
   const wantsSearch = !opts.only.length && !opts.all && !opts.full && !opts.perRepo && orgHigh !== null
     && tracked.every((n) => synced.has(n) || broken.has(n));
   const spent0 = client.spent;
   let mode = "per-repo";
   let items: number;
+  // What the run records once it has read everything, in one write.
+  let closing: (() => Promise<void>)[] = [];
+  const state: Partial<SyncState> = {};
+  const close = async (): Promise<void> => {
+    const writes = closing;
+    closing = [];
+    if (!writes.length && !Object.keys(state).length) return;
+    await db.write(async () => {
+      for (const w of writes) await w();
+      await saveSyncState(db, state);
+    });
+  };
+  // Only a poll of every tracked repo tells the webhooks' coverage.
+  const polls = !opts.only.length && !opts.full;
+  if (polls && wantsSearch) pollSeen = { before: iso(new Date(now.getTime() - MISS_GRACE_MS)), count: 0, refs: [] };
   try {
     if (wantsSearch) {
       // Runs inside each page's transaction; a compare-and-set, so a rolled-back page leaves nothing to remember.
-      const progress = (t: string) => advanceHighWater(db, t);
-      const r = await syncBySearch(db, client, tracked, searchSince(orgHigh as string), started, progress);
+      const progress = async (t: string) => { await advanceOrgHighWater(db, t); };
+      const r = await syncBySearch(db, client, tracked, searchSince(orgHigh as string), started, closing, progress);
       mode = "search";
       items = r.count;
       const high = r.newest && r.newest > (orgHigh as string) ? r.newest : (orgHigh as string);
-      await advanceHighWater(db, high);
-      const last = await getSetting(db, "search_catchup_at");
+      const reached = r.mark && r.mark > high ? r.mark : high;
+      if (reached > (orgHigh as string)) closing.push(async () => void await advanceOrgHighWater(db, reached));
+      const last = plan.state.search_catchup_at;
       if (!last || now.getTime() - new Date(last).getTime() >= CATCHUP_EVERY_MS) {
-        const c = await syncBySearch(db, client, tracked, iso(new Date(new Date(high).getTime() - CATCHUP_SPAN_MS)), iso(new Date(high)));
+        const c = await syncBySearch(db, client, tracked, iso(new Date(new Date(high).getTime() - CATCHUP_SPAN_MS)), iso(new Date(high)), closing);
         items += c.count;
-        await setSetting(db, "search_catchup_at", started);
+        state.search_catchup_at = started;
       }
       // One org-wide search covers every tracked repo, so each counts as synced now.
       // The search read every default-org repo, so errors of earlier runs other than not-found are stale; a failure of this run (at >= started) stays.
-      for (const n of tracked.filter((x) => ownerOf(x) === DEFAULT_OWNER)) await db.run(db.k.deleteFrom("sync_repo_errors").where("repo", "=", n).where("kind", "in", ["transient", "error"]).where("at", "<", started));
+      if (plan.failing.size) closing.push(() => clearRepoFailures(db, tracked.filter((x) => ownerOf(x) === DEFAULT_OWNER), { kinds: ["transient", "error"], before: started }));
       // Not the repos that were never read in full (no high water) or that cannot be read.
-      for (const n of tracked) {
-        await db.run(db.k.updateTable("main.repos").set({ synced_at: started }).where("name", "=", n).where("high_water", "is not", null)
-          .where((eb) => eb.not(eb.exists(eb.selectFrom("sync_repo_errors as e").select(eb.lit(1).as("one")).whereRef("e.repo", "=", "main.repos.name")))));
-      }
+      closing.push(() => markReposSyncedByError(db, tracked, started));
       console.log(`search: ${r.slices} slice${r.slices === 1 ? "" : "s"}${r.fallbacks ? `, ${r.fallbacks} listed per repo` : ""}`);
-      const at = await getSetting(db, "repos_refreshed_at");
-      if (!at || now.getTime() - new Date(at).getTime() >= META_REFRESH_MS) await refreshRepoList(db, client);
+      if (polls && pollSeen) {
+        state.polled_at = started;
+        if (pollSeen.count) {
+          state.poll_missed_at = started;
+          state.poll_missed = `${pollSeen.count} ${pollSeen.refs.join(" ")}`;
+          console.log(`poll: ${pollSeen.count} change${pollSeen.count === 1 ? "" : "s"} no webhook brought: ${pollSeen.refs.join(" ")}`);
+        }
+      }
+      const at = plan.state.repos_refreshed_at;
+      if (!at || now.getTime() - new Date(at).getTime() >= META_REFRESH_MS) {
+        // First: a repo the listing finds gone was synced until now.
+        await close();
+        await refreshRepoList(db, client, tracked, plan.failing);
+      }
     } else {
       syncFailures = 0;
-      items = await syncPerRepo(db, client, opts);
-      if (!opts.only.length && !syncFailures && (orgHigh === null || !opts.full)) await setSetting(db, "org_high_water", started);
+      items = await syncPerRepo(db, client, opts, tracked, plan);
+      if (!opts.only.length && !syncFailures && (orgHigh === null || !opts.full)) state.org_high_water = started;
+      if (polls && !syncFailures) state.polled_at = started;
     }
   } finally {
+    pollSeen = null;
     // The dashboard can show the rate budget from these.
-    const prefix = opts.full ? "sync_full" : "sync";
-    await setSetting(db, `${prefix}_points_last_run`, String(client.spent - spent0));
-    if (client.remaining !== null) await setSetting(db, "sync_rate_remaining", String(client.remaining));
-    if (client.resetAt) await setSetting(db, "sync_rate_reset_at", client.resetAt.toISOString());
+    state[opts.full ? "full_points_last_run" : "points_last_run"] = client.spent - spent0;
+    if (client.remaining !== null) state.rate_remaining = client.remaining;
+    if (client.resetAt) state.rate_reset_at = client.resetAt.toISOString();
+    await close();
   }
   // History written before ids were bound: one batched pass, nothing when every login is bound.
-  if (opts.full || (!opts.only.length && await getSetting(db, "author_ids_backfilled") === null)) {
+  if (opts.full || (!opts.only.length && plan.state.author_ids_backfilled_at === null)) {
     try {
       const { backfillAuthorIds } = await import("./author-ids.ts");
       const bound = await backfillAuthorIds(db, client);
       if (bound) console.log(`bound ${bound} author account id${bound === 1 ? "" : "s"}`);
-      await setSetting(db, "author_ids_backfilled", iso(new Date()));
-      await db.run(db.k.deleteFrom("main.settings").where("key", "=", "author_ids_error"));
+      await saveSyncState(db, { author_ids_backfilled_at: iso(new Date()), author_ids_error: null });
     } catch (e) {
       const msg = String((e as Error)?.message ?? e).slice(0, 200);
       console.log(`author ids: ${msg}`);
-      await setSetting(db, "author_ids_error", `${iso(new Date())} ${(e as { type?: string })?.type ?? ""} ${msg}`);
+      await saveSyncState(db, { author_ids_error: `${iso(new Date())} ${(e as { type?: string })?.type ?? ""} ${msg}` });
     }
   }
-  // Questions about items this sync found closed or merged no longer apply. Writes decisions only.
-  const { withdrawClosedQuestions, setAsideSupersededQuestions } = await import("./merge/withdraw.ts");
-  const withdrawn = await withdrawClosedQuestions(db, iso(new Date()));
-  if (withdrawn) console.log(`withdrew ${withdrawn} decision${withdrawn === 1 ? "" : "s"} about closed items`);
-  const aside = await setAsideSupersededQuestions(db, iso(new Date()));
-  if (aside) console.log(`set aside ${aside} superseded decision${aside === 1 ? "" : "s"}`);
   return { mode, items };
+}
+
+/**
+ * Why this run polls GitHub (pollReason), or null. Reads GitHub's list of the app's webhook deliveries first, which also asks
+ * for the failed ones again.
+ */
+async function whyPoll(db: Db, now = Date.now()): Promise<string | null> {
+  const { readAppSecrets } = await import("./github/install-token.ts");
+  const app = readAppSecrets();
+  const webhooks = !!app?.webhookSecret;
+  let deliveries: PollInputs["deliveries"] = null;
+  if (app && webhooks) {
+    try {
+      deliveries = await (await import("./github/deliveries.ts")).checkDeliveries(db, app, now);
+    } catch (e) {
+      console.log(`webhook deliveries: ${String((e as Error)?.message ?? e).slice(0, 200)}`);
+      deliveries = "error";
+    }
+  }
+  const [tracked, plan] = await db.together(() => Promise.all([trackedNames(db), loadSyncPlan(db)]));
+  const unread = plan.state.org_high_water === null || tracked.some((n) => !plan.synced.has(n) && !plan.broken.has(n));
+  return pollReason(plan.state, now, { webhooks, unread, deliveries });
 }
 
 /** How often a mirror run checks whether the default-branch poll is due (src/mainci POLL_EVERY_MS). */
@@ -1081,28 +1116,31 @@ async function sync(args: string[]): Promise<void> {
   let reserve = SYNC_RESERVE;
   let keep = FULL_KEEP;
   let restart = false;
+  let poll = false;
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--repo") opts.only.push(args[++i]);
+    else if (args[i] === "--poll") poll = true;
     else if (args[i] === "--full") opts.full = true;
     else if (args[i] === "--all") opts.all = true;
     else if (args[i] === "--per-repo") opts.perRepo = true;
     else if (args[i] === "--reserve") reserve = Number(args[++i]);
     else if (args[i] === "--restart") restart = true;
     else if (args[i] === "--keep") keep = Number(args[++i]);
-    else throw new Error(`unknown argument ${args[i]}\nusage: sync [--repo NAME ...] [--all] [--full] [--per-repo] [--reserve N] [--keep N] [--restart]`);
+    else throw new Error(`unknown argument ${args[i]}\nusage: sync [--repo NAME ...] [--all] [--full] [--per-repo] [--poll] [--reserve N] [--keep N] [--restart]`);
   }
   const release = acquireLock(opts.full ? fullLockPath() : lockPath());
   if (!release) return;
+  // Chores still running past their limit; the process cannot wait for them to end on their own.
+  const stuck: string[] = [];
   try {
     // The periodic container runs this command in a loop.
     setDbRole("periodic");
     const db = await openDb();
     const client = new Client(reserve);
-    if (restart) await db.run(db.k.deleteFrom("settings").where("key", "=", "full_sync_cursor"));
+    if (restart) await saveSyncState(db, { full_sync_cursor: null });
     const querier = opts.full ? lowPriority(client, { busy: () => lockHeld(lockPath()), minRemaining: keep }) : client;
     // Each run leaves a row for the Pipeline page; rows older than two days go.
-    const row = (await db.get(db.k.insertInto("sync_runs").values({ started_at: iso(new Date()) }).returning(kx.rowid("sync_runs").as("rowid"))))!.rowid;
-    await db.run(db.k.deleteFrom("sync_runs").where("started_at", "<", iso(new Date(Date.now() - 2 * 86400_000))));
+    const row = await startSyncRun(db, iso(new Date()));
     // The default-branch poll, and the warm builds it queues, keep their own cadence while a long pass runs. Its own client:
     // a client's rate figures follow one request at a time.
     const mainCi = exclusive(async () => {
@@ -1117,60 +1155,91 @@ async function sync(args: string[]): Promise<void> {
     const mainCiTimer = pollsMainCi ? setInterval(() => void mainCi.skip(), MAIN_CI_CHECK_MS) : undefined;
     mainCiTimer?.unref();
     try {
-      const { mode, items } = await runSync(db, querier, opts).finally(() => clearInterval(mainCiTimer));
-      await db.run(db.k.updateTable("sync_runs").set({ ended_at: iso(new Date()), mode, items }).where(kx.rowid("sync_runs"), "=", row));
-      console.log(`sync: mode=${mode} items=${items} points=${client.spent} left=${client.remaining}`);
+      const asked = poll || opts.full || opts.all || opts.perRepo || opts.only.length > 0;
+      const reason = asked ? "asked" : await whyPoll(db);
+      if (reason) {
+        const { mode, items } = await runSync(db, querier, opts).finally(() => clearInterval(mainCiTimer));
+        await finishSyncRun(db, row, { endedAt: iso(new Date()), mode, items });
+        console.log(`sync: mode=${mode} items=${items} points=${client.spent} left=${client.remaining} (${reason})`);
+      } else {
+        // The webhooks' re-reads keep the mirror current; the chores below still run on their own schedules.
+        await finishSyncRun(db, row, { endedAt: iso(new Date()), mode: "webhooks", items: 0 });
+        console.log("sync: mode=webhooks, no poll due");
+      }
+      const chores = !opts.full && !opts.only.length;
       // Files, commits and label events of the items that changed; a failed read leaves them for the next run.
-      if (!opts.full && !opts.only.length) {
-        try {
+      if (chores) {
+        await chore("activity", async () => {
           const n = await syncActivity(db, querier);
           if (n) console.log(`activity: ${n} items read, ${client.remaining} points left`);
-        } catch (e) {
-          console.log(`activity: ${String((e as Error)?.message ?? e).slice(0, 200)}`);
-        }
+        }, stuck);
       }
-      if (pollsMainCi) await mainCi.run();
+      if (pollsMainCi) await chore("main-ci", () => mainCi.run(), stuck);
       // Release download and star counts for the Downloads report; one failing repo is logged and skipped.
-      if (!opts.full && !opts.only.length) {
-        try {
-          await (await import("./downloads/poll.ts")).pollReleasesIfDue(db, undefined, Date.now(), (l) => console.log(l));
-        } catch (e) {
-          console.log(`releases: ${String((e as Error)?.message ?? e).slice(0, 200)}`);
-        }
-      }
+      if (chores) await chore("releases", async () => void await (await import("./downloads/poll.ts")).pollReleasesIfDue(db, undefined, Date.now(), (l) => console.log(l)), stuck);
       // GitHub App installations on accounts that are not allowed owners.
-      if (!opts.full && !opts.only.length) {
-        try {
-          await (await import("./github/allowed-owners.ts")).sweepInstallationsIfDue(db);
-        } catch (e) {
-          console.log(`github app: sweep: ${String((e as Error)?.message ?? e).slice(0, 200)}`);
-        }
-      }
+      if (chores) await chore("github app: sweep", async () => void await (await import("./github/allowed-owners.ts")).sweepInstallationsIfDue(db), stuck);
       // Findings whose fix is landing: a merged pull request, or a fix that reached the default branch through an advisory.
-      if (!opts.full && !opts.only.length) {
-        try {
+      if (chores) {
+        await chore("security", async () => {
           const { exec, fixupDir } = await import("./fixup/git.ts");
           await (await import("./security/land.ts")).pollLandingIfDue(db, { exec, root: fixupDir(), log: (l) => console.log(l) });
-        } catch (e) {
-          console.log(`security: ${String((e as Error)?.message ?? e).slice(0, 200)}`);
-        }
+        }, stuck, async () => `at ${(await import("./security/land.ts")).landingStage()}`);
       }
     } catch (e) {
-      await db.run(db.k.updateTable("sync_runs").set({ ended_at: iso(new Date()), error: String((e as Error)?.message ?? e).slice(0, 300) }).where(kx.rowid("sync_runs"), "=", row));
+      await finishSyncRun(db, row, { endedAt: iso(new Date()), error: String((e as Error)?.message ?? e).slice(0, 300) });
       throw e;
     }
   } finally {
     release();
   }
+  await endRun(stuck.length ? 1 : 0);
+}
+
+/** How long the end of a sync run waits for the database handle to close. */
+const CLOSE_MS = 5_000;
+
+/**
+ * Ends the sync process once its run is done. Whatever still holds the event loop is logged first: nothing should, so a
+ * line here names a handle some code left open. A chore left running past its limit is one of them.
+ */
+async function endRun(code: number): Promise<never> {
+  const open = process.getActiveResourcesInfo();
+  if (open.length) console.log(`sync: open at the end of the run: ${open.join(", ")}`);
+  let t: NodeJS.Timeout | undefined;
+  await Promise.race([closeDb().catch(() => undefined), new Promise((r) => { t = setTimeout(r, CLOSE_MS); })]);
+  clearTimeout(t);
+  process.exit(code);
+}
+
+/** Longest a chore after the mirror run may take before the run goes on without it. */
+const CHORE_MS = 15 * 60_000;
+
+/**
+ * Runs one chore after the mirror run. Its failure is logged under `name` and does not fail the run; one still running after
+ * `ms` is logged with `where` it is and the process's open resources, added to `stuck` and left behind.
+ */
+async function chore(name: string, fn: () => Promise<void>, stuck: string[], where?: () => Promise<string>, ms = CHORE_MS): Promise<void> {
+  let t: NodeJS.Timeout | undefined;
+  const late = new Promise<false>((r) => { t = setTimeout(() => r(false), ms); });
+  const run = fn().then(() => true, (e: unknown) => {
+    console.log(`${name}: ${String((e as Error)?.message ?? e).slice(0, 200)}`);
+    return true;
+  });
+  try {
+    if (await Promise.race([run, late])) return;
+    stuck.push(name);
+    const place = where ? ` (${await where()})` : "";
+    console.log(`${name}: still running after ${Math.round(ms / 60_000)} min${place}; the run goes on without it; open resources: ${process.getActiveResourcesInfo().join(", ")}`);
+  } finally {
+    clearTimeout(t);
+  }
 }
 
 async function syncStatus(): Promise<void> {
   const db = await openDb();
-  const rows = await db.all(db.k.selectFrom("repos as r").select((eb) => [
-    "r.name", "r.open_prs", "r.open_issues", "r.synced_at",
-    eb.exists(eb.selectFrom("tracked_repos as t").select(eb.lit(1).as("one")).whereRef("t.name", "=", "r.name")).as("tracked"),
-    eb.selectFrom("items as i").select(eb.fn.countAll<number>().as("n")).whereRef("i.repo", "=", "r.name").as("n"),
-  ]).orderBy("r.name"));
+  const [repos, tracked, counts] = await db.together(() => Promise.all([loadRepos(db, { all: true }), loadTrackedRepos(db), countItemsByRepo(db)]));
+  const rows = [...repos.values()].map((r) => ({ name: r.name, open_prs: r.open_prs, open_issues: r.open_issues, synced_at: r.synced_at, tracked: tracked.has(r.name), n: counts.get(r.name) ?? 0 }));
   console.log(`${"repo".padEnd(28)} ${"tracked".padEnd(7)} ${"open PRs".padStart(8)} ${"open iss".padStart(8)} ${"mirrored".padStart(8)}  synced_at`);
   for (const r of rows) {
     console.log(`${r.name.padEnd(28)} ${(r.tracked ? "yes" : "-").padEnd(7)} ${String(r.open_prs).padStart(8)} ${String(r.open_issues).padStart(8)} ${String(r.n).padStart(8)}  ${r.synced_at ?? "-"}`);
@@ -1178,12 +1247,11 @@ async function syncStatus(): Promise<void> {
 }
 
 export const commands = {
-  sync: { summary: "mirror issues and PRs of the tracked owners: [--repo NAME ...] [--all] [--full] [--per-repo] [--reserve N] [--keep N] [--restart] (default: org-wide search for changes; --full runs beside it and resumes after the last finished repo)", run: sync },
+  sync: { summary: "mirror issues and PRs of the tracked owners: [--repo NAME ...] [--all] [--full] [--per-repo] [--poll] [--reserve N] [--keep N] [--restart] (default: org-wide search for changes when a poll is due, a backstop to the GitHub App webhooks; --poll polls now; --full runs beside it and resumes after the last finished repo)", run: sync },
   "sync-status": { summary: "per repo: open PRs, open issues, mirrored rows, synced_at", run: syncStatus },
 };
 
 /** Marks a PR we just merged as merged in the mirror, so counts don't wait for the next sync; the sync later fills in what GitHub reports. */
 export async function markMerged(db: Db, repo: string, number: number, at: string): Promise<void> {
-  await db.run(db.k.updateTable("main.items").set((eb) => ({ state: "MERGED", merged_at: eb.fn.coalesce("merged_at", eb.val(at)), closed_at: eb.fn.coalesce("closed_at", eb.val(at)) }))
-    .where("repo", "=", repo).where("number", "=", number).where("state", "=", "OPEN"));
+  await applyLocal(db, [{ kind: "merged", repo, number, at }]);
 }

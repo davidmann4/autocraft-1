@@ -5,7 +5,7 @@ import type { Grant } from "../core/guard.ts";
 import { assignTo, unassignFrom, type Writer } from "./write.ts";
 import { ownerOf } from "../owners.ts";
 import type { Db } from "../db/index.ts";
-import * as kx from "../db/kx.ts";
+import { loadAssignments } from "../data/control/index.ts";
 
 export type Me = { id: string; login: string };
 export type Assignable = { id: string; state: string; assignees: string[] };
@@ -28,15 +28,10 @@ export async function pullRequestInfo(q: Querier, org: string, repo: string, num
 
 /** True when the last assign or unassign in the audit for the item is an assignment of `login` that succeeded, made by a run whose id starts with `runPrefix` (any run when omitted). */
 export async function weAssigned(db: Db, repo: string, number: number, login: string, runPrefix = ""): Promise<boolean> {
-  const last = await db.get(db.k.selectFrom("audit").select(["action", "details"])
-    .where("target", "=", `${repo}#${number}`)
-    .where("action", "in", ["assign", "unassign"])
-    .where((eb) => eb.not(kx.like(db, eb.fn.coalesce("details", eb.val("")), eb.val('%"error":%'))))
-    .orderBy(kx.rowid("audit"), "desc")
-    .limit(1));
-  if (last?.action !== "assign") return false;
-  const d = JSON.parse(last.details ?? "{}") as { assignee?: string; run?: string };
-  return d.assignee === login && (d.run ?? "").startsWith(runPrefix) && (!runPrefix || !!d.run);
+  const mine = (await loadAssignments(db, { refs: [`${repo}#${number}`] })).get(`${repo}#${number}`);
+  if (!mine || mine.assignee !== login) return false;
+  const run = mine.run ?? "";
+  return run.startsWith(runPrefix) && (!runPrefix || !!run);
 }
 
 /** Called by a stage when its work on an item starts: reads the item live and assigns `me` when it is open, nobody is assigned and the audit does not show that we assigned it (a person who removed us is final; our own unassign is not). A failure is logged and never stops the stage. Returns true when it assigned. */

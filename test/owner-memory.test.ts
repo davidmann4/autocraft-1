@@ -41,17 +41,17 @@ test("statements come from operators' own words only, and a related one reaches 
   // A post from before the note line existed: no prefix, written by the pipeline, known only from its audit row.
   const node = (id: number) => `IC_${Buffer.concat([Buffer.from([0x93, 0x00, 0xce, 0, 0, 0, 7, 0xce]), Buffer.from(new Uint8Array(new Uint32Array([id]).buffer).reverse())]).toString("base64url")}`;
   assert.equal(commentDatabaseId(node(4321987)), "4321987");
+  // The audit row is written when the post starts, before GitHub creates the comment.
   await comment(w, node(4321987), "craft-libs", 11, "boss", "Hyphenation dictionary vendoring is a library matter, see the other thread.");
-  await w.db.run(w.db.k.insertInto("audit").values({ at: "t", login: "comment-stage", action: "act-comment", target: "craft-libs#11", details: JSON.stringify({ url: "https://github.com/o/craft-libs/issues/11#issuecomment-4321987", state: "done" }) }));
+  await w.db.run(w.db.k.insertInto("audit").values({ at: "2026-02-28T23:59:59Z", login: "comment-stage", action: "act-comment", target: "craft-libs#11", details: JSON.stringify({ url: "https://github.com/o/craft-libs/issues/11#issuecomment-4321987", state: "done" }) }));
   await comment(w, "PRR_x", "craft-libs", 12, "boss", "Hyphenation review text posted by the pipeline without a note line.");
-  await w.db.run(w.db.k.insertInto("audit").values({ at: "t", login: "review", action: "review-post", target: "craft-libs#12", details: JSON.stringify({ review: "PRR_x", state: "done" }) }));
-  await w.db.run(w.db.k.insertInto("decisions").values({ id: "d1", kind: "close", repo: "app", number: 9, question: "q", options: "[]", asked_at: "2026-03-02T00:00:00Z", answer: "close", answer_note: "No new dependency for canvas export.", answered_by: "boss", answered_at: "2026-03-02T00:00:00Z" }));
+  await w.db.run(w.db.k.insertInto("audit").values({ at: "2026-02-28T23:59:59Z", login: "review", action: "review-post", target: "craft-libs#12", details: JSON.stringify({ review: "PRR_x", state: "done" }) }));
   await w.db.run(w.db.k.insertInto("conversation_turns").values({ repo: "app", number: 10, kind: "operator", login: "boss", at: "2026-03-03T00:00:00Z", body: "Keep language data out of the app crates.", block: "b", status: "answered", seq: 1 }));
 
-  assert.equal(await collectStatements(w.db), 3);
+  assert.equal(await collectStatements(w.db), 2);
   assert.equal(await collectStatements(w.db), 0);
-  const kinds = (await w.db.all(w.db.k.selectFrom("owner_statements").select("source_kind").orderBy("id"))).map((r) => r.source_kind).sort();
-  assert.deepEqual(kinds, ["comment", "conversation", "decision-note"]);
+  const kinds = (await w.db.all(w.db.k.selectFrom("owner_statements").select("source_kind").where("ignored", "=", 0).orderBy("id"))).map((r) => r.source_kind).sort();
+  assert.deepEqual(kinds, ["comment", "conversation"]);
 
   await embedStatements(w.db, fake);
   const pr = await vec("Add Danish hyphenation dictionary to the app");

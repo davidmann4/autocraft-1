@@ -7,10 +7,10 @@
 //   /data/diffs/<repo>   the cached PR diffs of each repository in the snapshot (the public ones), when they exist
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
+import { listSnapshotRepos } from "../data/external/index.ts";
 import { diffCacheDir } from "../review/diff.ts";
-import { buildSnapshot, snapshotFile } from "./snapshot.ts";
+import { buildSnapshot, errorLine, errorReport, SNAPSHOT_FAILED, snapshotFile } from "./snapshot.ts";
 import { openDb, TOOLS } from "./server/tools.ts";
 import { handle } from "./server/mcp.ts";
 
@@ -23,18 +23,7 @@ export type McpServer = { command: string; args: string[]; env: Record<string, s
 
 const REPO_DIR = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/;
 
-function snapshotRepos(file: string): string[] {
-  try {
-    const db = new DatabaseSync(file, { readOnly: true, timeout: 30_000 });
-    try {
-      return (db.prepare("SELECT DISTINCT repo FROM items").all() as { repo: string }[]).map((r) => r.repo).filter((r) => REPO_DIR.test(r));
-    } finally {
-      db.close();
-    }
-  } catch {
-    return [];
-  }
-}
+const snapshotRepos = (file: string): string[] => listSnapshotRepos(file).filter((r) => REPO_DIR.test(r));
 
 /** Read-only mounts and the stdio server definition; null when no snapshot has been built yet. */
 export function itemTools(): { mounts: Mount[]; mcpServers: Record<string, McpServer> } | null {
@@ -56,7 +45,16 @@ export function itemTools(): { mounts: Mount[]; mcpServers: Record<string, McpSe
 }
 
 async function snapshot(): Promise<void> {
-  const r = await buildSnapshot();
+  let r: Awaited<ReturnType<typeof buildSnapshot>>;
+  try {
+    r = await buildSnapshot();
+  } catch (e) {
+    console.error(errorReport(e));
+    // Last, so the end of the output the runner's snapshot keeper keeps holds it: the line it logs as the reason.
+    console.error(`${SNAPSHOT_FAILED}${errorLine(e)}`);
+    process.exitCode = 1;
+    return;
+  }
   console.log(`${snapshotFile()}: ${r.items} items, ${r.comments} comments, ${r.bytes} bytes${r.rebuilt ? " (rebuilt)" : ""}, changed ${JSON.stringify(r.changed)}`);
 }
 

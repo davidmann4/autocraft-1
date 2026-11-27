@@ -5,9 +5,11 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { writePlanCache } from "../src/core/plan-cache.ts";
 import { setStatusApproval } from "../src/prstatus/approval.ts";
-import { MARKER, runPrStatus } from "../src/prstatus/index.ts";
+import { MARKER, onlyWaitFlip, runPrStatus } from "../src/prstatus/index.ts";
 import type { Exec } from "../src/fixup/git.ts";
 import type { Querier } from "../src/mirror.ts";
+import { runCommand } from "../src/workflow/apply.ts";
+import { parse } from "../src/workflow/parse.ts";
 import { OPERATOR, world } from "./world-db.ts";
 
 test("one status comment per PR: posted in the queue, edited in a batch and after the merge, also when its record was lost", async () => {
@@ -74,4 +76,49 @@ test("one status comment per PR: posted in the queue, edited in a batch and afte
   } finally {
     w.close();
   }
+});
+
+test("an item nobody started: its hold's comment shows no steps, and says once that nobody holds it any more", async () => {
+  const w = await (await world()).repo();
+  try {
+    await w.acting(OPERATOR);
+    await w.issue(7);
+    await w.db.prepare("UPDATE items SET url = 'https://github.com/o/app/issues/' || number WHERE repo = 'app'").run();
+    await w.db.prepare("INSERT INTO settings (key, value) VALUES ('pipeline_login', 'pipeline-bot') ON CONFLICT (key) DO UPDATE SET value = excluded.value").run();
+    await setStatusApproval(w.db, OPERATOR, "app", true);
+    const bodies: string[] = [];
+    const exec: Exec = async (_cmd, _args, opts) => { bodies.push(opts?.input ?? ""); return { code: 0, stdout: "https://github.com/o/app/issues/7#issuecomment-1001\n", stderr: "" }; };
+    const querier: Querier = { spent: 0, remaining: 5000, query: async () => ({ repository: { issue: { comments: { pageInfo: { hasPreviousPage: false, startCursor: null }, nodes: [] } } } }) as never };
+    // Commands act under the app identity; the comments are written by the box account, since no app is registered to mint a token with.
+    const identity = (value: string) => w.db.prepare("UPDATE settings SET value = ? WHERE key = 'github_identity'").run(value);
+    const say = async (text: string) => {
+      await identity("app");
+      assert.equal((await runCommand(w.db, { login: OPERATOR, canWrite: async () => true }, "dashboard", { parsed: parse(text), items: [{ repo: "app", number: 7 }] })).items[0]!.outcome, "run");
+      await identity("box");
+    };
+    const run = async () => await runPrStatus(w.db, { repo: "app", by: "pipeline", runId: "t", limit: 10, exec, querier, base: null });
+    await say("hold");
+    assert.deepEqual((await run()).posted, ["app#7"]);
+    assert.match(bodies.at(-1)!, /Held by op/);
+    assert.doesNotMatch(bodies.at(-1)!, /implement|recommend/);
+    await say("resume");
+    assert.deepEqual((await run()).edited, ["app#7"]);
+    assert.match(bodies.at(-1)!, /Not held any more/);
+    assert.deepEqual((await run()).due, 0);
+  } finally {
+    w.close();
+  }
+});
+
+test("a head line flipping between Running and waiting for a Task Runner is not a new comment edit; other changes are", () => {
+  const run = "**Running: merge**\n\n1. review (done)\n2. merge (running)";
+  const wait = "**Waiting for a Task Runner**\n\n1. review (done)\n2. merge (running)";
+  // A comment already on GitHub may name the person: the next edit takes the name out.
+  const named = "**Waiting for ann's Task Runner (usage limit)**\n\n1. review (done)\n2. merge (running)";
+  assert.equal(onlyWaitFlip(wait, run), true);
+  assert.equal(onlyWaitFlip(run, wait), true);
+  assert.equal(onlyWaitFlip(named, wait), false);
+  assert.equal(onlyWaitFlip(named, run), false);
+  assert.equal(onlyWaitFlip(run, run.replace("(running)", "(done)")), false);
+  assert.equal(onlyWaitFlip(wait, "**Held by ann, 10:00 UTC**\n\n1. review (done)\n2. merge (running)"), false);
 });

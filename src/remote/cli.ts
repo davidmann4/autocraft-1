@@ -1,4 +1,4 @@
-// `autocraft-server inference [server|user-local]`: shows or sets the inference mode (src/remote/mode.ts). `autocraft-server remote cooloff clear <login>`: ends the cool-off of a login's helpers (src/remote/cooloff.ts).
+// `autocraft-server remote cooloff clear <login>`: ends the cool-off of a login's helpers (src/remote/cooloff.ts).
 // `autocraft-server remote token <login>`: makes a Task Runner credential for a maintainer or operator and prints only the credential,
 // so it can be piped into `autocraft login --stdin` on the same host without anyone seeing it (no device login needed).
 // `autocraft-server remote test-call <login> [<repo>#<n>] [--slot]`: queues a one-line small-tier call bound to the login's own
@@ -9,26 +9,15 @@ import { CLAUDE_PROMPTS } from "../prompts/index.ts";
 import type { ItemRef } from "../../web/src/api/types.ts";
 import { awaitCall, enqueueCall } from "./calls.ts";
 import { clearCooloff } from "./cooloff.ts";
-import { inferenceMode, isInferenceMode, setInferenceMode } from "./mode.ts";
 import { openDb } from "../db/open.ts";
+import { loadAccess } from "../data/access/index.ts";
+import { loadCalls } from "../data/runners/index.ts";
+import type { Db } from "../db/index.ts";
+
+/** The access row of a login (compared without case), or null. */
+const accessOf = async (db: Db, login: string): Promise<{ login: string; role: string } | null> => [...(await loadAccess(db, [login])).values()][0] ?? null;
 
 export const commands = {
-  inference: {
-    summary: "show or set the inference mode: server (accounts on this host) or user-local (maintainers' helpers)",
-    async run(args: string[]): Promise<void> {
-      const db = await openDb();
-      const want = args[0];
-      if (want === undefined) {
-        console.log(`inference: ${await inferenceMode(db)}`);
-        return;
-      }
-      if (!isInferenceMode(want) || args.length > 1) {
-        console.error("usage: autocraft-server inference [server|user-local]");
-        process.exit(1);
-      }
-      console.log(await setInferenceMode(db, want, "cli") ? `inference: ${want}` : `inference was already ${want}`);
-    },
-  },
   remote: {
     summary: "remote cooloff clear <login>: lets the login's helpers claim calls again after a cool-off; remote token <login> [--label <text>]: a Task Runner credential on stdout, for piping into autocraft login --stdin; remote test-call <login> [<repo>#<n>] [--slot]: a one-line call on the login's own Task Runner",
     async run(args: string[]): Promise<void> {
@@ -59,7 +48,7 @@ async function makeToken(args: string[]): Promise<void> {
     process.exit(1);
   }
   const db = await openDb();
-  const role = (await db.get(db.k.selectFrom("access").select("role").where("login", "=", login)))?.role;
+  const role = (await accessOf(db, login))?.role;
   if (role !== "maintainer" && role !== "operator") {
     console.error(`refused: ${login} is ${role ? `a ${role}` : "not on the access list"}; only maintainers and operators run model calls`);
     process.exit(1);
@@ -95,12 +84,8 @@ async function testCall(args: string[]): Promise<void> {
     process.exit(1);
   }
   const db = await openDb();
-  if (await inferenceMode(db) !== "user-local") {
-    console.error("refused: the inference mode is server; Task Runners take calls only in user-local");
-    process.exit(1);
-  }
   // access.login compares without case (NOCASE, citext): the call is bound to the login as the access list spells it.
-  const user = await db.get(db.k.selectFrom("access").select(["login", "role"]).where("login", "=", login));
+  const user = await accessOf(db, login);
   const role = user?.role;
   if (!user || (role !== "maintainer" && role !== "operator")) {
     console.error(`refused: ${login} is ${role ? `a ${role}` : "not on the access list"}; only maintainers and operators run model calls`);
@@ -121,8 +106,8 @@ async function testCall(args: string[]): Promise<void> {
     // A wait limit or a missing taker: the call was withdrawn, and its row says why.
     console.error((e as Error).message);
   }
-  const r = (await db.get(db.k.selectFrom("remote_calls").select(["state", "user_login", "own_lane", "error"]).where("id", "=", id)))!;
-  const lane = r.user_login === null ? "no lease" : `leased by ${r.user_login} in ${Number(r.own_lane) === 1 ? "the own lane" : "a slot"}`;
+  const r = (await loadCalls(db, [id])).get(id)!;
+  const lane = r.userLogin === null ? "no lease" : `leased by ${r.userLogin} in ${r.ownLane ? "the own lane" : "a slot"}`;
   console.log(`call ${id}: ${r.state}, ${lane}${reply !== null ? `; reply: ${reply}` : r.error ? `; ${r.error}` : ""}`);
   if (reply === null) process.exit(1);
 }

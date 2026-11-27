@@ -4,18 +4,19 @@ import { readFileSync } from "node:fs";
 import { buildSchema, GraphQLError, OverlappingFieldsCanBeMergedRule, parse, specifiedRules, validate, type GraphQLSchema } from "graphql";
 import type { Querier } from "../src/mirror.ts";
 
-let schema: GraphQLSchema | null = null;
+let schema: GraphQLSchema | undefined;
 
 // GitHub accepts `state` selected in both `... on Issue` and `... on PullRequest` (different enum types),
 // which this rule rejects; the mirror's production queries rely on it.
 const rules = specifiedRules.filter((r) => r !== OverlappingFieldsCanBeMergedRule);
 
 function getSchema(): GraphQLSchema {
+  if (schema) return schema;
   // graphql 17 rejects GitHub's schema for deprecating an implementing field whose interface field is not
   // deprecated; deprecation does not affect validity of queries, so the directive is dropped.
   const sdl = readFileSync(new URL("./fixtures/github-schema.graphql", import.meta.url), "utf8")
     .replace(/@deprecated\(\s*reason:\s*(?:"(?:[^"\\\n]|\\.)*"|"""[\s\S]*?""")\s*\)/g, "");
-  schema = buildSchema(sdl, { assumeValidSDL: true });
+  schema = buildSchema(sdl, { assumeValidSDL: true, noLocation: true });
   return schema;
 }
 

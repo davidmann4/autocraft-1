@@ -15,11 +15,9 @@ const ROOT = new URL("..", import.meta.url).pathname;
 export const PERMANENT: readonly string[] = [
   "src/db/",
   "src/db.ts",
-  "src/itemtools/snapshot.ts",
-  "src/itemtools/index.ts",
+  "src/data/views/snapshot.ts",
   "src/itemtools/server/tools.ts",
-  "src/reference-search.ts",
-  "src/reference-score-worker.ts",
+  "src/data/external/",
 ];
 
 export const TODO_FILE = join(ROOT, "test/raw-sql-not-converted.txt");

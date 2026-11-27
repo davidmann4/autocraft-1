@@ -3,6 +3,8 @@ import { readFileSync } from "node:fs";
 import { LABELS } from "./rules.ts";
 import { slugOf } from "../owners.ts";
 import type { Db } from "../db/index.ts";
+import { loadItems } from "../data/mirror/index.ts";
+import { loadRunRows } from "../data/triage/index.ts";
 
 export type Row = {
   repo: string; number: number; kind: "pr" | "issue"; title: string;
@@ -14,12 +16,12 @@ export const itemUrl = (r: { repo: string; number: number; kind: string }) =>
   `https://github.com/${slugOf(r.repo)}/${r.kind === "pr" ? "pull" : "issues"}/${r.number}`;
 
 export async function loadRows(db: Db, runId: string): Promise<Row[]> {
-  const rows = await db.all(db.k.selectFrom("classifications as c").innerJoin("items as i", (j) => j.onRef("i.repo", "=", "c.repo").onRef("i.number", "=", "c.number"))
-    .select((eb) => ["c.repo", "c.number", "i.kind", eb.fn.coalesce("i.title", eb.val("")).as("title"), "c.classifier", eb.fn.coalesce("c.type_label", eb.val("")).as("type_label"),
-      "c.flags", eb.fn.coalesce("c.reason", eb.val("")).as("reason"), "c.probs"]).$narrowType<{ kind: "pr" | "issue" }>().where("c.run_id", "=", runId));
-  return rows.map(({ flags, probs, ...r }) => ({
-    ...r, flags: flags ? JSON.parse(flags) : [], top: probs ? (JSON.parse(probs).top ?? null) : null,
-  }));
+  const verdicts = await loadRunRows(db, runId);
+  const items = await loadItems(db, verdicts.map((v) => ({ repo: v.repo, number: v.number })), "card");
+  return verdicts.flatMap(({ flags, probs, type_label, reason, ...r }) => {
+    const item = items.get(ref(r));
+    return item ? [{ repo: r.repo, number: r.number, kind: item.kind as Row["kind"], title: item.title ?? "", classifier: r.classifier, type_label: type_label ?? "", flags: flags ? JSON.parse(flags) : [], reason: reason ?? "", top: probs ? (JSON.parse(probs).top ?? null) : null }] : [];
+  });
 }
 
 /** Reference labels from a `pr,labels added` CSV: the first of the six type labels on each line. */

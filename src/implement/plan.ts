@@ -7,11 +7,14 @@ import type { Db } from "../db/index.ts";
 import { exec } from "../fixup/git.ts";
 import { guardItem } from "../core/guard.ts";
 import { byOfJob } from "../core/gates.ts";
-import { commentApprovalOf } from "../act/approval.ts";
+import { repoApproved } from "../core/repo-approvals.ts";
 import { textHash } from "../core/open-prs.ts";
-import { actionable } from "../decisions.ts";
+import { permKey, standings } from "../data/access/index.ts";
+import { loadGuidanceTurns } from "../data/conversations/index.ts";
+import { startAttempts } from "../data/implement/index.ts";
+import { loadComments, loadItems } from "../data/mirror/index.ts";
 import { ghComment } from "../github/write.ts";
-import { ownLoginTest } from "../github/identity.ts";
+import { githubIdentity, ownLoginTest } from "../github/identity.ts";
 import { ITEM_SERVER, itemTools } from "../itemtools/index.ts";
 import { claudeParts, CLAUDE_PROMPTS } from "../prompts/index.ts";
 import { referenceDir } from "../reference.ts";
@@ -19,22 +22,21 @@ import { defaultSemanticDeps, referenceProblems, type PublicText } from "../refe
 import { REFERENCE_SERVER, promptTier } from "../remote/bundle.ts";
 import { fixTurnMessage, mergeFixFields } from "../replylint.ts";
 import { isBotLogin } from "../review/bots.ts";
-import { settleMemo, settlesNow } from "../settlers.ts";
 import { endWorkspace } from "../build/workspaces.ts";
 import type { StepContext } from "../runner/steps.ts";
 import { queuerOf } from "./gate.ts";
-import { repoWorkflow } from "../workflow/store.ts";
 import {
   PLAN_ACCEPTANCE_MAX, PLAN_BODY_CHARS, PLAN_COMMENT_CHARS, PLAN_COMMENTS_MAX, PLAN_GUIDANCE_CHARS, PLAN_GUIDANCE_MAX, PLAN_ITEM_CHARS, PLAN_ITEMS_MAX, PLAN_MAX_TURNS,
   PLAN_OPTIONS_MAX, PLAN_PART_FILES_MAX, PLAN_PART_TITLE_CHARS, PLAN_PARTS_MAX, PLAN_QUESTION_CHARS, PLAN_QUESTIONS_MAX, PLAN_RECOMMENDATION_CHARS, PLAN_SUMMARY_CHARS,
   PLAN_TEXT_CHARS, PLAN_TIMEOUT_SEC,
   type PlanAsked, type PlanGuidance, type PlanInput, type PlanIssue,
 } from "./plan-types.ts";
-import { closeOnAnswer } from "./close.ts";
-import { askedSoFar, askQuestions, IMPLEMENT_ASKER, isLimitDecision, LIMIT_CLOSE, LIMIT_CLOSE_COMMENT, LIMIT_IMPLEMENT, settleQuestions, type QuestionDeps } from "./questions.ts";
-import { addRound, currentImplementation, roundsOf, setImplementationState, startImplementation, updateImplementation } from "./store.ts";
+import { addRounds, attemptNow, currentAttempt, writeStep } from "./attempt.ts";
+import { askedSoFar, askQuestions, IMPLEMENT_ASKER, LIMIT_IMPLEMENT, openQuestion, type QuestionDeps } from "./questions.ts";
 import { attemptGuidance, markStuck, STUCK_CAUSES, type StuckCause } from "./stuck.ts";
-import type { AskFailedRound, Implementation, PlanQuestion, PlanReply, PlanWorkflow } from "./types.ts";
+import { IMPLEMENT_START_RETRIES, startFailureTimes } from "./start-retry.ts";
+import { implementStartDelayMs } from "../core/backoff.ts";
+import type { AskFailedRound, Implementation, ImplementationRound, PlanQuestion, PlanReply, PlanWorkflow, QuestionRound, StartFailedRound } from "./types.ts";
 import { mainHeadOf, readyWorkspace, resetTree, runBoundCall, WorkspaceUnavailable, type CallResult } from "./workspace.ts";
 
 export const PLAN_PROMPT_ID = "implement.plan";
@@ -167,31 +169,34 @@ const cut = (s: string | null | undefined, n: number): string => (s ?? "").slice
  * The issue, its comments (bots and our own left out: our questions come in as `asked`), the thread's guidance by operators and write-maintainers and
  * the attempt's Try again notes, and the earlier questions.
  */
-export async function planInput(db: Db, o: { repo: string; number: number; sha: string; asked: PlanAsked[]; assume: boolean; implementationId: number | null }): Promise<PlanInput> {
-  const it = await db.get(db.k.selectFrom("items").select(["title", "body", "author", "labels"]).where("repo", "=", o.repo).where("number", "=", o.number));
-  if (!it) throw new Error(`${o.repo}#${o.number} is not in the mirror`);
-  const own = await ownLoginTest(db, o.repo);
-  const comments = (await db.all(db.k.selectFrom("comments").select(["author", "created_at", "body"]).where("repo", "=", o.repo).where("number", "=", o.number).orderBy("created_at").orderBy("id")))
+export async function planInput(db: Db, o: { repo: string; number: number; sha: string; asked: PlanAsked[]; assume: boolean; rounds: readonly ImplementationRound[] | null }): Promise<PlanInput> {
+  const ref = `${o.repo}#${o.number}` as const, key = [{ repo: o.repo, number: o.number }];
+  const [items, allComments, turns, own] = await db.together(() => Promise.all([
+    loadItems(db, key, "text"), loadComments(db, key, { order: "created", body: true }), loadGuidanceTurns(db, [ref]), ownLoginTest(db, o.repo),
+  ]));
+  const it = items.get(ref);
+  if (!it) throw new Error(`${ref} is not in the mirror`);
+  const comments = (allComments.get(ref) ?? [])
     .filter((c) => c.author === null || (!own(c.author) && !isBotLogin(c.author)))
     .slice(-PLAN_COMMENTS_MAX).map((c) => ({ author: c.author, at: c.created_at ?? "", body: cut(c.body, PLAN_COMMENT_CHARS) }));
   let labels: string[] = [];
   try { labels = (JSON.parse(it.labels ?? "[]") as unknown[]).map(String); } catch { /* none */ }
   const issue: PlanIssue = { number: o.number, title: it.title ?? "", body: cut(it.body, PLAN_BODY_CHARS), author: it.author, labels, comments };
-  const memo = settleMemo();
+  const said = turns.get(ref) ?? [];
+  const maintainers = [...new Set(said.flatMap((t) => (t.kind === "maintainer" && t.login ? [t.login] : [])))];
+  const stands = maintainers.length ? await standings(db, maintainers.map((login) => ({ login, repo: o.repo })), { identity: await githubIdentity(db) }) : new Map();
   const guidance: PlanGuidance[] = [];
-  for (const t of await db.all(db.k.selectFrom("conversation_turns").select(["kind", "login", "at", "body"]).where("repo", "=", o.repo).where("number", "=", o.number)
-    .where("kind", "in", ["operator", "maintainer"]).orderBy("at").orderBy("id"))) {
-    // A maintainer's message counts while they settle on the repo (write access where the app acts for them).
-    if (t.kind === "maintainer" && !await settlesNow(db, t.login, [o.repo], memo)) continue;
+  for (const t of said) {
+    // A maintainer had write access when they wrote it; the message counts until GitHub answers that they have none, or their role ends.
+    if (t.kind === "maintainer" && stands.get(permKey(t.login, o.repo)) === "no") continue;
     guidance.push({ from: t.kind as PlanGuidance["from"], login: t.login, at: t.at, text: cut(t.body, PLAN_GUIDANCE_CHARS) });
   }
-  if (o.implementationId !== null) {
-    for (const g of await attemptGuidance(db, o.implementationId)) guidance.push({ from: "try-again", login: g.by ?? "", at: g.at, text: cut(g.text, PLAN_GUIDANCE_CHARS) });
+  if (o.rounds !== null) {
+    for (const g of attemptGuidance(o.rounds)) guidance.push({ from: "try-again", login: g.by ?? "", at: g.at, text: cut(g.text, PLAN_GUIDANCE_CHARS) });
     guidance.sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0));
   }
   return {
-    ref: `${o.repo}#${o.number}`, repo: o.repo, sha: o.sha, issue, guidance: guidance.slice(-PLAN_GUIDANCE_MAX), asked: o.asked, assume: o.assume,
-    ...(await repoWorkflow(db, o.repo) === "new" ? { workflow: true } : {}),
+    ref, repo: o.repo, sha: o.sha, issue, guidance: guidance.slice(-PLAN_GUIDANCE_MAX), asked: o.asked, assume: o.assume, workflow: true,
   };
 }
 
@@ -199,8 +204,8 @@ export async function planInput(db: Db, o: { repo: string; number: number; sha: 
 
 /** Stores a parsed reply on the attempt (plan_json, plan_md and a `plan` round) before anything is posted or asked. Returns the round's id. */
 export async function storePlan(db: Db, impl: Implementation, r: { callId: number | null; reply: PlanReply }, at = new Date().toISOString()): Promise<number> {
-  await updateImplementation(db, impl.id, { plan: r.reply, planMd: planMarkdown(r.reply) }, at);
-  return await addRound(db, impl.id, "plan", { callId: r.callId, result: r.reply }, at);
+  const w = await writeStep(db, impl, { patch: { plan: r.reply, planMd: planMarkdown(r.reply) }, rounds: [{ kind: "plan", callId: r.callId, result: r.reply }], at });
+  return w!.roundIds[0]!;
 }
 
 /**
@@ -211,8 +216,7 @@ export async function storePlan(db: Db, impl: Implementation, r: { callId: numbe
 export async function finishPlan(db: Db, impl: Implementation, p: { round: number; callId: number | null; reply: PlanReply }, q: QuestionDeps): Promise<Implementation["state"]> {
   const at = q.now?.() ?? new Date().toISOString();
   if (p.reply.ready) {
-    await settleQuestions(db, impl, null, at);
-    await setImplementationState(db, impl.id, "planned", { decisionId: null, planCallId: p.callId }, at);
+    await writeStep(db, impl, { to: "planned", patch: { planCallId: p.callId }, at });
     return "planned";
   }
   await askQuestions(db, { ...impl, planCallId: p.callId }, p.reply, q, p.round);
@@ -226,9 +230,9 @@ export async function recordPlan(db: Db, impl: Implementation, r: { callId: numb
 }
 
 /** The attempt's newest plan round when the attempt has not moved on from it (its plan_call_id is another call's), or null. */
-export async function unfinishedPlan(db: Db, impl: Implementation): Promise<{ round: number; callId: number | null; reply: PlanReply } | null> {
+export function unfinishedPlan(impl: Implementation, rounds: readonly ImplementationRound[]): { round: number; callId: number | null; reply: PlanReply } | null {
   if (impl.state !== "planning") return null;
-  const last = (await roundsOf(db, impl.id)).filter((r) => r.kind === "plan").at(-1);
+  const last = rounds.filter((r) => r.kind === "plan").at(-1);
   if (!last || last.callId === impl.planCallId) return null;
   try {
     return { round: last.id, callId: last.callId, reply: parsePlanReply(JSON.stringify(last.result)) };
@@ -239,7 +243,7 @@ export async function unfinishedPlan(db: Db, impl: Implementation): Promise<{ ro
 
 // ---- the job -----------------------------------------------------------------------------------------------------
 
-export type PlanOptions = { repo: string; number: number; /** Nothing is written but the workspace and the call: no implementation row, no GitHub write, no decision. */ dry: boolean };
+export type PlanOptions = { repo: string; number: number; /** Nothing is written but the workspace and the call: no implementation row, no GitHub write, no question. */ dry: boolean };
 
 /** What one plan call and its follow-up turn came to. */
 type Planned = { callId: number; reply: PlanReply } | { callId: number | null; error: string; cause: StuckCause };
@@ -308,26 +312,31 @@ async function callPlan(ctx: StepContext, o: { repo: string; number: number; sha
   return { callId: r.callId, reply: { ...reply, questions: reply.questions.map((q) => (q.audience === "author" && bad.has(q.text) ? { ...q, audience: "maintainer" as const } : q)) } };
 }
 
-/** Whether the attempt's limit decision is answered, by someone who settles on the repo (actionable()), with Close or to go on with assumptions, or neither. */
-async function limitAnswer(db: Db, impl: Implementation): Promise<"close" | "implement" | null> {
-  if (!isLimitDecision(impl.decisionId)) return null;
-  const a = (await actionable(db)).find((x) => x.id === impl.decisionId);
-  return a?.answer === LIMIT_CLOSE.key ? "close" : a?.answer === LIMIT_IMPLEMENT.key ? "implement" : null;
+/** The maintainers answered the question asked after the last round of questions: go on with the stated assumptions. */
+function goesOnWithAssumptions(rounds: readonly ImplementationRound[]): boolean {
+  const { question, answer } = openQuestion(rounds);
+  return (question?.result as Partial<QuestionRound> | null)?.limit === true && answer?.option === LIMIT_IMPLEMENT.key;
 }
 
-/** Makes the attempt stuck and asks its decision (stuck.ts). */
+/** Makes the attempt stuck, a blocker of its workflow (stuck.ts). */
 async function stuck(db: Db, impl: Implementation, cause: StuckCause, detail: string): Promise<string> {
-  const id = await markStuck(db, impl, cause, detail);
-  return `${impl.repo}#${impl.number}: stuck (${cause}: ${detail}); decision ${id}`;
+  await markStuck(db, impl, cause, detail);
+  return `${impl.repo}#${impl.number}: stuck (${cause}: ${detail})`;
 }
 
-/** Carries out a Close answer on the limit decision (close.ts). A close that cannot be made as it stands makes the attempt stuck with the reason. */
-async function closeOnLimit(ctx: StepContext, impl: Implementation): Promise<string> {
+/**
+ * The attempt's workspace did not start, before the plan call: the attempt stays in `planning` with a `start-failed` round, and the
+ * planner starts it again after the backoff (start-retry.ts). The failure after IMPLEMENT_START_RETRIES retries makes it stuck.
+ */
+export async function startFailed(db: Db, impl: Implementation, error: string, at = new Date().toISOString()): Promise<string> {
   const ref = `${impl.repo}#${impl.number}`;
-  const r = await closeOnAnswer(ctx.db, impl, { decisionId: impl.decisionId!, answer: LIMIT_CLOSE.key, bucket: "plan", comment: LIMIT_CLOSE_COMMENT }, { by: byOfJob(ctx.job.requestedBy) });
-  if ("done" in r) return r.done;
-  if ("waiting" in r) return `${ref}: not closed yet: ${r.waiting}`;
-  return await stuck(ctx.db, impl, "close-failed", r.refused);
+  const before = startFailureTimes((await attemptNow(db, impl))?.rounds ?? []).length;
+  const detail = error.replace(/\s+/g, " ").slice(0, 300);
+  const w = await writeStep(db, impl, { expect: ["planning"], rounds: [{ kind: "start-failed", result: { error: detail } satisfies StartFailedRound }], at });
+  if (!w) return `${ref}: the workspace did not start (${detail}); the attempt left planning meanwhile`;
+  if (before >= IMPLEMENT_START_RETRIES) return await stuck(db, w.impl, "workspace-lost", `${before + 1} starts failed in a row: ${detail}`);
+  const due = new Date(Date.parse(at) + implementStartDelayMs(before + 1)).toISOString().slice(11, 16);
+  return `${ref}: the workspace did not start (${detail}); AutoCraft starts it again at ${due} UTC (retry ${before + 1} of ${IMPLEMENT_START_RETRIES})`;
 }
 
 /**
@@ -340,7 +349,7 @@ async function moveOn(ctx: StepContext, impl: Implementation, p: { round: number
   let state: Implementation["state"];
   try {
     state = await finishPlan(db, impl, p, {
-      commentsApproved: await commentApprovalOf(db, impl.repo) !== null && !("refused" in g),
+      commentsApproved: await repoApproved(db, impl.repo, "comment") && !("refused" in g),
       postComment: async (text) => {
         if ("refused" in g) throw new Error(g.refused);
         const r = await ghComment({ db, login: IMPLEMENT_ASKER }, g, exec, "implement-question", { repo: impl.repo, number: impl.number, pr: false }, { by: "model", kind: "comment", model: PROMPT.models[0] }, text, { call: p.callId, round: p.round });
@@ -351,13 +360,13 @@ async function moveOn(ctx: StepContext, impl: Implementation, p: { round: number
     });
   } catch (e) {
     const error = (e as Error).message.replace(/\s+/g, " ").slice(0, 300);
-    await addRound(db, impl.id, "ask-failed", { callId: p.callId, result: { planRound: p.round, error } satisfies AskFailedRound });
-    const tries = (await roundsOf(db, impl.id)).filter((r) => r.kind === "ask-failed" && (r.result as Partial<AskFailedRound> | null)?.planRound === p.round).length;
+    await addRounds(db, impl.id, [{ kind: "ask-failed", callId: p.callId, result: { planRound: p.round, error } satisfies AskFailedRound }]);
+    const tries = ((await attemptNow(db, impl))?.rounds ?? []).filter((r) => r.kind === "ask-failed" && (r.result as Partial<AskFailedRound> | null)?.planRound === p.round).length;
     if (tries >= ASK_TRIES) return await stuck(db, impl, "question-failed", `${tries} tries: ${error}`);
     throw new Error(`${ref}: the questions of plan round ${p.round} were not posted (try ${tries} of ${ASK_TRIES}); the next job tries again from the stored plan: ${error}`);
   }
   ctx.acted(1);
-  const rounds = (await roundsOf(db, impl.id)).filter((x) => x.kind === "plan").length;
+  const rounds = ((await attemptNow(db, impl))?.rounds ?? []).filter((x) => x.kind === "plan").length;
   return `${ref}: plan round ${rounds}: ${state === "planned" ? "planned" : "asked"} (call ${p.callId}, size ${p.reply.size})`;
 }
 
@@ -366,26 +375,31 @@ export async function runPlan(ctx: StepContext, o: PlanOptions): Promise<string>
   const db = ctx.db, ref = `${o.repo}#${o.number}`;
   const queuer = await queuerOf(db, o.repo, o.number);
   if (!queuer) throw new Error(`${ref} is not queued`);
-  const item = await db.get(db.k.selectFrom("items").select(["title", "body", "state"]).where("repo", "=", o.repo).where("number", "=", o.number));
-  if (!item || item.state !== "OPEN") throw new Error(`${ref} is not an open issue in the mirror`);
-  const hash = textHash(item.title ?? "", item.body ?? "");
+  const [item, cur] = await db.together(() => Promise.all([loadItems(db, [{ repo: o.repo, number: o.number }], "text"), o.dry ? null : currentAttempt(db, o.repo, o.number)]));
+  const it = item.get(ref);
+  if (!it || it.state !== "OPEN") throw new Error(`${ref} is not an open issue in the mirror`);
+  const hash = textHash(it.title ?? "", it.body ?? "");
 
   let impl: Implementation | null = null;
+  let rounds: ImplementationRound[] = [];
   let assume = false;
   let stored: { round: number; callId: number | null; reply: PlanReply } | null = null;
   if (!o.dry) {
-    impl = await currentImplementation(db, o.repo, o.number) ?? await startImplementation(db, { repo: o.repo, number: o.number, queuedBy: queuer, textHash: hash });
+    if (cur) ({ impl, rounds } = cur);
+    else {
+      const s = await startAttempts(db, [{ repo: o.repo, number: o.number, queuedBy: queuer, textHash: hash }]);
+      const r = s.refused[0];
+      if (r) throw new Error(`${ref} has implementation ${r.current.id} in state ${r.current.state}`);
+      impl = s.started[0]!;
+    }
     if (impl.state !== "planning" && impl.state !== "asked") return `${ref}: nothing to plan (implementation ${impl.id} is ${impl.state})`;
-    const limit = await limitAnswer(db, impl);
-    if (limit === "close") return await closeOnLimit(ctx, impl);
-    assume = limit === "implement";
+    assume = goesOnWithAssumptions(rounds);
     // A plan round stored by an earlier job of this text that never moved on: its questions or plan are carried out
     // without a new plan call.
-    stored = impl.textHash === hash ? await unfinishedPlan(db, impl) : null;
+    stored = impl.textHash === hash ? unfinishedPlan(impl, rounds) : null;
     if (stored) ctx.log(`${ref}: plan round ${stored.round} is stored and was not carried out; going on from it without a new plan call`);
     // The current text is what this round plans; a later edit plans again (issue-facts.ts textChanged).
-    await setImplementationState(db, impl.id, "planning", { textHash: hash });
-    impl = { ...impl, state: "planning", textHash: hash };
+    impl = (await writeStep(db, impl, { to: "planning", patch: { textHash: hash } }))!.impl;
   }
   const forLogin = impl?.queuedBy ?? queuer;
   const sha = await mainHeadOf(db, o.repo) ?? impl?.baseSha ?? null;
@@ -401,14 +415,19 @@ export async function runPlan(ctx: StepContext, o: PlanOptions): Promise<string>
       repo: o.repo, baseSha: sha, have: impl && impl.baseSha === sha ? impl.workspaceId : null,
       adopt: async (id) => {
         if (!impl) { dryWs = id; return; }
-        await updateImplementation(db, impl.id, { workspaceId: id, baseSha: sha });
+        await writeStep(db, impl, { patch: { workspaceId: id, baseSha: sha } });
         // A re-plan on a newer head leaves the attempt's earlier workspace behind.
         if (impl.workspaceId !== null && impl.workspaceId !== id && await endWorkspace(db, impl.workspaceId)) ctx.log(`workspace ${impl.workspaceId} (at ${impl.baseSha?.slice(0, 8)}) ended`);
       },
     });
   } catch (e) {
     await endDry();
-    if (e instanceof WorkspaceUnavailable && impl) return await stuck(db, impl, "workspace-lost", e.message);
+    if (e instanceof WorkspaceUnavailable && impl) {
+      if (!e.startFailure) return await stuck(db, impl, "workspace-lost", e.message);
+      const line = await startFailed(db, impl, e.message);
+      ctx.handled(1);
+      return line;
+    }
     throw e;
   }
   ctx.handled(1);
@@ -417,7 +436,7 @@ export async function runPlan(ctx: StepContext, o: PlanOptions): Promise<string>
   if (stored) planned = { callId: stored.callId ?? 0, reply: stored.reply };
   else {
     await ctx.progress(`${ref}: plan call in workspace ${wsId}`);
-    const input = await planInput(db, { repo: o.repo, number: o.number, sha, asked: impl ? await askedSoFar(db, impl) : [], assume, implementationId: impl?.id ?? null });
+    const input = await planInput(db, { repo: o.repo, number: o.number, sha, asked: impl ? askedSoFar(rounds) : [], assume, rounds: impl ? rounds : null });
     try {
       planned = await callPlan(ctx, { repo: o.repo, number: o.number, sha, workspaceId: wsId, forLogin, input });
     } finally {

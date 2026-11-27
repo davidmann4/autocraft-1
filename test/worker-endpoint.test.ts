@@ -8,7 +8,7 @@ import { KubeError, type EndpointSliceApi, type KEndpointSlice } from "../src/bu
 import { FencedError } from "../src/db/fence.ts";
 import { leaderKey } from "../src/db/leader.ts";
 import { computeChecks } from "../src/health-checks.ts";
-import { writeSetting } from "../src/settings-read.ts";
+import { writeSetting } from "../src/data/control/index.ts";
 import { mkdtempSync } from "node:fs";
 import { join } from "node:path";
 import { connectDb } from "../src/db/open.ts";

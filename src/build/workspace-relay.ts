@@ -3,10 +3,11 @@
 // rows and runs them on its WorkspaceSession, which settles each row (state and result). The rows are the record a resume reads; the wake only
 // shortens the waits. On Postgres both sides wake on NOTIFY and poll slowly behind it; on SQLite both poll at the model
 // queue's interval. workspace_calls is in no change topic, so the relay's writes never wake the planner.
-import { createHash } from "node:crypto";
 import { allocation } from "../agents/call.ts";
 import type { Db } from "../db/index.ts";
-import * as kx from "../db/kx.ts";
+import {
+  addWorkspaceCalls, claimQueuedCalls, countKeptImages, loadCallResult, loadRunningCalls, loadWorkspaces, markCalls, pruneWorkspaceImageBatch, refuseQueuedCalls, stubbedImages, stubImages as stubRows,
+} from "../data/build/index.ts";
 import { scaled } from "../remote/time-scale.ts";
 import { assertFence } from "../db/fence.ts";
 import { guardedApi, inClusterApi } from "./kube-api.ts";
@@ -26,14 +27,17 @@ const SAFETY_POLL_MS = scaled(10_000);
 export const KEPT_IMAGES = 60;
 /** Kept image bytes are dropped this long after their workspace ended. */
 export const IMAGE_KEEP_MS = 30 * 24 * 3600_000;
-/** The tools whose results carry images. */
-const IMAGE_TOOLS = ["screenshot", "read"];
 
 /** What the job runs a tool call on: a WorkspaceSession, or a stand-in in tests. */
 export type ToolSession = Pick<WorkspaceSession, "call">;
 
 const refusal = (why: string): WorkspaceToolResult => ({ text: `refused: ${why}`, isError: true });
 const iso = (): string => new Date().toISOString();
+
+/** The live workspace bound to a remote call, if any. */
+async function boundWorkspace(db: Db, callId: number): Promise<{ id: number } | undefined> {
+  return [...(await loadWorkspaces(db, { remoteCallIds: [callId] })).values()].find((w) => (LIVE_STATES as readonly string[]).includes(w.state));
+}
 
 /** Resolves a waiter early: `poke` before `wait` makes the next wait return at once. */
 class Waker {
@@ -83,22 +87,22 @@ function parseResult(text: string): WorkspaceToolResult {
  */
 export async function relayWorkspaceCall(db: Db, lease: { id: number; runId: number | null }, name: string, args: unknown,
   opts: { live: () => Promise<boolean>; signal?: AbortSignal; tick?: () => void }): Promise<WorkspaceToolResult> {
-  const ws = await db.get(db.k.selectFrom("workspaces").select("id").where("remote_call_id", "=", lease.id).where("state", "in", LIVE_STATES));
+  const ws = await boundWorkspace(db, lease.id);
   if (!ws) return refusal("this call has no live workspace");
   const waker = new Waker();
   let id = -1;
   const sub = db.listen(REPLY_CHANNEL, (p) => { if (p === null || p === String(id)) waker.poke(); });
   try {
-    id = Number((await db.get(db.k.insertInto("workspace_calls").values({
-      workspace_id: ws.id, run_id: lease.runId, tool: name, args: JSON.stringify(args ?? {}), state: "queued", created_at: iso(),
-    }).returning("id")))!.id);
+    id = (await addWorkspaceCalls(db, [{
+      workspace_id: ws.id, n: null, run_id: lease.runId, tool: name, args: JSON.stringify(args ?? {}), state: "queued", result: null, created_at: iso(), started_at: null, deadline_at: null, finished_at: null,
+    }]))[0]!;
     await db.notify(CALL_CHANNEL, String(ws.id));
     let lastTick = Date.now(), listening = false;
     for (;;) {
       await waker.wait(Math.min(listening ? SAFETY_POLL_MS : allocation.pollMs, TICK_MS), opts.signal);
       // Read before the row: a result written after the read is then sure to wake the next wait.
       listening = sub?.listening() ?? false;
-      const r = await db.fresh(() => db.get(db.k.selectFrom("workspace_calls").select(["state", "result"]).where("id", "=", id)));
+      const r = await db.fresh(() => loadCallResult(db, id));
       if ((r?.state === "done" || r?.state === "failed") && r.result) {
         const out = parseResult(r.result);
         if (out.images) await settleImages(db, ws.id, lease.runId, id, r.result);
@@ -106,9 +110,8 @@ export async function relayWorkspaceCall(db: Db, lease: { id: number; runId: num
       }
       const gone = opts.signal?.aborted ? "the request was cancelled" : !r ? "the call is gone" : !await opts.live() ? "the lease is gone" : null;
       if (gone) {
-        const withdrawn = await db.run(db.k.updateTable("workspace_calls").set({ state: "failed", result: JSON.stringify(refusal(gone)), finished_at: iso() })
-          .where("id", "=", id).where("state", "=", "queued"));
-        return withdrawn.changes ? refusal(gone) : { text: `call ${id} did not finish before ${gone}; it runs on in the workspace (for a shell command: shell_status ${id})`, isError: true };
+        const withdrawn = await markCalls(db, [{ id, where: ["queued"], set: { state: "failed", result: JSON.stringify(refusal(gone)), finished_at: iso() } }]);
+        return withdrawn.size ? refusal(gone) : { text: `call ${id} did not finish before ${gone}; it runs on in the workspace (for a shell command: shell_status ${id})`, isError: true };
       }
       if (opts.tick && Date.now() - lastTick >= TICK_MS) {
         lastTick = Date.now();
@@ -125,39 +128,19 @@ export async function relayWorkspaceCall(db: Db, lease: { id: number; runId: num
  * past that it keeps only their type, size and hash. The rest of the result stays as the record.
  */
 async function settleImages(db: Db, workspaceId: number, runId: number | null, id: number, stored: string): Promise<void> {
-  const kept = await db.get(db.k.selectFrom("workspace_calls").select((eb) => eb.fn.countAll<number>().as("n"))
-    .where("workspace_id", "=", workspaceId).where("id", "<", id).where("tool", "in", IMAGE_TOOLS)
-    .where((eb) => runId === null ? eb("run_id", "is", null) : eb("run_id", "=", runId))
-    .where(kx.jsonType(db, "result", "$.images[0].data"), "=", "text"));
-  if (Number(kept?.n ?? 0) < KEPT_IMAGES) return;
-  await stubImages(db, id, stored, "session image limit");
-}
-
-/** The row's images as type, size and hash with `note` on each; the rest of the result stays as it is. */
-async function stubImages(db: Db, id: number, stored: string, note: string): Promise<void> {
-  let o: { images?: { data?: unknown; mimeType?: unknown }[] };
-  try { o = JSON.parse(stored) as typeof o; } catch { return; }
-  if (!Array.isArray(o.images)) return;
-  const images = o.images.map((i) => {
-    if (typeof i?.data !== "string") return i;
-    const bytes = Buffer.from(i.data, "base64");
-    return { mimeType: i.mimeType, bytes: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex"), note };
-  });
-  await db.run(db.k.updateTable("workspace_calls").set({ result: JSON.stringify({ ...o, images }) }).where("id", "=", id).where("result", "=", stored));
+  if (await countKeptImages(db, workspaceId, runId, id) < KEPT_IMAGES) return;
+  const stubbed = stubbedImages(stored, "session image limit");
+  if (stubbed !== null) await stubRows(db, [{ id, stored, stubbed }]);
 }
 
 /** Drops the image bytes of calls in workspaces that ended more than IMAGE_KEEP_MS ago. Returns the rows changed. */
 export async function pruneWorkspaceImages(db: Db, nowMs: number = Date.now()): Promise<number> {
-  const before = new Date(nowMs - IMAGE_KEEP_MS).toISOString();
   let n = 0, last = 0;
   for (;;) {
-    const rows = await db.all(db.k.selectFrom("workspace_calls as c").innerJoin("workspaces as w", "w.id", "c.workspace_id").select(["c.id", "c.result"])
-      .where("w.ended_at", "is not", null).where("w.ended_at", "<", before).where("c.tool", "in", IMAGE_TOOLS)
-      .where("c.id", ">", last).where(kx.jsonType(db, "c.result", "$.images[0].data"), "=", "text").orderBy("c.id").limit(20));
-    if (!rows.length) return n;
-    for (const r of rows) await stubImages(db, r.id, r.result!, `${IMAGE_KEEP_MS / 86_400_000} days after the workspace ended`);
-    n += rows.length;
-    last = rows.at(-1)!.id;
+    const r = await pruneWorkspaceImageBatch(db, nowMs, last);
+    if (!r.rows) return n;
+    n += r.rows;
+    last = r.last;
   }
 }
 
@@ -185,9 +168,6 @@ export function jobSession(db: Db, workspaceId: number): ToolSession {
 const parseArgs = (text: string): unknown => {
   try { return JSON.parse(text); } catch { return null; }
 };
-
-/** The run of the call's live lease: only calls queued under it are served, so a row queued around a requeue never runs without a lease. */
-const leasedRun = (db: Db, callId: number) => db.k.selectFrom("remote_calls").select("run_id").where("id", "=", callId).where("state", "=", "leased");
 
 /**
  * Job side: serves the workspace bound to one remote call while the job waits for that call. `serve` claims the queued
@@ -218,11 +198,10 @@ export class WorkspaceServer {
    * is failed, since its outcome is unknown and its stored arguments are cut.
    */
   static async open(db: Db, callId: number, sessionOf: (db: Db, workspaceId: number) => ToolSession = jobSession): Promise<WorkspaceServer | null> {
-    const ws = await db.get(db.k.selectFrom("workspaces").select("id").where("remote_call_id", "=", callId).where("state", "in", LIVE_STATES));
+    const ws = await boundWorkspace(db, callId);
     if (!ws) return null;
     const s = new WorkspaceServer(db, callId, ws.id, sessionOf(db, ws.id));
-    const left = await db.all(db.k.selectFrom("workspace_calls").select(["id", "tool", "args", "n"]).where("workspace_id", "=", ws.id).where("state", "=", "running")
-      .where("run_id", "=", leasedRun(db, callId)).orderBy("id"));
+    const left = await loadRunningCalls(db, ws.id, callId);
     for (const r of left) {
       if (r.n !== null) s.#run(r.id, r.tool, parseArgs(r.args));
       else if (await s.#settle(r.id, "failed", { text: "failed: the runner restarted while this call ran, so its outcome is unknown; check the workspace and call it again", isError: true })) await db.notify(REPLY_CHANNEL, String(r.id));
@@ -238,21 +217,15 @@ export class WorkspaceServer {
 
   async serve(): Promise<void> {
     const { db } = this;
-    const rows = await db.all(db.k.selectFrom("workspace_calls").select(["id", "tool", "args"]).where("workspace_id", "=", this.workspaceId).where("state", "=", "queued")
-      .where("run_id", "=", leasedRun(db, this.callId)).orderBy("id"));
-    for (const r of rows) {
-      if (this.#running.has(r.id)) continue;
-      this.#running.add(r.id);
-      const args = parseArgs(r.args);
+    // One transaction: a call claimed by a pass that then fails would stay running with nothing that runs it.
+    const parsed = await db.write(async () => {
+      const rows = (await claimQueuedCalls(db, this.workspaceId, this.callId)).filter((r) => !this.#running.has(r.id));
       // The session gets the whole arguments; the row keeps them cut to its record size.
-      const claimed = await db.run(db.k.updateTable("workspace_calls").set({ state: "running", started_at: iso(), args: JSON.stringify(capJson(args ?? {})) })
-        .where("id", "=", r.id).where("state", "=", "queued"));
-      if (Number(claimed.changes) !== 1) {
-        this.#running.delete(r.id);
-        continue;
-      }
-      this.#run(r.id, r.tool, args);
-    }
+      const parsed = rows.map((r) => ({ ...r, parsed: parseArgs(r.args) }));
+      if (parsed.length) await markCalls(db, parsed.map((r) => ({ id: r.id, set: { args: JSON.stringify(capJson(r.parsed ?? {})) } })));
+      return parsed;
+    });
+    for (const r of parsed) this.#run(r.id, r.tool, r.parsed);
   }
 
   /** Runs one claimed row on the session and wakes the dashboard. A row the session left unsettled gets the result it returned. */
@@ -269,9 +242,7 @@ export class WorkspaceServer {
 
   /** Settles a row that is still queued or running; true when it did. */
   async #settle(id: number, state: "done" | "failed", res: WorkspaceToolResult): Promise<boolean> {
-    const r = await this.db.run(this.db.k.updateTable("workspace_calls").set({ state, result: JSON.stringify(res), finished_at: iso() })
-      .where("id", "=", id).where("state", "in", ["queued", "running"]));
-    return Number(r.changes) === 1;
+    return (await markCalls(this.db, [{ id, where: ["queued", "running"], set: { state, result: JSON.stringify(res), finished_at: iso() } }])).has(id);
   }
 
   /**
@@ -285,10 +256,7 @@ export class WorkspaceServer {
       this.#sub = null;
     }
     const { db } = this;
-    const refused = await db.all(db.k.updateTable("workspace_calls").set({ state: "failed", result: JSON.stringify(refusal("the model call is over")), finished_at: iso() })
-      .where("workspace_id", "=", this.workspaceId).where("state", "=", "queued")
-      .where((eb) => eb("run_id", "=", eb.selectFrom("remote_calls").select("run_id").where("id", "=", this.callId)))
-      .returning("id"));
-    for (const r of refused) await db.notify(REPLY_CHANNEL, String(r.id));
+    const refused = await refuseQueuedCalls(db, this.workspaceId, this.callId, JSON.stringify(refusal("the model call is over")));
+    for (const id of refused) await db.notify(REPLY_CHANNEL, String(id));
   }
 }

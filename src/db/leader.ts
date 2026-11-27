@@ -26,6 +26,7 @@ import type { Db } from "./index.ts";
 import { dbTarget, isPgUrl, loadPg } from "./open.ts";
 import { pgConnectionString, SERVER_KEEPALIVE, setSession, within } from "./postgres.ts";
 import { isFenced, type LeaderRole } from "./fence.ts";
+import { queryDb, type QueryDb } from "./query-db.ts";
 import { sql } from "./sql.ts";
 
 /**
@@ -111,7 +112,7 @@ const pause = (ms: number, signal?: AbortSignal): Promise<void> => new Promise((
   signal?.addEventListener("abort", done, { once: true });
 });
 
-async function putSetting(db: Db, key: string, value: string): Promise<void> {
+async function putSetting(db: QueryDb, key: string, value: string): Promise<void> {
   await db.prepare("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value").run(key, value);
 }
 
@@ -121,7 +122,7 @@ const serverMs = (plus = 0) => sql<number>`CAST(EXTRACT(EPOCH FROM clock_timesta
 type LeaseConn = { client: Pg.Client; info: ConnInfo; run: <O>(q: Compilable<O>) => Promise<O[]> };
 
 /** The lease connection: errors and its end go to `onLost`, so a dropped connection never crashes the process. */
-async function leaseClient(pg: typeof Pg.default, db: Db, url: string, role: LeaderRole, log: (l: string) => void, onLost: (c: Pg.Client, why: string) => void): Promise<LeaseConn> {
+async function leaseClient(pg: typeof Pg.default, db: QueryDb, url: string, role: LeaderRole, log: (l: string) => void, onLost: (c: Pg.Client, why: string) => void): Promise<LeaseConn> {
   const c = new pg.Client({
     connectionString: pgConnectionString(url), application_name: `autocraft-leader-${role}`, keepAlive: true, keepAliveInitialDelayMillis: 5_000,
     connectionTimeoutMillis: CONNECT_MS,
@@ -152,7 +153,8 @@ async function leaseClient(pg: typeof Pg.default, db: Db, url: string, role: Lea
  * Waits until this copy leads `role`, then resolves its lease; null when `signal` aborted first. The caller fences its
  * process to `lease.epoch` (setFence) before it starts work and stops at once when `lease.lost` aborts.
  */
-export async function elect(db: Db, role: LeaderRole, o: ElectOptions = {}): Promise<Lease | null> {
+export async function elect(handle: Db, role: LeaderRole, o: ElectOptions = {}): Promise<Lease | null> {
+  const db = queryDb(handle);
   const holder = o.holder ?? `${hostname()}:${process.pid}`;
   const log = o.log ?? ((l: string) => console.log(l));
   const url = o.url ?? dbTarget();
@@ -331,7 +333,7 @@ export async function elect(db: Db, role: LeaderRole, o: ElectOptions = {}): Pro
 }
 
 /** Removes the rows of standbys that stopped writing them. */
-async function pruneStandbys(db: Db, role: LeaderRole): Promise<void> {
+async function pruneStandbys(db: QueryDb, role: LeaderRole): Promise<void> {
   const rows = await db.prepare("SELECT key, value FROM settings WHERE key LIKE ?").all(`${standbyPrefix(role)}%`) as { key: string; value: string }[];
   for (const r of rows) {
     let at = NaN;
@@ -346,7 +348,8 @@ async function pruneStandbys(db: Db, role: LeaderRole): Promise<void> {
  * copy was ever elected (SQLite).
  */
 export async function leaderStatus(db: Db, role: LeaderRole, freshMs: number, nowMs = Date.now()): Promise<{ leader: LeaderStatus | null; standbys: number; unwatched: boolean } | null> {
-  const rows = await db.all(db.k.selectFrom("settings").select(["key", "value"]).where("key", "like", `${leaderKey(role)}%`));
+  const q = queryDb(db);
+  const rows = await q.all(q.k.selectFrom("settings").select(["key", "value"]).where("key", "like", `${leaderKey(role)}%`));
   const lead = rows.find((r) => r.key === leaderKey(role));
   if (!lead) return null;
   const parse = <T>(v: string | null): T | null => { try { return v ? JSON.parse(v) as T : null; } catch { return null; } };

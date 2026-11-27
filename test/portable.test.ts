@@ -2,7 +2,8 @@
 // AUTOCRAFT_TEST_PG_URL names a server (`pnpm test:pg test/portable.test.ts`) and skip otherwise.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import type { Db, Dialect } from "../src/db/index.ts";
+import type { Dialect } from "../src/db/index.ts";
+import type { Db } from "./helpers/raw-db.ts";
 import * as P from "../src/db/portable.ts";
 import { sql } from "../src/db/sql.ts";
 import { needsPg, testDatabase } from "./test-db.ts";

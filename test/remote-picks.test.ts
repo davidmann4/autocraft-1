@@ -10,12 +10,12 @@ import { handleMcp } from "../src/dash/mcp/index.ts";
 import * as userSettings from "../src/dash/api/user-settings.ts";
 import { createToken } from "../src/dash/mcp/tokens.ts";
 import type { Req, Role } from "../src/dash/types.ts";
-import { claimCall, dropQueueCache, enqueueCall, leasedBy, leaseTurnover, withdrawCall, type Caller } from "../src/remote/calls.ts";
+import { claimCall, enqueueCall, leasedBy, leaseTurnover, withdrawCall, type Caller } from "../src/remote/calls.ts";
+import { dropQueueCache } from "../src/data/runners/calls-shared.ts";
 import { defaultSemanticDeps } from "../src/reference-lint.ts";
 import { parseStatus, STATUS_FRESH_MS, storeStatus } from "../src/remote/helpers.ts";
 import { RateLimiter } from "../src/dash/server/util.ts";
 import { setUserMaxCalls } from "../src/remote/max-calls.ts";
-import { setInferenceMode } from "../src/remote/mode.ts";
 import { pickCall, setPickMinutes, unpickCall } from "../src/remote/picks.ts";
 import { PROTOCOL_VERSION, type Claim, type Tier } from "../src/remote/protocol.ts";
 import { whyWaiting, type ReadyRunner } from "../src/remote/queue-view.ts";
@@ -24,20 +24,30 @@ import { setManualOnly } from "../src/remote/manual-only.ts";
 import { setUserRepos } from "../src/remote/my-repos.ts";
 import { takerTest } from "../src/remote/takers.ts";
 import { insertWorkflow, updateWorkflow } from "../src/workflow/store.ts";
+import { releaseItemRunner, takeItemRunner } from "../src/data/workflow/index.ts";
 import { STARTED_HOLD_MS } from "../src/remote/started.ts";
-import { addFastTrack } from "../src/fasttrack.ts";
 import { allocation, poolRoom, repoBatches } from "../src/agents/call.ts";
 import { pool } from "../src/classify/run.ts";
 import { SCRATCH } from "./scratch.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb, type Db } from "./helpers/raw-db.ts";
 import { excluded, like } from "../src/db/kx.ts";
+
+/** A started item: the workflow row a maintainer's start command writes. */
+const startedItem = async (db: Db, by: string, repo: string, number: number): Promise<void> => {
+  await insertWorkflow(db, { repo, number, kind: "issue", entry: "review", state: "running", startedBy: by, startedAt: "2026-01-01T00:00:00Z", startedVia: "dashboard" });
+  dropQueueCache(db);
+};
+/** Ends every started item. */
+const endStarted = async (db: Db): Promise<void> => {
+  await db.run(db.k.updateTable("item_workflows").set({ state: "done" }));
+  dropQueueCache(db);
+};
 
 mkdirSync(SCRATCH, { recursive: true });
 const dir = mkdtempSync(join(SCRATCH, "remote-picks-"));
 
 describe("picks and Manual only", async () => {
   const db = await connectDb(join(dir, "t.db"));
-  await setInferenceMode(db, "user-local", "test");
   await db.run(db.k.insertInto("tracked_repos").values({ name: "photocraft" }).onConflict((oc) => oc.doNothing()));
   await db.run(db.k.insertInto("repos").values({ name: "photocraft", visibility: "public" }).onConflict((oc) => oc.column("name").doUpdateSet(excluded(["visibility"]))));
   const callers: Record<string, Caller> = {};
@@ -45,6 +55,11 @@ describe("picks and Manual only", async () => {
     await db.run(db.k.insertInto("access").values({ login, role }));
     if (role !== "viewer") callers[login] = { tokenId: (await createToken(db, login, "runner", { kind: "runner" })).row.id, login, role };
   }
+  /** The users' runners reported their last status too long ago to count. */
+  const unfresh = async (...logins: string[]) => {
+    await db.run(db.k.updateTable("remote_helpers").set({ reported_at: Date.now() - STATUS_FRESH_MS - 1000 }).where("login", "in", logins));
+    dropQueueCache(db);
+  };
   /** The user's runner reports ready now: two slots and the fast lane. */
   const ready = async (login: string) => await storeStatus(db, callers[login]!.tokenId, login, parseStatus({ slots: 3, busy: 0, readiness: "ready", harness: "claude", models: { top: "opus", small: "haiku" }, reserve: { fiveHour: 0, weekly: 0 } }));
   for (const login of ["alice", "bob", "olga"]) await ready(login);
@@ -208,7 +223,8 @@ describe("picks and Manual only", async () => {
   test("a Manual only user's runners take only their picks and are no room", async () => {
     const a = await q();
     // Both runners asked for work a moment ago (active), so both are room.
-    for (const login of ["alice", "bob", "olga"]) await db.run(db.k.updateTable("mcp_tokens").set({ idle_claim_at: Date.now() }).where("login", "=", login));
+    for (const login of ["alice", "bob", "olga"]) await db.run(db.k.updateTable("remote_helpers").set({ idle_claim_at: Date.now() }).where("login", "=", login));
+    dropQueueCache(db);
     const room = await remoteRoom(db, 0);
     await userSettings.setSettings(db, req("alice", "maintainer", { json: { manualOnly: true } }));
     assert.equal((await userSettings.settings(db, req("alice", "maintainer"))).manualOnly, true);
@@ -247,7 +263,7 @@ describe("picks and Manual only", async () => {
     const a = await q();
     await pickCall(db, user("bob"), a);
     const b = await q();
-    const env = (login: string, role: Role) => ({ db, user: () => user(login, role) as any, baseUrl: null, limiter: new RateLimiter(10, 60_000), canAnswer: false, expensive: () => 0, userLocal: true });
+    const env = (login: string, role: Role) => ({ db, user: () => user(login, role) as any, baseUrl: null, canAnswer: false, expensive: () => 0 });
     const rpc = async (login: string, role: Role, method: string, params?: Record<string, unknown>) => (await handleMcp(env(login, role), { jsonrpc: "2.0", id: 1, method, ...(params && { params }) }))!.result as any;
     const names = async (login: string, role: Role) => (await rpc(login, role, "tools/list")).tools.map((t: { name: string }) => t.name).filter((n: string) => n.includes("model_call"));
     assert.deepEqual(await names("eve", "viewer"), ["list_model_calls"]);
@@ -297,67 +313,68 @@ describe("picks and Manual only", async () => {
     await clear();
   });
 
-  test("My tasks items: fast-tracked only takes calls on fast-tracked items; by me only on the user's own; a repo counts only with such an item", async () => {
+  test("My tasks items: started only takes calls on started items; by me only on the user's own; a repo counts only with such an item", async () => {
     for (const n of [10, 11, 12]) await db.run(db.k.insertInto("items").values({ repo: "photocraft", number: n, kind: "pr", state: "OPEN", title: "x", author: "dev", created_at: "2026-01-01T00:00:00Z" }).onConflict((oc) => oc.doNothing()));
     const put = (taskItems: unknown) => userSettings.setSettings(db, req("alice", "maintainer", { json: { taskItems } }));
     assert.equal((await userSettings.settings(db, req("alice", "maintainer"))).taskItems, "all", "every item by default");
     await assert.rejects(put("some"), /taskItems must be one of/);
-    await put("fast");
+    await put("started");
     const at = (n: number) => [{ repo: "photocraft", number: n }];
     const takes = () => takerTest(db, Date.now());
     // Only alice's runner is fresh, so the taker rule reads her choice alone.
-    await db.run(db.k.updateTable("remote_helpers").set({ reported_at: Date.now() - STATUS_FRESH_MS - 1000 }).where("login", "<>", "alice"));
-    assert.equal(await takes()({ prompt_id: "review.opus", repos: ["photocraft"], step: "opus-review" }), false, "no fast-tracked item on the repo: no taker before the items are known");
+    await unfresh("bob", "olga");
+    assert.equal(await takes()({ prompt_id: "review.opus", repos: ["photocraft"], step: "opus-review" }), false, "no started item on the repo: no taker before the items are known");
     assert.equal(await leased("alice"), null, "an idle claim: alice's runner is active");
-    assert.equal(await remoteRoom(db, 0), 0, "no open fast-tracked item at all: no room, even for a question about no repo or task");
+    assert.equal(await remoteRoom(db, 0), 0, "no started item at all: no room, even for a question about no repo or task");
 
-    await addFastTrack(db, "bob", "photocraft#11");
-    await addFastTrack(db, "alice", "photocraft#12");
-    assert.ok(await remoteRoom(db, 0, Date.now(), undefined, "opus-review") > 0, "room for the task: the fast-tracked items are on a repo alice takes");
+    await startedItem(db, "bob", "photocraft", 11);
+    await startedItem(db, "alice", "photocraft", 12);
+    assert.ok(await remoteRoom(db, 0, Date.now(), undefined, "opus-review") > 0, "room for the task: the started items are on a repo alice takes");
     await setUserRepos(db, "alice", ["deckcraft"]);
-    assert.equal(await remoteRoom(db, 0, Date.now(), undefined, "opus-review"), 0, "no room once alice takes only a repo without fast-tracked items");
+    assert.equal(await remoteRoom(db, 0, Date.now(), undefined, "opus-review"), 0, "no room once alice takes only a repo without started items");
     await setUserRepos(db, "alice", []);
     await q({ ageMs: 60_000, items: at(10) });
     const bobs = await q({ items: at(11) }), mixed = await q({ items: [...at(10), ...at(12)] });
     dropQueueCache(db);
-    assert.equal(await takes()({ prompt_id: "review.opus", repos: ["photocraft"], step: "opus-review" }), true, "the repo now has fast-tracked items");
+    assert.equal(await takes()({ prompt_id: "review.opus", repos: ["photocraft"], step: "opus-review" }), true, "the repo now has started items");
     assert.equal(await takes()({ prompt_id: "review.opus", repos: ["photocraft"], step: "opus-review", refs: at(10) }), false, "but not this item");
-    assert.equal(await leased("alice"), bobs, "the older call on an item nobody fast-tracked is passed over");
-    assert.equal(await leased("alice"), mixed, "one fast-tracked item of a call is enough");
+    assert.equal(await leased("alice"), bobs, "the older call on an item nobody started is passed over");
+    assert.equal(await leased("alice"), mixed, "one started item of a call is enough");
     assert.equal(await leased("alice"), null);
     await clear();
 
     await put("mine");
     const theirs = await q({ ageMs: 60_000, items: at(11) }), own = await q({ items: at(12) });
     dropQueueCache(db);
-    assert.equal(await leased("alice"), own, "only the item alice fast-tracked");
+    assert.equal(await leased("alice"), own, "only the item alice started");
     for (const login of ["bob", "olga"]) await ready(login);
     assert.equal(await leased("bob"), theirs, "a runner that takes every item gets the rest");
-    assert.equal(await leased("alice"), null, "nothing else alice fast-tracked");
+    assert.equal(await leased("alice"), null, "nothing else alice started");
 
     const r: ReadyRunner = { login: "alice", role: "maintainer", manual: false, tiers: new Set<Tier>(["top"]), free: 1, repos: null, skip: new Set<string>(), items: { refs: new Set(["photocraft#12"]), repos: new Set(["photocraft"]) } };
     const c = { tier: "top" as Tier, promptId: "review.opus", step: "opus-review", repos: ["photocraft"], followUp: false, picked: null };
     assert.equal(whyWaiting({ ...c, refs: at(10) }, [r], 0, () => true).code, "items-off");
     assert.equal(whyWaiting({ ...c, refs: at(12) }, [r], 0, () => true).code, "behind");
-    assert.equal(whyWaiting({ ...c, refs: at(10) }, [{ ...r, items: { refs: new Set(), repos: new Set() } }], 0, () => true).code, "items-off", "no fast-tracked item on the repo is still about items, not repo access");
+    assert.equal(whyWaiting({ ...c, refs: at(10) }, [{ ...r, items: { refs: new Set(), repos: new Set() } }], 0, () => true).code, "items-off", "no started item on the repo is still about items, not repo access");
     await put("all");
     assert.equal(await db.get(db.k.selectFrom("user_settings").select((eb) => eb.lit(1).as("one")).where("login", "=", "alice").where("key", "=", "task_items")), undefined, "every item again stores nothing");
+    await endStarted(db);
     await clear();
   });
 
-  test("My tasks items in a pool: a fast-only runner gets the fast item's unit at once and no unit on other items, even with the other runners busy", async () => {
+  test("My tasks items in a pool: a started-only runner gets the started item's unit at once and no unit on other items, even with the other runners busy", async () => {
 
     const units = [21, 22, 23, 20];
     for (const n of units) await db.run(db.k.insertInto("items").values({ repo: "photocraft", number: n, kind: "issue", state: "OPEN", title: "x", author: "dev", created_at: "2026-01-01T00:00:00Z" }).onConflict((oc) => oc.doNothing()));
-    await addFastTrack(db, "bob", "photocraft#20");
-    await userSettings.setSettings(db, req("alice", "maintainer", { json: { taskItems: "fast" } }));
-    await db.run(db.k.updateTable("remote_helpers").set({ reported_at: Date.now() - STATUS_FRESH_MS - 1000 }).where("login", "<>", "alice"));
+    await startedItem(db, "bob", "photocraft", 20);
+    await userSettings.setSettings(db, req("alice", "maintainer", { json: { taskItems: "started" } }));
+    await unfresh("bob", "olga");
     assert.equal(await leased("alice"), null, "an idle claim: alice's runner is active");
     const refs = (i: number) => [{ repo: "photocraft", number: units[i]! }];
     const started: number[] = [];
     await pool(units.map((_, i) => async () => { started.push(i); }), poolRoom(db, () => ["photocraft"], refs, { promptId: "review.opus" }), { pollMs: 5 });
-    assert.deepEqual(started, [3], "only the fast-tracked item's unit started, though it came last");
-    assert.deepEqual(await repoBatches(db, units, 3, () => "photocraft", (n) => [{ repo: "photocraft", number: n }]), [[21, 22, 23], [20]], "the fast item is batched apart");
+    assert.deepEqual(started, [3], "only the started item's unit ran, though it came last");
+    assert.deepEqual(await repoBatches(db, units, 3, () => "photocraft", (n) => [{ repo: "photocraft", number: n }]), [[21, 22, 23], [20]], "the started item is batched apart");
 
     // Bob takes every item, and the calls ahead fill his slots: they take none of alice's.
     await ready("bob");
@@ -365,16 +382,18 @@ describe("picks and Manual only", async () => {
     for (let k = 0; k < 4; k++) await q({ items: refs(0) });
     dropQueueCache(db);
     const room = poolRoom(db, () => ["photocraft"], refs, { promptId: "review.opus" });
-    assert.equal(await room.room(0), 0, "no room for an unfast unit: bob is full");
-    assert.ok(await room.room(3) > 0, "room for the fast unit on alice's runner");
+    assert.equal(await room.room(0), 0, "no room for another unit: bob is full");
+    assert.ok(await room.room(3) > 0, "room for the started unit on alice's runner");
     await userSettings.setSettings(db, req("alice", "maintainer", { json: { taskItems: "all" } }));
     for (const login of ["alice", "bob", "olga"]) await ready(login);
+    await endStarted(db);
     await clear();
   });
 
   test("calls for an item a user started go to their runner first, in a slot under their Max calls at once, and past their cool-off", async () => {
     await db.run(db.k.updateTable("tracked_repos").set({ workflow: "new" }).where("name", "=", "photocraft"));
     const wf = await insertWorkflow(db, { repo: "photocraft", number: 5, kind: "pr", entry: "review", state: "running", startedBy: "alice", startedAt: new Date().toISOString(), startedVia: "github" });
+    dropQueueCache(db);
     await setUserMaxCalls(db, "alice", 1);
     const auto = await q({ ageMs: 10 * 60_000 });
     await db.run(db.k.insertInto("remote_cooloffs").values({ login: "alice", until: Date.now() + 60_000, reason: "testing cool-off" }));
@@ -396,12 +415,13 @@ describe("picks and Manual only", async () => {
   test("another user's runner takes a started item's call only while the starter has no fresh runner, under its own limits", async () => {
     await db.run(db.k.updateTable("tracked_repos").set({ workflow: "new" }).where("name", "=", "photocraft"));
     const wf = await insertWorkflow(db, { repo: "photocraft", number: 6, kind: "pr", entry: "review", state: "running", startedBy: "alice", startedAt: new Date().toISOString(), startedVia: "github" });
+    dropQueueCache(db);
     const call = await q({ items: [{ repo: "photocraft", number: 6 }] });
     assert.equal(await leased("bob"), null, "alice's runner is fresh: bob passes it over");
     const old = await q({ items: [{ repo: "photocraft", number: 6 }], ageMs: STARTED_HOLD_MS + 60_000 });
     assert.equal(await leased("bob"), old, "past the hold bob takes it, though alice's runner is fresh");
     await db.run(db.k.updateTable("remote_calls").set({ state: "done" }).where("id", "=", old));
-    await db.run(db.k.updateTable("remote_helpers").set({ reported_at: Date.now() - STATUS_FRESH_MS - 1000 }).where("login", "=", "alice"));
+    await unfresh("alice");
     await setUserMaxCalls(db, "bob", 1);
     const busy = await q({ ageMs: 60_000 });
     await db.run(db.k.updateTable("remote_calls").set({ state: "leased", user_login: "bob", leased_at: Date.now(), heartbeat_at: Date.now() }).where("id", "=", busy));
@@ -418,18 +438,54 @@ describe("picks and Manual only", async () => {
     await clear();
   });
 
+  test("a maintainer who took a started item's work: their Manual only runner takes its calls while the starter's runner cannot run them, no other item's, and the starter's runner comes first once it can", async () => {
+    await db.run(db.k.updateTable("tracked_repos").set({ workflow: "new" }).where("name", "=", "photocraft"));
+    const wf = await insertWorkflow(db, { repo: "photocraft", number: 40, kind: "issue", entry: "implement", state: "running", startedBy: "alice", startedAt: new Date().toISOString(), startedVia: "github" });
+    await takeItemRunner(db, { workflowId: wf, repo: "photocraft", number: 40, login: "bob", at: new Date().toISOString() });
+    await setManualOnly(db, "bob", true);
+    await unfresh("olga");
+    await storeStatus(db, callers.alice!.tokenId, "alice", parseStatus({ slots: 3, busy: 0, readiness: "quota-held", harness: "claude", models: { top: "opus", small: "haiku" }, reserve: { fiveHour: 0, weekly: 0 } }));
+    dropQueueCache(db);
+    const item = [{ repo: "photocraft", number: 40 }];
+    await q({ items: [{ repo: "photocraft", number: 41 }], ageMs: 60_000 });
+    const first = await q({ items: item });
+    assert.equal(await leased("bob"), first, "alice's runner is held by its usage limit: bob's takes the item's call");
+    assert.equal(await leased("bob"), null, "and no other item on the repo");
+    await ready("alice");
+    // Her helper asks for work: its last claim found nothing.
+    await db.run(db.k.updateTable("remote_helpers").set({ idle_claim_at: Date.now() }).where("login", "=", "alice"));
+    dropQueueCache(db);
+    const second = await q({ items: item });
+    assert.equal(await leased("bob"), null, "alice's runner could run it now: bob's passes the call over");
+    assert.equal(await leased("alice"), second);
+    await setUserMaxCalls(db, "alice", 1);
+    const third = await q({ items: item });
+    assert.equal(await leased("bob"), third, "alice runs her Max calls at once: bob's takes the next one");
+    await releaseItemRunner(db, { workflowId: wf, login: "bob", at: new Date().toISOString() });
+    dropQueueCache(db);
+    const fourth = await q({ items: item });
+    assert.equal(await leased("bob"), null, "released: bob's runner takes none of it");
+    await setUserMaxCalls(db, "alice", null);
+    await setManualOnly(db, "bob", false);
+    await updateWorkflow(db, wf, { state: "done" });
+    await ready("olga");
+    await clear();
+  });
+
   test("a starter's runner on Manual only, not taking the repo, is room and a taker for their started item alone", async () => {
     await db.run(db.k.updateTable("tracked_repos").set({ workflow: "new" }).where("name", "=", "photocraft"));
     const wf = await insertWorkflow(db, { repo: "photocraft", number: 7, kind: "pr", entry: "review", state: "running", startedBy: "alice", startedAt: new Date().toISOString(), startedVia: "github" });
-    await db.run(db.k.updateTable("remote_helpers").set({ reported_at: Date.now() - STATUS_FRESH_MS - 1000 }).where("login", "in", ["bob", "olga"]));
+    dropQueueCache(db);
+    await unfresh("bob", "olga");
     await setManualOnly(db, "alice", true);
     await setUserRepos(db, "alice", ["deckcraft"]);
-    await db.run(db.k.updateTable("mcp_tokens").set({ idle_claim_at: Date.now() }).where("login", "=", "alice"));
+    await db.run(db.k.updateTable("remote_helpers").set({ idle_claim_at: Date.now() }).where("login", "=", "alice"));
+    dropQueueCache(db);
     const now = Date.now(), st = await roomState(db, now), takes = takerTest(db, now);
     const started = [{ repo: "photocraft", number: 7 }], auto = [{ repo: "photocraft", number: 8 }];
-    assert.ok(await roomOf(db, st, 0, now, ["photocraft"], "opus-review", started) > 0, "room for her started item");
-    assert.equal(await roomOf(db, st, 0, now, ["photocraft"], "opus-review", auto), 0, "no room for an automatic item");
-    assert.ok(await roomOf(db, st, 0, now, ["photocraft"], "opus-review") > 0, "a job on the repo of her started item has room");
+    assert.ok(await roomOf(st, 0, ["photocraft"], "opus-review", started) > 0, "room for her started item");
+    assert.equal(await roomOf(st, 0, ["photocraft"], "opus-review", auto), 0, "no room for an automatic item");
+    assert.ok(await roomOf(st, 0, ["photocraft"], "opus-review") > 0, "a job on the repo of her started item has room");
     assert.ok(await takes({ prompt_id: "", repos: ["photocraft"], step: "opus-review", refs: started }), "a taker for her started item");
     assert.equal(await takes({ prompt_id: "", repos: ["photocraft"], step: "opus-review", refs: auto }), false, "none for an automatic item");
     await setUserRepos(db, "alice", []);
@@ -441,15 +497,17 @@ describe("picks and Manual only", async () => {
 
   test("the pre-merge check of a merge a maintainer approved waits for their runner, outside their My repos and while it is not ready", async () => {
     await db.run(db.k.updateTable("tracked_repos").set({ workflow: "new" }).where("name", "=", "photocraft"));
-    await db.run(db.k.updateTable("remote_helpers").set({ reported_at: Date.now() - STATUS_FRESH_MS - 1000 }).where("login", "in", ["bob", "olga"]));
+    await unfresh("bob", "olga");
     await setUserRepos(db, "alice", ["deckcraft"]);
     const premerge = { prompt_id: "", repos: ["photocraft"], step: "premerge" };
     assert.equal(await takerTest(db, Date.now())(premerge), false, "no started work: no taker");
     const at = new Date().toISOString();
     const wf = await insertWorkflow(db, { repo: "photocraft", number: 9, kind: "pr", entry: "review", state: "running", startedBy: "alice", startedAt: at, startedVia: "github", approvedBy: "alice", approvedAt: at, approvedVia: "github", step: "merge" });
+    dropQueueCache(db);
     assert.ok(await takerTest(db, Date.now())(premerge), "her approved merge: her runner takes the pre-merge check");
     assert.ok(await takerTest(db, Date.now())({ ...premerge, refs: [{ repo: "photocraft", number: 9 }] }), "and the call on its PR");
     await db.run(db.k.updateTable("remote_helpers").set({ readiness: "quota-held" }).where("login", "=", "alice"));
+    dropQueueCache(db);
     assert.ok(await takerTest(db, Date.now())(premerge), "her runner is held for its quota: the check waits for it");
     assert.equal(await takerTest(db, Date.now())({ ...premerge, refs: [{ repo: "photocraft", number: 10 }] }), false, "a PR nobody started has no taker");
     await setUserRepos(db, "alice", []);

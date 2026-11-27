@@ -20,11 +20,13 @@ function intArg(args: string[], flag: string, def: number): number {
   return n;
 }
 
+// The item snapshot carries the vectors. A pipeline job leaves its refresh to the runner leader's keeper
+// (src/itemtools/keeper.ts), which builds after each embed job ends; a run from the command line refreshes it here.
 async function embed(args: string[]): Promise<void> {
-  await embedCommand(args);
+  if (await embedCommand(args)) await refreshSnapshot();
 }
 
-/** The embed command; `onEmbedded` gets the running count of items embedded. Returns the total. */
+/** The embed command; `onEmbedded` gets the running count of items embedded. Returns the total. Does not refresh the item snapshot. */
 export async function embedCommand(args: string[], onEmbedded?: (n: number) => void): Promise<number> {
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--threads" || args[i] === "--batch") i++;
@@ -53,8 +55,6 @@ export async function embedCommand(args: string[], onEmbedded?: (n: number) => v
   });
   await db.close();
   console.log(`embedded ${r.embedded} items, removed ${r.pruned} stale vectors, ${(r.ms / 1000).toFixed(1)} s`);
-  // The item snapshot carries the vectors; similar_items sees new ones after this.
-  if (r.embedded > 0) await refreshSnapshot();
   return r.embedded;
 }
 

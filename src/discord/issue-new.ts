@@ -13,8 +13,8 @@
 // length-capped and stripped of mentions and foreign links before it is shown.
 import { randomBytes } from "node:crypto";
 import { askClaude } from "../classify/run.ts";
-import { BUTTON_URL_MAX, ISSUE_URL_MAX, cleanDraft, followUp, formDraft, issueUrl, sanitize, seedOf, type PublicRepo } from "./issue-draft.ts";
-import { fallbackQuestions, ISSUE_ANSWER_CHARS, ISSUE_BODY_CHARS, ISSUE_FORM_BODY_CHARS, ISSUE_TITLE_CHARS, parseDraft, parseQuestions, type FollowUpId, type IssueDraftInput, type IssueQuestionsInput } from "./issue-prompt.ts";
+import { BUTTON_URL_MAX, ISSUE_URL_MAX, cleanDraft, followUp, formDraft, issueUrl, seedOf, type PublicRepo } from "./issue-draft.ts";
+import { fallbackQuestions, ISSUE_ANSWER_CHARS, ISSUE_FORM_BODY_CHARS, ISSUE_TITLE_CHARS, parseDraft, parseQuestions, type FollowUpId, type IssueDraftInput, type IssueQuestionsInput } from "./issue-prompt.ts";
 import type { Call, Interactions } from "./interactions.ts";
 import type { DiscordKeys } from "./keys.ts";
 import { recordEvent } from "./events.ts";
@@ -22,6 +22,9 @@ import { botRefusal, FILING_IN_DISCORD, fileAsBot, fileIssue, JUNK_REFUSAL, junk
 import type { JunkAsk } from "./junk-ask.ts";
 import { deliver, fileRepoUrl, plain, renderMatches } from "./reply.ts";
 import { QUESTION_CHARS, type Match, type Search } from "./search.ts";
+import { setting } from "../data/control/index.ts";
+import { loadStepSpend, removeRunTexts } from "../data/inference/index.ts";
+import { loadReleaseAppNames, loadRepos } from "../data/mirror/index.ts";
 import { appCovers, botRepo, botRepos, FILING_MAX, type CoverageReading } from "./filing-repos.ts";
 import type { Db } from "../db/index.ts";
 import { DISCORD_TAKE_WAIT_MS } from "./limits.ts";
@@ -47,19 +50,18 @@ export const askIssueModel: IssueAsk = (async (db: Db, id: "discord.issue-questi
   (await askClaude(id, "haiku", [input], db, { maxWaitMs: DISCORD_TAKE_WAIT_MS }))?.text ?? null) as IssueAsk;
 
 export async function issueCapUsd(db: Db): Promise<number> {
-  const v = Number((await db.get(db.k.selectFrom("settings").select("value").where("key", "=", ISSUE_CAP_KEY)))?.value);
+  const v = Number(await setting(db, ISSUE_CAP_KEY));
   return Number.isFinite(v) && v >= 0 ? v : DEFAULT_ISSUE_CAP_USD;
 }
 
 export async function issueSpentTodayUsd(db: Db, now: number): Promise<number> {
   const day = new Date(now).toISOString().slice(0, 10);
-  return Number((await db.get(db.k.selectFrom("agent_runs").select((eb) => eb.fn.coalesce(eb.fn.sum<number>("cost_usd"), eb.lit(0)).as("c")).where("step", "=", ISSUE_STEP).where("started_at", ">=", day)))!.c);
+  return (await loadStepSpend(db, [ISSUE_STEP], day)).get(ISSUE_STEP) ?? 0;
 }
 
 /** The prompt and reply of an issue call hold what the person typed: finished calls lose their texts; `all` (at startup) removes every row. */
 export async function dropIssueTexts(db: Db, all = false): Promise<void> {
-  await db.run(db.k.deleteFrom("agent_run_texts").where("run_id", "in", (eb) => eb.selectFrom("agent_runs").select("id").where("step", "=", ISSUE_STEP)
-    .$if(!all, (q) => q.where("state", "<>", "running"))));
+  await removeRunTexts(db, { steps: [ISSUE_STEP], finishedOnly: !all });
 }
 
 type Session = {
@@ -198,10 +200,9 @@ export class IssueNew {
   async #apps(preselect: string | null): Promise<{ name: string; label: string }[]> {
     const { db } = this.#d;
     const offered = await botRepos(db);
-    const labels = offered.length ? await db.all(db.k.selectFrom("repos as r").leftJoin("release_apps as a", "a.repo", "r.name")
-      .select((eb) => ["r.name as name", eb.fn.coalesce("a.name", "r.name").as("label"), eb.fn.coalesce("r.open_issues", eb.lit(0)).as("open")])
-      .where("r.name", "in", offered.map((r) => r.name))) : [];
-    const known = new Map(labels.map((l) => [l.name, l]));
+    const names = offered.map((r) => r.name);
+    const [labels, repos] = await db.together(() => Promise.all([loadReleaseAppNames(db, names), loadRepos(db, { all: true, names })]));
+    const known = new Map(names.map((n) => [n, { label: labels.get(n) ?? n, open: repos.get(n)?.open_issues ?? 0 }]));
     let filing = 0;
     const rows = offered.filter((r) => r.name === preselect || !r.filingOnly || ++filing <= FILING_MAX).map((r) => ({ name: r.name, label: known.get(r.name)?.label ?? r.name, open: Number(known.get(r.name)?.open ?? 0), filingOnly: r.filingOnly }));
     const mine = rows.sort((x, y) => Number(y.name === preselect) - Number(x.name === preselect) || Number(y.filingOnly) - Number(x.filingOnly) || y.open - x.open || x.name.localeCompare(y.name));

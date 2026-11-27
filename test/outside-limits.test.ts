@@ -1,10 +1,16 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { inPilot } from "../src/pilot.ts";
+import { inScopeExpr } from "../src/data/workflow/fragments.ts";
 import { refreshOutsideHolds, releaseOutside, setOutsideLimits } from "../src/outside.ts";
-import { resumeStage } from "../src/push-outcomes.ts";
+import { held, releaseAll } from "../src/dash/api/outside.ts";
+import type { Req } from "../src/dash/types.ts";
+import { resumeStage } from "../src/data/control/index.ts";
+import { connectDb, type Db } from "./helpers/raw-db.ts";
 import { everySeq, mapSeq } from "../src/async-seq.ts";
-import { connectDb } from "../src/db/open.ts";
+
+/** The item is in the pipeline's scope (the workflow scope fragment), read as the planner reads it. */
+const inPilot = async (db: Db, repo: string, number: number): Promise<boolean> =>
+  !!await db.get(db.k.selectNoFrom((eb) => eb.lit(1).as("one")).where((eb) => inScopeExpr(db, eb, eb.val(repo), eb.cast<number>(eb.val(number), "bigint"))));
 
 const NOW = Date.parse("2026-11-08T12:00:00Z");
 const ago = (min: number) => new Date(NOW - min * 60_000).toISOString();
@@ -71,4 +77,23 @@ test("the surge breaker trips on many new outside items, holds only those, and s
   await refreshOutsideHolds(db, NOW + 3 * 3_600_000);
   assert.ok(await everySeq(surge, async (n) => await inPilot(db, "app", n)));
   assert.equal((await db.get(db.k.selectFrom("stage_trips").select("active").where("stage", "=", "outside-surge")))!.active, 0, "the old items do not trip it again");
+});
+
+test("an operator sees the authors with held items and releases everything held for one of them", async () => {
+  const { db, add } = await setup();
+  await db.run(db.k.insertInto("repos").values({ name: "app", visibility: "public" }));
+  await setOutsideLimits(db, "op", { prsPerDay: 1, issuesPerDay: 1, surgePerHour: 0 });
+  const busy = [await add("Busy", "pr", 60), await add("busy", "pr", 50), await add("busy", "pr", 40)];
+  await add("busy", "issue", 55);
+  const issue = await add("busy", "issue", 30);
+  const other = [await add("other", "pr", 60), await add("other", "pr", 20)];
+  await refreshOutsideHolds(db, NOW);
+  const req = (json?: unknown) => ({ method: "POST", path: "", params: {}, query: new URLSearchParams(), json, user: { login: "op", role: "operator", canWrite: async () => true, canRead: async () => true } }) as unknown as Req;
+  const list = async () => (await held(db, req())).map((h) => [h.author.toLowerCase(), h.prs, h.issues, h.surge]);
+  assert.deepEqual(await list(), [["busy", 2, 1, false], ["other", 1, 0, false]]);
+  assert.deepEqual(await releaseAll(db, req({ author: "busy" })), { released: 3 });
+  await refreshOutsideHolds(db, NOW);
+  assert.deepEqual(await list(), [["other", 1, 0, false]]);
+  assert.ok(await everySeq([...busy, issue], async (n) => await inPilot(db, "app", n)));
+  assert.equal(await inPilot(db, "app", other[1]!), false);
 });

@@ -1,5 +1,6 @@
 // Build tasks for a validated plan, and the warm build of the default branch.
-import { createTask, warmKeyOf, type NewTask } from "../build/tasks.ts";
+import { createTaskSet, warmKeyOf } from "../build/tasks.ts";
+import { hasWarmBuild, loadEnvs, type NewTask } from "../data/build/index.ts";
 import { rustPlan } from "../worker/rust.ts";
 import { WORKSPACE_TEST_TARGETS } from "../worker/rust-targets.ts";
 import type { TaskStep } from "../worker/types.ts";
@@ -7,7 +8,6 @@ import { featureOn } from "../build/features.ts";
 import type { VerifyPlan } from "./plan.ts";
 import type { ParamSpec, ScreenshotConfigBody } from "./screenshot-config.ts";
 import type { ShotStep } from "./types.ts";
-import { mapSeq } from "../async-seq.ts";
 import type { Db } from "../db/index.ts";
 
 const REQUIRES = { os: "linux", toolchains: ["rust-stable"] } as const;
@@ -35,7 +35,7 @@ export function tasksFor(plan: Planned, c: { repo: string; number: number; head:
 
 /** Queues the tasks; returns their ids, head task first. */
 export async function queueTasks(db: Db, plan: Planned, c: { repo: string; number: number; head: string; base: string }): Promise<number[]> {
-  return await mapSeq(tasksFor(plan, c), async (t) => await createTask(db, t));
+  return await createTaskSet(db, tasksFor(plan, c));
 }
 
 /**
@@ -45,34 +45,18 @@ export async function queueTasks(db: Db, plan: Planned, c: { repo: string; numbe
  * store, which the warm producer fills (src/build/warm-queue.ts).
  */
 export async function queueWarmBuild(db: Db, repo: string, mainSha: string, nowMs: number = Date.now()): Promise<number | null> {
-  if (!await db.get(db.k.selectFrom("build_envs").select("id").where("kind", "!=", "kubernetes").where("enabled", "=", 1).limit(1))) return null;
-  const same = await db.get(db.k.selectFrom("build_tasks").select((eb) => eb.lit(1).as("one"))
-    .where("repo", "=", repo).where("head_sha", "=", mainSha).where("warm_role", "=", "build"));
-  if (same) return null;
-  const since = new Date(nowMs - WARM_EVERY_MS).toISOString();
-  if (await db.get(db.k.selectFrom("build_tasks").select((eb) => eb.lit(1).as("one"))
-    .where("repo", "=", repo).where("warm_role", "=", "build").where("queued_at", ">", since))) return null;
-  return await createTask(db, {
+  const [envs, seen] = await db.together(() => Promise.all([loadEnvs(db, { enabled: true }), hasWarmBuild(db, repo, mainSha, new Date(nowMs - WARM_EVERY_MS).toISOString())]));
+  if (seen || !envs.some((e) => e.kind !== "kubernetes")) return null;
+  return (await createTaskSet(db, [{
     step: "verify", repo, headSha: mainSha, baseSha: mainSha, requires: { ...REQUIRES, toolchains: [...REQUIRES.toolchains] }, priority: WARM_PRIORITY,
     plan: warmBuildPlan(), warm: { key: warmKeyOf(repo), role: "build" },
-  });
+  }]))[0] ?? null;
 }
 
 /** The worker's warm build: the units a whole-workspace plan builds and tests, as the cluster's warm producer builds them. */
 function warmBuildPlan(): TaskStep[] {
   const [fetch, build] = rustPlan({ cargoArgs: ["--workspace"], test: false });
   return [fetch!, build!, { name: "build tests", cmd: ["cargo", "test", "--offline", "--locked", "--no-run", ...WORKSPACE_TEST_TARGETS], network: "none", timeoutSec: 3600 }];
-}
-
-/** Queues a new task with the same step, commits, requirements, plan, patch and warm role as task `id`. */
-export async function cloneTask(db: Db, id: number): Promise<number> {
-  const r = await db.get(db.k.selectFrom("build_tasks").select(["step", "repo", "number", "head_sha", "base_sha", "requires", "priority", "plan", "patch", "warm_key", "warm_role"])
-    .$narrowType<{ warm_role: "use" | "build" | null }>().where("id", "=", id));
-  if (!r) throw new Error(`no task ${id}`);
-  return await createTask(db, {
-    step: r.step, repo: r.repo, number: r.number, headSha: r.head_sha, baseSha: r.base_sha, requires: JSON.parse(r.requires), priority: r.priority,
-    plan: JSON.parse(r.plan), ...(r.patch === null ? {} : { patch: r.patch }), ...(r.warm_key && r.warm_role ? { warm: { key: r.warm_key, role: r.warm_role } } : {}),
-  });
 }
 
 const RENDER_TIMEOUT_SEC = 120;
@@ -141,5 +125,5 @@ export function screenshotTasks(script: ShotStep[], config: Pick<ScreenshotConfi
 /** Queues the screenshot tasks; returns their ids, head task first, or [] when the repo's screenshots switch is off. */
 export async function queueScreenshotTasks(db: Db, script: ShotStep[], config: Pick<ScreenshotConfigBody, "package" | "example" | "driver" | "commands">, c: { repo: string; number: number; head: string; base: string }): Promise<number[]> {
   if (!await featureOn(db, "screenshots", c.repo)) return [];
-  return await mapSeq(screenshotTasks(script, config, c), async (t) => await createTask(db, t));
+  return await createTaskSet(db, screenshotTasks(script, config, c));
 }

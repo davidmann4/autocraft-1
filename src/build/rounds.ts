@@ -1,11 +1,12 @@
 // One build round of a patch: a head task (the patch's crate tests, fmt, clippy and the regression test) and a base task
 // (the regression test alone, which must fail without the fix). A round is queued in one job and read in a later one, so no
 // job waits on a build.
-import { TERMINAL, createTask, getTask, type NewTask } from "./tasks.ts";
+import { TERMINAL, cloneTasks, createTask, getTask, type NewTask } from "./tasks.ts";
 import { tasksFor } from "./fix-tasks.ts";
 import { readLint } from "../prepush/index.ts";
-import { baseScopeRepos } from "../pilot.ts";
-import { cloneTask, queueWarmBuild } from "../verify/tasks.ts";
+import { loadLogTails } from "../data/build/index.ts";
+import { inRepoScope } from "../runner/scope.ts";
+import { queueWarmBuild } from "../verify/tasks.ts";
 import { outcomeOf } from "../verify/results.ts";
 import { mapSeq } from "../async-seq.ts";
 import type { Db } from "../db/index.ts";
@@ -21,20 +22,23 @@ const oneLine = (s: string, max = 300): string => s.replace(/\s+/g, " ").trim().
 
 /** The last part of the failing step's log of a finished task, for the next round's prompt. */
 export async function failureTail(db: Db, taskId: number, step: string): Promise<string> {
-  const rows = await db.all(db.k.selectFrom("build_task_logs").select("chunk").where("task_id", "=", taskId).where("step", "=", step).orderBy("seq", "desc").limit(40));
-  return rows.reverse().map((r) => r.chunk).join("").slice(-2500);
+  const tail = (await loadLogTails(db, [{ id: taskId, step }], { maxBytes: 2500, maxChunks: 40 })).get(taskId);
+  return (tail?.text ?? "").slice(-2500);
 }
 
 /** Queues the round's two tasks, [head, base]. Throws BuildError when they cannot be queued. */
 export async function queueRound(db: Db, r: RoundRequest): Promise<[number, number]> {
   const ids = await mapSeq(tasksFor({ repo: r.repo, number: null, main_sha: r.sha, crate: r.crate, test: r.test }, r.patch, r.testPatch, r.step ?? "fix-check"), async (t: NewTask) => await createTask(db, t));
   // The warm build is a pipeline task: it would never be claimed for a repo outside the pipeline scope.
-  if ((await baseScopeRepos(db)).has(r.repo)) await queueWarmBuild(db, r.repo, r.sha);
+  if (await inRepoScope(db, r.repo, "builds")) await queueWarmBuild(db, r.repo, r.sha);
   return [ids[0]!, ids[1]!];
 }
 
 /** Queues the round's tasks again after an environment error. */
-export const requeueRound = async (db: Db, ids: [number, number]): Promise<[number, number]> => [await cloneTask(db, ids[0]), await cloneTask(db, ids[1])];
+export async function requeueRound(db: Db, ids: [number, number]): Promise<[number, number]> {
+  const again = await cloneTasks(db, ids);
+  return [again.get(ids[0])!, again.get(ids[1])!];
+}
 
 /** What the finished round says. `retried`: the tasks were already queued again once, so an environment error is a failure. */
 export async function readRound(db: Db, ids: [number, number], retried = false): Promise<RoundRead> {

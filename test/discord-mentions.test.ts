@@ -12,7 +12,7 @@ import { handleMeta } from "../src/discord/index.ts";
 import { setup } from "../src/dash/api/discord.ts";
 import { countOf, forgetAuthor, handleDispatch, linksOf } from "../src/discord/store.ts";
 import { SCRATCH } from "./scratch.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb } from "./helpers/raw-db.ts";
 import { cols, excluded } from "../src/db/kx.ts";
 
 mkdirSync(SCRATCH, { recursive: true });

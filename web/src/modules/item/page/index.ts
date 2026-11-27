@@ -1,1 +1,0 @@
-export { ItemPageView } from "./ItemPage";

@@ -21,9 +21,16 @@ export function askText(check: string, patch: string): string {
   return ASK_TEMPLATE.replace("{{check}}", () => name).replace("{{patch}}", () => body);
 }
 
-/** The comment on a PR whose CI failure we could not fix: one line naming the failing checks. */
-export function askCiText(checks: string[]): string {
+/** A GitHub user login that can be mentioned (a bot's `name[bot]` cannot). */
+const LOGIN = /^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$/;
+
+/**
+ * The comment on a PR nobody approved for merge whose CI failure we could not fix: one line naming the failing checks, addressed to the
+ * PR's author by login when there is one to mention.
+ */
+export function askCiText(checks: string[], author: string | null = null): string {
   const names = [...new Set(checks.map((c) => c.replace(/[`@\r\n]/g, " ").trim().slice(0, 100)).filter(Boolean))].slice(0, 5);
   const list = names.map((n) => `\`${n}\``).join(", ");
-  return names.length ? `The CI check${names.length > 1 ? "s" : ""} ${list} fail${names.length > 1 ? "" : "s"} on this branch. Could you take a look?` : "CI fails on this branch. Could you take a look?";
+  const to = author && LOGIN.test(author) ? `@${author} ` : "";
+  return names.length ? `${to}The CI check${names.length > 1 ? "s" : ""} ${list} fail${names.length > 1 ? "" : "s"} on this branch. Could you take a look?` : `${to}CI fails on this branch. Could you take a look?`;
 }

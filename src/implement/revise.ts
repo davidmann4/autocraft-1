@@ -12,6 +12,10 @@ import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import type { Db } from "../db/index.ts";
+import { patchLines } from "../data/changes/index.ts";
+import { listAudit } from "../data/control/index.ts";
+import { loadItems } from "../data/mirror/index.ts";
+import { loadReviewsAt } from "../data/review/index.ts";
 import { assertFence } from "../db/fence.ts";
 import { guardedApi, inClusterApi, type KubeApi } from "../build/kube-api.ts";
 import { READY_LIMIT_MS } from "../build/workspace-launch.ts";
@@ -21,6 +25,7 @@ import type { CiFailure } from "../cifix/types.ts";
 import { reviseOf } from "../core/decide.ts";
 import { loadPrFact } from "../core/facts.ts";
 import { guard, guardRepo } from "../core/guard.ts";
+import { implementMay } from "./gate.ts";
 import { branchOf, forkOf } from "../github/fork.ts";
 import { parseFixes, type Fix } from "../fixup/candidates.ts";
 import { exec as realExec, fixupDir, Git, type Exec } from "../fixup/git.ts";
@@ -28,7 +33,6 @@ import { commitIdentity } from "../github/identity.ts";
 import { pipelineAccount, setPipelineLogin } from "../github/pipeline-account.ts";
 import { pushOwnBranch, type Writer } from "../github/write.ts";
 import { ghExec, type Gh } from "../merge/safe-merge.ts";
-import { WITHDRAWN } from "../merge/withdraw.ts";
 import { optionalChecks } from "../optional-checks.ts";
 import { ownerOf, slugOf } from "../owners.ts";
 import { FOLLOW_UP_ROUNDS, type BuildRun } from "./build.ts";
@@ -40,9 +44,10 @@ import {
   type CallDeps, type TurnPurpose, type TurnRound,
 } from "./session.ts";
 import { markStuck, type StuckCause } from "./stuck.ts";
-import { addRound, currentImplementation, implementationById, moveImplementationIf, roundsOf, updateImplementation, updateRound } from "./store.ts";
+import { addRounds, attemptNow, currentAttempt, roundOf, setRound, writeStep, type Attempt, type NewRound } from "./attempt.ts";
 import { implTitle } from "./template.ts";
 import { IMPLEMENT_WORKSPACE_DEADLINE_SEC, implementEnv } from "./workspace.ts";
+import { fixesToMake } from "../core/review-blocking.ts";
 import type { Implementation, ImplementationRound, ReviseRound } from "./types.ts";
 
 /** The audit login of the stage's writes. */
@@ -75,6 +80,8 @@ export type ReviseDeps = {
   exec: Exec;
   /** Directory holding one bare cache repository per repo. */
   root: string;
+  /** Replaces the installation-token minter (tests). */
+  mint?: Writer["mint"];
 };
 
 function workspaceApi(db: Db): KubeApi {
@@ -135,22 +142,21 @@ const undoMessage = (problems: string[]): string =>
 
 /** One unit of the revise bucket for the issue's current attempt: the job's summary line, and whether anything moved. */
 export async function runRevise(run: BuildRun, repo: string, number: number, deps: ReviseDeps = defaultReviseDeps()): Promise<{ summary: string; moved: boolean }> {
-  const before = await currentImplementation(run.db, repo, number);
-  const summary = await reviseUnit(run, repo, number, deps);
-  const after = before ? await implementationById(run.db, before.id) : null;
-  return { summary, moved: !!before && (after?.state !== before.state || after?.updatedAt !== before.updatedAt) };
+  const before = await currentAttempt(run.db, repo, number);
+  const summary = before ? await reviseUnit(run, before, deps) : `${repo}#${number}: no current implementation`;
+  const after = before ? (await attemptNow(run.db, before.impl))?.impl : null;
+  return { summary, moved: !!before && (after?.state !== before.impl.state || after?.updatedAt !== before.impl.updatedAt) };
 }
 
-async function reviseUnit(run: BuildRun, repo: string, number: number, deps: ReviseDeps): Promise<string> {
+async function reviseUnit(run: BuildRun, cur: Attempt, deps: ReviseDeps): Promise<string> {
   const db = run.db;
-  let impl = await currentImplementation(db, repo, number);
-  if (!impl) return `${repo}#${number}: no current implementation`;
+  let impl = cur.impl;
   if (impl.prNumber === null) return `${ref(impl)}: ${impl.state}; it has no PR to revise`;
   try {
-    const pr = await db.get(db.k.selectFrom("main.items").select(["state", "head_oid"]).where("repo", "=", repo).where("number", "=", impl.prNumber));
+    const pr = (await loadItems(db, [{ repo: impl.repo, number: impl.prNumber }], "ref")).get(`${impl.repo}#${impl.prNumber}`);
     if (pr && pr.state !== "OPEN") return `${ref(impl)}: ${await finish(db, impl, pr.state === "MERGED" ? "merged" : "closed")}`;
     if (impl.state === "pr-opened") {
-      const started = await start(run, deps, impl);
+      const started = await start(run, deps, impl, cur.rounds);
       if (typeof started === "string") return `${ref(impl)}: ${started}`;
       impl = started;
     }
@@ -158,25 +164,16 @@ async function reviseUnit(run: BuildRun, repo: string, number: number, deps: Rev
     return `${ref(impl)}: ${await revise(run, deps, impl)}`;
   } catch (e) {
     if (!(e instanceof Stuck)) throw e;
-    const now = (await implementationById(db, impl.id))!;
+    const now = (await attemptNow(db, impl))?.impl ?? impl;
     if (now.state !== "revising" && now.state !== "pr-opened") return `${ref(impl)}: ${now.state} meanwhile (${e.cause_}: ${e.message})`;
-    const id = await markStuck(db, now, e.cause_, e.message || null);
-    return `${ref(impl)}: revision of #${impl.prNumber} stuck (${e.cause_}${e.message ? `: ${e.message}` : ""}); decision ${id}`;
+    await markStuck(db, now, e.cause_, e.message || null);
+    return `${ref(impl)}: revision of #${impl.prNumber} stuck (${e.cause_}${e.message ? `: ${e.message}` : ""})`;
   }
 }
 
-/** The PR merged or closed: the attempt ends with it, a stuck revision's question is set aside, and the workspace is ended. */
+/** The PR merged or closed: the attempt ends with it (a stuck revision's blocker goes with it), and the workspace is ended. */
 async function finish(db: Db, impl: Implementation, to: "merged" | "closed"): Promise<string> {
-  const at = new Date().toISOString();
-  const moved = await db.write(async () => {
-    if (!await moveImplementationIf(db, impl.id, [impl.state], to, { reason: `PR #${impl.prNumber} ${to}` }, at)) return false;
-    if (impl.state === "stuck" && impl.decisionId) {
-      await db.run(db.k.updateTable("main.decisions").set({ answer: WITHDRAWN, answered_by: "pipeline", answered_at: at, applied_at: at, answer_note: `PR #${impl.prNumber} ${to}`, adopted_opinion: null })
-        .where("id", "=", impl.decisionId).where("answer", "is", null));
-    }
-    return true;
-  });
-  if (!moved) return `${impl.state} meanwhile; nothing recorded`;
+  if (!await writeStep(db, impl, { to, patch: { reason: `PR #${impl.prNumber} ${to}` }, expect: [impl.state] })) return `${impl.state} meanwhile; nothing recorded`;
   const ended = impl.workspaceId !== null && await endWorkspace(db, impl.workspaceId);
   return `PR #${impl.prNumber} ${to}; the attempt ends${ended ? `, workspace ${impl.workspaceId} ended` : ""}`;
 }
@@ -185,7 +182,7 @@ async function finish(db: Db, impl: Implementation, to: "merged" | "closed"): Pr
  * Starts the revision the PR's head needs, by the planner's own rule (reviseOf) on the PR's facts now: reads the review's fixes
  * and the CI failure, and writes the `revise` round with the move to `revising`. A string says why nothing started.
  */
-async function start(run: BuildRun, deps: ReviseDeps, impl: Implementation): Promise<Implementation | string> {
+async function start(run: BuildRun, deps: ReviseDeps, impl: Implementation, rounds: readonly ImplementationRound[]): Promise<Implementation | string> {
   const db = run.db, pr = impl.prNumber!;
   const f = await loadPrFact(db, impl.repo, pr);
   const due = f ? reviseOf(f) : null;
@@ -196,32 +193,28 @@ async function start(run: BuildRun, deps: ReviseDeps, impl: Implementation): Pro
   if (!from) throw new Stuck("push-failed", `no push of this implementation to ${impl.branch} is on record`);
   let review: { reason: string; fixes: Fix[] } | null = null;
   if (due.review) {
-    const r = await db.get(db.k.selectFrom("opus_reviews").select(["reason", "fixes"]).where("repo", "=", impl.repo).where("number", "=", pr).where("head_oid", "=", head)
-      .where("verdict", "=", "take-fix").orderBy("at", "desc").limit(1));
-    const fixes = parseFixes(r?.fixes ?? null);
+    const at = [...(await loadReviewsAt(db, [{ repo: impl.repo, number: pr, head }])).values()][0];
+    const r = at?.verdict === "take-fix" ? at : undefined;
+    const fixes = fixesToMake(parseFixes(r ? JSON.stringify(r.fixes) : null), f.workflow?.dropped, !!f.workflow?.approved);
     if (fixes.length) review = { reason: r?.reason ?? "", fixes };
   }
   let ci: CiFailure | null = null, ciSkip: string | null = null;
   if (due.ci) {
     const reading = await readFailure(deps.gh, impl.repo, head, await optionalChecks(db, impl.repo));
-    if (reading.kind === "failure") ci = reading.failure;
+    if (reading.kind !== "skip") ci = reading.failure;
     else ciSkip = reading.why;
   }
   const result: ReviseRound = { prNumber: pr, head, from, review: !!review, ci: !!ci, message: reviseMessage(pr, review, ci) };
-  const started = await db.write(async () => {
-    if (!await moveImplementationIf(db, impl.id, ["pr-opened"], review || ci ? "revising" : null)) return false;
-    // The round marks the head as revised also when there is nothing to send: the planner does not plan it again.
-    await addRound(db, impl.id, "revise", { result });
-    return true;
-  });
+  // The round marks the head as revised also when there is nothing to send: the planner does not plan it again.
+  const started = await writeStep(db, impl, { ...(review || ci ? { to: "revising" as const } : {}), expect: ["pr-opened"], rounds: [{ kind: "revise", result }] });
   if (!started) return "the attempt left pr-opened meanwhile";
   // Red CI with no failed check to read (a commit status, an optional check): nothing goes to the session; the PR waits for a person or a new run.
   if (!review && !ci) return `#${pr} has red CI at ${short(head)}, but ${ciSkip ?? "nothing to fix"}; nothing goes to the session`;
   // Counted by head: Try again on a stuck revision repeats its head, so each Try again allows one more revision.
-  const heads = new Set((await roundsOf(db, impl.id)).filter((r) => r.kind === "revise").map((r) => r.result as ReviseRound).filter((r) => r.review || r.ci).map((r) => r.head));
+  const heads = new Set([...rounds, roundOf(impl.id, started.roundIds[0]!, { kind: "revise", result }, "")].filter((r) => r.kind === "revise").map((r) => r.result as ReviseRound).filter((r) => r.review || r.ci).map((r) => r.head));
   if (heads.size > REVISIONS_MAX) throw new Stuck("revision-limit", `#${pr} went back to the session ${heads.size} times`);
   run.log(`${ref(impl)}: revision of #${pr} at ${short(head)} started (${[review && `${review.fixes.length} review fixes`, ci && `${ci.checks.length} failed checks`].filter(Boolean).join(", ")})`);
-  return (await implementationById(db, impl.id))!;
+  return started.impl;
 }
 
 // ---- the workspace -----------------------------------------------------------------------------------------------------
@@ -230,7 +223,7 @@ async function start(run: BuildRun, deps: ReviseDeps, impl: Implementation): Pro
  * The attempt's workspace, ready: the live one (a parked one is resumed, which restores its tree), else a new one made at the
  * base and restored from the lost workspace's stored checkpoint. The restored tree must hold exactly the pushed change.
  */
-async function readyWorkspace(run: BuildRun, deps: ReviseDeps, impl: Implementation): Promise<{ wsId: number; base: string }> {
+async function readyWorkspace(run: BuildRun, deps: ReviseDeps, impl: Implementation): Promise<{ wsId: number; base: string; impl: Implementation }> {
   const db = run.db;
   const live = async (id: number | null) => id !== null && LIVE_STATES.includes((await getWorkspace(db, id))?.state as WorkspaceStateName);
   const make = async (lost: number, why: string): Promise<number> => {
@@ -241,8 +234,7 @@ async function readyWorkspace(run: BuildRun, deps: ReviseDeps, impl: Implementat
     const from = lost;
     const id = await db.write(async () => {
       const id = await createWorkspace(db, { repo: impl.repo, baseSha: impl.baseSha!, envId, limits: { deadlineSec: IMPLEMENT_WORKSPACE_DEADLINE_SEC }, owner: `implementation ${impl.id}` });
-      await addRound(db, impl.id, "workspace", { result: { workspaceId: id, reason: why, from, restored: false } satisfies WorkspaceRound });
-      await updateImplementation(db, impl.id, { workspaceId: id });
+      impl = (await writeStep(db, impl, { patch: { workspaceId: id }, rounds: [{ kind: "workspace", result: { workspaceId: id, reason: why, from, restored: false } satisfies WorkspaceRound }] }))!.impl;
       return id;
     });
     run.log(`${ref(impl)}: workspace ${id} requested (${why}); it is restored from the checkpoint of workspace ${from}`);
@@ -278,8 +270,8 @@ async function readyWorkspace(run: BuildRun, deps: ReviseDeps, impl: Implementat
     }
     await sleep(READY_POLL_MS);
   }
-  await restore(run, deps, (await implementationById(db, impl.id))!, wsId);
-  return { wsId, base };
+  await restore(run, deps, impl, wsId);
+  return { wsId, base, impl };
 }
 
 /**
@@ -289,7 +281,7 @@ async function readyWorkspace(run: BuildRun, deps: ReviseDeps, impl: Implementat
  */
 async function restore(run: BuildRun, deps: ReviseDeps, impl: Implementation, wsId: number): Promise<void> {
   const db = run.db;
-  const all = await roundsOf(db, impl.id);
+  const all = await roundsNow(db, impl);
   const round = liveRound(all);
   if (!round) return;
   const w = round.result as WorkspaceRound;
@@ -313,7 +305,7 @@ async function restore(run: BuildRun, deps: ReviseDeps, impl: Implementation, ws
   const startedAt = all.filter((x) => x.kind === "revise").at(-1)?.at ?? "";
   const storedAt = (await getWorkspace(db, w.from))?.checkpoint_at ?? "";
   if (sha256(diff) !== impl.diffHash && !(storedAt && storedAt > startedAt)) throw new Stuck("workspace-lost", `the checkpoint of workspace ${w.from} is older than the change last pushed`);
-  await updateRound(db, round.id, { ...w, restored: true });
+  await setRound(db, impl.id, round.id, { ...w, restored: true });
   run.log(`${ref(impl)}: workspace ${wsId} restored from the checkpoint of workspace ${w.from}`);
 }
 
@@ -357,7 +349,7 @@ async function nextStep(db: Db, impl: Implementation, base: string, req: ReviseR
     return { turn: { purpose: "report", stdin: r.lost ? LOST_REPLY_MESSAGE : REPORT_MESSAGE, parentId: last.callId! } };
   }
   if (r.report.status === "blocked") {
-    await updateImplementation(db, impl.id, { report: r.report });
+    await writeStep(db, impl, { patch: { report: r.report } });
     throw needsDependency(r.report) ? new Stuck("needs-dependency", r.report.blocked_reason ?? "") : new Stuck("blocked", r.report.blocked_reason ?? "");
   }
   const after = live.filter((x) => x.id > last.id);
@@ -381,10 +373,10 @@ async function nextStep(db: Db, impl: Implementation, base: string, req: ReviseR
 async function revise(run: BuildRun, deps: ReviseDeps, impl: Implementation): Promise<string> {
   const db = run.db;
   const ws = await readyWorkspace(run, deps, impl);
-  impl = (await implementationById(db, impl.id))!;
+  impl = ws.impl;
   const pod = deps.pod(db, ws.wsId, run.cancelled);
   for (let n = 0;;) {
-    const all = await roundsOf(db, impl.id);
+    const all = await roundsNow(db, impl);
     const req = all.filter((r) => r.kind === "revise").at(-1)!.result as ReviseRound;
     const epoch = epochOf(all);
     const last = turnsOf(liveOf(epoch)).at(-1);
@@ -403,10 +395,9 @@ async function revise(run: BuildRun, deps: ReviseDeps, impl: Implementation): Pr
       const t = next.turn;
       const round = await db.write(async () => {
         const q = await queueTurn(db, deps.calls, { impl, workspaceId: ws.wsId, ...t });
-        await updateImplementation(db, impl.id, { sessionCallId: q.callId });
+        impl = (await writeStep(db, impl, { patch: { sessionCallId: q.callId } }))!.impl;
         return q;
       });
-      impl = (await implementationById(db, impl.id))!;
       run.log(`${ref(impl)}: turn ${round.callId} (${t.purpose}) queued for ${impl.queuedBy}'s Task Runner${t.parentId !== undefined ? `, on the session of call ${t.parentId}` : ""}`);
       await run.progress(`${ref(impl)}: revision turn ${round.callId} (${t.purpose})`);
       await awaitTurn(db, deps.calls, pod, { impl, workspaceId: ws.wsId, round, log: run.log });
@@ -426,7 +417,7 @@ async function checksRound(run: BuildRun, impl: Implementation, ws: { base: stri
   const round = checksOf(all).length + 1;
   await run.progress(`${ref(impl)}: revision checks, round ${round}`);
   const r = await runChecks(pod, { dir: roundDir(impl.id, round), base: ws.base, round });
-  await addRound(run.db, impl.id, "checks", { result: r });
+  await addRounds(run.db, impl.id, [{ kind: "checks", result: r }]);
   run.log(`${ref(impl)}: checks round ${round}: ${r.diffStat}; ${r.findings.length} findings${r.notes.length ? `; ${r.notes.join("; ")}` : ""}`);
   return r;
 }
@@ -435,13 +426,14 @@ async function checksRound(run: BuildRun, impl: Implementation, ws: { base: stri
 async function pushStep(run: BuildRun, deps: ReviseDeps, impl: Implementation, ws: { wsId: number; base: string }, pod: Pod, req: ReviseRound, checks: CheckRound, all: ImplementationRound[]): Promise<string> {
   const db = run.db;
   const d = await workspaceDiff(db, deps.api(db), ws.wsId);
-  if (!d.ok) return await pushFailed(db, impl, d.reason);
+  if (!d.ok) return await pushFailed(db, impl, d.reason, all);
   if (d.base !== impl.baseSha) throw new Stuck("push-failed", `the workspace diff is against ${short(d.base)}, not the attempt's base commit ${short(impl.baseSha ?? "")}`);
   if (sha256(d.diff) !== checks.diffHash) {
     // The tree is not the one the last clean checks ran on: they run again on it, once.
     if (refusalOf(all).some((x) => x === "recheck")) throw new Stuck("push-failed", "the workspace changed after the checks, twice");
-    await addRound(db, impl.id, "refusal", { result: { kind: "recheck", reason: "the workspace changed after the last clean checks" } });
-    await checksRound(run, impl, ws, pod, await roundsOf(db, impl.id));
+    const recheck: NewRound = { kind: "refusal", result: { kind: "recheck", reason: "the workspace changed after the last clean checks" } };
+    const [id] = await addRounds(db, impl.id, [recheck]);
+    await checksRound(run, impl, ws, pod, [...all, roundOf(impl.id, id!, recheck, "")]);
     return "the workspace changed after the checks; they ran again, and the next job goes on";
   }
   const r = await pushRevision(db, deps, impl, req, d.diff, run.by ?? "pipeline", run.log);
@@ -450,23 +442,24 @@ async function pushStep(run: BuildRun, deps: ReviseDeps, impl: Implementation, w
     if (r.moved) return `not pushed: ${r.reason}; the next job pushes onto the new head`;
     if (r.problems?.length) {
       if (epochOf(all).some((x) => refusalKind(x) === "diff")) throw new Stuck("diff-refused", r.problems.slice(0, 3).join("; "));
-      await addRound(db, impl.id, "refusal", { result: { kind: "diff", reason: r.reason, problems: r.problems } });
+      await addRounds(db, impl.id, [{ kind: "refusal", result: { kind: "diff", reason: r.reason, problems: r.problems } }]);
       return `the change was refused (${r.reason}); an undo turn is next`;
     }
     if (!r.retry) throw new Stuck("push-failed", r.reason);
-    return await pushFailed(db, impl, r.reason);
+    return await pushFailed(db, impl, r.reason, all);
   }
   const bytes = Buffer.from(d.diff);
-  if (!await moveImplementationIf(db, impl.id, ["revising"], "pr-opened", { diffHash: sha256(d.diff), diffStat: diffStat(bytes) })) return `pushed ${short(r.commit)}; the attempt left revising meanwhile`;
+  if (!await writeStep(db, impl, { to: "pr-opened", patch: { diffHash: sha256(d.diff), diffStat: diffStat(bytes) }, expect: ["revising"] })) return `pushed ${short(r.commit)}; the attempt left revising meanwhile`;
   return `pushed ${short(r.commit)} to #${req.prNumber} (${checks.diffStat}); the review runs again`;
 }
 
 const refusalOf = (all: ImplementationRound[]) => epochOf(all).map(refusalKind).filter((k): k is string => k !== null);
 
 /** A push that a later run may make: recorded, and stuck after PUSH_FAILURES_MAX in a row. */
-async function pushFailed(db: Db, impl: Implementation, reason: string): Promise<string> {
-  await addRound(db, impl.id, "refusal", { result: { kind: "push", reason } });
-  const tail = [...epochOf(await roundsOf(db, impl.id))].reverse();
+async function pushFailed(db: Db, impl: Implementation, reason: string, all: readonly ImplementationRound[]): Promise<string> {
+  const refusal: NewRound = { kind: "refusal", result: { kind: "push", reason } };
+  const [id] = await addRounds(db, impl.id, [refusal]);
+  const tail = [...epochOf([...all, roundOf(impl.id, id!, refusal, "")])].reverse();
   const streak = tail.findIndex((x) => refusalKind(x) !== "push");
   if ((streak < 0 ? tail.length : streak) >= PUSH_FAILURES_MAX) throw new Stuck("push-failed", reason);
   return `not pushed (${reason}); the next run tries again`;
@@ -479,11 +472,10 @@ type Push = { commit: string; from: string | null; built: string | null; revisio
 
 /** The implementation's pushes to `branch`, oldest first. */
 async function pushesOf(db: Db, impl: Implementation, branch: string): Promise<Push[]> {
-  const rows = await db.all(db.k.selectFrom("audit").select("details").where("action", "=", "implement-push").where("target", "=", ref(impl)).orderBy("at", "asc"));
+  const rows = await listAudit(db, { actions: ["implement-push"], targets: [ref(impl)], order: "asc" });
   const sha = (v: unknown): string | null => (typeof v === "string" && SHA.test(v) ? v : null);
   return rows.flatMap((r) => {
-    let x: Record<string, unknown>;
-    try { x = JSON.parse(r.details ?? "{}"); } catch { return []; }
+    const x = r.details ?? {};
     const commit = sha(x.commit);
     if (x.impl !== impl.id || x.branch !== branch || x.state !== "done" || !commit) return [];
     return [{ commit, from: sha(x.from), built: sha(x.built), revision: x.revise !== undefined }];
@@ -534,12 +526,12 @@ export async function pushRevision(db: Db, d: ReviseDeps, impl: Implementation, 
   const moved = (reason: string): PushResult => { log(`  ${ref(impl)}: revision not pushed: ${reason}`); return { ok: false, reason, retry: true, moved: true }; };
   try {
     if (!impl.baseSha || !impl.branch) return fail("the attempt has no base commit or branch", false);
-    const w: Writer = { db, login: ACTOR };
+    const w: Writer = { db, login: ACTOR, ...(d.mint && { mint: d.mint }) };
     const git = new Git(d.exec, d.root, repo);
     const who = await pipelineAccount(d.exec);
     await setPipelineLogin(db, who.login);
     if (!await git.fetchBranch(ownerOf(repo), repo, await branchOf(db, repo), impl.baseSha)) return fail("the base commit is no longer in the repository", false);
-    const rg = await guardRepo(db, repo, "fix-issue", by);
+    const rg = await guardRepo(db, repo, "fix-issue", by, undefined, { members: [await implementMay(db, repo, number)] });
     if ("refused" in rg) return fail(rg.refused, true);
     const fork = await forkOnce(repo, () => forkOf(w, rg, d.exec, who.login, repo));
     const [forkOwner, forkName] = fork.split("/") as [string, string];
@@ -549,7 +541,7 @@ export async function pushRevision(db: Db, d: ReviseDeps, impl: Implementation, 
     const before = await builtTree(git, d.root, await pushesOf(db, impl, impl.branch), req.from);
     if (!before) return fail(`the change as of our last push ${short(req.from)} cannot be rebuilt from ${impl.branch}`, false);
     const author = await commitIdentity(db, repo, async () => who);
-    const it = await db.get(db.k.selectFrom("main.items").select("title").where("repo", "=", repo).where("number", "=", number));
+    const it = (await loadItems(db, [{ repo, number }], "card")).get(`${repo}#${number}`);
     const message = `${implTitle(impl.plan?.kind ?? "change", it?.title ?? "")}: ${[req.review && "the review's fixes", req.ci && "the failing CI checks"].filter(Boolean).join(" and ")}\n\nRevision for #${req.prNumber}.\n`;
     const made = await commitDiff(git, d.root, impl.baseSha, diff, () => message, { name: author.name, email: author.email });
     if (!made.ok) return fail(made.reason, false, made.problems);
@@ -569,7 +561,7 @@ export async function pushRevision(db: Db, d: ReviseDeps, impl: Implementation, 
       rmSync(scratch, { recursive: true, force: true });
     }
     const commit = await git.commit(tree, head, message, { name: author.name, email: author.email });
-    const seen = await db.get(db.k.selectFrom("main.items").select("head_oid").where("repo", "=", repo).where("number", "=", req.prNumber));
+    const seen = (await loadItems(db, [{ repo, number: req.prNumber }], "pr")).get(`${repo}#${req.prNumber}`);
     if (seen?.head_oid !== head) return moved(`the mirror has #${req.prNumber} at ${short(seen?.head_oid ?? "")}, not at its head ${short(head)} yet`);
     // The guard is the PR's: the push changes the PR, and its issue may be closed or held while the PR is revised.
     const g = await guard(db, { repo, number: req.prNumber }, { kind: "implement", bucket: "revise", head }, by);
@@ -577,7 +569,7 @@ export async function pushRevision(db: Db, d: ReviseDeps, impl: Implementation, 
     // Without the ref a later gc may prune `made`; builtTree then rebuilds it.
     await git.git(["update-ref", `${BUILT_REF}/${impl.id}`, made.commit]);
     const push = await pushOwnBranch(w, g, git, "implement-push", { repo, number, remote: fork, branch: impl.branch, sha: commit },
-      { fork, base: impl.baseSha, impl: impl.id, from: head, built: made.commit, revise: req.prNumber, ...(made.check.compileTime.length && { compileTime: made.check.compileTime }) });
+      { fork, base: impl.baseSha, impl: impl.id, from: head, built: made.commit, revise: req.prNumber, changed: patchLines(delta), ...(made.check.compileTime.length && { compileTime: made.check.compileTime }) });
     if (push.code !== 0 && /stale info/i.test(push.stderr)) return moved(`the head of #${req.prNumber} moved from ${short(head)} during the push`);
     if (push.code !== 0) return fail(`the push failed: ${oneLine(push.stderr)}`, true);
     log(`  ${ref(impl)}: pushed ${short(commit)} onto ${short(head)} of #${req.prNumber}`);
@@ -585,4 +577,11 @@ export async function pushRevision(db: Db, d: ReviseDeps, impl: Implementation, 
   } catch (e) {
     return fail(oneLine(String((e as Error).message ?? e)), true);
   }
+}
+
+/** The attempt's rounds as stored now; a newer attempt of the issue ends the revision's job. */
+async function roundsNow(db: Db, impl: Implementation): Promise<ImplementationRound[]> {
+  const a = await attemptNow(db, impl);
+  if (!a) throw new Error(`${ref(impl)}: a newer attempt started meanwhile`);
+  return a.rounds;
 }

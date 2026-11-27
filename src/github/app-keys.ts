@@ -9,6 +9,8 @@
 import { readFileSync } from "node:fs";
 import { appSecretsOf, checkSecretsFileMode, readSecrets, type AppSecrets, type Secrets } from "../dash/server/config.ts";
 import { TokenBox } from "../dash/server/crypto.ts";
+import * as access from "../data/access/index.ts";
+import type { Sealed } from "../data/access/index.ts";
 import type { Db } from "../db/index.ts";
 import { envVar } from "../env.ts";
 
@@ -37,17 +39,14 @@ export class AppKeys {
    */
   async load(): Promise<this> {
     const file = this.#file ? fileKeys(this.#file) : null;
-    if (file && !await this.#db.get(this.#db.k.selectFrom("github_app").select("id").where("id", "=", 1))) {
-      await this.#db.run(this.#db.k.insertInto("github_app").values(this.#row(file)).onConflict((oc) => oc.column("id").doNothing()));
+    if (file && await access.importAppIfAbsent(this.#db, { appId: Number(file.id), slug: file.slug, sealed: this.#seal(file) })) {
       console.log(`imported the GitHub App ${file.slug} from the secrets file into the database`);
     }
     await this.#read();
     const app = this.#app;
     if (file?.webhookSecret && app && app.id === file.id && app.webhookSecret !== file.webhookSecret) {
       const next = { ...app, webhookSecret: file.webhookSecret };
-      const r = await this.#db.run(this.#db.k.updateTable("github_app").set({ keys_enc: this.#row(next).keys_enc, updated_at: new Date().toISOString() })
-        .where("id", "=", 1).where("app_id", "=", file.id).where("keys_enc", "is not", null));
-      if (r.changes === 1) this.#set(next);
+      if (await access.swapAppWebhook(this.#db, Number(file.id), this.#seal(next))) this.#set(next);
     }
     return this;
   }
@@ -75,21 +74,18 @@ export class AppKeys {
    * with `replaceUnreadable`; otherwise the refusal has code EUNREADABLE.
    */
   async save(app: AppSecrets, replaceUnreadable = false): Promise<void> {
-    const row = this.#row(app);
     const unreadable = this.#unreadable;
     if (unreadable !== null && !replaceUnreadable) throw Object.assign(new Error("the stored keys are sealed with a different session_key"), { code: "EUNREADABLE" });
-    const r = await this.#db.run(this.#db.k.insertInto("github_app").values(row)
-      .onConflict((oc) => oc.column("id").doUpdateSet(row).where((eb) => unreadable === null ? eb("github_app.keys_enc", "is", null)
-        : eb.or([eb("github_app.keys_enc", "is", null), eb("github_app.keys_enc", "=", unreadable)]))));
-    if (!r.changes) throw Object.assign(new Error("another app is registered"), { code: "EEXIST" });
+    if (!await access.saveApp(this.#db, { appId: Number(app.id), slug: app.slug, sealed: this.#seal(app) }, { replaceUnreadable: unreadable as Sealed | null })) {
+      throw Object.assign(new Error("another app is registered"), { code: "EEXIST" });
+    }
     this.#unreadable = null;
     this.#set(app);
   }
 
   /** Forgets the app's keys; the row stays, so the secrets file's keys are not imported again. */
   async clear(): Promise<void> {
-    await this.#db.run(this.#db.k.insertInto("github_app").values({ id: 1, app_id: null, slug: null, keys_enc: null, updated_at: new Date().toISOString() })
-      .onConflict((oc) => oc.column("id").doUpdateSet({ app_id: null, slug: null, keys_enc: null, updated_at: new Date().toISOString() })));
+    await access.clearApp(this.#db);
     this.#unreadable = null;
     this.#set(null);
   }
@@ -102,16 +98,16 @@ export class AppKeys {
     this.#readAt = Date.now();
   }
 
-  #row(app: AppSecrets) {
-    return { id: 1, app_id: app.id, slug: app.slug, keys_enc: this.#box.seal(JSON.stringify(app), AAD), updated_at: new Date().toISOString() };
+  #seal(app: AppSecrets): Sealed {
+    return this.#box.seal(JSON.stringify(app), AAD) as Sealed;
   }
 
   async #read(): Promise<void> {
-    const row = await this.#db.get(this.#db.k.selectFrom("github_app").select("keys_enc").where("id", "=", 1));
-    const plain = row?.keys_enc ? this.#box.open(row.keys_enc, AAD) : null;
+    const row = await access.loadAppSealed(this.#db);
+    const plain = row ? this.#box.open(row.sealed, AAD) : null;
     let app: AppSecrets | null = null;
     try { app = plain ? (JSON.parse(plain) as AppSecrets) : null; } catch { /* unreadable, as below */ }
-    const unreadable = row?.keys_enc && !app ? row.keys_enc : null;
+    const unreadable = row && !app ? row.sealed : null;
     if (unreadable && !this.#unreadable) console.error("the stored GitHub App keys cannot be opened with this session_key (was session_key changed?); no app is in use");
     this.#unreadable = unreadable;
     this.#set(app);

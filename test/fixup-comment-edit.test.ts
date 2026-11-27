@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { newestOwnComment } from "../src/fixup/conflict.ts";
 import { withNote } from "../src/github/note.ts";
-import { commentText, fixupCommentEdited, fixupCommentLines, carryCommentText, operatorCommentText } from "../src/fixup/template.ts";
+import { commentText, fixupCommentEdited, fixupCommentLines, operatorCommentText } from "../src/fixup/template.ts";
 
 const BOT = new Set(["bot"]);
 const q = (nodes: object[], reviews: object[] = []) => ({ async query() { return { repository: { pullRequest: { comments: { nodes }, reviews: { nodes: reviews } } } }; } });
@@ -10,7 +10,7 @@ const node = (text: string, login = "bot") => ({ databaseId: 9, body: withNote({
 
 test("a second review-fix push extends our newest comment; anything else posts a new one", async () => {
   const first = commentText(["a.rs", "b.md"]);
-  const mine = await newestOwnComment(q([node(first)]), BOT, "app", 1);
+  const mine = await newestOwnComment(q([node(first, "Bot")]), BOT, "app", 1);
   assert.equal(mine?.id, "9");
   const lines = fixupCommentLines(mine!.body)!;
   const edited = fixupCommentEdited(lines, ["c.rs"]);
@@ -18,7 +18,7 @@ test("a second review-fix push extends our newest comment; anything else posts a
   // A third round keeps both earlier lines.
   assert.equal(fixupCommentLines(withNote({ by: "fixed" }, edited))?.length, 2);
   // Not ours to extend: carry, operator, other text, another author, a later review, a failed read.
-  assert.equal(fixupCommentLines(carryCommentText([3], ["a.rs"])), null);
+  assert.equal(fixupCommentLines("Carried over from #3: `a.rs`."), null);
   assert.equal(fixupCommentLines(operatorCommentText(["a.rs"])), null);
   assert.equal(fixupCommentLines("Looks good"), null);
   assert.equal(await newestOwnComment(q([node(first, "someone")]), BOT, "app", 1), null);

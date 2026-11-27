@@ -2,7 +2,7 @@
 // One small chart per stage (a single measure and scale each); account lines share one 0-100 % scale.
 import { useLayoutEffect, useRef, useState } from "react";
 import { useQuery } from "../../api/client";
-import type { RateBucket, Rates, UsagePause } from "../../api/types";
+import type { RateBucket, Rates } from "../../api/types";
 import { clock, num } from "../../lib/format";
 import { Segmented } from "../../ui/molecules/Segmented";
 import { cn } from "../../ui/cn";
@@ -77,96 +77,14 @@ function StageChart({ buckets, hourly, title }: { buckets: RateBucket[]; hourly:
   );
 }
 
-const SERIES = ["var(--st-c1)", "var(--st-c2)", "var(--st-c3)", "var(--st-c4)", "var(--st-c5)"];
-
-/** Lines of use (0-100 %) per account over time. Colour follows the account's position in the list, not its value. */
-function UseChart({ r, field, title, pause }: { r: Rates; field: "fiveHourPct" | "weeklyPct"; title: string; pause: number | undefined }) {
-  const [box, W] = useWidth();
-  const [hover, setHover] = useState<number | null>(null);
-  const H = 170;
-  const pad = { l: 34, r: 8, t: 8, b: 20 };
-  const n = r.accounts[0]?.samples.length ?? 0;
-  if (!n) return <p className="text-sm text-ink/55">No readings yet.</p>;
-  const x = (i: number) => pad.l + (i / Math.max(1, n - 1)) * (W - pad.l - pad.r);
-  const y = (v: number) => pad.t + (H - pad.t - pad.b) * (1 - v / 100);
-  const ts = r.accounts[0]!.samples.map((s) => s.t);
-  const every = Math.ceil((W < 400 ? 70 : 56) / ((W - pad.l - pad.r) / Math.max(1, n - 1)));
-  const hourly = r.bucket === "hour";
-  const label = (t: string) => (hourly ? tickLabel(t, true) : `${new Date(t).toLocaleDateString("en", { weekday: "short" })} ${clock(t)}`);
-  return (
-    <div>
-      <ul className="mb-2 flex flex-wrap gap-x-4 gap-y-1">
-        {r.accounts.map((a, k) => (
-          <li key={a.id} className="flex items-center gap-1.5 text-xs text-ink/70">
-            <span className="h-0.5 w-4 rounded-full" style={{ background: SERIES[k] }} />
-            {a.label}
-          </li>
-        ))}
-      </ul>
-      <div ref={box} className="relative w-full">
-        <svg
-          width={W}
-          height={H}
-          className="block touch-pan-y"
-          role="img"
-          aria-label={title}
-          onMouseLeave={() => setHover(null)}
-          onMouseMove={(e) => {
-            const rect = e.currentTarget.getBoundingClientRect();
-            setHover(Math.min(n - 1, Math.max(0, Math.round(((e.clientX - rect.left - pad.l) / (W - pad.l - pad.r)) * (n - 1)))));
-          }}
-        >
-          {[0, 50, 100].map((t) => (
-            <g key={t}>
-              <line x1={pad.l} x2={W - pad.r} y1={y(t)} y2={y(t)} stroke="var(--st-line)" strokeDasharray={t === 0 ? undefined : "2 3"} />
-              <text x={pad.l - 5} y={y(t) + 3} textAnchor="end" className="fill-current text-[11px] text-ink/45">
-                {t}%
-              </text>
-            </g>
-          ))}
-          {pause !== undefined && <line x1={pad.l} x2={W - pad.r} y1={y(pause)} y2={y(pause)} className="stroke-bad" strokeOpacity={0.5} strokeDasharray="4 3" />}
-          {ts.map((t, i) => i % every === 0 && (
-            <text key={t} x={x(i)} y={H - 5} textAnchor={i === 0 ? "start" : "middle"} className="fill-current text-[11px] text-ink/45">
-              {tickLabel(t, hourly)}
-            </text>
-          ))}
-          {r.accounts.map((a, k) => {
-            const pts = a.samples.map((s, i) => (s[field] === null ? null : `${x(i)},${y(s[field]!)}`)).filter(Boolean);
-            return <polyline key={a.id} points={pts.join(" ")} fill="none" stroke={SERIES[k]} strokeWidth={2} strokeLinejoin="round" strokeLinecap="round" opacity={hover === null ? 1 : 0.9} />;
-          })}
-          {hover !== null && (
-            <g>
-              <line x1={x(hover)} x2={x(hover)} y1={pad.t} y2={H - pad.b} stroke="rgb(var(--st-fg-rgb))" strokeOpacity={0.3} />
-              {r.accounts.map((a, k) => a.samples[hover]?.[field] != null && <circle key={a.id} cx={x(hover)} cy={y(a.samples[hover]![field]!)} r={4} fill={SERIES[k]} stroke="var(--st-bg)" strokeWidth={2} />)}
-            </g>
-          )}
-        </svg>
-        {hover !== null && (
-          <div className="pointer-events-none absolute top-0 z-10 whitespace-nowrap rounded border border-line-strong bg-raised px-2 py-1 text-xs shadow-md" style={{ left: Math.min(Math.max(x(hover) - 70, 0), W - 190) }}>
-            <div className="text-ink/60">{label(ts[hover]!)}</div>
-            {r.accounts.map((a, k) => (
-              <div key={a.id} className="num flex items-center gap-1.5">
-                <span className="size-2 rounded-sm" style={{ background: SERIES[k] }} />
-                {a.label}: {a.samples[hover]?.[field] ?? "–"}
-                {a.samples[hover]?.[field] != null && " %"}
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
 export function RatesView() {
   const [win, setWin] = useState<"24h" | "7d">("24h");
   const q = useQuery<Rates>(`rates-${win}`, (a) => a.rates(win));
-  const pause = useQuery<UsagePause>("accounts-pause", (a) => a.accounts.pause()).data;
   const r = q.data;
   const hourly = r?.bucket === "hour";
   const per = hourly ? "hour" : "day";
   return (
-    <Page title="Rates" sub="Items moving through the pipeline and account use">
+    <Page title="Rates" sub="Items moving through the pipeline">
       <div className="mt-3 flex items-center gap-3">
         <Segmented<"24h" | "7d"> label="Window" value={win} onChange={setWin} options={[{ value: "24h", label: "Last 24 hours" }, { value: "7d", label: "Last 7 days" }]} />
       </div>
@@ -193,18 +111,6 @@ export function RatesView() {
               })}
             </div>
             <StageTable r={r} />
-          </Block>
-          <Block title="Account use over time" aside="dashed line: pause level">
-            <div className="grid gap-x-6 gap-y-5 md:grid-cols-2">
-              <div className="min-w-0">
-                <h3 className="mb-1 text-sm font-semibold">5-hour use</h3>
-                <UseChart r={r} field="fiveHourPct" title="5-hour use per account over time" pause={pause?.fiveHour} />
-              </div>
-              <div className="min-w-0">
-                <h3 className="mb-1 text-sm font-semibold">Weekly use</h3>
-                <UseChart r={r} field="weeklyPct" title="Weekly use per account over time" pause={pause?.weekly} />
-              </div>
-            </div>
           </Block>
         </div>
       )}

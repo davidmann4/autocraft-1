@@ -19,7 +19,7 @@ import { createWorkspace } from "../src/build/workspaces.ts";
 import { warmPlan } from "../src/worker/rust.ts";
 import { startWorkerServer } from "../src/build/worker-api.ts";
 import { SCRATCH } from "./scratch.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb } from "./helpers/raw-db.ts";
 
 mkdirSync(SCRATCH, { recursive: true });
 const dir = mkdtempSync(join(SCRATCH, "build-pods-"));

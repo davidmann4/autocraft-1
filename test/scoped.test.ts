@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb } from "./helpers/raw-db.ts";
 import { SHADOWED_TABLES } from "../src/repos.ts";
 
 test("a scoped handle sees tracked repos only and writes through main. to every repo", async () => {

@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { isHalt, NoTakerError, WaitLimitError } from "./agents/call.ts";
 import { jevAvailable } from "./agents/jev.ts";
 import { runModelStep } from "./agents/step.ts";
-import { inferenceMode, tierOfModel } from "./remote/mode.ts";
+import { tierOfModel } from "./remote/mode.ts";
 import { ownTaker } from "./remote/takers.ts";
 import { scaled } from "./remote/time-scale.ts";
 import { CLAUDE_PROMPTS } from "./prompts/index.ts";
@@ -157,14 +157,12 @@ export type SemanticDeps = {
   jevUsable?(): Promise<boolean>;
 };
 
-/** The longest wait for a free account slot before the Haiku check gives up (counts as no): the fix turn must follow while the prompt cache is warm. */
-export const HAIKU_WAIT_MS = 30_000;
 /**
- * The same in the user-local mode, where the check waits for a helper that may be busy with a long call: an unanswered
- * check lets the text out unchecked, which costs more than a fix turn on a cold cache.
+ * The longest wait of the Haiku check for a Task Runner that may be busy with a long call: an unanswered check lets the text
+ * out unchecked, which costs more than a fix turn on a cold cache.
  */
 export const HAIKU_WAIT_REMOTE_MS = 10 * 60_000;
-/** The same for a check bound to a maintainer: their own lane takes it at once, so a longer wait means none will. */
+/** The wait of a check bound to a maintainer: their own lane takes it at once, so a longer wait means none will. */
 export const HAIKU_WAIT_OWN_MS = scaled(60_000);
 
 /** `forLogin`: the Haiku check runs only on that user's own Task Runners (a maintainer's conversation turn). */
@@ -187,7 +185,7 @@ export function defaultSemanticDeps(db: Db, ref: string, o: { forLogin?: string 
           throw e;
         }
       }
-      const r = await runModelStep(db, REFERENCE_HAIKU, [{ ref, text }], { maxWaitMs: await inferenceMode(db) === "user-local" ? HAIKU_WAIT_REMOTE_MS : HAIKU_WAIT_MS });
+      const r = await runModelStep(db, REFERENCE_HAIKU, [{ ref, text }], { maxWaitMs: HAIKU_WAIT_REMOTE_MS });
       return r.ok ? r.value : null;
     },
     jevUsable: async () => await jevAvailable(db),

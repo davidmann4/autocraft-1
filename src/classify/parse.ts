@@ -7,9 +7,6 @@ export type Item = {
   title: string; body: string;
   lines_changed: number | null; files_changed: number | null;
   author_association: string | null;
-  /** Only the Decide summary sends these. */
-  labels?: string[];
-  comments?: { author: string | null; body: string }[];
 };
 
 export type Verdict = {
@@ -37,20 +34,6 @@ export function itemInput(i: Item): Record<string, unknown> {
   if (i.kind === "pr") { o.lines_changed = i.lines_changed; o.files_changed = i.files_changed; }
   return o;
 }
-
-export const COMMENT_LIMIT = 800;
-export const COMMENTS_PER_ITEM = 3;
-
-/** itemInput plus GitHub labels and the first comments: the Decide summary's input. */
-export function summaryInput(i: Item): Record<string, unknown> {
-  return {
-    ...itemInput(i), labels: i.labels ?? [],
-    comments: (i.comments ?? []).slice(0, COMMENTS_PER_ITEM).map((c) => ({ author: c.author, body: c.body.slice(0, COMMENT_LIMIT) })),
-  };
-}
-
-export const SUMMARY_MIN = 40;
-export const SUMMARY_MAX = 1000;
 
 const isLabel = (v: unknown): v is Label => typeof v === "string" && (LABELS as readonly string[]).includes(v);
 

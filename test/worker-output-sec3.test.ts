@@ -13,7 +13,7 @@ import { computeChecks } from "../src/health-checks.ts";
 import { runFix, type FixDeps } from "../src/security/fix.ts";
 import { advanceSecurityFixes } from "../src/security/actions.ts";
 import { rustPlan } from "../src/worker/rust.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb } from "./helpers/raw-db.ts";
 
 const HEAD = [
   "fn add(a: i32, b: i32) -> i32 { a + b }",

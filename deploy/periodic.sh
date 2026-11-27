@@ -22,7 +22,8 @@ last_backup() {
   if [ -n "$f" ]; then stat -c %Y "$f"; else echo 0; fi
 }
 while true; do
-  node --no-warnings src/cli.ts sync || echo "sync exited $?" >&2
+  # A run that does not end within 15 minutes is stopped, so the loop always goes on.
+  timeout --kill-after=30s 900 node --no-warnings src/cli.ts sync || echo "sync exited $?" >&2
   if [ "$snapshots" = 1 ] && [ $(( $(date +%s) - $(last_backup) )) -ge 86400 ]; then
     bash deploy/backup.sh daily 7 || echo "backup exited $?" >&2
   fi

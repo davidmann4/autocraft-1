@@ -9,20 +9,17 @@ import type { RunnersReply } from "../web/src/api/types.ts";
 import { addLogin } from "../src/access.ts";
 import { splitRunnerTokens } from "../src/db.ts";
 import { apiRoutes } from "../src/dash/api/index.ts";
-import { answering } from "../src/dash/mcp/index.ts";
 import { createToken } from "../src/dash/mcp/tokens.ts";
 import { loadConfig } from "../src/dash/server/config.ts";
 import { randomToken, sha256hex } from "../src/dash/server/crypto.ts";
-import { startServer } from "../src/dash/server/index.ts";
+import { startServer, SUBMIT_BODY_LIMIT } from "../src/dash/server/index.ts";
 import { FakeProvider } from "../src/dash/server/provider.ts";
 import { HttpError, RateLimiter } from "../src/dash/server/util.ts";
 import { parseClaim } from "../src/remote/calls.ts";
 import { addressKey, MAX_PENDING_PER_ADDRESS, startLogin } from "../src/remote/device-login.ts";
-import { setInferenceMode } from "../src/remote/mode.ts";
-import { setMaintainerWrites } from "../src/settlers.ts";
 import { PROTOCOL_VERSION, ROUTES, type LoginStartReply, type PendingRunnerLogin } from "../src/remote/protocol.ts";
 import { SCRATCH } from "./scratch.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb } from "./helpers/raw-db.ts";
 import { sqliteOnly } from "./test-db.ts";
 
 mkdirSync(SCRATCH, { recursive: true });
@@ -76,13 +73,12 @@ describe("over HTTP", async () => {
   let base = "";
   let close: () => Promise<void>;
   before(async () => {
-    await setInferenceMode(db, "user-local", "test");
     await addLogin(db, "cli", "maint", "maintainer", null);
     await addLogin(db, "cli", "watcher", "viewer", null);
     await addLogin(db, "cli", "boss", "operator", null);
     const config = loadConfig({ AUTOCRAFT_DEV_AUTH: "1", AUTOCRAFT_LISTEN: "127.0.0.1:0", AUTOCRAFT_DB: file, AUTOCRAFT_DEV_PERMS: perms });
     const limiter = new RateLimiter(60, 3600_000);
-    const s = await startServer({ config, db, provider: new FakeProvider(perms), feedbackLimiter: limiter, routes: apiRoutes({ limiter }) });
+    const s = await startServer({ config, db, provider: new FakeProvider(perms), routes: apiRoutes() });
     base = s.url;
     close = s.close;
   });
@@ -150,44 +146,31 @@ describe("over HTTP", async () => {
     assert.match(String((noAgent.body.error as { message: string }).message), /tick Agent access/);
   });
 
-  test("a runner's scopes: agent access opens /mcp, answering adds the answer tools, and the owner changes both", async () => {
-    answering.enabled = true;
-    try {
-      const boss = await signedIn("boss");
-      const { token, row } = await createToken(db, "boss", "studio", { kind: "runner", canAgent: true });
-      const tools = await toolNames(token);
-      assert.ok(tools.includes("list_inbox"), tools.join());
-      assert.ok(!tools.includes("answer_decision"));
-      const list = await boss<RunnersReply>("POST", "/api/runners/scopes", { id: row.id, agent: true, answer: true });
-      assert.deepEqual(list.runners.filter((r) => r.tokenId === row.id).map((r) => [r.agent, r.answer]), [[true, true]]);
-      assert.equal(list.answering, true);
-      assert.ok((await toolNames(token)).includes("answer_decision"));
-      assert.ok(await db.prepare("SELECT 1 FROM audit WHERE action = 'runner-scopes' AND login = 'boss'").get());
-      await boss("POST", "/api/runners/scopes", { id: row.id, agent: false, answer: false });
-      assert.equal((await post("/mcp", { jsonrpc: "2.0", id: 1, method: "ping" }, token)).status, 403);
-      await (await signedIn("maint"))("POST", "/api/runners/scopes", { id: row.id, agent: true, answer: false }, 404);
-    } finally {
-      answering.enabled = false;
-    }
+  test("a runner's scopes: agent access opens /mcp, answering adds the command tool, and the owner changes both", async () => {
+    const boss = await signedIn("boss");
+    const { token, row } = await createToken(db, "boss", "studio", { kind: "runner", canAgent: true });
+    const tools = await toolNames(token);
+    assert.ok(tools.includes("list_repos"), tools.join());
+    assert.ok(!tools.includes("command"));
+    const list = await boss<RunnersReply>("POST", "/api/runners/scopes", { id: row.id, agent: true, answer: true });
+    assert.deepEqual(list.runners.filter((r) => r.tokenId === row.id).map((r) => [r.agent, r.answer]), [[true, true]]);
+    assert.equal(list.answering, true);
+    assert.ok((await toolNames(token)).includes("command"));
+    assert.ok(await db.get(db.k.selectFrom("audit").select((eb) => eb.lit(1).as("one")).where("action", "=", "runner-scopes").where("login", "=", "boss")));
+    await boss("POST", "/api/runners/scopes", { id: row.id, agent: false, answer: false });
+    assert.equal((await post("/mcp", { jsonrpc: "2.0", id: 1, method: "ping" }, token)).status, 403);
+    await (await signedIn("maint"))("POST", "/api/runners/scopes", { id: row.id, agent: true, answer: false }, 404);
   });
 
-  test("approving with answering needs a login that settles decisions", async () => {
-    answering.enabled = true;
-    try {
-      const credential = `acrun_${randomToken(32)}`;
-      const { userCode } = await start(credential, { answer: true });
-      const maint = await signedIn("maint");
-      const card = await maint<PendingRunnerLogin>("GET", `/api/runners/pending?code=${userCode}`);
-      assert.deepEqual(card.scopes, { agent: true, answer: true });
-      await maint("POST", "/api/runners/approve", { code: userCode, agent: true, answer: true }, 403);
-      await setMaintainerWrites(db, true);
-      const list = await maint<RunnersReply>("POST", "/api/runners/approve", { code: userCode, agent: true, answer: true });
-      assert.ok(list.runners.some((r) => r.label === "laptop" && r.agent && r.answer));
-      assert.ok((await toolNames(credential)).includes("answer_decision"));
-    } finally {
-      answering.enabled = false;
-      await setMaintainerWrites(db, false);
-    }
+  test("a maintainer approves a Task Runner that sends commands; a viewer cannot", async () => {
+    const credential = `acrun_${randomToken(32)}`;
+    const { userCode } = await start(credential, { answer: true });
+    const maint = await signedIn("maint");
+    const card = await maint<PendingRunnerLogin>("GET", `/api/runners/pending?code=${userCode}`);
+    assert.deepEqual(card.scopes, { agent: true, answer: true });
+    const list = await maint<RunnersReply>("POST", "/api/runners/approve", { code: userCode, agent: true, answer: true });
+    assert.ok(list.runners.some((r) => r.label === "laptop" && r.agent && r.answer));
+    assert.ok((await toolNames(credential)).includes("command"));
   });
 
   test("device login: the runner starts, a maintainer looks up the code and approves, the runner polls and claims", async () => {
@@ -278,7 +261,7 @@ describe("over HTTP", async () => {
     }).returning("id")))!.id);
     const enc = (body: unknown) => ({ encoding: "gzip+base64", body: gzipSync(JSON.stringify(body)).toString("base64") });
     const reply = { ok: true, text: "<script>alert(1)</script> UNION SELECT", model: "claude-opus-4-5", usage: { inputTokens: 1, outputTokens: 1 }, durationMs: 5 };
-    assert.equal((await post(ROUTES.submit, enc({ ...reply, text: "x".repeat(8 * 1024 * 1024) }), secret)).status, 413);
+    assert.equal((await post(ROUTES.submit, enc({ ...reply, text: "x".repeat(SUBMIT_BODY_LIMIT) }), secret)).status, 413);
     assert.equal((await post(ROUTES.heartbeat, enc({ phase: "running", progress: "Reading /etc/passwd" }), secret)).status, 200);
     assert.deepEqual(await post(ROUTES.submit, enc(reply), secret), { status: 200, body: { accepted: true } });
     assert.equal((await db.get(db.k.selectFrom("remote_calls").select("reply").where("id", "=", call)))!.reply, reply.text);

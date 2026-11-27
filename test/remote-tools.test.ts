@@ -17,13 +17,12 @@ import { FakeProvider } from "../src/dash/server/provider.ts";
 import { RateLimiter } from "../src/dash/server/util.ts";
 import type { Embedder } from "../src/embed/model.ts";
 import { awaitCall, claimCall, enqueueCall, submitCall, type Caller } from "../src/remote/calls.ts";
-import { setInferenceMode } from "../src/remote/mode.ts";
 import { PROTOCOL_VERSION, ROUTES, type TaskBundle } from "../src/remote/protocol.ts";
-import { buildReferenceIndex } from "../src/reference-search.ts";
+import { buildReferenceIndex } from "../src/data/external/index.ts";
 import { PASSAGES_PER_LEASE, referenceOptions } from "../src/remote/tools.ts";
 import { SCRATCH } from "./scratch.ts";
 import { writeTestSnapshot } from "./test-db.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb } from "./helpers/raw-db.ts";
 import { startWorkerServer } from "../src/build/worker-api.ts";
 
 mkdirSync(SCRATCH, { recursive: true });
@@ -48,7 +47,6 @@ describe("per-lease tools of remote calls", async () => {
   before(async () => {
     allocation.pollMs = 10;
     referenceOptions.embedder = fake;
-    await setInferenceMode(db, "user-local", "test");
     const now = new Date().toISOString();
     await db.run(db.k.insertInto("repos").values({ name: "photocraft", owner: "storytold", visibility: "public" }));
     await db.run(db.k.insertInto("items").values({ repo: "photocraft", number: 7, kind: "issue", state: "OPEN", title: "Wave filter crashes", body: "b", author: "alice", created_at: now, updated_at: now }));
@@ -75,7 +73,7 @@ describe("per-lease tools of remote calls", async () => {
     await submitCall(db, leases.get("ended")!.secret, { ok: false, error: "x", durationMs: 1 });
     const config = loadConfig({ AUTOCRAFT_DEV_AUTH: "1", AUTOCRAFT_LISTEN: "127.0.0.1:0", AUTOCRAFT_DB: dbFile, AUTOCRAFT_DEV_PERMS: permsFile });
     const limiter = new RateLimiter(60, 3600_000);
-    const s = await startServer({ config, db, provider: new FakeProvider(permsFile), feedbackLimiter: limiter, routes: apiRoutes({ limiter }) });
+    const s = await startServer({ config, db, provider: new FakeProvider(permsFile), routes: apiRoutes() });
     base = s.url;
     close = s.close;
   });

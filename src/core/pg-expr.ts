@@ -1,4 +1,4 @@
-// Postgres forms of the SQLite fragments the change-log and live-topic registries are written in (src/core/plan-inputs.ts,
+// Postgres forms of the SQLite fragments the change-log and live-topic registries are written in (src/db/plan-inputs.ts,
 // src/live.ts), for the Postgres triggers (src/db/pg-triggers.ts).
 
 /** A stored JSON text `x` when it is an array, else '[]' (Postgres; CASE keeps the cast from running on text that is not JSON). */

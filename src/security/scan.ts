@@ -4,19 +4,18 @@
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join, resolve, sep } from "node:path";
 import type { FindingVerification } from "../../web/src/api/types.ts";
+import { addAudit } from "../data/control/index.ts";
+import * as sec from "../data/security/index.ts";
 import { featureOn } from "../build/features.ts";
-import { audit } from "../dash/audit.ts";
 import type { CratesResult } from "../verify/crates.ts";
+import { holdCheckouts } from "../sandbox/checkout.ts";
 import { writeAndQueue } from "./scantest.ts";
-import { ACTIVE_STATES, findingKey, finishScan, scanRow } from "./store.ts";
+import { finishScan } from "./store.ts";
 import {
   securityRepo, parseCandidates, parseScanTest, parseThreatModel, parseVerdict, survives, titleKey,
   type Candidate, type SecurityAreaInput, type SecurityModelInput, type SecurityScanTestInput, type SecurityVerifyInput, type ThreatArea, type ThreatModel,
 } from "./rules.ts";
-import { forEachSeq } from "../async-seq.ts";
 import type { Db } from "../db/index.ts";
-import * as kx from "../db/kx.ts";
-import type { NotNull } from "kysely";
 
 /** One model call. `text` is null when the call gave no answer; `cost` is what it cost whatever the outcome, null when unknown. */
 /** `runId` is the first agent run the call made (shown on the scan page); absent when it made none. */
@@ -52,7 +51,6 @@ const MAX_FILE = 2 * 1024 * 1024;
 /** Calls are repeated once when the reply cannot be read. */
 const ATTEMPTS = 2;
 
-const now = (): string => new Date().toISOString();
 const mean = (xs: number[]): number | null => (xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : null);
 
 /** Bytes of the regular files under `paths` in the checkout, counted up to BYTES_CAP; null when none of the paths exists. */
@@ -129,45 +127,54 @@ export const earlierFinding = (known: Known[], c: Pick<Candidate, "title" | "cat
  * stored under an older rule are linked too.
  */
 export async function linkRepeatedFindings(db: Db): Promise<number> {
-  const rows = await db.all(db.k.selectFrom("security_findings").select(["repo", "number", "state", "fingerprint", "title", "refs", "category"]).orderBy("repo").orderBy("number"));
-  let linked = 0, repo = "", known: Known[] = [];
+  const rows = await sec.loadFindingsForLinking(db);
+  let repo = "", known: Known[] = [];
+  const links: { repo: string; number: number; duplicateOf: number }[] = [];
   for (const r of rows) {
     if (r.repo !== repo) { repo = r.repo; known = []; }
     const k = knownOf(r);
     const earlier = r.state === "new" && k.sink ? earlierFinding(known, { title: r.title, category: r.category ?? "", refs: k.refs as Candidate["refs"] }) : undefined;
-    if (earlier && (await db.run(db.k.updateTable("security_findings").set({ state: "duplicate", duplicate_of: earlier.number, updated_at: now() })
-      .where("repo", "=", r.repo).where("number", "=", r.number).where("state", "=", "new"))).changes) {
-      await audit(db, "pipeline", "security-finding-duplicate", findingKey(r.repo, r.number), { duplicateOf: earlier.number });
+    if (earlier) {
+      links.push({ repo: r.repo, number: r.number, duplicateOf: earlier.number });
       k.state = "duplicate";
-      linked++;
     }
     known.push(k);
   }
-  return linked;
+  if (!links.length) return 0;
+  return await db.write(async () => {
+    const marked = new Set(await sec.markDuplicates(db, links));
+    const hit = links.filter((l) => marked.has(sec.findingKey(l.repo, l.number)));
+    await addAudit(db, hit.map((l) => ({ login: "pipeline", action: "security-finding-duplicate", target: `${l.repo}:finding:${l.number}`, details: { duplicateOf: l.duplicateOf } })));
+    return hit.length;
+  });
 }
+
+/** The states a verdict is stored over: `new` too, since Stop lists a finding that its verify call is still judging. */
+const VERDICT_FROM: sec.StoredFindingState[] = ["unverified", "new"];
 
 const parse = <T>(s: string): T => JSON.parse(s) as T;
 
 class Capped extends Error {}
 class Stopped extends Error {}
 
+
 /**
  * Runs scan `scanId` (created by the API in state `modeling`) to the end: done, stopped, capped or failed.
  * Returns the summary line of the job.
  */
 export async function runScan(db: Db, scanId: number, deps: ScanDeps): Promise<string> {
-  const scan = await scanRow(db, scanId);
-  if (!scan) throw new Error(`no scan ${scanId}`);
-  if (!ACTIVE_STATES.includes(scan.state)) return `scan ${scanId} already ${scan.state}`;
+  const data = await sec.loadScanRun(db, scanId);
+  if (!data) throw new Error(`no scan ${scanId}`);
+  const { scan } = data;
+  if (!sec.ACTIVE_STATES.includes(scan.state as sec.ScanState)) return `scan ${scanId} already ${scan.state}`;
   const { repo, cap_usd: cap } = scan;
-  const stopped = async (): Promise<boolean> => await deps.cancelled() || (await scanRow(db, scanId))?.state === "stopped";
-  const setState = async (state: "modeling" | "scanning" | "verifying"): Promise<void> => void await db.run(db.k.updateTable("security_scans").set({ state }).where("id", "=", scanId).where("state", "in", ACTIVE_STATES));
+  const stopped = async (): Promise<boolean> => await deps.cancelled() || (await sec.loadScanGuard(db, scanId))?.state === "stopped";
+  const setState = (state: "modeling" | "scanning" | "verifying"): Promise<void> => sec.setScanState(db, scanId, state);
   const progress = (line: string): void => { deps.progress?.(line); deps.log(line); };
-  const cost = async (): Promise<number> => (await scanRow(db, scanId))!.cost_usd;
+  const cost = async (): Promise<number> => (await sec.loadScanGuard(db, scanId))!.cost_usd;
   // The calls of an earlier run of this scan (a continued scan) feed the estimates like the calls of this run.
-  const earlier = async (kind: string): Promise<number[]> => (await db.all(db.k.selectFrom("security_calls").select("cost_usd").$narrowType<{ cost_usd: NotNull }>()
-    .where("scan_id", "=", scanId).where("kind", "=", kind).where("ok", "=", 1).where("cost_usd", "is not", null).orderBy("id"))).map((r) => r.cost_usd);
-  const areaCalls: number[] = await earlier("area"), verifyCalls: number[] = await earlier("verify");
+  const earlier = (kind: string): number[] => data.callCosts.filter((c) => c.kind === kind).map((c) => c.costUsd);
+  const areaCalls: number[] = earlier("area"), verifyCalls: number[] = earlier("verify");
   let areaGuess = areaGuessUsd(0);
 
   /** One call with the cap and stop checks before it; the call's cost goes to the scan and, for area work, to the area. */
@@ -176,15 +183,13 @@ export async function runScan(db: Db, scanId: number, deps: ScanDeps): Promise<s
     for (let attempt = 0; attempt < ATTEMPTS; attempt++) {
       if (await stopped()) throw new Stopped();
       if (cap !== null && await cost() + expected > cap) throw new Capped();
-      const id = (await db.get(db.k.insertInto("security_calls").values({ scan_id: scanId, kind, area_idx: meta.area ?? null, finding_number: meta.finding ?? null, started_at: now() }).returning("id")))!.id;
+      const callId = await sec.beginScanCall(db, { scanId, kind, areaIdx: meta.area ?? null, finding: meta.finding ?? null });
       let reply: Reply | null = null;
       try { reply = await run(); } catch (e) { deps.log(`${kind} call failed: ${(e as Error).message}`.slice(0, 300)); }
       // A call that answered without a reported cost counts as the expected cost; one that failed counts what it reported.
       const c = reply ? reply.cost ?? (reply.text !== null ? expected : 0) : 0;
       const value = reply?.text != null ? readReply(reply.text) : null;
-      await db.run(db.k.updateTable("security_calls").set({ ended_at: now(), ok: value === null ? 0 : 1, cost_usd: reply ? c : null, agent_run_id: reply?.runId ?? null }).where("id", "=", id));
-      await db.run(db.k.updateTable("security_scans").set((eb) => ({ cost_usd: eb("cost_usd", "+", c) })).where("id", "=", scanId));
-      if (meta.bill !== undefined) await db.run(db.k.updateTable("security_areas").set((eb) => ({ cost_usd: eb("cost_usd", "+", c) })).where("scan_id", "=", scanId).where("idx", "=", meta.bill));
+      await sec.endScanCall(db, { callId, scanId, ok: value !== null, costUsd: reply ? c : null, runId: reply?.runId ?? null, chargeUsd: c, ...(meta.bill !== undefined && { billArea: meta.bill }) });
       spent += c;
       if (value !== null) return { value, cost: spent };
     }
@@ -197,16 +202,19 @@ export async function runScan(db: Db, scanId: number, deps: ScanDeps): Promise<s
     throw new Error(`${repo}: scan ${scanId} failed: ${msg}`);
   };
 
+  // The scan reads the checkout for its whole run; held, pruning cannot evict it and silently drop the findings of later areas.
+  let release = (): void => {};
   try {
     const co = await deps.checkout(repo, scan.commit_sha ?? undefined);
     if (!co) return await fail("The repository could not be checked out for a read-only scan.");
+    release = holdCheckouts([co.dir]);
     if (scan.commit_sha && co.sha !== scan.commit_sha) return await fail(`The checkout is at ${co.sha.slice(0, 7)}, not the scan's pinned commit ${scan.commit_sha.slice(0, 7)}.`);
-    await db.run(db.k.updateTable("security_scans").set({ commit_sha: co.sha }).where("id", "=", scanId));
+    await sec.setScanCommit(db, scanId, co.sha);
     const base = { repo: securityRepo(repo), number: scanId, project: repo, commit: co.sha } as const;
 
     // A continued scan keeps its threat model and areas; only the areas still pending are scanned.
     const kept = scan.threat_model ? parse<{ summary: string; entryPoints: ThreatModel["entryPoints"] }>(scan.threat_model) : null;
-    const keptAreas = kept ? await db.all(db.k.selectFrom("security_areas").select(["idx", "name", "paths", "entry_points", "risk", "why", "state"]).where("scan_id", "=", scanId).orderBy("idx")) : [];
+    const keptAreas = kept ? data.areas : [];
     const resumed = !!kept && keptAreas.length > 0;
     let summaryText: string, entryPoints: ThreatModel["entryPoints"];
     const areas: ThreatArea[] = [];
@@ -236,20 +244,16 @@ export async function runScan(db: Db, scanId: number, deps: ScanDeps): Promise<s
         sizes.push(bytes);
       }
       if (!areas.length) return await fail("The threat model named no area that exists in the checkout.");
-      await forEachSeq(areas, async (a, i) => void await db.run(db.k.insertInto("security_areas")
-        .values({ scan_id: scanId, idx: i, name: a.name, paths: JSON.stringify(a.paths), entry_points: JSON.stringify(a.entryPoints), risk: a.risk, why: a.why })));
-      const total = sizes.map(areaGuessUsd).reduce((x, y) => x + y, 0);
-      await db.run(db.k.updateTable("security_scans")
-        .set({ areas_total: areas.length, estimate_usd: await cost() + total, threat_model: JSON.stringify({ summary: summaryText, entryPoints }) }).where("id", "=", scanId));
+      await sec.saveThreatModel(db, scanId, {
+        summaryJson: JSON.stringify({ summary: summaryText, entryPoints }), guessUsd: sizes.map(areaGuessUsd).reduce((x, y) => x + y, 0),
+        areas: areas.map((a, i) => ({ idx: i, name: a.name, paths: JSON.stringify(a.paths), entry_points: JSON.stringify(a.entryPoints), risk: a.risk, why: a.why })),
+      });
     }
     const guesses = sizes.map(areaGuessUsd);
 
-    const known: Known[] = (await db.all(db.k.selectFrom("security_findings").select(["number", "state", "fingerprint", "title", "refs", "category"]).where("repo", "=", repo).orderBy("number"))).map(knownOf);
-
-    const unverifiedOf = async (area: string): Promise<{ number: number; c: Candidate }[]> =>
-      (await db.all(db.k.selectFrom("security_findings").select(kx.cols("security_findings")).$narrowType<{ severity: Candidate["severity"] }>()
-        .where("scan_id", "=", scanId).where("area", "=", area).where("state", "=", "unverified").orderBy("number")))
-        .map((r) => ({ number: r.number, c: { title: r.title, severity: r.severity, urgent: r.urgent === 1, category: r.category ?? "", refs: parse<Candidate["refs"]>(r.refs), reach: r.reach, impact: r.impact } }));
+    const known: Known[] = data.known.map(knownOf);
+    const leftoverOf = new Map(data.leftover.map((l) => [l.areaIdx, l]));
+    const toCandidate = (r: sec.UnverifiedRow): Candidate => ({ title: r.title, severity: r.severity as Candidate["severity"], urgent: r.urgent === 1, category: r.category ?? "", refs: parse<Candidate["refs"]>(r.refs), reach: r.reach, impact: r.impact });
 
     // ---- areas ----
     for (const [idx, area] of areas.entries()) {
@@ -262,30 +266,40 @@ export async function runScan(db: Db, scanId: number, deps: ScanDeps): Promise<s
         entry_points: entryPoints.filter((e) => area.entryPoints.includes(e.name)),
       };
       // An area the cap stopped during verification has its findings already; only the unchecked ones are verified.
-      const leftover = resumed ? await unverifiedOf(area.name) : [];
-      const hasFindings = resumed && !!await db.get(db.k.selectFrom("security_findings").select((eb) => eb.lit(1).as("one")).where("scan_id", "=", scanId).where("area", "=", area.name).limit(1));
+      const left = resumed ? leftoverOf.get(idx) : undefined;
+      const leftover = (left?.unverified ?? []).map((r) => ({ number: r.number, c: toCandidate(r) }));
+      const hasFindings = !!left && left.findings > 0;
       const found = hasFindings ? { value: [] as Candidate[], cost: 0 } : await call<Candidate[]>("area", areaGuess, { area: idx, bill: idx }, () => deps.ask("security.area", input), parseCandidates);
       if (!found) {
-        await db.run(db.k.updateTable("security_areas").set({ state: "failed" }).where("scan_id", "=", scanId).where("idx", "=", idx));
+        await sec.finishArea(db, { scanId, idx, failed: true });
         deps.log(`area ${area.name}: no readable answer`);
       } else {
         if (!hasFindings) areaCalls.push(found.cost);
         const fresh: { number: number; c: Candidate }[] = [...leftover];
+        const rows: sec.NewScanFinding[] = [];
+        // The findings of this area, numbered when they are stored; until then a negative number names the row.
+        const stored: { known: Known; c: Candidate; repeat: boolean }[] = [];
         for (const c of found.value) {
           const refs = realRefs(co.dir, c.refs);
           // The first ref is the sink: a finding whose sink is not a real line is dropped.
           if (!refs.length || refs[0]!.path !== c.refs[0]!.path || refs[0]!.line !== c.refs[0]!.line) continue;
           const cand: Candidate = { ...c, refs };
-          const earlier = earlierFinding(known, cand);
-          const at = now();
+          const dupe = earlierFinding(known, cand);
           // A repeat is kept as a hidden row that points at the earlier finding, which shows it in its timeline.
-          const row = (await db.get(db.k.insertInto("security_findings").values((eb) => ({
-            repo, number: eb.selectFrom("security_findings").select((s) => s(s.fn.coalesce(s.fn.max("number"), s.lit(0)), "+", s.lit(1)).as("n")).where("repo", "=", repo),
-            scan_id: scanId, area: area.name, title: cand.title, severity: cand.severity, urgent: cand.urgent ? 1 : 0, state: earlier ? "duplicate" : "unverified",
-            refs: JSON.stringify(cand.refs), category: cand.category, reach: cand.reach, impact: cand.impact, fingerprint: fingerprintOf(cand), created_at: at, updated_at: at, duplicate_of: earlier?.number ?? null,
-          })).returning("number")))!;
-          known.push({ number: row.number, state: earlier ? "duplicate" : "unverified", fingerprint: fingerprintOf(cand), sink: cand.refs[0]!, refs: cand.refs, title: cand.title, category: cand.category ?? null });
-          if (!earlier) fresh.push({ number: row.number, c: cand });
+          rows.push({
+            scan_id: scanId, area: area.name, title: cand.title, severity: cand.severity, urgent: cand.urgent ? 1 : 0, state: dupe ? "duplicate" : "unverified",
+            refs: JSON.stringify(cand.refs), category: cand.category, reach: cand.reach, impact: cand.impact, verification: null, fingerprint: fingerprintOf(cand),
+            fix_commit: null, fix_pr: null, ghsa_id: null, fork: null, fix_patch: null, fix_title: null, fix_summary: null, fix_branch: null, fix_files: null, fix_ref: null,
+            note: null, env_wait_at: null, reason: null, decided_by: null, duplicate_of: dupe && dupe.number > 0 ? dupe.number : null, fix_attempts: 0, last_failure: null,
+            ...(dupe && dupe.number < 0 ? { repeats: -dupe.number - 1 } : {}),
+          });
+          const entry: Known = { number: -rows.length, state: dupe ? "duplicate" : "unverified", fingerprint: fingerprintOf(cand), sink: cand.refs[0]!, refs: cand.refs, title: cand.title, category: cand.category ?? null };
+          known.push(entry);
+          stored.push({ known: entry, c: cand, repeat: !!dupe });
+        }
+        for (const [i, number] of (await sec.addScanFindings(db, repo, rows)).entries()) {
+          stored[i]!.known.number = number;
+          if (!stored[i]!.repeat) fresh.push({ number, c: stored[i]!.c });
         }
         // ---- verify ----
         for (const f of fresh) {
@@ -295,13 +309,13 @@ export async function runScan(db: Db, scanId: number, deps: ScanDeps): Promise<s
           const checked = await call("verify", mean(verifyCalls) ?? VERIFY_GUESS_USD, { finding: f.number, bill: idx }, () => deps.ask("security.verify", vin), parseVerdict);
           if (!checked) {
             const v: FindingVerification = { kind: "reasoning", result: "Not verified: the verify call gave no readable answer.", notes: "", score: null, proposedTest: null };
-            await db.run(db.k.updateTable("security_findings").set({ state: "new", verification: JSON.stringify(v), updated_at: now() }).where("repo", "=", repo).where("number", "=", f.number));
+            await sec.advanceFinding(db, { repo, number: f.number, from: VERDICT_FROM, to: "new", set: { verification: JSON.stringify(v) } });
             continue;
           }
           verifyCalls.push(checked.cost);
           const verdict = checked.value;
           const v: FindingVerification = { kind: "reasoning", result: verdict.result, notes: verdict.notes, score: verdict.score, proposedTest: verdict.proposedTest };
-          await db.run(db.k.updateTable("security_findings").set({ state: survives(verdict) ? "new" : "disproved", verification: JSON.stringify(v), updated_at: now() }).where("repo", "=", repo).where("number", "=", f.number));
+          await sec.advanceFinding(db, { repo, number: f.number, from: VERDICT_FROM, to: survives(verdict) ? "new" : "disproved", set: { verification: JSON.stringify(v) } });
           if (survives(verdict)) {
             // The test row is written before `confirmed`, so the automatic fix sees it and waits for the result.
             if (verdict.proposedTest?.trim() && deps.writeTest && deps.crates && await featureOn(db, "scan-tests")) {
@@ -316,13 +330,10 @@ export async function runScan(db: Db, scanId: number, deps: ScanDeps): Promise<s
           }
         }
       }
-      await db.run(db.k.updateTable("security_areas").set((eb) => ({ state: eb.case().when("state", "=", "failed").then("failed").else("done").end() })).where("scan_id", "=", scanId).where("idx", "=", idx));
-      const left = guesses.slice(idx + 1);
-      const avg = (await db.get(db.k.selectFrom("security_areas").select((eb) => eb.fn.avg<number>("cost_usd").as("a")).where("scan_id", "=", scanId).where("state", "!=", "pending")))!.a;
-      await db.run(db.k.updateTable("security_scans").set({ areas_done: idx + 1, estimate_usd: await cost() + left.length * avg }).where("id", "=", scanId));
+      if (found) await sec.finishArea(db, { scanId, idx, failed: false });
     }
     await finishScan(db, scanId, "done");
-    return `${repo}: scan ${scanId} done: ${areas.length} areas, ${(await db.get(db.k.selectFrom("security_findings").select((eb) => eb.fn.countAll<number>().as("n")).where("scan_id", "=", scanId).where("state", "=", "new")))!.n} findings, $${(await cost()).toFixed(2)}`;
+    return `${repo}: scan ${scanId} done: ${areas.length} areas, ${await sec.countFindings(db, { scanId, state: "new" })} findings, $${(await cost()).toFixed(2)}`;
   } catch (e) {
     if (e instanceof Capped) {
       await finishScan(db, scanId, "capped");
@@ -334,5 +345,7 @@ export async function runScan(db: Db, scanId: number, deps: ScanDeps): Promise<s
     }
     await finishScan(db, scanId, "failed", (e as Error).message.slice(0, 500));
     throw e;
+  } finally {
+    release();
   }
 }

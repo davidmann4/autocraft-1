@@ -55,6 +55,11 @@ test("Workers AI stands in for the jev command: answers and usage come back, a r
     const broke = jevFailure(await askJevCloudflare(cfg, "{\"state\":{},\"questions\":{}}", 5000, base));
     assert.equal(broke?.kind, "account");
     assert.match(broke?.reason ?? "", /credit/);
+    const stderr = (line: string) => ({ code: 1, stderr: `${line}\n` });
+    const gone = jevFailure(stderr("jev: API error status=400: Model execution failed (User Input Error): Unknown model: jev-1.14.0"));
+    assert.equal(gone?.kind, "model");
+    assert.match(gone?.reason ?? "", /jev-1\.14\.0/);
+    assert.equal(jevFailure(stderr("jev: API error status=400: Invalid value at questions.x.type: Invalid discriminator value")), null);
     status = 503;
     assert.equal(jevFailure(await askJevCloudflare(cfg, "{\"state\":{},\"questions\":{}}", 5000, base)), null);
 

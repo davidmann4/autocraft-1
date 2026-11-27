@@ -16,6 +16,7 @@
 import type { AliasedRawBuilder, Expression, ExpressionBuilder, InsertObject, RawBuilder, SelectQueryBuilder, SqlBool } from "kysely";
 import type { Db, Dialect, Param } from "./index.ts";
 import { nowParam, pgPath, quote, rowidOf } from "./portable.ts";
+import { queryDb } from "./query-db.ts";
 import { fts5Query, tsQueryText, type Search } from "./search.ts";
 import { sql } from "./sql.ts";
 import { COLUMNS, type DB } from "./types.ts";
@@ -61,11 +62,6 @@ export function jsonType(d: D, e: Ex, path?: string): RawBuilder<JsonType | null
   return sql`(SELECT CASE json_typeof(v) WHEN 'string' THEN 'text' WHEN 'boolean' THEN v::text WHEN 'number' THEN CASE WHEN v::text ~ '^-?[0-9]+$' THEN 'integer' ELSE 'real' END ELSE json_typeof(v) END FROM (SELECT ${v} AS v) AS jt)`;
 }
 
-/** The number of elements of the JSON array `e`; NULL for NULL. */
-export function jsonArrayLength(d: D, e: Ex): RawBuilder<number | null> {
-  return pgOf(d) ? sql`json_array_length((${x(e)})::json)` : sql`json_array_length(${x(e)})`;
-}
-
 /** Whether `e` is valid JSON: a predicate for `where(...)`; selected, it reads 1/0 on both. */
 export function jsonValid(d: D, e: Ex): RawBuilder<SqlBool> {
   return pgOf(d) ? sql`((${x(e)}) IS JSON)` : sql`json_valid(${x(e)})`;
@@ -96,6 +92,23 @@ export function jsonEach<A extends string, T extends ElemType = "text">(d: D, e:
 }
 
 /**
+ * The string at `key` of each element of the JSON array in `e`: `from` is the table expression to join (as `jsonEach`), `value` the string, NULL for an
+ * element that is not an object or has no such key. Text that is not a JSON array has no elements.
+ */
+export function jsonEachField<A extends string>(d: D, e: Ex, key: string, alias: A): { from: AliasedRawBuilder<{ value: string }, A>; value: RawBuilder<string | null> } {
+  if (pgOf(d)) {
+    return {
+      from: sql<{ value: string }>`LATERAL (SELECT e ->> ${sql.lit(key)} AS value FROM json_array_elements(CASE WHEN (${x(e)}) IS JSON ARRAY THEN (${x(e)})::json ELSE '[]'::json END) AS e)`.as(alias),
+      value: sql`${sql.ref(`${alias}.value`)}`,
+    };
+  }
+  return {
+    from: sql<{ value: string }>`json_each(CASE WHEN json_valid(${x(e)}) THEN CASE json_type(${x(e)}) WHEN 'array' THEN ${x(e)} ELSE '[]' END ELSE '[]' END)`.as(alias),
+    value: sql`(CASE ${sql.ref(`${alias}.type`)} WHEN 'object' THEN json_extract(${sql.ref(`${alias}.value`)}, ${sql.lit(`$.${key}`)}) END)`,
+  };
+}
+
+/**
  * `e IN (values)` with the list bound as one JSON parameter, so the statement text is the same for any length and an
  * empty list matches nothing (Kysely's `in` with an empty array is a syntax error on Postgres). `type` is the elements'
  * type on Postgres; compare a citext column with "citext" to keep SQLite's NOCASE match. `not` gives NOT IN.
@@ -106,6 +119,94 @@ export function inList(d: D, e: Ex, values: readonly Param[], type: ElemType = "
   if (!pgOf(d)) return sql`${x(e)} ${op} (SELECT value FROM json_each(${list}))`;
   const v = sql.raw(type === "text" ? "value" : `value::${type}`);
   return sql`${x(e)} ${op} (SELECT ${v} FROM json_array_elements_text((${list})::json) AS value)`;
+}
+
+// ---- JSON row sets ----------------------------------------------------------------------------------------------
+
+/** Column names of `valuesTable` and `updateFrom` are written into the statement text, so they must be plain names. */
+const IDENT = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const ident = (name: string): string => {
+  if (!IDENT.test(name)) throw new Error(`not a plain column name: ${name}`);
+  return name;
+};
+
+/**
+ * A subselect as JSON array text of its rows (objects keyed by the select's column names), for a select list: SQLite
+ * `json_group_array(json_object(..))`, Postgres `json_agg`. Rows keep the subselect's `ORDER BY`; no row gives `[]`.
+ * Text, integers and reals only (no booleans, no blobs). Every column needs a name (an alias or a plain reference). Read
+ * the value with `parseJsonRows`. `q` may refer to the enclosing query's tables.
+ */
+export function jsonRows(d: D, q: SelectQueryBuilder<any, any, any>): RawBuilder<string | null> {
+  const pairs = sql.join(selectionNames(q).flatMap((n) => [sql.lit(n), sql.ref(`s.${n}`)]));
+  return pgOf(d)
+    ? sql`(SELECT COALESCE(json_agg(json_build_object(${pairs})), '[]'::json)::text FROM ${q} AS s)`
+    : sql`(SELECT json_group_array(json_object(${pairs})) FROM ${q} AS s)`;
+}
+
+/** The rows of a `jsonRows` value; none for NULL. */
+export function parseJsonRows<T = Record<string, unknown>>(value: string | null | undefined): T[] {
+  return value === null || value === undefined ? [] : (JSON.parse(value) as T[]);
+}
+
+type ValuesRow<C extends Record<string, ElemType>> = { [K in keyof C]: ElemTs<C[K]> | null };
+
+/**
+ * A table expression named `alias` over `rows`, bound as one JSON parameter, with the columns `cols` (name to type; the
+ * type is the Postgres cast, as in `jsonEach`). The statement text is the same for any number of rows. Row values are
+ * text, numbers or null; a missing key is NULL. Generalizes `refPairs` and `tupleIn`.
+ */
+export function valuesTable<C extends Record<string, ElemType>, A extends string>(d: D, rows: readonly Record<string, Param>[], cols: C, alias: A): AliasedRawBuilder<ValuesRow<C>, A> {
+  const list = JSON.stringify(rows);
+  const pg = pgOf(d);
+  const proj = sql.join(Object.entries(cols).map(([name, type]) => {
+    const get = sql.raw(`value ->> ${quote(ident(name))}`);
+    return pg && type !== "text" ? sql`(${get})::${sql.raw(type)} AS ${sql.id(name)}` : sql`${get} AS ${sql.id(name)}`;
+  }));
+  return pg
+    ? sql<ValuesRow<C>>`(SELECT ${proj} FROM json_array_elements((${list})::json) AS value)`.as(alias)
+    : sql<ValuesRow<C>>`(SELECT ${proj} FROM json_each(${list}))`.as(alias);
+}
+
+/**
+ * A table expression named `alias` over `rows` that may hold blobs, which cannot travel as JSON (`valuesTable`): every value
+ * is its own parameter, so keep the rows few. Needs at least one row.
+ */
+export function blobTable<C extends Record<string, ElemType | "bytea">, A extends string>(d: D, rows: readonly Record<keyof C & string, Param>[], cols: C, alias: A): AliasedRawBuilder<{ [K in keyof C]: C[K] extends "bytea" ? Uint8Array : ElemTs<C[K] & ElemType> }, A> {
+  const pg = pgOf(d);
+  const picks = rows.map((r) => sql`SELECT ${sql.join(Object.entries(cols).map(([name, type]) => pg ? sql`(${r[name]})::${sql.raw(type)} AS ${sql.id(ident(name))}` : sql`${r[name]} AS ${sql.id(ident(name))}`))}`);
+  return sql<any>`(${sql.join(picks, sql` UNION ALL `)})`.as(alias);
+}
+
+/** Keys per JSON key list and rows per `updateFrom` statement. */
+export const JSON_CHUNK = 10_000;
+
+/** `rows` in slices of `n` (default 10,000) for JSON key lists; `batches` slices to BATCH_ROWS for multi-row VALUES. */
+export const chunks = <T>(rows: readonly T[], n: number = JSON_CHUNK): T[][] => Array.from({ length: Math.ceil(rows.length / n) }, (_, i) => rows.slice(i * n, (i + 1) * n));
+
+/**
+ * `UPDATE table SET c = v.c FROM (rows) v WHERE table.k = v.k`: one statement sets different values on many rows, in
+ * chunks of 10,000 rows. `keyCols` match rows; `setCols` default to every other column of the first row. Values are text,
+ * numbers or null, stored as the column's own type (Postgres reads the rows with json_populate_recordset against the
+ * table, so a JSON number into a bigint or text into a citext column needs no cast). Returns the rows changed. Call
+ * inside `db.write`.
+ */
+export async function updateFrom(db: Db, table: string, keyCols: readonly string[], rows: readonly Record<string, Param>[], setCols?: readonly string[]): Promise<number> {
+  if (rows.length === 0) return 0;
+  const set = setCols ?? Object.keys(rows[0]).filter((c) => !keyCols.includes(c));
+  if (set.length === 0 || keyCols.length === 0) throw new Error("updateFrom needs key columns and columns to set");
+  const qdb = queryDb(db), k = qdb.k as any;
+  const names = [...keyCols, ...set].map(ident);
+  let changed = 0;
+  for (const chunk of chunks(rows)) {
+    const v = db.dialect === "postgres"
+      ? sql`json_populate_recordset(NULL::${sql.table(table)}, ${JSON.stringify(chunk)}::json)`.as("v")
+      : valuesTable(db, chunk, Object.fromEntries(names.map((n) => [n, "text" as const])), "v");
+    const q = k.updateTable(table).from(v)
+      .set((eb: ExpressionBuilder<any, any>) => Object.fromEntries(set.map((c) => [c, eb.ref(`v.${c}`)])))
+      .where((eb: ExpressionBuilder<any, any>) => eb.and(keyCols.map((c) => eb(`${table}.${c}`, "=", eb.ref(`v.${c}`)))));
+    changed += (await qdb.run(q)).changes;
+  }
+  return changed;
 }
 
 // ---- item refs ----------------------------------------------------------------------------------------------------
@@ -192,6 +293,14 @@ export function ciEq(d: D, a: Ex, b: Ex): RawBuilder<SqlBool> {
 }
 
 /**
+ * `ciEq` for a text column that has an index on `col COLLATE NOCASE` (on Postgres the index holds `lower(col)`): Postgres
+ * compares `lower(a) = lower(b)`, which that index serves, where ciEq's citext cast of the column keeps every index out of use.
+ */
+export function nocaseEq(d: D, a: Ex, b: Ex): RawBuilder<SqlBool> {
+  return pgOf(d) ? sql`lower(${x(a)}) = lower(${x(b)})` : sql`${x(a)} = ${x(b)} COLLATE NOCASE`;
+}
+
+/**
  * `e` sorted and grouped case-insensitively as SQLite's NOCASE does (ASCII letters folded to lower case, then by code
  * point), for `orderBy(...)` and `groupBy(...)`. On Postgres it is `lower(e)` by code point: citext would sort in the
  * database's collation. Compare with `ciEq` or `inList(..., "citext")`.
@@ -223,6 +332,19 @@ export function like(d: D, a: Ex, pattern: Ex, escape?: string): RawBuilder<SqlB
 /** `e` without any of the characters of `chars` at either end (SQLite `trim(e, chars)`, Postgres `btrim`). */
 export function trimChars(d: D, e: Ex, chars: string): RawBuilder<string | null> {
   return pgOf(d) ? sql`btrim(${x(e)}, ${chars})` : sql`trim(${x(e)}, ${chars})`;
+}
+
+/** The size in bytes of the UTF-8 text `e`, as `Buffer.byteLength` counts it. */
+export function byteLength(d: D, e: Ex): RawBuilder<number> {
+  return pgOf(d) ? sql`octet_length(${x(e)})` : sql`length(CAST(${x(e)} AS BLOB))`;
+}
+
+/** The ISO timestamp `e` (as `Date.toISOString` writes it) less `hours`, in the same form; NULL when it is NULL. */
+export function isoMinusHours(d: D, e: Ex, hours: number): RawBuilder<string | null> {
+  const n = sql.lit(Math.trunc(hours));
+  return pgOf(d)
+    ? sql`to_char(((${x(e)})::timestamptz - make_interval(hours => ${n})) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')`
+    : sql`strftime('%Y-%m-%dT%H:%M:%fZ', ${x(e)}, '-' || ${n} || ' hours')`;
 }
 
 /** `text` with `esc` (one character), `%` and `_` escaped by `esc`: `like(db, "title", eb.val(`%${likeEscape(s)}%`), "\\")`. */
@@ -312,13 +434,13 @@ export const batches = <T>(rows: readonly T[]): T[][] => Array.from({ length: Ma
  * rowid only increases. Postgres runs two statements: call it inside `db.write`.
  */
 export async function replaceRow<T extends keyof DB & string>(db: Db, table: T, key: readonly string[], row: InsertObject<DB, T>): Promise<void> {
-  const k = db.k as any;
+  const q = queryDb(db), k = q.k as any;
   if (db.dialect !== "postgres") {
-    await db.run(k.insertInto(table).orReplace().values(row));
+    await q.run(k.insertInto(table).orReplace().values(row));
     return;
   }
-  await db.run(k.deleteFrom(table).where((eb: ExpressionBuilder<any, any>) => eb.and(key.map((c) => eb(c, "=", (row as Record<string, unknown>)[c])))));
-  await db.run(k.insertInto(table).values(row));
+  await q.run(k.deleteFrom(table).where((eb: ExpressionBuilder<any, any>) => eb.and(key.map((c) => eb(c, "=", (row as Record<string, unknown>)[c])))));
+  await q.run(k.insertInto(table).values(row));
 }
 
 /**
@@ -326,14 +448,14 @@ export async function replaceRow<T extends keyof DB & string>(db: Db, table: T, 
  * rowids in the order given. Call inside `db.write`.
  */
 export async function replaceRows<T extends keyof DB & string>(db: Db, table: T, key: readonly string[], rows: readonly InsertObject<DB, T>[]): Promise<void> {
-  const k = db.k as any;
+  const q = queryDb(db), k = q.k as any;
   for (const chunk of batches(rows)) {
     if (db.dialect !== "postgres") {
-      await db.run(k.insertInto(table).orReplace().values(chunk));
+      await q.run(k.insertInto(table).orReplace().values(chunk));
       continue;
     }
-    await db.run(k.deleteFrom(table).where((eb: ExpressionBuilder<any, any>) => eb.or(chunk.map((row) => eb.and(key.map((c) => eb(c, "=", (row as Record<string, unknown>)[c])))))));
-    await db.run(k.insertInto(table).values(chunk));
+    await q.run(k.deleteFrom(table).where((eb: ExpressionBuilder<any, any>) => eb.or(chunk.map((row) => eb.and(key.map((c) => eb(c, "=", (row as Record<string, unknown>)[c])))))));
+    await q.run(k.insertInto(table).values(chunk));
   }
 }
 
@@ -412,7 +534,7 @@ export function commentHits<A extends string, O extends CommentHitOpts = {}>(d: 
 }
 
 // ---- fragment twins ------------------------------------------------------------------------------------------------
-// Typed twins of SQL-text fragments that other files splice into their statements (`pilotSql` → `pilotExpr`). A twin
+// Typed twins of SQL-text fragments that other files splice into their statements. A twin
 // takes its caller's expression builder and names the caller's tables by alias strings, as the text version does.
 
 /** The expression builder a fragment twin takes from its caller: any query's, since the twin names the caller's tables by alias. */
@@ -460,7 +582,7 @@ export function rowArray(d: D, q: SelectQueryBuilder<any, any, any>): RawBuilder
  * Every value is an integer, text or null, which a JSON array carries unchanged.
  */
 export async function rowValues(db: Db, queries: readonly SelectQueryBuilder<any, any, any>[]): Promise<unknown[][]> {
-  const row: Record<string, string | null> | undefined = await db.get(db.k.selectNoFrom(queries.map((q, k) => rowArray(db, q).as(`c${k}`))));
+  const row: Record<string, string | null> | undefined = await queryDb(db).get(queryDb(db).k.selectNoFrom(queries.map((q, k) => rowArray(db, q).as(`c${k}`))));
   return queries.map((_, k) => { const v = row?.[`c${k}`]; return v === null || v === undefined ? [] : (JSON.parse(v) as unknown[]); });
 }
 

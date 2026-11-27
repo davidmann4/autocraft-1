@@ -5,16 +5,15 @@
 //    requests, transfers, fix-up pushes, CI approvals, edits, and every rule, review and automatic write.
 // The instance-wide setting `github_identity` decides whether that is used at all: under `box` (the default) the box
 // account makes every write, and `as` only appears in the audit row as a record of what it would be.
-import { audit } from "../dash/audit.ts";
+import { apart } from "../apart.ts";
+import * as access from "../data/access/index.ts";
+import * as control from "../data/control/index.ts";
 import type { Grant, Guarded, GuardedFiling } from "../core/guard.ts";
 import { ownerOf } from "../owners.ts";
 import { knownSlugs, rememberSlug } from "./slugs.ts";
 import { AppError, call, GITHUB_API } from "./app.ts";
 import { AppNotInstalledError, installationToken, readAppSecrets, RepoNotInInstallationError } from "./install-token.ts";
-import { setting } from "../settings-read.ts";
 import type { Db } from "../db/index.ts";
-import { excluded } from "../db/kx.ts";
-import { noteReadIdentity } from "./read.ts";
 
 export type Identity = "app" | `user:${string}`;
 export type GithubIdentity = "box" | "app";
@@ -24,9 +23,16 @@ const KEY = "github_identity";
 
 /** The one instance-wide switch: whose account GitHub writes and dashboard sign-in use. Read at every use, never cached. */
 export async function githubIdentity(db: Db): Promise<GithubIdentity> {
-  const value = await setting(db, KEY);
+  const value = await control.setting(db, KEY);
   return value === "app" ? "app" : "box";
 }
+
+/**
+ * Why `actor` may not act on `repo` in the maintainer workflow (start, answer, approve a merge, stop), or null: an AutoCraft login with
+ * the operator or maintainer role, live write access, and the app identity, so merges and closes run as the person.
+ */
+export const actRefusal = async (db: Db, actor: { login: string | null; canWrite(repo: string): Promise<boolean> }, repo: string): Promise<access.ActRefusal | null> =>
+  await access.canAct(db, actor, repo, { identity: await githubIdentity(db) });
 
 /** Returns false when nothing changed. A change ends every dashboard session, so everyone signs in again under the new mode. */
 export async function setGithubIdentity(db: Db, by: string, value: unknown): Promise<boolean> {
@@ -34,17 +40,15 @@ export async function setGithubIdentity(db: Db, by: string, value: unknown): Pro
   const was = await githubIdentity(db);
   if (was === value) return false;
   await db.write(async () => {
-  if (value === "box") await db.run(db.k.deleteFrom("main.settings").where("key", "=", KEY));
-  else await db.run(db.k.insertInto("main.settings").values({ key: KEY, value }).onConflict((oc) => oc.column("key").doUpdateSet(excluded(["value"]))));
-  await audit(db, by, "github-identity", value, { identity: value, was });
-  // Sessions' own tokens belong to whichever identity created them; the grant revocation below covers app sessions.
-  await db.run(db.k.deleteFrom("sessions"));
-  // The stored user tokens belong to the mode being left: queue their revocation at GitHub (the vault's sweep).
-  const stored = await db.all(db.k.deleteFrom("user_tokens").returning(["login", "token_enc"]));
-  const at = new Date().toISOString();
-  for (const t of stored) await db.run(db.k.insertInto("user_token_revocations").values({ login: t.login, token_enc: t.token_enc, queued_at: at, kind: "grant" }));
+    if (value === "box") await control.deleteSetting(db, KEY);
+    else await control.writeSetting(db, KEY, value);
+    await control.addAudit(db, [{ login: by, action: "github-identity", target: value, details: { identity: value, was } }]);
+    // Sessions' own tokens belong to whichever identity created them; the grant revocation below covers app sessions.
+    await access.endAllSessions(db);
+    // The stored user tokens belong to the mode being left: queue their revocation at GitHub (the vault's sweep).
+    await access.dropAllUserTokens(db);
   });
-  noteReadIdentity(value === "app");
+  access.noteIdentity(value === "app");
   return true;
 }
 
@@ -53,13 +57,6 @@ export type WriteKind = "merge" | "close" | "other";
 
 /** Only a merge or a close that carries out a person's answer is made as that person; every other write is the app's. */
 export const actsAsPerson = (kind: WriteKind): boolean => kind === "merge" || kind === "close";
-
-/** The person who answered `decisionId`, or the app (no decision, not answered yet): who a merge or close for it is made as. */
-export async function identityOfDecision(db: Db, decisionId: string | undefined): Promise<Identity> {
-  if (decisionId === undefined) return "app";
-  const row = await db.get(db.k.selectFrom("decisions").select("answered_by").where("id", "=", decisionId).where("answer", "is not", null));
-  return row?.answered_by ? `user:${row.answered_by}` : "app";
-}
 
 /** The identity a write of `kind` under grant `g` is made as. */
 export const identityFor = (g: Guarded | Grant | GuardedFiling, kind: WriteKind = "other"): Identity => (actsAsPerson(kind) ? g.as : "app");
@@ -88,7 +85,7 @@ export async function appCoverage(owner: string, repo: string, mint: (owner: str
 
 /** Tracked repos by coverage; `unconfirmed` are those GitHub could not answer for. */
 export async function trackedCoverage(db: Db, mint?: (owner: string, repo: string) => Promise<string>): Promise<{ uncovered: string[]; unconfirmed: string[] }> {
-  const names = (await db.all(db.k.selectFrom("main.tracked_repos").select("name").orderBy("name"))).map((r) => r.name);
+  const names = [...(await control.loadTrackedRepos(db)).keys()];
   const uncovered: string[] = [], unconfirmed: string[] = [];
   for (const n of names) {
     const c = await appCoverage(ownerOf(n), n, mint);
@@ -105,7 +102,7 @@ export function coverageSnapshot(db: Db, refresh = true): { uncovered: string[];
   if (!coverageMemo || (!coverageMemo.running && Date.now() - coverageMemo.at > maxAge)) {
     const prev = coverageMemo;
     coverageMemo = { at: Date.now(), running: true, uncovered: prev?.uncovered ?? [], unconfirmed: prev?.unconfirmed ?? [] };
-    void trackedCoverage(db).then((r) => { coverageMemo = { at: Date.now(), running: false, ...r }; }, () => { coverageMemo = { at: Date.now(), running: false, uncovered: [], unconfirmed: prev?.unconfirmed ?? [] }; });
+    void apart(() => trackedCoverage(db)).then((r) => { coverageMemo = { at: Date.now(), running: false, ...r }; }, () => { coverageMemo = { at: Date.now(), running: false, uncovered: [], unconfirmed: prev?.unconfirmed ?? [] }; });
   }
   return { uncovered: coverageMemo.uncovered, unconfirmed: coverageMemo.unconfirmed };
 }
@@ -176,14 +173,6 @@ export async function commitIdentity(
   return { name: w.login, login: w.login, email: w.email };
 }
 
-/** The bot logins (bare slug and `<slug>[bot]`) of every known slug plus `extra`; the registered app's slug is recorded when `db` is given. */
-export async function ownBotLogins(db: Db, extra: string | null = null): Promise<string[]> {
-  const live = appSlug();
-  if (live) { try { await rememberSlug(db, live); } catch { /* a read-only connection: the live slug is still used below */ } }
-  const slugs = new Set([...await knownSlugs(db), ...(live ? [live] : []), ...(extra ? [extra] : [])]);
-  return [...slugs].flatMap((s) => [s, `${s}[bot]`]);
-}
-
 /** Slug of the registered GitHub App, read from the secrets file at most once a minute; null when none is registered or the file is unreadable. */
 let slugMemo: { at: number; slug: string | null } | null = null;
 export function appSlug(): string | null {
@@ -197,15 +186,17 @@ export function appSlug(): string | null {
 /**
  * Logins whose items and comments are ours: the box account (when recorded) and the bot of every app slug ever seen (a bare slug in the
  * mirror, `<slug>[bot]` in REST), on every repo whatever the identity setting, so items from before a switch stay ours.
- * `slug` is an extra slug injectable for tests; the registered app's is recorded and included by default.
+ * Lower case: compare GitHub's spelling with isOwnLogin. `slug` is an extra slug injectable for tests; the registered app's is recorded
+ * and included by default.
  */
 export async function ownLogins(db: Db, _repo: string, slug: string | null = null): Promise<Set<string>> {
-  const out = new Set<string>();
-  const box = await setting(db, "pipeline_login");
-  if (box) out.add(box);
-  for (const l of await ownBotLogins(db, slug)) out.add(l);
+  const out = await access.loadOwnLogins(db);
+  if (slug) out.add(slug.toLowerCase()).add(`${slug.toLowerCase()}[bot]`);
   return out;
 }
+
+/** Whether `login`, as GitHub or the mirror spells it, is one of `own` (ownLogins: lower case, every form of the app's logins). */
+export const isOwnLogin = (own: ReadonlySet<string>, login: string | null | undefined): boolean => !!login && own.has(login.toLowerCase());
 
 /** A login as ownLogins compares it: lowercased, without an `app/` prefix or a `[bot]` suffix. */
 export const plainLogin = (login: string): string => login.toLowerCase().replace(/^app\//, "").replace(/\[bot\]$/, "");

@@ -1,4 +1,4 @@
-// Dashboard -> runner requests for what lives on the runner's disk (build artifacts, the Claude account directories),
+// Dashboard -> runner requests for what lives on the runner's disk (build artifacts),
 // for a dashboard that does not share that disk (AUTOCRAFT_RUNNER_URL). There is no lease to authenticate them, so each
 // request carries a token the dashboard signs with a key derived from the secrets file's session_key, which both
 // processes read: it names the method, the path, a hash of the body and the signed-in login, and lasts a minute. The
@@ -48,9 +48,7 @@ export const runnerClient = (): RunnerClient | null => client;
 
 export class RunnerError extends Error {
   status: number;
-  /** The runner marked this refusal as its own answer to the operation (an AccountError), not a failure of the request itself. */
-  answered: boolean;
-  constructor(status: number, message: string, answered = false) { super(message); this.status = status; this.answered = answered; }
+  constructor(status: number, message: string) { super(message); this.status = status; }
 }
 
 /** One signed request to the runner's /internal/ API as `login`. A refusal the runner explains comes back as RunnerError with its status. */
@@ -63,9 +61,8 @@ export async function callRunner(c: RunnerClient, method: "GET" | "POST", path: 
   });
   if (!res.ok) {
     let msg = `the runner answered ${res.status}`;
-    let answered = false;
-    try { const j = (await res.json()) as { error?: string; account?: boolean }; msg = j.error ?? msg; answered = j.account === true; } catch { /* not JSON */ }
-    throw new RunnerError(res.status, msg, answered);
+    try { msg = ((await res.json()) as { error?: string }).error ?? msg; } catch { /* not JSON */ }
+    throw new RunnerError(res.status, msg);
   }
   return res;
 }

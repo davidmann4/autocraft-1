@@ -1,6 +1,6 @@
 // The build of an implementation: AutoCraft's own check findings go back to the same session as a follow-up and a clean
-// round makes it ready for its PR; findings that survive three follow-ups make it stuck with a decision, whose Try again
-// starts a new attempt with the answer's note as guidance. A restart at any await picks up from the rounds without a second
+// round makes it ready for its PR; findings that survive three follow-ups make it stuck, a blocker whose Try again answer
+// starts a new attempt with the answer's words as guidance. A restart at any await picks up from the rounds without a second
 // session in the workspace.
 import assert from "node:assert/strict";
 import { test } from "node:test";
@@ -9,8 +9,9 @@ import type { WorkspaceCallRequest } from "../src/build/workspace-call.ts";
 import { runBuild, type BuildDeps, type BuildRun } from "../src/implement/build.ts";
 import type { Pod } from "../src/implement/checks.ts";
 import { LOST_REPLY_MESSAGE } from "../src/implement/session.ts";
-import { implementDecisionId, STUCK_OPTIONS } from "../src/implement/stuck.ts";
-import { currentImplementation, implementationById, roundsOf, setImplementationState, startImplementation } from "../src/implement/store.ts";
+import { STUCK_OPTIONS, type StuckQuestion } from "../src/implement/stuck.ts";
+import { recordAnswers } from "../src/data/implement/index.ts";
+import { currentImplementation, implementationById, roundsOf, setImplementationState, startImplementation } from "./implement-rows.ts";
 import type { PlanReply, SessionReport } from "../src/implement/types.ts";
 import { textHash } from "../src/core/open-prs.ts";
 import { OPERATOR, world } from "./world-db.ts";
@@ -72,7 +73,7 @@ function withCallRows(s: Awaited<ReturnType<typeof setup>>) {
   const queue = s.deps.calls.queue;
   s.deps.calls.queue = async (db, r) => {
     const id = await queue(db, r), now = Date.now();
-    await db.run(db.k.insertInto("main.remote_calls").values({
+    await s.db.run(s.db.k.insertInto("main.remote_calls").values({
       id, step: "implement", stage: 0, prompt_id: r.promptId, prompt_version: r.promptVersion, tier: r.tier, effort: r.effort, asked_model: r.model, bundle: "{}",
       state: "queued", since: now, seen_at: now, max_attempts: 2, timeout_ms: 1000, parent_id: r.parentId ?? null,
     } as never));
@@ -106,13 +107,13 @@ test("findings that survive three follow-ups make the attempt stuck, and Try aga
   const stuck = (await implementationById(s.db, s.impl.id))!;
   assert.equal(stuck.state, "stuck");
   assert.equal(s.queued.filter((q) => q.parentId !== undefined).length, 3);
-  const id = implementDecisionId("app", 7);
-  const d = (await s.db.get(s.db.k.selectFrom("decisions").select(["options", "answer"]).where("id", "=", id)))!;
-  const keys = (JSON.parse(d.options) as { key: string }[]).map((o) => o.key);
-  assert.ok(keys.includes(STUCK_OPTIONS.tryAgain.key) && keys.includes(STUCK_OPTIONS.close.key) && keys.includes("backlog"));
-  assert.ok(!keys.includes(STUCK_OPTIONS.draft.key), "a change that fails the diff check is not offered as a draft PR");
+  const blocker = (await roundsOf(s.db, s.impl.id)).filter((r) => r.kind === "question").at(-1)!;
+  const q = blocker.result as StuckQuestion;
+  assert.equal(q.stuck, true);
+  assert.equal(q.recommended, STUCK_OPTIONS.tryAgain.key);
+  assert.ok(!q.options!.some((o) => o.key === STUCK_OPTIONS.draft.key), "a change that fails the diff check is not offered as a draft PR");
 
-  await s.db.run(s.db.k.updateTable("decisions").set({ answer: STUCK_OPTIONS.tryAgain.key, answer_note: "Keep the old signature.", answered_by: OPERATOR, answered_at: new Date().toISOString() }).where("id", "=", id));
+  await recordAnswers(s.db, [{ id: s.impl.id, question: blocker.id, by: OPERATOR, via: "github", option: STUCK_OPTIONS.tryAgain.key, text: "Keep the old signature." }]);
   await runBuild(s.run, "app", 7, s.deps);
   const next = (await currentImplementation(s.db, "app", 7))!;
   assert.notEqual(next.id, s.impl.id);
@@ -126,7 +127,7 @@ test("a restart after a turn's reply was read asks the same session for the repo
   const normal = s.deps.calls.await;
   s.deps.calls.await = async (db, id) => {
     // The reply is read (and dropped from the call) and the runner stops before the round is written.
-    await db.run(db.k.updateTable("main.remote_calls").set({ state: "done", reply: null, consumed_at: Date.now() }).where("id", "=", id));
+    await s.db.run(s.db.k.updateTable("main.remote_calls").set({ state: "done", reply: null, consumed_at: Date.now() }).where("id", "=", id));
     throw new Error(RESTART);
   };
   await assert.rejects(runBuild(s.run, "app", 7, s.deps), new RegExp(RESTART));

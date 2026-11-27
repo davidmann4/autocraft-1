@@ -1,18 +1,17 @@
-// Home: the Task Runner line, what waits for the reader's answer, what they started, problems, stuck items and the live board.
-// Viewers see what waits for a maintainer and what runs. Every list updates in place from the live topics.
+// Home: the Task Runner line, then the reader's own items (started, approved, held or asked), most recently updated first, with
+// the conversation's last line. Viewers see what waits for a maintainer.
 import { Link } from "react-router-dom";
 import { CaretRightIcon, WarningCircleIcon, XCircleIcon } from "@phosphor-icons/react";
 import { t } from "../../../../../src/i18n/index.ts";
 import { useQuery } from "../../../api/client";
-import { usePageProject } from "../../../api/scope";
 import type { HomeProblem, MaintainRow, MaintainRunnerLine } from "../../../api/types";
-import { itemPath } from "../../../lib/links";
 import { useUser } from "../../../shell/UserContext";
-import { Badge } from "../../../ui/atoms/Badge";
-import { ItemIcon } from "../../../ui/atoms/ItemIcon";
 import { Pending } from "../../../ui/atoms/Pending";
+import { messageTime } from "../../../lib/format";
 import { cn } from "../../../ui/cn";
-import { LiveBoard } from "../../home/LiveBoard";
+import { ItemRef } from "../../../ui/molecules/ItemRef";
+import { GithubButton } from "../../../ui/atoms/GithubButton";
+import { githubItemUrl } from "../../../lib/links";
 import type { ViewProps } from "../../../registry/types";
 
 const calls = (n: number) => (n === 1 ? t("1 call running") : t("{n} calls running", { n }));
@@ -30,7 +29,7 @@ function RunnerLine({ r }: { r: MaintainRunnerLine }) {
         ? ["bg-warn", t("0 Task Runners connected · {others}", { others: others(r.others) }), t("Set up a Task Runner")]
         : ["bg-bad", t("0 Task Runners connected"), t("Set up a Task Runner")];
   return (
-    <Link to="/runner" className="flex min-h-11 items-center gap-2.5 rounded-lg border border-line bg-raised px-3 py-2 text-sm hover:bg-ink/[0.04]">
+    <Link to="/runner" className="flex min-h-11 items-center gap-2.5 rounded-xl border border-line bg-raised px-3.5 py-2.5 text-sm hover:bg-ink/[0.04]">
       <span aria-hidden className={cn("size-2.5 shrink-0 rounded-full", dot)} />
       <span className="min-w-0 flex-1">
         {text}
@@ -41,58 +40,66 @@ function RunnerLine({ r }: { r: MaintainRunnerLine }) {
   );
 }
 
-/** Who started it and whether it is approved for merge, for the reader's own items. */
-function byLine(r: MaintainRow): string {
-  const started = t("started by {login}", { login: r.startedBy });
-  const approved = r.approvedBy ? t("approved by {login}", { login: r.approvedBy }) : t("not approved");
-  return r.stoppedBy ? t("{started}, stopped by {login}", { started, login: r.stoppedBy }) : t("{started}, {approved}", { started, approved });
-}
+const OWN_SHOWN = 8;
 
-function ItemRow({ r, by }: { r: MaintainRow; by?: boolean }) {
+/** One of the reader's items: the item, the conversation's last line, and a dot when that line is a question to the reader. */
+function OwnRow({ r }: { r: MaintainRow }) {
+  const ask = !!r.last?.question;
+  const by = r.last?.by ?? "AutoCraft";
   return (
-    <li className="relative flex items-start gap-3 px-3 py-3 hover:bg-ink/[0.025]">
-      <ItemIcon kind={r.kind} state="open" className="mt-0.5" tip={false} />
+    <li className="relative flex items-start gap-2.5 py-3 pl-2.5 pr-3 transition-colors duration-fast hover:bg-ink/[0.03]">
+      <span aria-hidden className={cn("mt-[6px] size-2 shrink-0 rounded-full", ask ? "bg-accent" : "bg-transparent")} />
       <div className="min-w-0 flex-1">
-        <Link to={itemPath(r.repo, r.number)} className="block rounded text-md font-medium leading-snug after:absolute after:inset-0 hover:underline">
-          {r.title}
-        </Link>
-        <div className="mt-0.5 text-xs text-ink/70">
-          <span className="code">
-            {r.repo}#{r.number}
-          </span>
-          {r.author && <> · {r.author}</>}
+        <div className="flex items-start gap-3">
+          <ItemRef repo={r.repo} number={r.number} kind={r.kind} state={r.state ?? "open"} title={r.title} stretch github={false} className="min-w-0 flex-1 font-medium" />
+          <time dateTime={r.updatedAt} className="num mt-0.5 shrink-0 whitespace-nowrap text-xs text-ink/70">{messageTime(r.updatedAt)}</time>
+          <GithubButton href={githubItemUrl(r.repo, r.number, r.kind)} label={t("Open {ref} on GitHub", { ref: `${r.repo}#${r.number}` })} className="mt-[calc((1lh-1.75rem)/2)]" />
         </div>
-        <div className="mt-1 line-clamp-2 text-sm">
-          {r.weight && (
-            <Badge tone={r.weight === "urgent" ? "bad" : r.weight === "low" ? "neutral" : "warn"} className="mr-1.5">
-              {r.weight}
-            </Badge>
-          )}
-          {r.blocked && <span className="text-bad">{t("Blocker")} · </span>}
-          <span className={r.waits ? "text-accent-ink" : "text-ink/80"}>{r.line}</span>
-          {by && <span className="text-ink/70"> · {byLine(r)}</span>}
-        </div>
+        <p className={cn("mt-1 line-clamp-2 pl-6 text-sm", ask ? "font-medium text-accent-ink" : "text-ink/70")}>
+          {ask && <span className="sr-only">{t("Question for you:")} </span>}
+          <span className={ask ? undefined : "text-ink"}>{by === "AutoCraft" ? "AutoCraft" : `@${by}`}</span>: {r.last?.text ?? r.line}
+        </p>
       </div>
     </li>
   );
 }
 
-function List({ title, rows, empty, by }: { title: string; rows: MaintainRow[]; empty?: string; by?: boolean }) {
-  if (!rows.length && !empty) return null;
+function OwnItems({ rows, total }: { rows: MaintainRow[]; total: number }) {
+  const title = t("My items");
   return (
-    <section aria-label={title} className="flex flex-col gap-1">
-      <h2 className="mt-2 text-sm font-semibold text-ink/70">
-        {title} {rows.length > 0 && <span className="num font-normal">({rows.length})</span>}
+    <section aria-labelledby="home-own" className="flex flex-col gap-1">
+      <h2 id="home-own" className="mb-1 mt-4 text-md font-semibold">
+        {title}
       </h2>
       {rows.length ? (
-        <ul className="divide-y divide-line rounded-lg border border-line bg-panel">
-          {rows.map((r) => (
-            <ItemRow key={`${r.repo}#${r.number}`} r={r} by={by} />
+        <ul className="divide-y divide-line overflow-hidden rounded-xl border border-line bg-raised">
+          {rows.slice(0, OWN_SHOWN).map((r) => (
+            <OwnRow key={`${r.repo}#${r.number}`} r={r} />
           ))}
         </ul>
       ) : (
-        <p className="rounded-lg border border-line px-3 py-3 text-sm text-ink/70">{empty}</p>
+        <p className="rounded-lg border border-line px-3 py-3 text-sm text-ink/70">{t("Nothing started or approved by you.")}</p>
       )}
+      {total > rows.length && <Link to="/items?filter=mine" className="mt-1 inline-flex min-h-11 w-fit items-center gap-1 self-center rounded px-3 text-sm font-medium text-accent-ink hover:underline">
+        {t("Show more")} <CaretRightIcon aria-hidden />
+      </Link>}
+    </section>
+  );
+}
+
+function List({ title, rows }: { title: string; rows: MaintainRow[] }) {
+  if (!rows.length) return null;
+  return (
+    <section aria-label={title} className="flex flex-col gap-1">
+      <h2 className="mt-2 text-sm font-semibold text-ink/70">{title}</h2>
+      <ul className="divide-y divide-line rounded-lg border border-line bg-panel">
+        {rows.map((r) => (
+          <li key={`${r.repo}#${r.number}`} className="relative px-3 py-2.5 hover:bg-ink/[0.025]">
+            <ItemRef repo={r.repo} number={r.number} kind={r.kind} state="open" title={r.title} stretch />
+            <p className="mt-0.5 pl-6 text-sm text-ink/70">{r.line}</p>
+          </li>
+        ))}
+      </ul>
     </section>
   );
 }
@@ -124,75 +131,17 @@ function Attention({ rows }: { rows: HomeProblem[] }) {
   );
 }
 
-const STUCK_SHOWN = 5;
-
-/** Open items nothing moves (the liveness check); staff only. */
-function Stuck() {
-  const { data } = useQuery("stuck", (a) => a.stuckItems(), { project: null });
-  // The liveness check covers every repo; the page's project narrows it here.
-  const project = usePageProject();
-  const rows = (data?.items ?? []).filter((i) => i.verdict === "stuck" && (!project || i.repo === project));
-  if (!rows.length) return null;
-  const title = t("Stuck");
-  return (
-    <section aria-label={title} className="flex flex-col gap-1">
-      <div className="mt-2 flex items-center">
-        <h2 className="text-sm font-semibold text-ink/70">
-          {title} <span className="num font-normal">({rows.length})</span>
-        </h2>
-        <Link to="/stuck" className="ml-auto inline-flex min-h-11 items-center text-xs text-accent-ink hover:underline md:min-h-0">
-          {t("All stuck items")}
-        </Link>
-      </div>
-      <ul className="divide-y divide-line rounded-lg border border-line bg-panel">
-        {rows.slice(0, STUCK_SHOWN).map((i) => (
-          <li key={`${i.repo}#${i.number}`} className="relative flex items-start gap-3 px-3 py-3 hover:bg-ink/[0.025]">
-            <ItemIcon kind={i.kind} state="open" className="mt-0.5" tip={false} />
-            <div className="min-w-0 flex-1">
-              <Link to={itemPath(i.repo, i.number)} className="block text-md font-medium leading-snug after:absolute after:inset-0 hover:underline">
-                {i.title ?? `${i.repo}#${i.number}`}
-              </Link>
-              <div className="mt-0.5 text-xs text-ink/70">
-                <span className="code">
-                  {i.repo}#{i.number}
-                </span>{" "}
-                · {i.cause}
-              </div>
-            </div>
-          </li>
-        ))}
-      </ul>
-    </section>
-  );
-}
-
 export function HomeView(_: ViewProps) {
   const user = useUser();
   const { data, error } = useQuery("maintain-home", (a) => a.maintain.home());
   if (!data) return <Pending error={error} />;
-  const viewer = user.role === "viewer";
   return (
     <div className="h-full overflow-y-auto">
-      <div className="mx-auto flex max-w-[768px] flex-col gap-3 px-4 pb-10 pt-5 md:px-6">
-        <h1 className="text-xl font-semibold">{t("Home")}</h1>
+      <div className="mx-auto flex max-w-[784px] flex-col gap-3 px-4 pb-12 pt-5 md:px-8 md:pt-8">
+        <h1 className="text-xl font-semibold tracking-[-0.01em] md:text-2xl">{t("Home")}</h1>
         {data.runner && <RunnerLine r={data.runner} />}
-        {viewer ? (
-          <>
-            <List title={t("Waiting for a maintainer")} rows={data.waiting} />
-            <Attention rows={data.attention} />
-            <List title={t("Running")} rows={data.running} empty={t("Nothing is running.")} />
-          </>
-        ) : (
-          <>
-            <List title={t("Needs your answer")} rows={data.needs} empty={t("Nothing needs your answer.")} />
-            <Attention rows={data.attention} />
-            <List title={t("Started by you")} rows={data.mine} empty={t("Nothing started by you.")} by />
-            <Stuck />
-          </>
-        )}
-        <div className="mt-4">
-          <LiveBoard to="/now" />
-        </div>
+        <Attention rows={data.attention} />
+        {user.role === "viewer" ? <List title={t("Recently updated")} rows={data.recent} /> : <OwnItems rows={data.mine} total={data.mineTotal} />}
       </div>
     </div>
   );

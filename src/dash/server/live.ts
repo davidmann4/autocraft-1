@@ -2,7 +2,6 @@
 // (src/live.ts) and tells every connected browser which topics changed. The stream
 // carries topic names and counters only, never data: browsers refetch through the API.
 import type { ServerResponse } from "node:http";
-import { readSeqs } from "../../live.ts";
 import { exclusive } from "../../async-seq.ts";
 import { refreshReadIdentity } from "../../github/read.ts";
 import type { Db } from "../../db/index.ts";
@@ -108,7 +107,7 @@ export class LiveHub {
   private async check(): Promise<void> {
     let now: Record<string, number>;
     try {
-      now = await readSeqs(this.db);
+      now = await this.db.seqs();
     } catch (e) {
       console.error(`live: ${(e as Error).message}`);
       return;

@@ -4,7 +4,7 @@
 import type { ItemStatus, QueueRow } from "../../../web/src/api/types.ts";
 import { isHiddenRepo, type HiddenRepos } from "../../hidden-sql.ts";
 import { BLOCKS_REVIEW, blockersOfWait } from "../../review/blockers.ts";
-import { quietFixPrs } from "../../security/quiet.ts";
+import { listQuietPrs } from "../../data/security/index.ts";
 import type { Req } from "../types.ts";
 import { canSeeInternals } from "./staff.ts";
 import { blankIfHidden, hiddenRepos } from "./visible.ts";
@@ -14,7 +14,7 @@ export type Reader = { staff: boolean; hidden: HiddenRepos; /** Quiet pull reque
 
 export async function readerOf(db: Db, req: Req): Promise<Reader> {
   const staff = canSeeInternals(req);
-  return { staff, hidden: await hiddenRepos(db, req), quiet: staff ? new Set() : await quietFixPrs(db) };
+  return { staff, hidden: await hiddenRepos(db, req), quiet: staff ? new Set() : await listQuietPrs(db) };
 }
 
 /** The reader of one item's trace context (src/dash/api/trace.ts): `veiled` there says the item is quiet for this reader. */

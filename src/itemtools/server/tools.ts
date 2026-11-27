@@ -72,7 +72,7 @@ export const TOOLS = [
   },
   {
     name: "item",
-    description: "One issue or pull request: state, labels, author, dates, body, the latest comments and reviews, and decision outcomes recorded for it.",
+    description: "One issue or pull request: state, labels, author, dates, body, and the latest comments and reviews.",
     inputSchema: {
       type: "object", additionalProperties: false, required: ["repo", "number"],
       properties: {
@@ -174,10 +174,7 @@ function item(db: DatabaseSync, a: Record<string, string | number>): ToolResult 
     const what = c.kind === "review" ? `review${c.review_state ? ` ${c.review_state.toLowerCase()}` : ""}` : "comment";
     parts.push(`--- ${what} by ${c.author ?? "?"} at ${c.created_at ?? ""}${c.commit_oid ? ` on ${c.commit_oid.slice(0, 8)}` : ""} ---\n${cut(c.body, 2000)}`);
   }
-  let body = cut(parts.join("\n"), MAX_RESULT - 4000);
-  const dec = db.prepare("SELECT kind, answer, answer_label, answered_at FROM decision_outcomes WHERE repo = ? AND number = ? ORDER BY answered_at").all(it.repo, it.number) as
-    { kind: string; answer: string; answer_label: string | null; answered_at: string | null }[];
-  if (dec.length) body += `\n\nDecision outcomes (kind: chosen option, date):\n${dec.map((d) => `- ${d.kind}: ${d.answer}${d.answer_label ? ` (${d.answer_label})` : ""}, ${(d.answered_at ?? "").slice(0, 10)}`).join("\n")}`;
+  const body = cut(parts.join("\n"), MAX_RESULT - 4000);
   return { text: frame(`${it.repo}#${it.number}`, body) };
 }
 

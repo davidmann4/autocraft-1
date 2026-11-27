@@ -4,7 +4,7 @@
 // app has no user and cannot be assigned.
 import { exec, type Exec } from "../fixup/git.ts";
 import type { Db } from "../db/index.ts";
-import { excluded } from "../db/kx.ts";
+import * as control from "../data/control/index.ts";
 
 export type Who = { login: string; nodeId: string; email: string };
 export type Me = { id: string; login: string };
@@ -44,8 +44,7 @@ export async function pipelineMe(log: (line: string) => void = () => {}, run: Ex
 /** Records the pipeline login; a bot login is refused so the stored value is always the box account's. */
 export async function setPipelineLogin(db: Db, login: string, overwrite = true): Promise<boolean> {
   if (!login || isBotLogin(login)) return false;
-  const q = db.k.insertInto("main.settings").values({ key: "pipeline_login", value: login });
-  await db.run(q.onConflict((oc) => overwrite ? oc.column("key").doUpdateSet(excluded(["value"])) : oc.column("key").doNothing()));
+  if (overwrite || !await control.hasSetting(db, "pipeline_login")) await control.writeSetting(db, "pipeline_login", login);
   return true;
 }
 

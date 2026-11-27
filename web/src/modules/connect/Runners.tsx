@@ -44,7 +44,7 @@ const readinessBadge = (h: RunnerInfo): { text: string; tone: Tone } => {
 const used = (w: UsageWindow | null | undefined) => (w ? `${Math.round(w.usedPercent)}%` : "–");
 
 const AGENT = "Agent access";
-const ANSWER = "Can answer decisions and approve merges";
+const ANSWER = "Can send commands and approve merges";
 /** Answering works only through agent access: ticking it ticks agent access, and unticking agent access unticks it. */
 const withAgent = (s: LoginScopes, agent: boolean): LoginScopes => ({ agent, answer: agent && s.answer });
 const withAnswer = (s: LoginScopes, answer: boolean): LoginScopes => ({ agent: s.agent || answer, answer });

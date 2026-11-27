@@ -1,4 +1,4 @@
-// The load rig: a scratch dashboard (user-local mode, fresh data directory), a fault-injection proxy, a ledger the fake
+// The load rig: a scratch dashboard (fresh data directory), a fault-injection proxy, a ledger the fake
 // harnesses report to, N Task Runners (worker/autocraft.mjs with the fake harness), and a driver that queues calls the way a
 // job process does. No external services: helpers run with scripts/loadtest/preload.mjs, which answers the plan-usage
 // endpoint itself and blocks every other non-loopback request.
@@ -126,7 +126,6 @@ export class Rig {
     this.db = (await import(join(ROOT, "src/db.ts"))).connect(this.dbPath);
     const mode = await import(join(ROOT, "src/remote/mode.ts"));
     const tokens = await import(join(ROOT, "src/dash/mcp/tokens.ts"));
-    mode.setInferenceMode(this.db, "user-local", "rig");
     this.repos = Array.from({ length: this.o.repos }, (_, i) => `rigrepo${i + 1}`);
     this.users = [];
     const now = new Date().toISOString();

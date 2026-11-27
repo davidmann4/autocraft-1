@@ -1,18 +1,15 @@
 // Optional Discord mention counting, ping replies and issue search. It runs only when AUTOCRAFT_DISCORD_TOKEN_FILE and AUTOCRAFT_DISCORD_KEY_FILE
 // are set; the runner starts it next to the worker server. See docs/pipeline.md.
 import { loadConfig, type Config } from "../dash/server/config.ts";
-import { TokenBox } from "../dash/server/crypto.ts";
 import { bindSecrets, processAppKeys } from "../github/app-keys.ts";
-import { githubIdentity } from "../github/identity.ts";
-import { providerFor } from "../dash/server/provider.ts";
-import { userForLogin } from "../dash/server/sessions.ts";
-import { audit } from "../dash/audit.ts";
+import { audit } from "./audit.ts";
 import { envVar } from "../env.ts";
 import { localEmbedder } from "../embed/model.ts";
 import { VectorIndex } from "../embed/vectors.ts";
 import { guildPerms, type Overwrite, type Role } from "./perms.ts";
 import { Gateway } from "./gateway.ts";
 import { Interactions } from "./interactions.ts";
+import { AtCommands } from "./at-commands.ts";
 import { Pings } from "./pings.ts";
 import { Signals, dropSignalTexts } from "./signals.ts";
 import { deleteRepliesOf } from "./replies.ts";
@@ -23,12 +20,16 @@ import { addFilingRepo, filingReposWithMode, FilingRepoError, offerState, remove
 import { forgetLink } from "./links.ts";
 import { Search } from "./search.ts";
 import { installAccountCommands } from "./commands.ts";
-import { DecisionAlerts, installAlertCommands } from "./alerts.ts";
+import { Alerts, installAlertCommands } from "./alerts.ts";
 import { installSearchCommands } from "./search-commands.ts";
 import { dropIssueTexts, installIssueNew } from "./issue-new.ts";
 import { installPanel, postPanel } from "./panel.ts";
+import { installRolePanel, roleConfig, RoleConfigError, rolePanelState, setRoleConfig, watchRoleGrants, watchRolePanel } from "./role-panel.ts";
 import { DiscordConfigError, readKeyFile, readTokenFile, type DiscordKeys } from "./keys.ts";
-import { forgetAuthor, forgetMessages, handleDispatch, setStatus, upsertCategory, upsertChannel } from "./store.ts";
+import { forgetAuthor, forgetMessages, handleDispatch, setStatus } from "./store.ts";
+import { forgetFollowsOf } from "./threads.ts";
+import { ThreadResults } from "./results.ts";
+import { forgetVerifyRows, listChannelBriefs, markWatched, removeChannelTree, saveCategories, saveChannels, setViewable, type CategoryRow, type ChannelReport } from "../data/discord/index.ts";
 import type { Db } from "../db/index.ts";
 import { openDb } from "../db/open.ts";
 
@@ -40,11 +41,11 @@ const LISTED = new Set([0, 5, 15]);
 /** Keeps the channel list the admin page shows; no message is involved. Rows of deleted channels are removed by handleDispatch, which runs first. */
 export async function handleMeta(db: Db, type: string, d: unknown): Promise<void> {
   const x = d as { id?: string; name?: string; guild_id?: string; type?: number; parent_id?: string | null; position?: number; unavailable?: boolean; channels?: Channel[]; threads?: Channel[]; roles?: Role[]; role?: Role; role_id?: string; user?: { id?: string }; members?: { user?: { id?: string }; roles?: string[] }[]; permission_overwrites?: Overwrite[] };
-  const thread = async (guildId: string, t: Channel): Promise<void> => {
-    if (t.parent_id) await upsertChannel(db, { channelId: t.id, guildId, guildName: null, name: t.name ?? null, parentId: t.parent_id });
-  };
+  const threads = (guildId: string, list: Channel[]): ChannelReport[] =>
+    list.flatMap((t) => t.parent_id ? [{ channelId: t.id, guildId, guildName: null, name: t.name ?? null, parentId: t.parent_id }] : []);
+  const category = (guildId: string, c: { id: string; name?: string; position?: number }): CategoryRow => ({ categoryId: c.id, guildId, name: c.name ?? "", position: c.position ?? 0 });
   const reviewGuild = async (guildId: string): Promise<void> => {
-    for (const id of guildPerms.channelIds(guildId)) await db.run(db.k.updateTable("discord_channels").set({ viewable: guildPerms.viewable(guildId, id) ? 1 : 0 }).where("channel_id", "=", id));
+    await setViewable(db, guildPerms.channelIds(guildId).map((channelId) => ({ channelId, viewable: guildPerms.viewable(guildId, channelId) })));
   };
   if (type === "READY") {
     guildPerms.botId = x.user?.id ?? null;
@@ -56,27 +57,29 @@ export async function handleMeta(db: Db, type: string, d: unknown): Promise<void
     if (x.guild_id && x.user?.id && x.user.id === guildPerms.botId) { guildPerms.setBotRoles(x.guild_id, (x as { roles?: string[] }).roles ?? []); await reviewGuild(x.guild_id); }
   } else if (type === "GUILD_CREATE" && x.id) {
     guildPerms.setGuild(x.id, x.roles ?? [], x.members, x.channels ?? []);
-    for (const c of x.channels ?? []) {
-      if (c.type === CATEGORY) await upsertCategory(db, { categoryId: c.id, guildId: x.id, name: c.name ?? null, position: c.position ?? null });
-      else if (c.type === undefined || LISTED.has(c.type)) await upsertChannel(db, { channelId: c.id, guildId: x.id, guildName: x.name ?? null, name: c.name ?? null, position: c.position, categoryId: c.parent_id, viewable: guildPerms.viewable(x.id!, c.id) });
-    }
-    for (const t of x.threads ?? []) await thread(x.id, t);
+    const guildId = x.id;
+    const channels = x.channels ?? [];
+    await db.write(async () => {
+      await saveCategories(db, channels.filter((c) => c.type === CATEGORY).map((c) => category(guildId, c)));
+      await saveChannels(db, [
+        ...channels.filter((c) => c.type !== CATEGORY && (c.type === undefined || LISTED.has(c.type)))
+          .map((c): ChannelReport => ({ channelId: c.id, guildId, guildName: x.name ?? null, name: c.name ?? null, position: c.position, categoryId: c.parent_id, viewable: guildPerms.viewable(guildId, c.id) })),
+        ...threads(guildId, x.threads ?? []),
+      ]);
+    });
   } else if ((type === "CHANNEL_CREATE" || type === "CHANNEL_UPDATE") && x.id && x.guild_id && x.type === CATEGORY) {
-    await upsertCategory(db, { categoryId: x.id, guildId: x.guild_id, name: x.name ?? null, position: x.position ?? null });
+    await saveCategories(db, [category(x.guild_id, { id: x.id, name: x.name, position: x.position })]);
   } else if ((type === "CHANNEL_CREATE" || type === "CHANNEL_UPDATE") && x.id && x.guild_id && (x.type === undefined || LISTED.has(x.type))) {
     guildPerms.setChannel(x.guild_id, x.id, x.permission_overwrites);
-    await upsertChannel(db, { channelId: x.id, guildId: x.guild_id, guildName: null, name: x.name ?? null, position: x.position, categoryId: x.parent_id, viewable: guildPerms.viewable(x.guild_id, x.id) });
+    await saveChannels(db, [{ channelId: x.id, guildId: x.guild_id, guildName: null, name: x.name ?? null, position: x.position, categoryId: x.parent_id, viewable: guildPerms.viewable(x.guild_id, x.id) }]);
   } else if ((type === "THREAD_CREATE" || type === "THREAD_UPDATE") && x.id && x.guild_id) {
-    await thread(x.guild_id, x as Channel);
+    await saveChannels(db, threads(x.guild_id, [x as Channel]));
   } else if (type === "THREAD_LIST_SYNC" && x.guild_id) {
-    for (const t of x.threads ?? []) await thread(x.guild_id, t);
+    await saveChannels(db, threads(x.guild_id, x.threads ?? []));
   } else if ((type === "CHANNEL_DELETE" || type === "THREAD_DELETE") && x.id) {
-    const gone = x.id;
-    await db.run(db.k.deleteFrom("discord_channels").where((eb) => eb.or([eb("channel_id", "=", gone), eb("parent_id", "=", gone)])));
-    await db.run(db.k.deleteFrom("discord_categories").where("category_id", "=", gone));
+    await removeChannelTree(db, { channelOrParentId: x.id });
   } else if (type === "GUILD_DELETE" && x.id && !x.unavailable) {
-    await db.run(db.k.deleteFrom("discord_channels").where("guild_id", "=", x.id));
-    await db.run(db.k.deleteFrom("discord_categories").where("guild_id", "=", x.id));
+    await removeChannelTree(db, { guildId: x.id });
   }
 }
 
@@ -96,19 +99,13 @@ export function dispatcher(db: Db, keys: DiscordKeys, interactions: Interactions
   };
 }
 
-/** Decision alerts by direct message. The GitHub permissions of a linked login are read as the dashboard reads them, from the dashboard's configuration when this process has it, else from the cached permissions only. */
-function installDecisionAlerts(db: Db, keys: DiscordKeys, rest: RestClient, interactions: Interactions, signal: AbortSignal, log: (l: string) => void): void {
+/** Workflow alerts by direct message. The GitHub permissions of a linked login are read as the dashboard reads them, from the dashboard's configuration when this process has it, else from the cached permissions only. */
+function installAlerts(db: Db, keys: DiscordKeys, rest: RestClient, interactions: Interactions, signal: AbortSignal, log: (l: string) => void): void {
   let config: Config | null = null;
   try { config = loadConfig(process.env); } catch (e) { log(`runner: Discord alerts use cached permissions only: ${(e as Error).message}`); }
   const appKeys = processAppKeys();
   if (config && appKeys) bindSecrets(config.secrets, appKeys);
-  const box = config ? new TokenBox(config.secrets.sessionKey) : null;
-  const provider = config ? providerFor(config, async () => await githubIdentity(db)) : null;
-  const alerts = new DecisionAlerts({
-    db, keys, rest, log, baseUrl: config?.baseUrl ?? envVar("BASE_URL") ?? null,
-    // Without the dashboard configuration there is no token box: userForLogin then answers from cached permissions, as it does for agent tokens.
-    userFor: async (login, role, forWrite) => await userForLogin(db, box as never, provider as never, login, role, forWrite),
-  });
+  const alerts = new Alerts({ db, keys, rest, log, baseUrl: config?.baseUrl ?? envVar("BASE_URL") ?? null });
   installAlertCommands(interactions, alerts);
   alerts.start(signal);
 }
@@ -140,8 +137,13 @@ export async function startDiscord(db: Db, signal: AbortSignal, log: (l: string)
   installSearchCommands(interactions, { db, keys, search });
   installAccountCommands(interactions, { db, keys });
   installPanel(interactions, db, installIssueNew(interactions, { db, keys, search, log }));
-  installDecisionAlerts(db, keys, rest, interactions, signal, log);
-  const pings = new Pings({ db, keys, rest, search, log });
+  installAlerts(db, keys, rest, interactions, signal, log);
+  installRolePanel(interactions, { db, keys, rest, log, baseUrl: envVar("BASE_URL") ?? null });
+  watchRolePanel(db, rest, log, signal);
+  watchRoleGrants(db, keys, rest, log, signal);
+  const results = new ThreadResults({ db, keys, rest, log });
+  results.start(signal);
+  const pings = new Pings({ db, keys, rest, search, log, commands: new AtCommands({ db, keys, rest, log, followed: () => void results.sync() }) });
   const signals = new Signals({ db, keys, log });
   const reactor = new Reactor({ db, rest, log });
   // A crash during a call can leave the question in a recorded prompt.
@@ -152,7 +154,7 @@ export async function startDiscord(db: Db, signal: AbortSignal, log: (l: string)
     onState: async (state, detail) => await setStatus(db, state, detail),
     onDispatch: dispatcher(db, keys, interactions, pings, signals, reactor),
   });
-  log("runner: Discord mention counting, pings and search started");
+  log("runner: Discord mention counting, pings, commands and search started");
   void gw.run(signal).catch((e: Error) => log(`runner: Discord stopped: ${e.message}`));
 }
 
@@ -160,6 +162,7 @@ const USAGE = `usage: autocraft-server discord forget --message <message link or
        autocraft-server discord channels
        autocraft-server discord watch <channel id> | unwatch <channel id>
        autocraft-server discord panel post <channel id>
+       autocraft-server discord role-panel | role-panel set <channel id> <role id> | role-panel off
        autocraft-server discord filing list | add <owner/name> | remove <owner/name>
        autocraft-server discord offer list | hide <name> | show <name>`;
 
@@ -201,18 +204,18 @@ async function discord(args: string[]): Promise<void> {
       console.log(`deleted ${n} mention ${n === 1 ? "row" : "rows"} and ${replies} ${replies === 1 ? "reply" : "replies"}`);
     } else {
       const n = await forgetAuthor(db, keys, id);
+      const follows = await forgetFollowsOf(db, keys, id);
       const links = await forgetLink(db, keys, id);
       const signedIn = await forgetReporter(db, keys.hash("author", id));
-      await audit(db, "cli", "discord-forget", "user", { rows: n, links, signedIn });
-      console.log(`deleted ${n} mention ${n === 1 ? "row" : "rows"} and ${links} ${links === 1 ? "link" : "links"}${signedIn ? " and the GitHub sign-in" : ""}`);
+      const verify = await forgetVerifyRows(db, keys.hash("author", id));
+      await audit(db, "cli", "discord-forget", "user", { rows: n, follows, links, signedIn, verify });
+      console.log(`deleted ${n} mention ${n === 1 ? "row" : "rows"}, ${follows} thread ${follows === 1 ? "row" : "rows"} and ${links} ${links === 1 ? "link" : "links"}${signedIn ? " and the GitHub sign-in" : ""}`);
     }
   } else if (sub === "channels") {
-    for (const c of await db.all(db.k.selectFrom("discord_channels").select(["channel_id", "guild_name", "name", "watched"])
-      .orderBy("guild_name", (o) => o.asc().nullsFirst()).orderBy("name", (o) => o.asc().nullsFirst())))
-      console.log(`${c.watched ? "watched " : "-       "} ${c.channel_id} ${c.guild_name ?? "?"} / #${c.name ?? "?"}`);
+    for (const c of await listChannelBriefs(db))
+      console.log(`${c.watched ? "watched " : "-       "} ${c.channelId} ${c.guildName ?? "?"} / #${c.name ?? "?"}`);
   } else if ((sub === "watch" || sub === "unwatch") && a) {
-    const r = await db.run(db.k.updateTable("discord_channels").set({ watched: sub === "watch" ? 1 : 0 }).where("channel_id", "=", a));
-    if (!r.changes) die("no such channel; the bot has not reported it");
+    if (!await markWatched(db, a, sub === "watch")) die("no such channel; the bot has not reported it");
     await audit(db, "cli", sub === "watch" ? "discord-watch" : "discord-unwatch", a);
     console.log(`${sub === "watch" ? "watching" : "no longer watching"} ${a}`);
   } else if (sub === "panel" && a === "post" && b) {
@@ -224,6 +227,16 @@ async function discord(args: string[]): Promise<void> {
     if (!r) die("no such channel; the bot has not reported it");
     await audit(db, "cli", "discord-panel", b, { message: r.messageId, created: r.created });
     console.log(`${r.created ? "posted" : "updated"} the panel in ${b} (message ${r.messageId})${r.pinError ? `; not pinned: ${r.pinError}` : ""}`);
+  } else if (sub === "role-panel" && !a) {
+    const [cfg, st] = await Promise.all([roleConfig(db), rolePanelState(db)]);
+    if (!cfg) console.log("the contributor role panel is off");
+    else console.log(`contributor role ${cfg.roleId} in server ${cfg.guildId}, panel in ${cfg.channelId}: ${st?.channelId === cfg.channelId ? (st.error ? `not posted: ${st.error}` : `message ${st.messageId}`) : "not posted yet"}`);
+  } else if (sub === "role-panel" && a === "set" && b && args[3]) {
+    const cfg = await setRoleConfig(db, "cli", { channelId: b, roleId: args[3] }).catch((e: Error) => die(e instanceof RoleConfigError ? e.message : `saving failed: ${e.message}`));
+    console.log(`the runner posts the contributor role panel in ${cfg!.channelId}; Verify gives role ${cfg!.roleId}`);
+  } else if (sub === "role-panel" && a === "off") {
+    await setRoleConfig(db, "cli", null);
+    console.log("the contributor role panel is off; the runner removes the posted panel");
   } else if (sub === "react-emoji") {
     if (!a) {
       console.log(await reactEmoji(db));
@@ -253,5 +266,5 @@ async function discord(args: string[]): Promise<void> {
 }
 
 export const commands = {
-  discord: { summary: "Discord mentions: forget --message|--user | channels | watch | unwatch | panel post | filing list|add|remove | offer list|hide|show", run: (args: string[]) => discord(args) },
+  discord: { summary: "Discord mentions: forget --message|--user | channels | watch | unwatch | panel post | role-panel [set|off] | filing list|add|remove | offer list|hide|show", run: (args: string[]) => discord(args) },
 };

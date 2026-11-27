@@ -27,7 +27,7 @@ export async function runUnassign(db: Db, p: UnassignParams): Promise<UnassignRe
   const log = p.log ?? (() => {});
   const q = p.querier ?? new Client(500);
   const out: UnassignResult = { unassigned: [], failed: [], due: 0 };
-  const opts = { repo: p.repo, ...(p.plans ? { plans: p.plans } : {}) };
+  const opts = { repo: p.repo, by: p.by, ...(p.plans ? { plans: p.plans } : {}) };
   const due = [
     ...(await planned(db, "unassign", opts)).map((x) => ({ pr: true, number: x.facts.number })),
     ...(await plannedItems(db, "unassign", opts)).filter((x) => x.facts.kind === "issue").map((x) => ({ pr: false, number: x.facts.number })),

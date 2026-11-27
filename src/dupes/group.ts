@@ -39,7 +39,7 @@ export type CompareIssue = { ref: string; title: string; body: string; state: st
 export type CompareIssues = { ref: string; issues: CompareIssue[] };
 
 export type PrOther = { number: number; duplicate: boolean; better: string[]; carry: string[] };
-/** summary: 2 or 3 sentences for the decision; why: one sentence behind the recommendation. Null when the reply had none. */
+/** summary: 2 or 3 sentences on the group; why: one sentence behind the pick. Null when the reply had none. */
 type Prose = { summary: string | null; why: string | null };
 export type PrComparison = { keep: number; reason: string; others: PrOther[] } & Prose;
 export type IssueOther = { number: number; adds: string[] };

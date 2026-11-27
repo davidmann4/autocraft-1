@@ -4,7 +4,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { fillHarness } from "../src/prompts/harness.ts";
-import { CLAUDE_PROMPTS, EXAMPLES, REFERENCE_NOTE, REFERENCE_TOOLS_NOTE, claudeArgs, claudeParts, joinParts, withoutRepoDir, type ClaudePromptId } from "../src/prompts/index.ts";
+import { CLAUDE_PROMPTS, EXAMPLES, REFERENCE_NOTE, REFERENCE_TOOLS_NOTE, TASK_BUDGET_CLAUDE, claudeArgs, claudeParts, joinParts, withoutRepoDir, type ClaudePromptId } from "../src/prompts/index.ts";
 import { forHarness } from "../src/remote/calls.ts";
 import { agentsDefinition, MCP_PATH } from "../src/sandbox/agents.ts";
 import type { TaskBundle } from "../src/remote/protocol.ts";
@@ -64,8 +64,9 @@ test("a helper's path root moves only the marked sandbox paths and the path argu
   const args = claudeArgs("review.opus", "opus", true, { config: MCP_PATH, servers: ["items"] }, null, false, true, true);
   const agents = JSON.stringify(agentsDefinition(["items"]));
   const b = { ...BUNDLE, hints: { claude: { args, agents } } };
-  assert.deepEqual(forHarness(b, "claude"), b);
-  const h = forHarness(b, "claude", root).hints.claude!;
+  // A Claude Code that takes every flag the arguments carry (the task budget included).
+  assert.deepEqual(forHarness(b, "claude", "", TASK_BUDGET_CLAUDE), b);
+  const h = forHarness(b, "claude", root, TASK_BUDGET_CLAUDE).hints.claude!;
   const value = (flag: string) => h.args.flatMap((a, i) => (h.args[i - 1] === flag ? [a] : []));
   assert.deepEqual(value("--add-dir"), [`${root}/repo`, `${root}/repos`, `${root}/repo-docs`]);
   assert.deepEqual(value("--mcp-config"), [`${root}/mcp.json`]);

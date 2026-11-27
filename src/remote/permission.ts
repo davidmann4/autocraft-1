@@ -4,7 +4,8 @@ import { AppError, call, GITHUB_API } from "../github/app.ts";
 import { installationToken } from "../github/install-token.ts";
 import { WRITE_PERMISSIONS } from "../dash/server/provider.ts";
 import type { Db } from "../db/index.ts";
-import { excluded } from "../db/kx.ts";
+import { loadPermissions, permKey, PERM_READ_TTL, PERM_WRITE_TTL, savePermissions } from "../data/access/index.ts";
+import { loadRepos } from "../data/mirror/index.ts";
 
 export const APP_PERMISSION_TTL = 60_000;
 
@@ -42,7 +43,7 @@ export function appPermission(db: Db, login: string, repo: string, deps: Permiss
 }
 
 async function lookup(db: Db, login: string, repo: string, deps: PermissionDeps): Promise<AppPermission> {
-  const row = await db.get(db.k.selectFrom("main.repos").select("owner").where("name", "=", repo));
+  const row = (await loadRepos(db, { names: [repo] })).get(repo);
   if (!row?.owner) return { kind: "unavailable" };
   let token: string;
   try {
@@ -54,8 +55,7 @@ async function lookup(db: Db, login: string, repo: string, deps: PermissionDeps)
     const r = await call(deps.apiBase ?? GITHUB_API, `/repos/${encodeURIComponent(row.owner)}/${encodeURIComponent(repo)}/collaborators/${encodeURIComponent(login)}/permission`, token) as { permission?: unknown; role_name?: unknown };
     const role = typeof r.role_name === "string" ? r.role_name : "";
     const permission = WRITE_PERMISSIONS.has(role) ? role : typeof r.permission === "string" ? r.permission : "none";
-    await db.run(db.k.insertInto("repo_permissions").values({ login, repo, permission, checked_at: new Date().toISOString() })
-      .onConflict((oc) => oc.columns(["login", "repo"]).doUpdateSet(excluded(["permission", "checked_at"]))));
+    await savePermissions(db, [{ login, repo, permission, checkedAt: new Date().toISOString() }]);
     return { kind: "ok", permission };
   } catch (e) {
     // A 404 does not prove the user lacks access: the installation may not see the repo, or the login may have been renamed.
@@ -63,4 +63,42 @@ async function lookup(db: Db, login: string, repo: string, deps: PermissionDeps)
     if (e instanceof AppError && e.status === 404) return { kind: "unavailable" };
     return { kind: "error", why: `GitHub permission check failed: ${(e as Error).message}` };
   }
+}
+
+/** A login's write access to a repo: decided, or unknown with the reason. */
+export type WriteCheck = { kind: "yes" } | { kind: "no" } | { kind: "unknown"; why: string };
+export type PermissionFn = (db: Db, login: string, repo: string) => Promise<AppPermission>;
+
+/**
+ * Write access for a command from a surface with no dashboard session to read it with (Discord, an agent): a cached check younger than
+ * PERM_WRITE_TTL decides; else the GitHub App is asked, which refreshes the cached row. When the app cannot ask for the repo, a cached
+ * check within PERM_READ_TTL decides, and with none it is a no. When GitHub fails, the answer is unknown, never a no.
+ */
+export async function freshWrite(db: Db, login: string, repo: string, permission: PermissionFn = (d, l, r) => appPermission(d, l, r)): Promise<WriteCheck> {
+  const cached = async (maxAgeMs: number): Promise<WriteCheck | null> => {
+    const row = (await loadPermissions(db, [{ login, repo }])).get(permKey(login, repo));
+    if (!row || Date.now() - Date.parse(row.checkedAt) >= maxAgeMs) return null;
+    return { kind: WRITE_PERMISSIONS.has(row.permission) ? "yes" : "no" };
+  };
+  const recent = await cached(PERM_WRITE_TTL);
+  if (recent) return recent;
+  const app = await permission(db, login, repo).catch((e: Error): AppPermission => ({ kind: "error", why: e.message }));
+  if (app.kind === "ok") return { kind: WRITE_PERMISSIONS.has(app.permission) ? "yes" : "no" };
+  if (app.kind === "error") return { kind: "unknown", why: app.why };
+  // Nothing can tell: a dashboard sign-in reads it again.
+  return await cached(PERM_READ_TTL) ?? { kind: "no" };
+}
+
+/** `canWrite` and `writeError` of a command actor (src/workflow/apply.ts Actor) from `freshWrite`, one check per repo. */
+export function writeAccess(db: Db, login: string, permission?: PermissionFn): { canWrite: (repo: string) => Promise<boolean>; writeError: (repo: string) => Promise<string | null> } {
+  const memo = new Map<string, Promise<WriteCheck>>();
+  const check = (repo: string): Promise<WriteCheck> => {
+    let p = memo.get(repo);
+    if (!p) memo.set(repo, (p = freshWrite(db, login, repo, permission)));
+    return p;
+  };
+  return {
+    canWrite: async (repo) => (await check(repo)).kind === "yes",
+    writeError: async (repo) => { const w = await check(repo); return w.kind === "unknown" ? w.why : null; },
+  };
 }

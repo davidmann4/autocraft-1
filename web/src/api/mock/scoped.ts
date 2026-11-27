@@ -4,7 +4,7 @@ import type { Api } from "../client";
 import { requestProject } from "../scope";
 
 /** The Api calls whose server routes are `scoped` (src/dash/api/index.ts). */
-const SCOPED = new Set(["decisions.list", "needs", "needsOutside", "items", "itemStatusList", "activity", "now", "nowFeed", "live", "home", "next", "queuePage", "queue", "queueBatches", "work"]);
+const SCOPED = new Set(["activity", "live", "next", "queuePage"]);
 
 function narrow(v: unknown, repo: string, depth = 0): unknown {
   if (depth > 8 || v === null || typeof v !== "object") return v;

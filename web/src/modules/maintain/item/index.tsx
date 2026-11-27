@@ -1,4 +1,4 @@
-// The new dashboard's item page (ui_v2): status, steps, numbered parts and the command box beside the GitHub side.
+// The item page: the chat with AutoCraft beside the item's GitHub side and its events.
 import type { FeatureModule } from "../../../registry/types";
 import { lazyView } from "../../../registry/lazyView";
 import { t } from "../../../../../src/i18n/index.ts";

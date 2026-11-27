@@ -4,7 +4,9 @@
 // stops jobs whose cancel was requested, runs the autopilot (queues jobs while the
 // pipeline switch is on) and puts jobs that a stop or an earlier runner left
 // unfinished back in the queue to resume (src/runner/resuming.ts).
-import { advanceWorkflows } from "../workflow/advance.ts";
+import { recheckDelayMs } from "../core/backoff.ts";
+import { advanceWorkflows, type FailedCheck } from "../workflow/advance.ts";
+import { endGoneCloses } from "../act/gone.ts";
 import { copyLogs, JobLogCopy, pruneJobLogs } from "./job-log.ts";
 import { spawn, type ChildProcess } from "node:child_process";
 import { appendFileSync, statSync, closeSync, mkdirSync, openSync, readFileSync, utimesSync } from "node:fs";
@@ -13,36 +15,40 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { dbEnv, dbLockName, dbTarget } from "../db/open.ts";
 import { advancePreapprovals, preapprovalInputs } from "../preapproval/index.ts";
-import { applyProposals, AUTOPILOT_USER, isDraining, isEnabled, planDue, type Detected } from "./autopilot.ts";
-import { recordUsageSamples } from "../agents/accounts.ts";
-import { AccountWatcher } from "../agents/manage.ts";
-import { failRunning, pruneRuns } from "../agents/runs.ts";
+import { applyProposals, AUTOPILOT_USER, isEnabled, KEY_ENABLED, loadPlanDue, planDue, type Detected } from "./autopilot.ts";
+import { pruneRuns } from "../agents/runs.ts";
 import { pruneJevUnsure } from "../agents/step.ts";
 import { pruneTasks, reapLost } from "../build/tasks.ts";
+import { loadStaleTasks } from "../data/build/index.ts";
+import { freshConfig } from "../data/control/index.ts";
 import { pruneBench } from "../nightly/index.ts";
 import { prunePlanHistory } from "../core/plan-cache.ts";
-import { commandWorkExpr, drainCommands, pruneCommands } from "../github/commands.ts";
+import { drainCommands, pruneCommands } from "../github/commands.ts";
 import { checkPendingUpdate } from "../build/worker-update.ts";
-import { endJob, JOB_KEEP_MS, now, pruneJobs, resumeJob, RUNNER_STOPPED } from "./jobs.ts";
-import { advanceSecurityFixes, autoFixConfirmed } from "../security/actions.ts";
-import { advanceScanTests } from "../security/scantest.ts";
+import { JOB_KEEP_MS, now, pruneJobs, scrub } from "./jobs.ts";
+import { endJob, recoverJobs } from "./lifecycle.ts";
+import { advanceSecurityFixes, autoFixConfirmed, loadSecurityFixWork } from "../security/actions.ts";
+import { advanceScanTests, loadScanTestWork } from "../security/scantest.ts";
 import { OffThread } from "./offthread.ts";
-import { groupsFile, killGroups, removeGroupsFile } from "./groups.ts";
 import { buildDiffFacts } from "../review/diff.ts";
-import { loadSteps, modelsOf, usesClaude, type Params } from "./steps.ts";
-import { jobBlock } from "./concurrency.ts";
+import { laneOf, loadSteps, modelsOf, usesClaude, type Params, type StepDef } from "./steps.ts";
+import { jobBlock, STEP_PARALLEL_KEY, wantOf } from "./concurrency.ts";
 import { queueRoomPass } from "../agents/call.ts";
 import { TRY_STEP } from "../build/workspace-session.ts";
 import { pruneWorkspaceImages } from "../build/workspace-relay.ts";
 import { noTakerFor } from "../remote/takers.ts";
-import { JOB_DEADLINE_ENV, stepDeadlineMin, stepNoProgressMin } from "./deadlines.ts";
+import { JOB_DEADLINE_ENV, RUNNER_FAILING_MS, stepDeadlineMin, stepNoProgressMin } from "./deadlines.ts";
 import { envVar } from "../env.ts";
 import { anyRepinDue } from "../repin/due.ts";
-import { jobRemoteQueue, REMOTE_WAIT_CAP_MS, withdrawJobCalls } from "../remote/calls.ts";
+import { REMOTE_WAIT_CAP_MS } from "../remote/calls.ts";
+import { CALLER_STALE_MS, jobRoom, roomState, type JobCalls, type RoomState } from "../remote/room.ts";
+import { CAPACITY_EVERY_MS, capacityText, readJobCapacity, type JobCapacity } from "./capacity.ts";
+import { claimJob, failQueued, loadLiveJobs, loadRunnerTick, markDeadlineStops, saveLaneState, setPids, type LogCursor, type QueuedJob, type RunningState } from "../data/jobs/index.ts";
+import { loadSyncState, hasSyncRequests } from "../data/mirror/index.ts";
+import { hasCommandWork, linkWorkflows } from "../data/workflow/index.ts";
 import { exclusive } from "../async-seq.ts";
 import { refreshReadIdentity } from "../github/read.ts";
 import type { Db } from "../db/index.ts";
-import { excluded, jsonNum } from "../db/kx.ts";
 
 export const logsDir = (): string => envVar("RUNNER_LOGS") ?? join(homedir(), ".cache/autocraft-logs/jobs");
 
@@ -51,24 +57,32 @@ export function runnerLockPath(): string {
   return join(dir, `runner-${dbLockName()}.lock`);
 }
 
-export const HEARTBEAT_KEY = "runner_heartbeat";
-/** How often the runner brings the flowchart summary up to date (src/flow/summary.ts). */
-export const FLOW_EVERY_MS = 20_000;
+/** The lane_state mark the runner writes on every tick. */
+export const HEARTBEAT_MARK = "heartbeat";
+/** The worst failure of the runner's parts as JSON TickFailure, written with the heartbeat; "" while none fails. */
+export const TICK_FAILURE_MARK = "tick_failure";
 /** How often queued webhook items are read again from GitHub. */
 export const WEBHOOK_DRAIN_MS = 5_000;
 /** How often the runner checks for a repo due for its daily reconcile. */
 export const RECONCILE_CHECK_MS = 5 * 60_000;
 const CLI = fileURLToPath(new URL("../cli.ts", import.meta.url));
 
-/** Job processes at once. A job that calls Claude also waits for a free account slot (see startJobs). */
+/**
+ * The most job processes at once (the ceiling of the capacity-based cap, src/runner/capacity.ts): the database connection budget
+ * of src/db/postgres.ts. A job that calls Claude also waits for room in the model queue (see startJobs).
+ */
 export const DEFAULT_MAX_JOBS = 32;
+/** The job capacity mark: the cap startJobs keeps and where it comes from (JSON JobCapacity). */
+export const JOB_CAPACITY_MARK = "job_capacity";
+/** A Claude job started this recently that has no call queued or leased yet is still preparing its call: it takes room the queue does not show yet. */
+const PREPARING_MS = 90_000;
 
 export type RunnerOptions = {
   db: Db;
   /** Database the children and worker threads open (a SQLite path or a postgres:// URL); default `dbTarget()`. */
   dbTarget?: string;
   logs?: string;
-  /** Most job processes running at once. */
+  /** Most job processes running at once: the ceiling of the capacity-based cap. */
   maxJobs?: number;
   /** Time a job gets to stop after SIGTERM before SIGKILL. */
   killAfterMs?: number;
@@ -76,8 +90,6 @@ export type RunnerOptions = {
   log?: (line: string) => void;
   /** The planner's detection pass (default: a worker thread on its own connection to `dbTarget`). Tests pass a fake. */
   detect?: (nowMs: number) => Promise<Detected>;
-  /** The flowchart summary refresh (default: a worker thread). */
-  refreshFlow?: () => Promise<unknown>;
   /** Longest run of a job of a step in minutes, given the job's `limit` param (default: stepDeadlineMin). Tests pass a short one. */
   maxMin?: (step: string, items?: number) => number;
   /** Minutes a job may show no progress, by step (default: stepNoProgressMin). */
@@ -101,6 +113,9 @@ function isJobProcess(pid: number, id: number): boolean {
   }
 }
 
+/** An error as the health check shows it: one scrubbed line. */
+const errorText = (e: unknown): string => scrub(((e as Error)?.message ?? String(e)).replace(/\s+/g, " ").trim()).slice(0, 200);
+
 function killGroup(pid: number, signal: NodeJS.Signals): void {
   try {
     process.kill(-pid, signal);
@@ -109,13 +124,34 @@ function killGroup(pid: number, signal: NodeJS.Signals): void {
   }
 }
 
+/** The `number` param of a job (a security finding), or null. */
+function numberOfParams(params: string): number | null {
+  try { const n = (JSON.parse(params) as { number?: unknown }).number; return typeof n === "number" ? n : null; } catch { return null; }
+}
+
+/** The calls a job makes as the start test reads them: its repo and step, and the item a lane job works on (its `number`). */
+export function jobCalls(step: string, repo: string | null, params: string): JobCalls {
+  const number = repo && laneOf(params) ? numberOfParams(params) : null;
+  return { step, ...(repo && { repos: [repo] }), ...(repo && number !== null && { refs: [{ repo, number }] }) };
+}
+
+type TickReads = Awaited<ReturnType<Runner["load"]>>;
+
+/**
+ * Since when a part of the runner's work has failed each time it ran, and its latest error: `fail` for a pass's reads, its
+ * cancels or the pass itself, `warn` for any other part.
+ */
+export type TickFailure = { since: string; state: "warn" | "fail"; error: string };
+
+/** The part that reads a pass's one wave; when it fails, the parts read one by one. */
+const READS = "the pass's reads, now made one by one";
+
 export class Runner {
   readonly db: Db;
   readonly running = new Map<number, Running>();
   /** Ended jobs whose end could not be recorded: every tick records them again, so their rows reach a final state. */
   private readonly unrecorded = new Map<number, { code: number | null; signal: NodeJS.Signals | null; spawnError: string | null }>();
   private stopping = false;
-  private flowAt = 0;
   private webhookAt = 0;
   private webhooking: Promise<void> | null = null;
   /** The autorepin drain (src/repin), apart from the webhook pass so its git work never delays re-reads and comment commands. */
@@ -126,14 +162,23 @@ export class Runner {
   private reconcileClient: import("../mirror.ts").Client | null = null;
   private planning: Promise<void> | null = null;
   private detected: Detected | null = null;
+  /** The parts that failed when they last ran (not every part runs on every pass), and what is stored of them (undefined: what an earlier runner left). */
+  private readonly failing = new Map<string, TickFailure>();
+  private storedFailure: string | undefined;
+  /** Jobs were queued at the last look: the next tick reads the model queue's room with the rest. */
+  private jobsWaited = false;
+  /** The job cap startJobs keeps (src/runner/capacity.ts), when it was read, and the text last stored in the mark. */
+  private capacity: { at: number; c: JobCapacity } | null = null;
+  private storedCapacity = "";
   /** What the last pre-approval pass read (preapprovalInputs) and the earliest time its answer changes with the clock alone. */
   private preapprovalMark: { sig: string; wakeAt: number } | null = null;
-  private flowing: Promise<void> | null = null;
+  /** The workflows whose check failed when it last ran, kept between the passes of advanceWorkflows. */
+  private readonly failedWorkflows = new Map<number, FailedCheck>();
+  /** Planner passes that failed in a row (their detection, or queueing what it found), and when the planner runs again for it. */
+  private planRetry: { times: number; at: number } | null = null;
   private readonly planThread: OffThread;
-  private readonly flowThread: OffThread;
-  private readonly o: Required<Omit<RunnerOptions, "db" | "lockFile" | "detect" | "refreshFlow" | "maxMin" | "graceMs" | "noProgressMin">> & { lockFile: string | null };
+  private readonly o: Required<Omit<RunnerOptions, "db" | "lockFile" | "detect" | "maxMin" | "graceMs" | "noProgressMin">> & { lockFile: string | null };
   private readonly detect: (nowMs: number) => Promise<Detected>;
-  private readonly refreshFlow: () => Promise<unknown>;
   private readonly maxMin: (step: string, items?: number) => number;
   private readonly graceMs: number;
   private readonly noProgressMin: (step: string) => number;
@@ -146,12 +191,10 @@ export class Runner {
     };
     mkdirSync(this.o.logs, { recursive: true });
     this.planThread = new OffThread(this.o.dbTarget);
-    this.flowThread = new OffThread(this.o.dbTarget);
     this.detect = opts.detect ?? ((t) => this.planThread.plan(t));
     this.maxMin = opts.maxMin ?? stepDeadlineMin;
     this.graceMs = opts.graceMs ?? 600_000;
     this.noProgressMin = opts.noProgressMin ?? stepNoProgressMin;
-    this.refreshFlow = opts.refreshFlow ?? (() => this.flowThread.flow());
   }
 
   /**
@@ -160,39 +203,48 @@ export class Runner {
    * resuming jobs stay; other calls of jobs, model-queue waits and work leases of the gone runner end.
    */
   async recover(): Promise<number> {
-    const rows = await this.db.all(this.db.k.selectFrom("jobs").select(["id", "pid", "cancel_requested_at"]).where("state", "=", "running"));
-    for (const r of rows) {
-      if (this.running.has(r.id)) continue;
-      if (r.pid && isJobProcess(r.pid, r.id)) {
+    return await recoverJobs(this.db, {
+      skip: (id) => this.running.has(id),
+      stop: (r) => {
+        if (!r.pid || !isJobProcess(r.pid, r.id)) return;
         killGroup(r.pid, "SIGKILL");
         // A command-line run's process leads no group of its own.
         try { process.kill(r.pid, "SIGKILL"); } catch { /* gone with its group */ }
-      }
-      const cancelled = r.cancel_requested_at !== null;
-      if (!cancelled && await resumeJob(this.db, r.id, "the runner restarted", "crash")) {
-        this.o.log(`job ${r.id}: left running by an earlier runner, queued to resume`);
-        continue;
-      }
-      await this.db.run(this.db.k.updateTable("jobs")
-        .set((eb) => ({ state: cancelled ? "cancelled" : "failed", ended_at: now(), pid: null, error: cancelled ? eb.ref("error") : eb.fn.coalesce("error", eb.val(RUNNER_STOPPED)) }))
-        .where("id", "=", r.id).where("state", "=", "running"));
-      // Replies an earlier run of the job left unread are not kept (as in endJob).
-      await this.db.run(this.db.k.updateTable("main.remote_calls").set({ reply: null }).where("job_id", "=", r.id).where("state", "=", "done").where("reply", "is not", null));
-      this.o.log(`job ${r.id}: left running by an earlier runner, marked ${cancelled ? "cancelled" : "failed"}`);
-    }
-    // Model calls of a runner that is gone no longer hold an account slot.
-    const orphans = await failRunning(this.db, "The runner stopped during this call.");
-    if (orphans) this.o.log(`${orphans} agent runs left running by an earlier runner, marked failed`);
-    await this.db.run(this.db.k.deleteFrom("model_waits"));
-    await withdrawJobCalls(this.db, "The runner stopped during this call.");
-    await this.db.run(this.db.k.deleteFrom("work_leases"));
-    return rows.length;
+      },
+      log: this.o.log,
+    });
   }
 
-  /** One pass: heartbeat, cancels, autopilot, new jobs. */
+  /**
+   * One pass: heartbeat, cancels, autopilot, new jobs. Everything it decides on is read in one wave; a part that changed
+   * something (a job's end recorded, proposals applied) makes the parts after it read again, and so does a wave that failed:
+   * one broken read then stops its own part only. The heartbeat and the jobs' new log lines are written beside it: it ends
+   * once they have landed. The heartbeat carries how the parts fail since the passes before it, for the health check.
+   */
   async tick(): Promise<void> {
-    const t = now();
-    await this.db.run(this.db.k.insertInto("settings").values({ key: HEARTBEAT_KEY, value: t }).onConflict((oc) => oc.column("key").doUpdateSet(excluded(["value"]))));
+    const worst = this.worstFailure(), failure = worst ? JSON.stringify(worst) : "";
+    // Writes are awaited at the end of the pass, so each handles its own failure: a promise that rejects before that would end the process.
+    const beside = [saveLaneState(this.db, [{ kind: "mark", step: HEARTBEAT_MARK, value: now() }, ...(failure !== this.storedFailure ? [{ kind: "mark" as const, step: TICK_FAILURE_MARK, value: failure }] : [])])
+      .then(() => { this.storedFailure = failure; }, (e) => this.o.log(`runner: heartbeat not stored: ${(e as Error)?.message ?? String(e)}`))];
+    try {
+      await this.pass(beside);
+      this.passed("pass");
+    } catch (e) {
+      this.noteFailure("pass", e, "fail");
+      throw e;
+    } finally {
+      await Promise.all(beside);
+    }
+  }
+
+  /** The failure the health check shows: of those that have lasted, else of all, a `fail` before a `warn`, then the oldest. */
+  private worstFailure(): TickFailure | null {
+    const t = Date.now();
+    const rank = (f: TickFailure): number => (t - Date.parse(f.since) >= RUNNER_FAILING_MS ? 2 : 0) + (f.state === "fail" ? 1 : 0);
+    return [...this.failing.values()].sort((a, b) => rank(b) - rank(a) || Date.parse(a.since) - Date.parse(b.since))[0] ?? null;
+  }
+
+  private async pass(beside: Promise<void>[]): Promise<void> {
     if (this.o.lockFile) {
       try {
         utimesSync(this.o.lockFile, new Date(), new Date());
@@ -200,40 +252,94 @@ export class Runner {
         // removed under us; the next start notices
       }
     }
-    await this.cancels();
-    await this.recordEnds();
+    const read = await this.load();
+    const { wave } = read;
+    try {
+      if (wave) {
+        await this.checkRunning(wave.jobs.running);
+        beside.push(this.copyRunningLogs());
+      } else await this.cancels();
+      this.passed("cancels");
+    } catch (e) { this.fault("cancels", e, "fail"); }
+    if (await this.recordEnds()) read.stale = true;
     if (this.stopping) return;
     try {
-      await refreshReadIdentity(this.db);
-    } catch (e) {
-      this.o.log(`GitHub identity not refreshed: ${(e as Error).message}`);
-    }
+      const lost = await reapLost(this.db, read.at, wave?.staleTasks);
+      if (lost) {
+        read.stale = true;
+        this.o.log(`${lost} build tasks lost their worker`);
+      }
+      this.passed("build tasks");
+    } catch (e) { this.fault("build tasks", e); }
     try {
-      const lost = await reapLost(this.db);
-      if (lost) this.o.log(`${lost} build tasks lost their worker`);
-    } catch (e) {
-      this.o.log(`build tasks: ${(e as Error).message}`);
-    }
-    await this.webhookTick();
+      const hooks = wave ? wave.webhooks : read.webhooksDue ? await this.webhookWork() : null;
+      if (hooks) {
+        this.passed("webhooks");
+        this.webhookTick(...hooks);
+      }
+    } catch (e) { this.fault("webhooks", e); }
     this.reconcileTick();
-    await this.usageTick();
+    await this.pruneTick();
     this.workerUpdateTick();
-    await this.autopilot();
-    await this.startJobs();
-    if (!this.flowing && Date.now() - this.flowAt >= FLOW_EVERY_MS) {
-      this.flowAt = Date.now();
-      this.flowing = this.refreshFlow().then(() => undefined, (e) => this.o.log(`flowchart summary: ${(e as Error).message}`)).finally(() => (this.flowing = null));
+    await this.autopilot(read);
+    await this.startJobs(read);
+  }
+
+  /** The part ran and did not fail. */
+  private passed(part: string): void {
+    this.failing.delete(part);
+  }
+
+  private noteFailure(part: string, e: unknown, state: TickFailure["state"]): void {
+    this.failing.set(part, { since: this.failing.get(part)?.since ?? now(), state, error: `${part}: ${errorText(e)}` });
+  }
+
+  /** Logs the failure of a part of the pass; the pass goes on, and the part counts as failing until it runs through (TickFailure). */
+  private fault(part: string, e: unknown, state: TickFailure["state"] = "warn"): void {
+    this.noteFailure(part, e, state);
+    this.o.log(`${part}: ${(e as Error)?.message ?? String(e)}`);
+  }
+
+  /**
+   * What a tick reads, in one wave. `stale`: a part of the tick wrote since, so what follows it reads again. `wave` is null
+   * when the wave failed (on Postgres one broken read fails all of them): every part then reads its own, as after a write.
+   */
+  private async load() {
+    const db = this.db, at = Date.now();
+    const webhooksDue = !this.webhooking && at - this.webhookAt >= WEBHOOK_DRAIN_MS;
+    if (webhooksDue) this.webhookAt = at;
+    try {
+      const [start, staleTasks, fixes, scanTests, seqs, plan, webhooks] = await db.together(() => Promise.all([
+        this.loadStart(at), loadStaleTasks(db, at), loadSecurityFixWork(db), loadScanTestWork(db), db.seqs(), this.planning ? null : loadPlanDue(db, at),
+        webhooksDue ? this.webhookWork() : null,
+        refreshReadIdentity(db).catch((e: unknown) => this.o.log(`GitHub identity not refreshed: ${(e as Error).message}`)),
+      ]));
+      this.passed(READS);
+      return { at, wave: { ...start, staleTasks, fixes, scanTests, seqs, plan, webhooks }, webhooksDue, stale: false };
+    } catch (e) {
+      this.fault(READS, e, "fail");
+      return { at, wave: null, webhooksDue, stale: true };
     }
   }
 
+  /** Commands in comments, autorepins whose pull request was merged or closed or whose lockfile task ended (src/repin), webhook re-reads. */
+  private async webhookWork(): Promise<[boolean, boolean, boolean]> {
+    return await Promise.all([hasCommandWork(this.db), anyRepinDue(this.db), hasSyncRequests(this.db)]);
+  }
+
+  /** What startJobs reads: the jobs, the switch and the cap, and (when jobs waited at the last tick, so some likely wait now) the model queue's room. */
+  private async loadStart(at: number) {
+    const db = this.db;
+    const [jobs, live, cfg, room] = await db.together(() => Promise.all([
+      loadRunnerTick(db, at, CALLER_STALE_MS), loadLiveJobs(db), freshConfig(db, [KEY_ENABLED, STEP_PARALLEL_KEY]), this.jobsWaited ? roomState(db, at) : undefined,
+    ]));
+    return { jobs, live, on: cfg.pipelineEnabled, draining: cfg.pipelineDraining, cap: cfg.stepParallel, room };
+  }
+
   /** Reads the items GitHub App webhooks named again from GitHub, off the tick, while no sync run holds its lock. The poll covers any that fail. */
-  private async webhookTick(): Promise<void> {
-    if (this.webhooking || Date.now() - this.webhookAt < WEBHOOK_DRAIN_MS) return;
-    this.webhookAt = Date.now();
-    const commands = !!await this.db.get(this.db.k.selectFrom("main.github_commands").select((eb) => eb.lit(1).as("one")).where((eb) => commandWorkExpr(eb)).limit(1));
-    // Autorepins whose pull request was merged or closed, or whose lockfile task ended (src/repin).
-    const repins = !this.repinning && await anyRepinDue(this.db);
-    if (!commands && !repins && !await this.db.get(this.db.k.selectFrom("main.sync_requests").select((eb) => eb.lit(1).as("one")).limit(1))) return;
+  private webhookTick(commands: boolean, repinDue: boolean, requests: boolean): void {
+    const repins = !this.repinning && repinDue;
+    if (!commands && !repins && !requests) return;
     this.webhooking = (async () => {
       const { lockHeld, lockPath, fullLockPath, Client, SYNC_RESERVE } = await import("../mirror.ts");
       if (lockHeld(lockPath()) || lockHeld(fullLockPath())) return;
@@ -263,9 +369,9 @@ export class Runner {
    * Below the reserve nothing is read until the limit resets; the sync's reading is newer than ours when it is the later one.
    */
   private async seedRate(c: import("../mirror.ts").Client): Promise<import("../mirror.ts").Client> {
-    const get = async (k: string): Promise<string | undefined> => (await this.db.get(this.db.k.selectFrom("main.settings").select("value").where("key", "=", k)))?.value ?? undefined;
-    const seen = Number(await get("sync_rate_remaining"));
-    const reset = Date.parse(await get("sync_rate_reset_at") ?? "");
+    const state = await loadSyncState(this.db);
+    const seen = state.rate_remaining ?? NaN;
+    const reset = Date.parse(state.rate_reset_at ?? "");
     if (Number.isFinite(seen) && Number.isFinite(reset) && reset > Date.now()) {
       c.remaining = c.remaining === null ? seen : Math.min(c.remaining, seen);
       c.resetAt = new Date(reset);
@@ -296,10 +402,11 @@ export class Runner {
    * The planner. Detection reads a lot and runs off the loop, at most one pass at a time; the
    * tick queues what it found, so a slow detection never delays the heartbeat or cancels.
    */
-  private async autopilot(): Promise<void> {
+  private async autopilot(read: TickReads): Promise<void> {
     const found = this.detected;
     this.detected = null;
     if (found) {
+      read.stale = true;
       for (const l of found.logs) this.o.log(l);
       try {
         // Detection read the database a moment ago; the switch may have been turned off since.
@@ -309,45 +416,96 @@ export class Runner {
           const fixes = await autoFixConfirmed(this.db);
           if (fixes) this.o.log(`autopilot: started the private fix of ${fixes} confirmed security findings`);
         }
-      } catch (e) {
-        this.o.log(`autopilot: ${(e as Error).message}`);
-      }
+        this.planRetry = null;
+        this.passed("autopilot");
+      } catch (e) { this.planFault("autopilot", e); }
     }
+    // What a part reads while nothing wrote since the wave.
+    const wave = (): TickReads["wave"] => (read.stale ? null : read.wave);
     // A private fix waits for its build without a job; the next job starts when the build tasks end, for operator-started fixes with the pipeline off too.
     try {
-      const next = await advanceSecurityFixes(this.db, isEnabled(this.db));
+      const w = wave();
+      const next = await (w ? advanceSecurityFixes(this.db, w.on, w.fixes) : advanceSecurityFixes(this.db, await isEnabled(this.db)));
+      if (next) read.stale = true;
       if (next) this.o.log(`security: continued the private fix of ${next} findings after their builds`);
-    } catch (e) { this.o.log(`security fixes: ${(e as Error).message}`); }
+      this.passed("security fixes");
+    } catch (e) { this.fault("security fixes", e); }
     // The build task of a scan test is read here (database only); a finding whose test ended can then start its automatic fix.
     try {
-      for (const t of await advanceScanTests(this.db)) {
+      for (const t of await advanceScanTests(this.db, wave()?.scanTests)) {
+        read.stale = true;
         this.o.log(`security: scan test of ${t.repo} finding ${t.number}: ${t.state}`);
         if (await isEnabled(this.db) && t.state !== "not-shown") await autoFixConfirmed(this.db, t.repo, t.number);
       }
-    } catch (e) { this.o.log(`security scan tests: ${(e as Error).message}`); }
+      this.passed("security scan tests");
+    } catch (e) { this.fault("security scan tests", e); }
     // Pre-approved merges move on rows other steps wrote; they are read here, not on a timer of their own.
-    try { await this.preapprovals(); } catch (e) { this.o.log(`preapprovals: ${(e as Error).message}`); }
-    if (this.planning || !await planDue(this.db)) return;
+    try { await this.preapprovals(read); } catch (e) { this.fault("preapprovals", e); }
+    if (this.planning) return;
+    try {
+      const due = await planDue(this.db, read.at, wave()?.plan ?? undefined);
+      this.passed("planner reads");
+      if (!due && (!this.planRetry || read.at < this.planRetry.at)) return;
+    } catch (e) {
+      this.fault("planner reads", e);
+      return;
+    }
     this.planning = this.detect(Date.now())
-      .then((d) => { this.detected = d; }, (e) => this.o.log(`autopilot: detection failed: ${(e as Error).message}`))
+      .then((d) => { this.detected = d; this.passed("planner"); }, (e) => this.planFault("planner", e))
       .finally(() => (this.planning = null));
+  }
+
+  /** A failed planner pass runs again by itself: planDue moved its marks before it ran. */
+  private planFault(part: "planner" | "autopilot", e: unknown): void {
+    this.fault(part, e);
+    const times = (this.planRetry?.times ?? 0) + 1;
+    this.planRetry = { times, at: Date.now() + recheckDelayMs(times) };
   }
 
   /**
    * The pre-approval pass, when what it reads changed since the last one (read before it runs, so its own moves make the next tick run it
-   * again) or a time it was told about has come, also one told after the pass ended (a permission read's answer). A pass that throws runs
-   * again on the next tick.
+   * again) or a time it was told about has come, also one told after the pass ended (a permission read's answer). A pass that failed in any
+   * part runs again on the next tick; a workflow whose check keeps failing is checked again after a backoff.
    */
-  private async preapprovals(): Promise<void> {
+  private async preapprovals(read: TickReads): Promise<void> {
     const t = Date.now();
-    const sig = await preapprovalInputs(this.db);
+    const sig = preapprovalInputs(read.stale || !read.wave ? await this.db.seqs() : read.wave.seqs);
     const m = this.preapprovalMark;
-    if (m && m.sig === sig && t < m.wakeAt) return;
+    if (m && m.sig === sig && t < m.wakeAt) return this.passed("preapprovals");
     this.preapprovalMark = null;
+    read.stale = true;
     const next = { sig, wakeAt: Infinity };
-    // The maintainer workflow's blockers and recommendations come first: a blocker stops its merge leg before the leg moves on.
-    try { await advanceWorkflows(this.db, this.o.log); } catch (e) { this.o.log(`workflows: ${(e as Error).message}`); }
-    await advancePreapprovals(this.db, this.o.log, {}, (at) => { if (at < next.wakeAt) next.wakeAt = at; });
+    const wake = (at: number): void => { if (at < next.wakeAt) next.wakeAt = at; };
+    try {
+      await linkWorkflows(this.db);
+      this.passed("links");
+    } catch (e) {
+      this.fault("links", e);
+      wake(t);
+    }
+    // The maintainer workflow's blockers and recommendations come first: a blocker stops its merge leg before the leg moves on,
+    // so legs wait while their blockers could not be checked.
+    let checked = false;
+    try {
+      await advanceWorkflows(this.db, this.o.log, wake, this.failedWorkflows);
+      checked = true;
+      // A workflow whose own check fails is shown on its item and as its own health check (advance.ts FAILING_SHOWN), not as the runner's.
+      this.passed("workflows");
+    } catch (e) {
+      this.fault("workflows", e);
+      wake(t);
+    }
+    try {
+      await endGoneCloses(this.db);
+      this.passed("closes");
+    } catch (e) {
+      this.fault("closes", e);
+      wake(t);
+    }
+    if (checked) {
+      await advancePreapprovals(this.db, this.o.log, {}, wake, this.failedWorkflows);
+      this.passed("preapprovals");
+    }
     this.preapprovalMark = next;
   }
 
@@ -364,26 +522,11 @@ export class Runner {
       .finally(() => (this.updating = false));
   }
 
-  private usageAt = 0;
-  private refreshAt = 0;
   private pruneAt = 0;
-  private watcher: AccountWatcher | undefined;
 
-  /** Records usage readings that changed (at most every 15 s), reads sign-in state (every 15 minutes) and plan usage (every 5) of accounts through the claude command, and prunes old agent data hourly. */
-  private async usageTick(): Promise<void> {
+  /** Prunes old jobs, logs and agent data hourly. */
+  private async pruneTick(): Promise<void> {
     const t = Date.now();
-    if (t - this.usageAt >= 15_000) {
-      this.usageAt = t;
-      try {
-        await recordUsageSamples(this.db, t);
-      } catch (e) {
-        this.o.log(`usage samples: ${(e as Error).message}`);
-      }
-    }
-    if (t - this.refreshAt >= 60_000) {
-      this.refreshAt = t;
-      void (this.watcher ??= new AccountWatcher(this.db, (m) => this.o.log(m))).tick(t);
-    }
     if (t - this.pruneAt >= 3600_000) {
       this.pruneAt = t;
       try {
@@ -434,18 +577,24 @@ export class Runner {
     }
   }
 
+  /** The cancels and deadlines alone, while the runner stops. */
   private async cancels(): Promise<void> {
-    await this.checkRunning();
-    // The new log lines of every running job, in one write (each job at most every JOB_LOG_FLUSH_MS).
+    if (this.running.size) await this.checkRunning((await loadRunnerTick(this.db, Date.now(), CALLER_STALE_MS)).running);
+    await this.copyRunningLogs();
+  }
+
+  /** The new log lines of every running job, in one write (each job at most every JOB_LOG_FLUSH_MS). */
+  private async copyRunningLogs(): Promise<void> {
     await copyLogs(this.db, [...this.running.values()].map((r) => r.logCopy)).catch((e: Error) => this.o.log(`job logs not stored: ${e.message}`));
   }
 
-  private async checkRunning(): Promise<void> {
+  private async checkRunning(states: RunningState[]): Promise<void> {
+    const byId = new Map(states.map((r) => [r.id, r]));
     for (const [id, r] of this.running) {
-      const row = await this.db.get(this.db.k.selectFrom("jobs").select("cancel_requested_at").where("id", "=", id));
+      const row = byId.get(id);
       // Time a user-local model call waits for a helper counts like waiting for an account slot: not toward the deadline, and not as a time without progress.
       const nowMs = Date.now();
-      const remote = await jobRemoteQueue(this.db, id);
+      const remote = { queued: row?.queued ?? false, lastLeaseAt: row?.lastLeaseAt ?? null };
       if (r.remoteSeen?.queued) r.remoteWaitMs += nowMs - r.remoteSeen.at;
       r.remoteSeen = { at: nowMs, queued: remote.queued };
       // Up to REMOTE_WAIT_CAP_MS of it; past that a call nobody takes no longer holds the job and its item.
@@ -461,7 +610,7 @@ export class Runner {
       if ((late || idle) && !cancel && r.flaggedAt === null && r.termAt === null) {
         r.flaggedAt = Date.now();
         const msg = r.stopMsg = idle && !late ? noProgressError(r.noProgressMin) : deadlineError(r.deadlineMin);
-        await this.db.run(this.db.k.updateTable("jobs").set({ error: msg }).where("id", "=", id).where("state", "=", "running"));
+        await markDeadlineStops(this.db, [{ id, error: msg }]);
         try { appendFileSync(r.logPath, `${now()} ${msg}; the job may finish its current item, and is stopped ${Math.round(this.graceMs / 60_000)} min from now\n`); } catch { /* the log is gone */ }
         this.o.log(`job ${id}: ${msg}; finishing its current item`);
       }
@@ -485,92 +634,116 @@ export class Runner {
   }
 
   /**
-   * Starts queued jobs: security first (priority 2), then by id. A job whose step calls Claude starts only while the
-   * model queue has room for its class and its repo (queueRoomPass; a job without a repo param spans repos and is asked about
-   * none), so processes do not sit waiting for slots, unless no job of its step runs. Such a job with a repo starts only while
-   * a Task Runner that may take its repo and its step's task is connected and ready (busy or not); a job no Task Runner may take
-   * waits queued. The room is read once per pass, so a start takes one from every room counted so far, and a room first read
-   * later in the pass starts with the pass's starts taken off: the Task Runners that serve one repo or task may serve others.
+   * Starts queued jobs: security first (priority 2), then by id. A job whose step calls Claude starts only while a Task Runner
+   * user who would take its calls (its repo, its step's task and, for a lane job, its item; the people whose started work it is
+   * first) has a slot left after the queued calls that user would take (src/remote/room.ts jobRoom), so processes do not sit
+   * waiting for slots, unless no job of its step runs. Calls no free runner takes hold nobody's room. A job without a repo param
+   * spans repos and is asked about none. Such a job with a repo starts only while a Task Runner may take its calls (the taker
+   * rule, src/remote/takers.ts); a job no Task Runner may take waits queued. The room is read once per pass; each start, and each
+   * Claude job still preparing its call, holds a slot of one user who would take it.
    */
-  private async startJobs(): Promise<void> {
+  private async startJobs(read: TickReads): Promise<void> {
     const steps = await loadSteps();
-    const queued = (await this.db.all(this.db.k.selectFrom("jobs").select(["id", "step", "params", "requested_by", "repo"]).where("state", "=", "queued").orderBy("id")))
-      .sort((a, b) => (steps.get(b.step)?.priority ?? 0) - (steps.get(a.step)?.priority ?? 0) || a.id - b.id);
+    const { jobs: tick, live, on, draining, cap, room: state } = read.stale || !read.wave ? await this.loadStart(Date.now()) : read.wave;
+    const queued = tick.queued.sort((a, b) => (steps.get(b.step)?.priority ?? 0) - (steps.get(a.step)?.priority ?? 0) || a.id - b.id);
+    this.jobsWaited = queued.length > 0;
     if (!queued.length) return;
+    const running = live.filter((j) => j.state === "running");
     // Automatic jobs wait while the pipeline is off; they are cancelled when it is switched off. While it drains, nothing new starts.
-    const [on, draining] = await Promise.all([isEnabled(this.db), isDraining(this.db)]);
-    // Room by class, then by the job's step and repo ("" for a job without one): a runner counts only for the tasks it takes.
-    const room = new Map<number, Map<string, number>>();
-    const pass = await queueRoomPass(this.db);
-    let started = 0;
-    for (const q of queued) {
-      if (draining || (q.requested_by === AUTOPILOT_USER && !on)) continue;
-      if (this.running.size >= this.o.maxJobs) return;
-      const step = steps.get(q.step);
-      if (!step) {
-        await this.db.run(this.db.k.updateTable("jobs").set({ state: "failed", ended_at: now(), error: "This step does not exist in this build." }).where("id", "=", q.id).where("state", "=", "queued"));
-        continue;
-      }
-      if (await this.blocked(steps, q.id)) continue;
+    const st = state ?? await roomState(this.db);
+    const pass = await queueRoomPass(this.db, undefined, st);
+    const rooms = jobRoom(st);
+    const maxJobs = await this.jobCap(st);
+    // Claude jobs still preparing their call hold a slot the queue does not show yet, of a Task Runner that would take it, as this pass's starts do.
+    const nowMs = Date.now();
+    const calling = new Map(tick.running.map((r) => [r.id, r.queued || r.lastLeaseAt !== null]));
+    for (const j of running) {
+      const r = this.running.get(j.id), step = steps.get(j.step);
+      if (!r || calling.get(j.id) !== false || nowMs - r.startedAt > PREPARING_MS || !step) continue;
       let claude = false;
-      try { claude = usesClaude(modelsOf(step, JSON.parse(q.params) as Params)); } catch { /* params are checked when the job runs */ }
-      const cls = step.priority ?? 0;
-      let byRepo = room.get(cls);
-      if (!byRepo) room.set(cls, (byRepo = new Map()));
-      const key = `${q.step}\n${q.repo ?? ""}`;
-      const roomOf = async (): Promise<number> => byRepo.get(key) ?? await pass.room(cls, q.repo ? [q.repo] : undefined, q.step) - started;
-      if (claude && q.repo && !await pass.taker([q.repo], q.step)) {
-        // A pipeline job waits for a Task Runner; a command-line session job (`workspace try`) is not replanned, so it fails.
-        const why = q.step === TRY_STEP ? await noTakerFor(this.db, q.repo, q.step) : null;
-        if (why) await this.db.run(this.db.k.updateTable("jobs").set({ state: "failed", ended_at: now(), error: why }).where("id", "=", q.id).where("state", "=", "queued"));
-        continue;
-      }
-      if (claude && !await this.db.get(this.db.k.selectFrom("jobs").select((eb) => eb.lit(1).as("one")).where("step", "=", step.name).where("state", "=", "running").limit(1))) {
+      try { claude = usesClaude(modelsOf(step, JSON.parse(j.params) as Params)); } catch { /* not a Claude job */ }
+      if (claude) rooms.take(step.priority ?? 0, jobCalls(j.step, j.repo, j.params));
+    }
+    const pids: Promise<unknown>[] = [];
+    const failed: { id: number; error: string }[] = [];
+    try {
+      for (const q of queued) {
+        if (draining || (q.requested_by === AUTOPILOT_USER && !on)) continue;
+        if (this.running.size >= maxJobs) return;
+        const step = steps.get(q.step);
+        if (!step) {
+          failed.push({ id: q.id, error: "This step does not exist in this build." });
+          continue;
+        }
+        // The claim checks the same rules in one statement; this test spares the model-queue questions for a job that cannot start.
+        if (await jobBlock(this.db, steps, { ...wantOf(q.step, q.params), repo: q.repo }, { states: ["running"], mutex: true, active: running, cap })) continue;
+        let claude = false;
+        try { claude = usesClaude(modelsOf(step, JSON.parse(q.params) as Params)); } catch { /* params are checked when the job runs */ }
+        const cls = step.priority ?? 0, calls = jobCalls(q.step, q.repo, q.params);
+        if (claude && q.repo && !await pass.taker(calls.repos, q.step, calls.refs)) {
+          // A pipeline job waits for a Task Runner; a command-line session job (`workspace try`) is not replanned, so it fails.
+          const why = q.step === TRY_STEP ? await noTakerFor(this.db, q.repo, q.step) : null;
+          if (why) failed.push({ id: q.id, error: why });
+          continue;
+        }
         // Nothing of the step runs: it starts anyway, and takes a slot of the room.
-      } else if (claude) {
-        byRepo.set(key, await roomOf());
-        if (byRepo.get(key)! <= 0) continue;
+        if (claude && running.some((j) => j.step === step.name) && rooms.room(cls, calls) <= 0) continue;
+        const spawned = await this.start(q, step, steps, cap, tick.logCursors.get(q.id));
+        if (spawned) {
+          // Written at once, beside the next starts: a runner that takes over stops what the process left running by its pid (recover).
+          if (spawned.pid !== null) pids.push(setPids(this.db, [{ id: q.id, pid: spawned.pid }]).catch((e: unknown) => this.fault(`job ${q.id}: pid not stored`, e)));
+          running.push({ id: q.id, step: step.name, state: "running", repo: q.repo, number: numberOfParams(q.params), params: q.params, items: null, requested_by: q.requested_by, resumes: q.resumes, cancel_requested_at: null, started_at: null, pid: spawned.pid });
+          if (claude) rooms.take(cls, calls);
+        }
       }
-      if (await this.start(q.id, step.name, steps) && claude) {
-        byRepo.set(key, await roomOf());
-        started++;
-        for (const m of room.values()) for (const [k, n] of m) m.set(k, n - 1);
-      }
+    } finally {
+      await Promise.all(pids);
+      await failQueued(this.db, failed);
     }
   }
 
-  /** Why the queued job cannot start: a running job (of this runner or a command-line run) of the same step and repo, a full step, or a held mutex. */
-  private async blocked(steps: Awaited<ReturnType<typeof loadSteps>>, id: number): Promise<string | null> {
-    const r = await this.db.get(this.db.k.selectFrom("jobs").select(["step", "repo", jsonNum(this.db, "params", "$.number").as("number")]).where("id", "=", id));
-    return r ? await jobBlock(this.db, steps, r, { states: ["running"], mutex: true }) : "gone";
-  }
-
-  /** The job's `limit` param (its items), when it has one. */
-  private async limitOf(id: number): Promise<number | undefined> {
+  /**
+   * The most job processes now: the capacity of the Task Runners and build environments (src/runner/capacity.ts), read at most every
+   * CAPACITY_EVERY_MS, within the ceiling `maxJobs`. A change is stored as the job capacity mark (the runner health check shows it) and logged.
+   */
+  private async jobCap(st: RoomState): Promise<number> {
+    const nowMs = Date.now();
+    if (this.capacity && nowMs - this.capacity.at < CAPACITY_EVERY_MS) return this.capacity.c.max;
     try {
-      const p = JSON.parse((await this.db.get(this.db.k.selectFrom("jobs").select("params").where("id", "=", id)))!.params) as { limit?: unknown };
-      return typeof p.limit === "number" ? p.limit : undefined;
-    } catch { return undefined; }
+      const c = await readJobCapacity(this.db, st, this.o.maxJobs, nowMs);
+      this.capacity = { at: nowMs, c };
+      this.passed("job capacity");
+      const value = JSON.stringify(c);
+      if (value !== this.storedCapacity) {
+        await saveLaneState(this.db, [{ kind: "mark", step: JOB_CAPACITY_MARK, value }]);
+        if (this.storedCapacity === "" || this.capacity.c.max !== (JSON.parse(this.storedCapacity) as JobCapacity).max) this.o.log(`runner: ${capacityText(c)}`);
+        this.storedCapacity = value;
+      }
+    } catch (e) {
+      this.fault("job capacity", e);
+      // Without a reading, the last one, or the ceiling before any.
+      this.capacity = { at: nowMs, c: this.capacity?.c ?? { max: this.o.maxJobs, inference: 0, pods: 0, other: 0, floor: 0, ceiling: this.o.maxJobs } };
+    }
+    return this.capacity.c.max;
   }
 
-  private async start(id: number, stepName: string, steps: Awaited<ReturnType<typeof loadSteps>>): Promise<boolean> {
+  /** The job's claim, then its process; null when another job holds the step or the claim failed. */
+  private async start(q: QueuedJob, step: StepDef, steps: Map<string, StepDef>, cap: number, cursor: LogCursor | undefined): Promise<{ pid: number | null } | null> {
+    const id = q.id, stepName = step.name;
     const logPath = join(this.o.logs, `job-${id}.log`);
-    // The check and the claim are one write transaction, so a command-line run cannot take the step in between.
-    // Read before the claim: nothing may wait between the claim and the spawn.
-    const logCopy = await JobLogCopy.open(this.db, id, logPath);
-    const deadlineMin = this.maxMin(stepName, await this.limitOf(id));
-    const claimed = await this.db.write(async () => await this.blocked(steps, id) ? 0
-      : (await this.db.run(this.db.k.updateTable("jobs").set({ state: "running", started_at: now(), log_path: logPath }).where("id", "=", id).where("state", "=", "queued"))).changes);
-    if (!claimed) return false;
-    const groups = groupsFile(this.o.logs, id);
-    removeGroupsFile(groups);
+    const logCopy = JobLogCopy.open(id, logPath, cursor);
+    const deadlineMin = this.maxMin(stepName, q.limit ?? undefined);
+    const mutexSteps = step.exclusive ? [...steps.values()].filter((x) => x.exclusive === step.exclusive).map((x) => x.name) : [];
+    // One guarded statement: a command-line run cannot take the step in between.
+    const claimed = await claimJob(this.db, { id, step: stepName, repo: q.repo, number: numberOfParams(q.params), lane: laneOf(q.params), cap: cap === Infinity ? null : cap, mutexSteps, logPath });
+    if (!claimed) return null;
     const fd = openSync(logPath, "a");
     let child: ChildProcess;
     try {
       child = spawn(process.execPath, [CLI, "runner", "exec", String(id)], {
         detached: true,
         stdio: ["ignore", fd, fd],
-        env: { ...dbEnv(this.o.dbTarget), AUTOCRAFT_JOB_GROUPS: groups, [JOB_DEADLINE_ENV]: String(deadlineMin) },
+        env: { ...dbEnv(this.o.dbTarget), [JOB_DEADLINE_ENV]: String(deadlineMin) },
       });
     } finally {
       closeSync(fd);
@@ -580,7 +753,6 @@ export class Runner {
     child.on("error", (e) => (spawnError = e.message));
     const exited = new Promise<void>((resolve) => {
       child.on("close", (code, signal) => {
-        removeGroupsFile(groups);
         void this.finish(id, code, signal, spawnError)
           .catch((e) => {
             this.unrecorded.set(id, { code, signal, spawnError });
@@ -595,9 +767,8 @@ export class Runner {
       });
     });
     this.running.set(id, { child, termAt: null, exited, startedAt: Date.now(), deadlineMin, logPath, logCopy, flaggedAt: null, noProgressMin: this.noProgressMin(stepName), stopMsg: null, remoteWaitMs: 0, remoteSeen: null });
-    await this.db.run(this.db.k.updateTable("jobs").set({ pid: child.pid ?? null }).where("id", "=", id));
     this.o.log(`job ${id}: started (pid ${child.pid})`);
-    return true;
+    return { pid: child.pid ?? null };
   }
 
   private async finish(id: number, code: number | null, signal: NodeJS.Signals | null, spawnError: string | null): Promise<void> {
@@ -605,15 +776,19 @@ export class Runner {
     if (r) this.o.log(`job ${id}: ${r.state === "queued" ? "queued to resume after the restart" : r.state}${r.state === "failed" && r.error ? `: ${r.error}` : ""}`);
   }
 
-  private async recordEnds(): Promise<void> {
+  /** True when it recorded one. */
+  private async recordEnds(): Promise<boolean> {
+    let some = false;
     for (const [id, e] of [...this.unrecorded]) {
       try {
         await this.finish(id, e.code, e.signal, e.spawnError);
         this.unrecorded.delete(id);
+        some = true;
       } catch (err) {
         this.o.log(`job ${id}: end still not recorded: ${(err as Error).message}`);
       }
     }
+    return some;
   }
 
   /**
@@ -623,8 +798,6 @@ export class Runner {
   abandon(): void {
     this.stopping = true;
     for (const r of this.running.values()) if (r.child.pid) killGroup(r.child.pid, "SIGKILL");
-    // Model calls run in groups of their own; the jobs list theirs in their groups files.
-    killGroups([...this.running.keys()].map((id) => groupsFile(this.o.logs, id)));
   }
 
   /** Resolves when every running job has ended. */
@@ -641,7 +814,7 @@ export class Runner {
     await this.idle();
     clearInterval(timer);
     await this.recordEnds();
-    await Promise.all([this.planThread.close(), this.flowThread.close()]);
+    await this.planThread.close();
   }
 
   /** Polls until `signal` aborts, then stops running jobs. */

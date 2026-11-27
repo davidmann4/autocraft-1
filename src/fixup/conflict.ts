@@ -9,30 +9,33 @@ import { REPO_PATH } from "../sandbox/command.ts";
 import { audit } from "../dash/audit.ts";
 import type { By } from "../core/gates.ts";
 import { guard, liveOf } from "../core/guard.ts";
-import { ownLogins } from "../github/identity.ts";
+import { isOwnLogin, ownLogins } from "../github/identity.ts";
 import type { Note } from "../github/note.ts";
 import { ghAskComment, ghComment, ghEditComment, pushBranch, type Writer } from "../github/write.ts";
+import { MAX_PATCH_BYTES } from "../build/tasks.ts";
 import { foldFormat, queueLintFor, readLint } from "../prepush/index.ts";
 import { findingsWord, lintVerdict, testsNoteOf } from "../prepush/tests.ts";
 import { cachedDiff } from "../review/diff.ts";
 import { mergeInAllowed } from "../merge/base.ts";
 import { MAX_DIFF_CHARS } from "../review/opus.ts";
-import { changedHunks, hasBinary, ownDiffKey } from "../review/own-diff.ts";
+import { changedHunks, changedLines, hasBinary, ownDiffKey } from "../review/own-diff.ts";
 import { checkLine, parseCheck, recordCheck } from "../patchcheck/index.ts";
 import { CHECK_DIFF_CAP, CHECK_PATCH_CAP, type FixupCheckInput } from "../patchcheck/types.ts";
 import { CLAUDE_PROMPTS, untrustedJson } from "../prompts/index.ts";
-import { isQuiet } from "../security/quiet.ts";
+import { loadQuiet } from "../data/security/index.ts";
 import { patchGiveaway, QUIET_PATCH_REFUSAL } from "../security/rules.ts";
 import { BASE_NAME, type ConflictCandidate } from "./conflict-state.ts";
 import type { Git } from "./git.ts";
 import { dropSessions, sessionAsk, storeSessions, type Kept, type SessionLedger } from "../prepush/resume.ts";
-import { noteLive, type FixupDeps, type FixupSummary, type PrNode, type Who } from "./index.ts";
+import { noteLive, type FixupDeps, type FixupSummary, type PrNode } from "./index.ts";
 import { answerText, buildScriptsAt, conflictView, endNewline, hasMarkers, locateInHead, parseResolution, resolvablePath, spliceSections, type ConflictFile, type ConflictSection } from "./patch.ts";
 import { ensureAuthorWrites } from "./author-permission.ts";
 import { longLivedOf, pushable } from "./pushable.ts";
 import { conflictAskText, conflictCommentCount, conflictCommentText, mergeMessage } from "./template.ts";
 import { ownerOf } from "../owners.ts";
-import * as kx from "../db/kx.ts";
+import * as changes from "../data/changes/index.ts";
+import { finishPatch, setOwnDiff, storePatch } from "../data/changes/index.ts";
+import { loadItems, loadRepos } from "../data/mirror/index.ts";
 import type { Db } from "../db/index.ts";
 
 const CHECK = CLAUDE_PROMPTS["fixup.check"];
@@ -74,35 +77,29 @@ const oneLine = (s: string) => s.replace(/\s+/g, " ").trim().slice(0, 200);
 
 /** Written before the push, so a crash between the push and its record leaves the merge commit in the push chain. */
 async function recordPushing(db: Db, at: string, c: ConflictCandidate, files: string[], base: string | null, toHead: string): Promise<void> {
-  if (c.lint) { await db.run(db.k.updateTable("conflict_merges").set({ state: "pushing", to_head: toHead, patch: null }).where(kx.rowid("conflict_merges"), "=", c.lint.rowid)); return; }
-  await db.run(db.k.insertInto("conflict_merges").values({ repo: c.repo, number: c.number, from_head: c.head, to_head: toHead, base_sha: base, state: "pushing", reason: null, files: JSON.stringify(files), attempt: c.attempt, created_at: at }));
+  await changes.recordPushing(db, { kind: "conflict", repo: c.repo, number: c.number, head: c.head, commit: toHead, files, attempt: c.attempt, baseSha: base, storedId: c.lint?.rowid, at });
 }
 
 async function record(db: Db, at: string, c: ConflictCandidate, state: string, reason: string | null, files: string[], base: string | null, toHead: string | null = null): Promise<void> {
-  const open = await db.get(db.k.selectFrom("conflict_merges").select(kx.rowid("conflict_merges").as("id")).where("repo", "=", c.repo).where("number", "=", c.number).where("from_head", "=", c.head)
-    .where("state", "in", ["pushing", "linting"]).orderBy(kx.rowid("conflict_merges"), "desc").limit(1));
-  if (open) await db.run(db.k.updateTable("conflict_merges").set({ state, reason, files: JSON.stringify(files), to_head: toHead, base_sha: base, patch: null }).where(kx.rowid("conflict_merges"), "=", open.id));
-  else {
-    await db.run(db.k.insertInto("conflict_merges").values({ repo: c.repo, number: c.number, from_head: c.head, to_head: toHead, base_sha: base, state, reason, files: JSON.stringify(files), attempt: c.attempt, created_at: at }));
-  }
-  await db.run(db.k.insertInto("main.stages").values({ repo: c.repo, number: c.number, stage: "take", at, actor: "fixup",
-    note: state === "merged" ? `merged ${c.base} at ${short(c.head)}: ${files.length ? files.join(", ") : "no conflicts"}` : state === "asked" ? `asked the contributor to merge ${c.base} at ${short(c.head)}` : `conflict merge ${state} at ${short(c.head)}: ${reason}` }));
+  const note = state === "merged" ? `merged ${c.base} at ${short(c.head)}: ${files.length ? files.join(", ") : "no conflicts"}` : state === "asked" ? `asked the contributor to merge ${c.base} at ${short(c.head)}` : `conflict merge ${state} at ${short(c.head)}: ${reason}`;
+  await finishPatch(db, { kind: "conflict", repo: c.repo, number: c.number, head: c.head, state, reason, files, toHead, baseSha: base, attempt: c.attempt, at, note: { repo: c.repo, number: c.number, stage: "take", at, actor: "fixup", note }, jobNote: null });
 }
 
 /**
  * Whether the PR's own diff is unchanged by the merge, read from the local commits (no GitHub call, and no wait for GitHub to show the new head).
  * Only a clean git merge is `same`: the key ignores line positions, so a model resolution may have moved PR lines. A binary file is `changed`.
- * `delta` is what changed, for the review. Both are null when git cannot say.
+ * `delta` is what changed, for the review; `lines` how many of the PR's lines a model's resolution changed (a clean merge changes none). All
+ * are null when git cannot say.
  */
-async function ownDiffAfterMerge(git: Git, head: string, baseSha: string, commit: string, resolved: string[]): Promise<{ ownDiff: "same" | "changed" | null; delta: string | null }> {
+async function ownDiffAfterMerge(git: Git, head: string, baseSha: string, commit: string, resolved: string[]): Promise<{ ownDiff: "same" | "changed" | null; delta: string | null; lines: number | null }> {
   try {
     const mb = (await git.must(["merge-base", head, baseSha])).trim();
     const before = await git.diffText(mb, head), after = await git.diffText(baseSha, commit);
-    if (!resolved.length && !hasBinary(before) && !hasBinary(after) && ownDiffKey(before) === ownDiffKey(after)) return { ownDiff: "same", delta: null };
+    if (!resolved.length && !hasBinary(before) && !hasBinary(after) && ownDiffKey(before) === ownDiffKey(after)) return { ownDiff: "same", delta: null, lines: 0 };
     // Over the review's size cap the delta is not kept: the review then reads the whole diff (and is refused as too large if that is over the cap too).
     const delta = changedHunks(before, after, resolved) || null;
-    return { ownDiff: "changed", delta: delta && delta.length <= MAX_DIFF_CHARS ? delta : null };
-  } catch { return { ownDiff: null, delta: null }; }
+    return { ownDiff: "changed", delta: delta && delta.length <= MAX_DIFF_CHARS ? delta : null, lines: resolved.length ? changedLines(before, after) : 0 };
+  } catch { return { ownDiff: null, delta: null, lines: null }; }
 }
 
 async function live(db: Db, x: ConflictRun, c: ConflictCandidate): Promise<PrNode | null> {
@@ -122,7 +119,7 @@ const NEWEST_QUERY = `query($owner: String!, $name: String!, $n: Int!) {
 }`;
 
 /**
- * Our own comment (author in `logins`: the box login, the bare app slug and `<slug>[bot]`) when it is the newest comment on the PR and no review came after it, read live in
+ * Our own comment (author in `logins`: the box login, the bare app slug and `<slug>[bot]`, lower case) when it is the newest comment on the PR and no review came after it, read live in
  * one call; null otherwise, and when the read fails.
  */
 export async function newestOwnComment(querier: { query(q: string, v: object): Promise<unknown> }, logins: ReadonlySet<string>, repo: string, number: number): Promise<{ id: string; body: string } | null> {
@@ -133,7 +130,7 @@ export async function newestOwnComment(querier: { query(q: string, v: object): P
     } | null } };
     const pr = r.repository?.pullRequest;
     const last = pr?.comments?.nodes?.[0];
-    if (!pr || !last || !last.author || !logins.has(last.author.login)) return null;
+    if (!pr || !last || !last.author || !isOwnLogin(logins, last.author.login)) return null;
     const posted = last.createdAt;
     const review = pr.reviews?.nodes?.[0]?.submittedAt;
     if (review && (!posted || review > posted)) return null;
@@ -144,7 +141,7 @@ export async function newestOwnComment(querier: { query(q: string, v: object): P
 /** Our own conflict note when it is the newest comment on the PR and no review came after it: its comment id and the number of merges it reports. */
 export async function newestConflictNote(x: ConflictRun, c: ConflictCandidate, db?: Db): Promise<{ id: string; count: number } | null> {
   try {
-    const last = await newestOwnComment(x.d.querier, new Set([(await x.who()).login, ...(db ? await ownLogins(db, x.repo) : [])]), x.repo, c.number);
+    const last = await newestOwnComment(x.d.querier, new Set([(await x.who()).login.toLowerCase(), ...(db ? await ownLogins(db, x.repo) : [])]), x.repo, c.number);
     if (!last) return null;
     const count = conflictCommentCount(last.body, c.base);
     return count === null ? null : { id: last.id, count };
@@ -160,6 +157,7 @@ export async function askConflict(db: Db, x: ConflictRun, c: ConflictCandidate):
     if (pr.baseRefName && pr.baseRefName !== c.base) { x.log(`  ${ref}: skipped: the base branch is now ${pr.baseRefName}`); return; }
     if (pr.mergeable !== "CONFLICTING") { x.log(`  ${ref}: skipped: GitHub no longer reports a conflict`); return; }
     if (!BASE_NAME.test(c.base)) { x.log(`  ${ref}: skipped: unusable base branch name`); return; }
+    if ((await loadQuiet(db, [`${x.repo}#${c.number}`])).size > 0) { x.log(`  ${ref}: not asked: nothing is posted about a quiet pull request`); return; }
     const g = await guard(db, { repo: x.repo, number: c.number }, { kind: "conflict", bucket: "ask", head: c.head }, x.by);
     if ("refused" in g) { x.log(`  ${ref}: skipped: ${g.refused}`); return; }
     const cm = await ghAskComment(x.gw, x.d.exec, "conflict-comment", g, { by: "fixed" }, conflictAskText(c.base), { run: x.runId, head: c.head });
@@ -184,7 +182,9 @@ export async function mergeConflict(db: Db, x: ConflictRun, c: ConflictCandidate
   const ref = refOf(c);
   let files: string[] = [];
   let baseSha: string | null = null;
-  const fail = async (state: "failed" | "refused" | "rejected", raw: string) => {
+  // The push is recorded: what fails after it (the comment) changes nothing about it.
+  let merged = false;
+  const fail = async (state: "failed" | "refused" | "rejected" | "superseded", raw: string) => {
     const reason = x.scrub(raw);
     await record(db, x.at(), c, state, reason, files, baseSha);
     x.summary.failed.push({ ref, reason });
@@ -199,7 +199,7 @@ export async function mergeConflict(db: Db, x: ConflictRun, c: ConflictCandidate
   };
   try {
     if (!BASE_NAME.test(c.base)) { await skip("unusable base branch name"); return; }
-    const def = (await db.get(db.k.selectFrom("repos").select("default_branch").where("name", "=", x.repo)))?.default_branch;
+    const def = (await loadRepos(db, { names: [x.repo] })).get(x.repo)?.default_branch;
     if (def && def !== c.base) { await skip(`the PR's base ${c.base} is not the default branch ${def}`); return; }
     const pr = await live(db, x, c);
     if (!pr) return;
@@ -217,7 +217,7 @@ export async function mergeConflict(db: Db, x: ConflictRun, c: ConflictCandidate
     if (c.lint && (await git.git(["cat-file", "-e", `${baseSha}^{commit}`])).code !== 0) { await fail("failed", "the base commit of the stored resolution is no longer in the cache"); return; }
     if ((await git.git(["merge-base", "--is-ancestor", baseSha, head])).code === 0) { await skip(`${c.base} is already in the branch`); return; }
     const who = await x.who();
-    const merge = await git.mergeInto(head, baseSha);
+    const merge = await git.mergeTreeOf(head, baseSha);
     // A resolution may not write a build script of either parent.
     const scriptsOf = async (): Promise<ReadonlySet<string> | null> => {
       const [h, b] = [await buildScriptsAt(git, head), await buildScriptsAt(git, baseSha!)];
@@ -311,9 +311,9 @@ export async function mergeConflict(db: Db, x: ConflictRun, c: ConflictCandidate
       await x.claim(c);
       if (!x.d.resolve) { await fail("failed", "no resolver"); return; }
       checkout = (await x.d.checkout?.(x.repo, c.number, head)) ?? undefined;
-      const body = ((await db.get(db.k.selectFrom("items").select("body").where("repo", "=", x.repo).where("number", "=", c.number)))?.body ?? "").slice(0, 4000);
+      const body = ((await loadItems(db, [{ repo: x.repo, number: c.number }], "text")).get(refOf(c))?.body ?? "").slice(0, 4000);
       const repoDir = checkout ? { repo_dir: REPO_PATH } : {};
-      const quiet = await isQuiet(db, x.repo, c.number);
+      const quiet = (await loadQuiet(db, [`${x.repo}#${c.number}`])).size > 0;
       const resFiles: { path: string; mode: string; content: string }[] = [];
       const keptNow: Kept = {};
       // One resolver call and one check per file, so the size caps apply to a file, not to the whole PR. Every file must pass before anything is pushed.
@@ -360,14 +360,13 @@ export async function mergeConflict(db: Db, x: ConflictRun, c: ConflictCandidate
       // A resolution with Rust files is stored and linted before it is pushed (the collect step above pushes it, or asks again with the findings).
       const rs = resFiles.map((f) => f.path).filter((p) => p.endsWith(".rs"));
       dropSessions(c.lint?.session, keptNow);
-      const task = rs.length ? await queueLintFor(db, { step: "conflict", repo: x.repo, number: c.number, head, base: baseSha, patch: await git.diffText(head, tree), files: rs }) : null;
+      const patch = rs.length ? await git.diffText(head, tree) : "";
+      // The lint task takes the merge as a patch on the head; one over the task limit is over it at every run for this head.
+      if (Buffer.byteLength(patch) > MAX_PATCH_BYTES) { await refuse("the merge is larger than 1 MiB as a patch, over the lint task limit"); return; }
+      const task = rs.length ? await queueLintFor(db, { step: "conflict", repo: x.repo, number: c.number, head, base: baseSha, patch, files: rs }) : null;
       if (task !== null) {
         const round = c.lint ? c.lint.round + 1 : 1;
-        if (c.lint) await db.run(db.k.updateTable("conflict_merges").set({ patch: JSON.stringify(resFiles), files: JSON.stringify(files), lint_task: task, lint_round: round, session: storeSessions(keptNow, new Date(x.at())) }).where(kx.rowid("conflict_merges"), "=", c.lint.rowid));
-        else {
-          await db.run(db.k.insertInto("conflict_merges").values({ repo: x.repo, number: c.number, from_head: c.head, to_head: null, base_sha: baseSha, state: "linting", reason: null, files: JSON.stringify(files), attempt: c.attempt, created_at: x.at(),
-            patch: JSON.stringify(resFiles), lint_task: task, lint_round: round, session: storeSessions(keptNow, new Date(x.at())) }));
-        }
+        await storePatch(db, { kind: "conflict", storedId: c.lint?.rowid, repo: x.repo, number: c.number, head: c.head, patch: JSON.stringify(resFiles), files, lintTask: task, lintRound: round, lintState: "pending", session: storeSessions(keptNow, new Date(x.at())), baseSha: baseSha ?? undefined, attempt: c.attempt, at: x.at() });
         x.ledger.stored(keptNow);
         x.log(`  ${ref}: resolution stored; lint task ${task} queued (round ${round})`);
         return;
@@ -378,26 +377,30 @@ export async function mergeConflict(db: Db, x: ConflictRun, c: ConflictCandidate
     const g = await guard(db, { repo: x.repo, number: c.number }, c.lint ? { kind: "lint", bucket: "conflict", head: c.head, source: "review" } : { kind: "conflict", bucket: "merge", head: c.head }, x.by, liveOf(db, x.d.querier));
     if ("refused" in g) { x.log(`  ${ref}: skipped: ${g.refused}`); return; }
     await recordPushing(db, x.at(), c, files, baseSha, commit);
-    const push = await pushBranch(x.gw, git, "conflict-push", g, { remote: pr.headRepository.nameWithOwner, branch: pr.headRefName, sha: commit }, { run: x.runId, from: head, to: commit, base: c.base, files });
+    const push = await pushBranch(x.gw, git, "conflict-push", g, { remote: pr.headRepository.nameWithOwner, branch: pr.headRefName, sha: commit }, { run: x.runId, from: head, to: commit, base: c.base, files, ...(own.lines !== null ? { changed: own.lines } : {}) });
     if (push.code !== 0) {
       const err = oneLine(push.stderr);
       if (/denied|403|permission|not allowed|protected branch|declined|GH013/i.test(err)) { await held("push-denied", "the branch cannot be pushed to"); return; }
-      if (/stale info|rejected|fetch first/i.test(err)) await fail("refused", "the branch moved since the review");
+      // Another push came first: the try says nothing about the merge, and the new head gets its own.
+      if (/stale info/i.test(err)) await fail("superseded", "the branch moved before the push");
+      else if (/rejected|fetch first/i.test(err)) await fail("refused", "the branch moved since the review");
       else await fail("failed", `push failed: ${err}`);
       return;
     }
     await record(db, x.at(), c, "merged", null, files, baseSha, commit);
-    if (own.ownDiff) await db.run(db.k.updateTable("conflict_merges").set({ own_diff: own.ownDiff, own_delta: own.delta }).where("repo", "=", x.repo).where("number", "=", c.number).where("to_head", "=", commit).where("state", "=", "merged"));
+    merged = true;
+    if (own.ownDiff) await setOwnDiff(db, [{ repo: x.repo, number: c.number, toHead: commit, ownDiff: own.ownDiff, ownDelta: own.delta }]);
     x.summary.pushed.push(ref);
     x.log(`  ${ref}: merged ${c.base} into the branch: ${short(commit)} on ${short(head)}${files.length ? `, resolved ${files.join(", ")}` : ""}`);
     const note: Note = files.length ? { by: "model", kind: "comment", model: CONFLICT.models[0] } : { by: "fixed" };
     const prev = await newestConflictNote(x, c, db);
     const cm = prev
       ? await ghEditComment(x.gw, g, x.d.exec, "conflict-comment-edit", { repo: x.repo, number: c.number, commentId: prev.id }, note, conflictCommentText(c.base, prev.count + 1, x.at()), { run: x.runId })
-      : await ghComment(x.gw, g, x.d.exec, "conflict-comment", { repo: x.repo, number: c.number, pr: true }, note, conflictCommentText(c.base), { run: x.runId });
+      : await ghComment(x.gw, g, x.d.exec, "conflict-comment", { repo: x.repo, number: c.number, pr: true }, note, conflictCommentText(c.base), { run: x.runId, to: commit });
     if (cm.code !== 0) x.log(`  ${ref}: comment failed: ${oneLine(cm.stderr)}`);
   } catch (e) {
     if (isHalt(e)) throw e;
+    if (merged) { x.log(`  ${ref}: after the push: ${x.scrub(oneLine(String((e as Error).message ?? e)))}`); return; }
     await fail("failed", oneLine(String((e as Error).message ?? e)));
   }
 }

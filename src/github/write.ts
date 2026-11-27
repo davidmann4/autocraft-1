@@ -4,9 +4,8 @@
 // `Guarded` value that only core/guard.ts makes, so the compiler enforces that the
 // guard ran right before. Transports (querier, exec, git, merge command) stay
 // injected so tests fake them and assert the rows.
-import { recordPush } from "../push-outcomes.ts";
 import type { Grant, Guarded, GuardedFiling, GuardedItem, GuardedRepo } from "../core/guard.ts";
-import { auditIdentity, githubIdentity, identityFor, type WriteKind } from "./identity.ts";
+import { auditIdentity, githubIdentity, identityFor, isOwnLogin, type WriteKind } from "./identity.ts";
 
 /** The PR steps that push to a contributor's branch or ask on the PR where it is closed to us (`lint`: the collect step of a stored patch). */
 export type AskKind = "fixup" | "conflict" | "cifix" | "lint";
@@ -16,20 +15,24 @@ import type { Exec, ExecResult, Git } from "../fixup/git.ts";
 import { Client, type Querier } from "../mirror.ts";
 import { appChildEnv, AppNotInstalledError, installationToken, RepoNotInInstallationError, type TokenScope } from "./install-token.ts";
 import { type Note, withNote } from "./note.ts";
+import { isUnsent, markUnsent, rateLimited, refusedWrite, unclearWrite } from "./unsent.ts";
+import { advisoryMade, byUs, commentMade, issueMade, nodeCommentMade, reviewMade, reviewReads, type GhRead } from "./made.ts";
 import { scrub } from "../runner/scrub.ts";
 import { ownerOf, slugOf, splitSlug } from "../owners.ts";
 import { AppError, appJwt, call, GITHUB_API } from "./app.ts";
-import type { AppSecrets } from "../dash/server/config.ts";
+import type { AppOwner, AppSecrets } from "../dash/server/config.ts";
 import { currentJobId } from "../agents/call.ts";
 import { resumedRun } from "../runner/resuming.ts";
 import { createHash } from "node:crypto";
 import { giveaway } from "../security/rules.ts";
 import { filterSeq, forEachSeq } from "../async-seq.ts";
 import type { Db } from "../db/index.ts";
-import * as kx from "../db/kx.ts";
+import { abandonWrites, addOwnCommits, addOwnPush, addPushOutcomes, beginWrite, finishWrite, landOwnPush, loadMadeBefore, loadPaceWaits, loadTakenWrites, loadWriteTries } from "../data/control/index.ts";
 import { openDb } from "../db/open.ts";
+import { effect } from "../db/effects.ts";
 
 export { GITHUB_ACTIONS } from "./actions.ts";
+export { unclearWrite } from "./unsent.ts";
 export type { Note } from "./note.ts";
 
 /** Who writes (the audit login: the stage name, or the operator for manual actions) and where the row goes. */
@@ -75,7 +78,9 @@ const posted = (note: Note, text: string): string => withNote(note, scrub(text))
 // app token, and the caller supplies the person's transport. Every other write of such a grant is the app's
 // (`actsAsPerson` in identity.ts), whatever transport the caller passes.
 
-const inAppLane = async (w: Writer, g: AnyGrant, kind: WriteKind = "other"): Promise<boolean> => await githubIdentity(w.db) === "app" && identityFor(g, kind) === "app";
+/** Read before the request a lane is chosen for, so a failure of it sent nothing. */
+const inAppLane = async (w: Writer, g: AnyGrant, kind: WriteKind = "other"): Promise<boolean> =>
+  await githubIdentity(w.db).catch((e) => { throw markUnsent(e); }) === "app" && identityFor(g, kind) === "app";
 
 /**
  * The child environment for a grant's repo, holding an installation token that reaches that repo only (and `scope`'s).
@@ -88,9 +93,9 @@ async function appEnv(w: Writer, g: AnyGrant, scope?: TokenScope): Promise<Recor
     return appChildEnv(await (w.mint ?? installationToken)(owner, g.repo, scope));
   } catch (e) {
     const fix = "install it on the repository or set the repository's identity back to legacy";
-    if (e instanceof AppNotInstalledError) throw new AppNoAccessError(`app identity: the GitHub App is not installed on ${owner}; ${fix}`);
-    if (e instanceof RepoNotInInstallationError) throw new AppNoAccessError(`app identity: ${owner}/${g.repo} is not in the GitHub App's installation; ${fix}`);
-    throw new Error(`app identity: no installation token for ${owner}/${g.repo}: ${oneLine(String((e as Error).message ?? e))}`);
+    if (e instanceof AppNotInstalledError) throw markUnsent(new AppNoAccessError(`app identity: the GitHub App is not installed on ${owner}; ${fix}`));
+    if (e instanceof RepoNotInInstallationError) throw markUnsent(new AppNoAccessError(`app identity: ${owner}/${g.repo} is not in the GitHub App's installation; ${fix}`));
+    throw markUnsent(new Error(`app identity: no installation token for ${owner}/${g.repo}: ${oneLine(String((e as Error).message ?? e))}`));
   }
 }
 
@@ -134,15 +139,10 @@ async function laneQuery(w: Writer, g: Guarded | Grant, q: Querier, kind: WriteK
 // (identity, repo owner) under a margin, inside begin(), so every write path is covered. Operator presses (`user:`
 // identities) are exempt.
 export const PACE_PER_MINUTE = 60;
-export const PACE_PER_HOUR = 400;
-/** Bulk writes (the label writes of the labels-apply step, the PR status comments) start only while the key has used less than this share of each limit, so they leave room for the writes that move PRs. */
-export const BULK_SHARE = 0.5;
+/** Bulk writes (the label writes of the labels-apply step, the PR status comments) start only while the key has used less than a share of each limit, so they leave room for the writes that move PRs. */
 const BULK_ACTIONS = new Set(["labels-apply", "pr-status-comment", "pr-status-comment-edit"]);
 /** The longest a write waits for the budget; past it the write is refused as paced and the caller retries later. */
 export const PACE_MAX_WAIT_MS = 15_000;
-/** After a secondary-limit failure the key pauses this long. */
-export const SECONDARY_PAUSE_MS = 60_000;
-const SECONDARY_LIMIT = /secondary rate limit|abuse/i;
 
 /** The write was held back by pacing for longer than the bound and nothing was written or recorded. Retry later. */
 export class WritePacedError extends Error {
@@ -167,61 +167,30 @@ function paceOwner(identity: string, target: string, owner?: string): string {
   return owner ?? (ownerOf(name) || name);
 }
 
-/** How long a write of `action` by `identity` on `owner`'s key waits for the budget now (0: it may start). Reads only. */
-async function keyWait(db: Db, action: string, identity: string, owner: string, now: number): Promise<number> {
-  const valid = (eb: kx.AnyEb) => eb.case().when(kx.jsonValid(db, "details")).then(eb.ref("details")).end();
-  const rows = await db.all(db.k.selectFrom("audit")
-    .select((eb) => ["at", kx.jsonText(db, valid(eb), "$.state").as("state"), kx.jsonText(db, valid(eb), "$.error").as("error")])
-    .where("at", ">=", new Date(now - 3_600_000).toISOString())
-    .where((eb) => eb.and([eb(kx.jsonText(db, valid(eb), "$.identity"), "=", identity), eb(kx.jsonText(db, valid(eb), "$.paceOwner"), "=", owner)]))
-    .orderBy("at").orderBy(kx.rowid("audit")));
-  const times = rows.map((r) => Date.parse(r.at));
-  const inMinute = times.filter((t) => t > now - 60_000);
-  const share = BULK_ACTIONS.has(action) ? BULK_SHARE : 1;
-  const perMinute = Math.floor(PACE_PER_MINUTE * share);
-  const perHour = Math.floor(PACE_PER_HOUR * share);
-  let wait = 0;
-  if (inMinute.length >= perMinute) wait = inMinute[inMinute.length - perMinute]! + 60_000 - now;
-  if (times.length >= perHour) wait = Math.max(wait, times[times.length - perHour]! + 3_600_000 - now);
-  const lastSecondary = rows.filter((r) => r.state === "failed" && SECONDARY_LIMIT.test(r.error ?? "")).map((r) => Date.parse(r.at)).at(-1);
-  if (lastSecondary !== undefined) wait = Math.max(wait, lastSecondary + SECONDARY_PAUSE_MS - now);
-  return wait > 0 ? Math.max(wait, 1) : 0;
-}
-
 /**
- * How long the pipeline's write of `action` on `repo` (made as the app, or the box account while writes use it) waits for
+ * How long the pipeline's write of `action` on each of `repos` (made as the app, or the box account while writes use it) waits for
  * the budget now; 0 when it may start. The planner reads it so it does not queue a job whose writes would be refused as paced.
  */
-export async function pipelineWriteWait(db: Db, action: string, repo: string, now: number = Date.now()): Promise<number> {
+export async function pipelineWriteWaits(db: Db, action: string, repos: readonly string[], now: number = Date.now()): Promise<Map<string, number>> {
+  if (!repos.length) return new Map();
   const identity = await githubIdentity(db) === "box" ? "legacy" : "app";
-  return await keyWait(db, action, identity, paceOwner(identity, repo), now);
+  const owners = new Map(repos.map((r) => [r, paceOwner(identity, r)] as const));
+  const waits = await loadPaceWaits(db, [...new Set(owners.values())].map((owner) => ({ action, identity, owner })), now);
+  return new Map(repos.map((r) => [r, waits.get(`${action}\t${identity}\t${owners.get(r)!}`) ?? 0]));
 }
 
-/**
- * Tries to insert the row inside one BEGIN IMMEDIATE: counts the key's rows of the last hour (json_extract over the
- * window's rows via the audit_at index: fine at this volume) and inserts when under budget. Returns the row id, or
- * how long to wait before the window frees.
- */
-async function tryBegin(w: Writer, action: string, target: string, details: Details, now: number, ownerArg?: string): Promise<{ id: number } | { wait: number }> {
+/** Adds the `started` row when the key is under budget (the module counts the key's rows of the last hour under the writer lock); else how long to wait before the window frees. */
+async function tryBegin(w: Writer, action: string, target: string, details: Details, now: number, ownerArg?: string): Promise<{ id: number; paceOwner: string | null } | { wait: number }> {
   const identity = String(details.identity ?? "");
-  const owner = paceOwner(identity, target, ownerArg);
-  const insert = async (d: Details): Promise<number> => (await w.db.get(w.db.k.insertInto("audit")
-    .values({ at: new Date(now).toISOString(), login: w.login, action, target, details: JSON.stringify(d) })
-    .returning(kx.rowid("audit").as("rowid"))))!.rowid;
-  const started = { ...details, state: "started" };
-  if (identity.startsWith("user:")) return { id: await insert(started) };
-  return await w.db.write(async () => {
-    const wait = await keyWait(w.db, action, identity, owner, now);
-    if (wait > 0) return { wait };
-    return { id: await insert({ ...started, paceOwner: owner }) };
-  });
+  const pace = identity.startsWith("user:") ? null : { identity, owner: paceOwner(identity, target, ownerArg), bulk: BULK_ACTIONS.has(action) };
+  return await beginWrite(w.db, { at: new Date(now).toISOString(), login: w.login, action, target, details, pace });
 }
 
 /** The running job's id, joined to the audit row so a write can be traced to its job. Absent outside a job. */
 const jobOf = (): { jobId?: number } => { const j = currentJobId(); return j === null ? {} : { jobId: j }; };
 
 /** Audit rows of writes this process has begun and not yet finished, with what resolves when they finish. */
-const inFlight = new Map<number, { done: Promise<void>; end: () => void }>();
+const inFlight = new Map<number, { done: Promise<void>; end: () => void; owner: string | null }>();
 let stoppedWhy: string | null = null;
 /**
  * Writes that finished whose caller has not asked for another write since: it may still be recording what the write did
@@ -270,10 +239,10 @@ async function park(cleanup?: () => Promise<void>): Promise<never> {
   return await new Promise<never>(() => {});
 }
 
-function track(id: number): void {
+function track(id: number, owner: string | null): void {
   let end = (): void => {};
   const done = new Promise<void>((r) => { end = r; });
-  inFlight.set(id, { done, end });
+  inFlight.set(id, { done, end, owner });
 }
 
 function untrack(id: number): void {
@@ -300,8 +269,8 @@ async function begin(w: Writer, action: string, target: string, details: Details
     if ("id" in r) {
       // Checked and tracked in one turn of the event loop: stopWrites either waits for this write, or it is not made.
       const id = r.id;
-      if (stoppedWhy !== null) return await park(async () => { await w.db.run(w.db.k.deleteFrom("audit").where(kx.rowid("audit"), "=", id)); await beforePark?.(); });
-      track(id);
+      if (stoppedWhy !== null) return await park(async () => { await abandonWrites(w.db, [id]); await beforePark?.(); });
+      track(id, r.paceOwner);
       return id;
     }
     if (now - t0 + r.wait > PACE_MAX_WAIT_MS) throw new WritePacedError(`${String(details.identity)} on ${paceOwner(String(details.identity), target, owner) || "all owners"}`, r.wait);
@@ -313,13 +282,9 @@ async function begin(w: Writer, action: string, target: string, details: Details
 async function finish(w: Writer, id: number, details: Details, error?: string, owes = true): Promise<void> {
   const d = error === undefined ? { ...details, state: "done" } : { ...details, state: "failed", error };
   // The pacing key's owner, set by begin(), stays on the row.
+  const owner = inFlight.get(id)?.owner ?? null;
   try {
-    await w.db.write(async () => {
-      const row = await w.db.get(w.db.k.selectFrom("audit").select("details").where(kx.rowid("audit"), "=", id));
-      let owner: unknown = null;
-      try { owner = (JSON.parse(row?.details ?? "null") as { paceOwner?: unknown } | null)?.paceOwner ?? null; } catch { /* no owner */ }
-      await w.db.run(w.db.k.updateTable("audit").set({ details: JSON.stringify(owner === null ? d : { ...d, paceOwner: owner }) }).where(kx.rowid("audit"), "=", id));
-    });
+    await finishWrite(w.db, id, owner === null ? d : { ...d, paceOwner: owner });
   } finally {
     if (owes) owed++;
     untrack(id);
@@ -327,69 +292,123 @@ async function finish(w: Writer, id: number, details: Details, error?: string, o
 }
 
 /**
- * A creating write is made once per job, even when the job resumed after a restart (src/runner/resuming.ts): `key` tells
- * this write from the job's other writes of the same action on the same target (a hash of the text, a run id, a commit),
- * and `replay` rebuilds the result from the row of the write the job's earlier run made.
+ * A creating write is made once, also when the job resumed after a restart (src/runner/resuming.ts) or a later run tries it again: `key`
+ * tells this write from the other writes of the same action on the same target (a hash of the text, a run id, a commit), and `replay`
+ * rebuilds the result from the row of the earlier write. `lasting`: the key names one write for good (it holds the id of the card,
+ * command or call the write carries out), so an earlier done row of any run is that write; without it only a done row of this job's own
+ * earlier run is. `find` looks on GitHub for a write begun at `since` whose outcome was never learned, whichever run began it, leaving out
+ * `taken`: what other writes are recorded to have made. Its details complete that row. Without `find` GitHub itself refuses a repeat (one open PR per head, a push over a moved branch) or the repeat does
+ * no harm (a rerun).
  */
-type Once<T> = { key: string; also?: string[]; replay: (d: Details) => T };
+type Once<T> = { key: string; also?: string[]; lasting?: boolean; replay: (d: Details) => T; find?: (since: string, taken: ReadonlySet<string>) => Promise<Details | null> };
 
-/** The key of a write made once per job: a hash of what tells it apart. */
+/** An earlier write's outcome is unknown and could not be settled (`cause`: GitHub could not be read, or what it shows not recorded): the write was not made again. */
+export class UnsettledError extends Error {}
+
+/** The key of a write made once: a hash of what tells it apart. */
 const onceKey = (...parts: unknown[]): string => createHash("sha256").update(JSON.stringify(parts)).digest("hex").slice(0, 32);
 
-/** What tells two comments of one job with the same text apart: the decision, card, comment or command they answer. */
-const answered = (d: Details): unknown[] => ["decision", "card", "comment", "command"].map((k) => d[k] ?? null);
+/** What tells two comments with the same text apart: what they answer (a decision, card, comment, command, action, call or repin), or the commit they are about: the `head` an ask is made at, the commit a push note reports (`to`). */
+const answered = (d: Details): unknown[] => ["decision", "card", "comment", "command", "action", "call", "repin", "head", "to"].map((k) => d[k] ?? null);
+/** Whether the details name by id what the comment answers: a comment with the same text and id is then the same one. */
+const answersOne = (d: Details): boolean => ["decision", "card", "comment", "action", "call", "repin"].some((k) => d[k] !== undefined && d[k] !== null);
+
+const earlier = new WeakMap<Db, Map<string, Promise<Awaited<ReturnType<typeof loadMadeBefore>>>>>();
+/** A resumed job's rows from before its run started: they cannot change while it runs, so every write of the run shares one read. */
+const earlierWrites = (db: Db, job: number, before: string): Promise<Awaited<ReturnType<typeof loadMadeBefore>>> => {
+  const byJob = earlier.get(db) ?? earlier.set(db, new Map()).get(db)!;
+  const key = `${job}@${before}`;
+  return byJob.get(key) ?? byJob.set(key, loadMadeBefore(db, job, before).catch((e) => { byJob.delete(key); throw e; })).get(key)!;
+};
+
+type Tried = { id: number; at: string; details: Details };
+/**
+ * The details of the write when an earlier run made it, or the row of a try whose outcome is unknown (the run was stopped before
+ * recording it, or its request went out and failed without GitHub refusing it) with the time of the earliest such try. Null when there is neither.
+ */
+async function madeBefore(w: Writer, action: string, target: string, once: Pick<Once<unknown>, "key" | "also" | "lasting" | "find">): Promise<{ done: Details } | { unknown: Tried } | null> {
+  const keys = [once.key, ...once.also ?? []];
+  const open = (rows: Tried[]): { unknown: Tried } | null => {
+    const list = rows.filter((r) => unclearWrite(r.details));
+    const row = list.find((r) => r.details.state === "started") ?? list[0];
+    return row ? { unknown: { ...row, at: list[list.length - 1]!.at } } : null;
+  };
+  const job = currentJobId();
+  const run = job === null ? null : await resumedRun(w.db, job);
+  const mine = job !== null && run ? (await earlierWrites(w.db, job, run.startedAt)).get(`${action}\t${target}`)?.filter((r) => typeof r.details.writeKey === "string" && keys.includes(r.details.writeKey)) ?? [] : [];
+  const made = mine.find((r) => r.details.state === "done");
+  if (made) return { done: made.details };
+  if (once.find) {
+    const tries = await loadWriteTries(w.db, { action, target, keys });
+    const at = tries.findIndex((r) => r.details.state === "done");
+    if (once.lasting && at >= 0) return { done: tries[at]!.details };
+    // A try older than a done one was settled by it: the same text may be posted again later.
+    const left = open(at < 0 ? tries : tries.slice(0, at));
+    if (left) return left;
+  }
+  return open(mine);
+}
 
 /**
- * In a resumed job: the details of the successful write its earlier run made with this action, target and one of `keys`,
- * or null. A write the earlier run began and never finished (it was stopped before recording the outcome) is made again,
- * and the new row names the unknown one (`repeats`).
+ * What comes before a write's request: the result of the earlier run that made it (`was`), or the row of the write now begun. It sends
+ * nothing, so an error of it leaves nothing made by this call; an UnsettledError leaves open what the earlier run made.
  */
-async function madeBefore(w: Writer, action: string, target: string, keys: string[]): Promise<{ done: Details } | { unknown: number } | null> {
-  const job = currentJobId();
-  if (job === null) return null;
-  const run = await resumedRun(w.db, job);
-  if (!run) return null;
-  const rows = await w.db.all(w.db.k.selectFrom("audit").select([kx.rowid("audit").as("id"), "details"]).$narrowType<{ details: string }>()
-    .where("target", "=", target).where("action", "=", action).where("at", "<", run.startedAt)
-    .where((eb) => eb.and([
-      eb(kx.jsonNum(w.db, "details", "$.jobId"), "=", job),
-      kx.inList(w.db, kx.jsonText(w.db, "details", "$.writeKey"), keys),
-      eb(kx.jsonText(w.db, "details", "$.state"), "in", ["done", "started"]),
-    ]))
-    .orderBy(kx.rowid("audit"), "desc"));
-  const done = rows.find((r) => (JSON.parse(r.details) as Details).state === "done");
-  if (done) return { done: JSON.parse(done.details) as Details };
-  return rows.length ? { unknown: Number(rows[0]!.id) } : null;
+async function started<T>(w: Writer, identity: string, action: string, target: string, details0: Details, once?: Once<T>, owner?: string): Promise<{ was: T } | { id: number; details: Details }> {
+  let repeats: number | undefined;
+  if (once) {
+    const before = await madeBefore(w, action, target, once);
+    if (before && "done" in before) {
+      console.log(`${action} on ${target}: made by an earlier run, not made again`);
+      return { was: once.replay(before.done) };
+    }
+    if (before && once.find) {
+      try {
+        const found = await once.find(before.unknown.at, await loadTakenWrites(w.db, { target, action, since: before.unknown.at }));
+        if (found) {
+          const { error: _, ...was } = before.unknown.details;
+          const d = { ...was, ...found, state: "done" };
+          await finishWrite(w.db, before.unknown.id, d);
+          console.log(`${action} on ${target}: made by an earlier run (found on GitHub), not made again`);
+          return { was: once.replay(d) };
+        }
+      } catch (e) {
+        throw new UnsettledError(`${action} on ${target} may have been made by an earlier run and its outcome could not be read: ${oneLine(String((e as Error).message ?? e))}`, { cause: e });
+      }
+    }
+    if (before && before.unknown.details.state === "started") {
+      repeats = before.unknown.id;
+      console.log(`${action} on ${target}: an earlier run began it with an unknown outcome (audit row ${repeats}); made again`);
+    }
+  }
+  const details = { ...details0, identity, ...jobOf(), ...(once && { writeKey: once.key }), ...(repeats !== undefined && { repeats }) };
+  effect("github-write");
+  return { id: await begin(w, action, target, details, owner), details };
 }
 
 /**
  * Records the row first, runs the write, then marks the row done with `view`'s extra details or failed with the error.
- * With `once`, a write the job's earlier run made is not made again: its recorded result is returned.
+ * With `once`, a write the job's earlier run made is not made again: its recorded result, or what GitHub shows of it, is returned.
+ * An error from before the request is marked unsent; one of the bookkeeping after it is not.
  */
-async function recorded<T>(w: Writer, identity: string, action: string, target: string, details0: Details, f: () => Promise<T>, view?: (r: T) => Details, failure?: (r: T) => string | null, once?: Once<T>, /** The pacing key's owner when the target's repo has no `repos` row. */ owner?: string): Promise<T> {
-  let repeats: number | undefined;
-  if (once) {
-    const before = await madeBefore(w, action, target, [once.key, ...once.also ?? []]);
-    if (before && "done" in before) {
-      console.log(`${action} on ${target}: made by this job before the restart, not made again`);
-      return once.replay(before.done);
-    }
-    if (before) {
-      repeats = before.unknown;
-      console.log(`${action} on ${target}: this job began it before the restart with an unknown outcome (audit row ${repeats}); made again`);
-    }
+async function recorded<T>(w: Writer, identityOf: string | Promise<string>, action: string, target: string, details0: Details, f: () => Promise<T>, view?: (r: T) => Details, failure?: (r: T) => string | null, once?: Once<T>, /** The pacing key's owner when the target's repo has no `repos` row. */ owner?: string): Promise<T> {
+  let begun: Awaited<ReturnType<typeof started<T>>>;
+  try {
+    begun = await started(w, await identityOf, action, target, details0, once, owner);
+  } catch (e) {
+    throw e instanceof UnsettledError ? e : markUnsent(e);
   }
-  const details = { ...details0, identity, ...jobOf(), ...(once && { writeKey: once.key }), ...(repeats !== undefined && { repeats }) };
-  const id = await begin(w, action, target, details, owner);
+  if ("was" in begun) return begun.was;
+  const { id, details } = begun;
   let r: T;
   try {
     r = await f();
   } catch (e) {
-    await finish(w, id, details, oneLine(String((e as Error).message ?? e)));
+    await finish(w, id, isUnsent(e) ? { ...details, sent: false } : details, oneLine(String((e as Error).message ?? e)));
     throw e;
   }
   const bad = failure?.(r) ?? null;
-  if (bad !== null) await finish(w, id, details, bad);
+  // What is known not to have gone out is recorded as such: a later run makes the write without looking for it.
+  if (bad !== null) await finish(w, id, (r as { sent?: false } | undefined)?.sent === false ? { ...details, sent: false } : details, bad);
   else await finish(w, id, { ...details, ...view?.(r) });
   return r;
 }
@@ -439,10 +458,11 @@ export async function commentOn(w: Writer, g: Grant, q: Querier, action: string,
   covers(g, item.repo, item.number);
   q = await laneQuery(w, g, q);
   const body = posted(note, text);
-  const r = await recorded(w, await idOf(w, g), action, refOf(item.repo, item.number), { ...details, text: body },
+  const r = await recorded(w, idOf(w, g), action, refOf(item.repo, item.number), { ...details, text: body },
     () => q.query(ADD_COMMENT, { id: item.id, body }) as Promise<{ addComment?: { commentEdge?: { node?: { url?: string } } } }>,
     (x) => ({ url: x.addComment?.commentEdge?.node?.url ?? undefined }), undefined,
-    { key: onceKey(body, ...answered(details)), replay: (d) => ({ addComment: { commentEdge: { node: { url: typeof d.url === "string" ? d.url : "" } } } }) });
+    { key: onceKey(body, ...answered(details)), lasting: answersOne(details), replay: (d) => ({ addComment: { commentEdge: { node: { url: typeof d.url === "string" ? d.url : "" } } } }),
+      find: async (since, taken) => { const url = await nodeCommentMade(q, { id: item.id, body, since, mine: await byUs(w.db), taken }); return url === null ? null : { url }; } });
   return r.addComment?.commentEdge?.node?.url ?? "";
 }
 
@@ -464,7 +484,7 @@ export async function closeItem(w: Writer, g: Grant, q: Querier, item: ItemRef &
   const duplicateOf = reason === "DUPLICATE" ? o?.duplicateOf : undefined;
   const d0 = reason ? { ...details, reason, ...(o?.keptRef ? { kept: o.keptRef } : {}) } : details;
   let fellBack = false;
-  await recorded(w, await idOf(w, g, "close"), "act-close", refOf(item.repo, item.number), d0, async () => {
+  await recorded(w, idOf(w, g, "close"), "act-close", refOf(item.repo, item.number), d0, async () => {
     if (item.pr) return q.query(CLOSE_PR, { id: item.id });
     if (!reason) return q.query(CLOSE_ISSUE, { id: item.id });
     if (reason !== "DUPLICATE") return q.query(CLOSE_ISSUE_AS, { id: item.id, reason });
@@ -481,25 +501,25 @@ export async function closeItem(w: Writer, g: Grant, q: Querier, item: ItemRef &
 export async function assignTo(w: Writer, g: Grant, q: Querier, item: ItemRef, user: { id: string; login: string }, details: Details = {}): Promise<void> {
   covers(g, item.repo, item.number);
   q = await laneQuery(w, g, q);
-  await recorded(w, await idOf(w, g), "assign", refOf(item.repo, item.number), { ...details, assignee: user.login }, () => q.query(ASSIGN, { id: item.id, user: user.id }));
+  await recorded(w, idOf(w, g), "assign", refOf(item.repo, item.number), { ...details, assignee: user.login }, () => q.query(ASSIGN, { id: item.id, user: user.id }));
 }
 
 export async function unassignFrom(w: Writer, g: Grant, q: Querier, item: ItemRef, user: { id: string; login: string }, details: Details = {}): Promise<void> {
   covers(g, item.repo, item.number);
   q = await laneQuery(w, g, q);
-  await recorded(w, await idOf(w, g), "unassign", refOf(item.repo, item.number), { ...details, assignee: user.login }, () => q.query(UNASSIGN, { id: item.id, user: user.id }));
+  await recorded(w, idOf(w, g), "unassign", refOf(item.repo, item.number), { ...details, assignee: user.login }, () => q.query(UNASSIGN, { id: item.id, user: user.id }));
 }
 
 export async function reopenItem(w: Writer, g: Grant, q: Querier, item: ItemRef & { pr: boolean }, details: Details = {}): Promise<void> {
   covers(g, item.repo, item.number);
   q = await laneQuery(w, g, q);
-  await recorded(w, await idOf(w, g), "act-reopen", refOf(item.repo, item.number), details, () => q.query(item.pr ? REOPEN_PR : REOPEN_ISSUE, { id: item.id }));
+  await recorded(w, idOf(w, g), "act-reopen", refOf(item.repo, item.number), details, () => q.query(item.pr ? REOPEN_PR : REOPEN_ISSUE, { id: item.id }));
 }
 
 export async function removeLabel(w: Writer, g: Grant, q: Querier, item: ItemRef, label: { id: string; name: string }, details: Details = {}): Promise<void> {
   covers(g, item.repo, item.number);
   q = await laneQuery(w, g, q);
-  await recorded(w, await idOf(w, g), "act-unlabel", refOf(item.repo, item.number), { ...details, label: label.name }, () => q.query(REMOVE_LABEL, { id: item.id, label: label.id }));
+  await recorded(w, idOf(w, g), "act-unlabel", refOf(item.repo, item.number), { ...details, label: label.name }, () => q.query(REMOVE_LABEL, { id: item.id, label: label.id }));
 }
 
 /** Moves an issue to another repository of the organisation (`to.id` is its node id). The grant `gTo` must cover the target repo; returns the issue's new URL. */
@@ -508,7 +528,7 @@ export async function transferIssue(w: Writer, g: Grant, gTo: Grant, q: Querier,
   covers(gTo, to.repo);
   // The move needs both repositories.
   q = await laneQuery(w, g, q, "other", { also: [to.repo] });
-  const r = await recorded(w, await idOf(w, g), "act-transfer", refOf(item.repo, item.number), { ...details, to: to.repo },
+  const r = await recorded(w, idOf(w, g), "act-transfer", refOf(item.repo, item.number), { ...details, to: to.repo },
     () => q.query(TRANSFER_ISSUE, { id: item.id, repo: to.id }) as Promise<{ transferIssue?: { issue?: { url?: string } } }>,
     (x) => ({ url: x.transferIssue?.issue?.url ?? undefined }), undefined,
     { key: onceKey(to.repo), replay: (d) => ({ transferIssue: { issue: { url: typeof d.url === "string" ? d.url : "" } } }) });
@@ -519,7 +539,7 @@ export async function transferIssue(w: Writer, g: Grant, gTo: Grant, q: Querier,
 export async function requestReviewers(w: Writer, g: Grant, q: Querier, item: ItemRef, users: { id: string; login: string }[], details: Details = {}): Promise<void> {
   covers(g, item.repo, item.number);
   q = await laneQuery(w, g, q);
-  await recorded(w, await idOf(w, g), "act-request-reviewers", refOf(item.repo, item.number), { ...details, reviewers: users.map((u) => u.login) },
+  await recorded(w, idOf(w, g), "act-request-reviewers", refOf(item.repo, item.number), { ...details, reviewers: users.map((u) => u.login) },
     () => q.query(REQUEST_REVIEWS, { id: item.id, users: users.map((u) => u.id) }));
 }
 
@@ -527,24 +547,27 @@ export async function requestReviewers(w: Writer, g: Grant, q: Querier, item: It
 export async function postReview(w: Writer, q: Querier, g: Guarded<"post-review">, nodeId: string, note: Note, text: string, details: Details = {}): Promise<string | null> {
   q = await laneQuery(w, g, q);
   const body = posted(note, text);
-  const r = await recorded(w, await idOf(w, g), "review-post", refOf(g.repo, g.number), { ...details, head: g.head },
+  const r = await recorded(w, idOf(w, g), "review-post", refOf(g.repo, g.number), { ...details, head: g.head },
     () => q.query(ADD_REVIEW, { pr: nodeId, oid: g.head, body }) as Promise<{ addPullRequestReview?: { pullRequestReview?: { id?: string } | null } | null }>,
     (x) => ({ review: x.addPullRequestReview?.pullRequestReview?.id ?? undefined }),
     (x) => (x.addPullRequestReview?.pullRequestReview?.id ? null : "GitHub returned no review"),
-    { key: onceKey(g.head, body), replay: (d) => ({ addPullRequestReview: { pullRequestReview: { id: typeof d.review === "string" ? d.review : undefined } } }) });
+    { key: onceKey(g.head, body), replay: (d) => ({ addPullRequestReview: { pullRequestReview: { id: typeof d.review === "string" ? d.review : undefined } } }),
+      find: async (since, taken) => { const review = await reviewMade(q, { id: nodeId, head: g.head, body, since, mine: await byUs(w.db), taken }); return review === null ? null : { review }; } });
   return r.addPullRequestReview?.pullRequestReview?.id ?? null;
 }
 
 export async function editReview(w: Writer, q: Querier, g: Guarded<"post-review">, reviewId: string, note: Note, text: string, details: Details = {}): Promise<void> {
   q = await laneQuery(w, g, q);
   const body = posted(note, text);
-  await recorded(w, await idOf(w, g), "review-edit", refOf(g.repo, g.number), { ...details, head: g.head, review: reviewId }, () => q.query(EDIT_REVIEW, { id: reviewId, body }));
+  // An edit whose answer was lost may have gone through: one that would change nothing is not made.
+  if (await reviewReads(q, reviewId, body)) return;
+  await recorded(w, idOf(w, g), "review-edit", refOf(g.repo, g.number), { ...details, head: g.head, review: reviewId }, () => q.query(EDIT_REVIEW, { id: reviewId, body }));
 }
 
 export async function createLabel(w: Writer, g: GuardedRepo, q: Querier, repo: string, repoId: string, label: { name: string; color: string; description: string }, retry: Retry = direct, details: Details = {}): Promise<void> {
   covers(g, repo);
   q = await laneQuery(w, g, q);
-  await recorded(w, await idOf(w, g), "label-create", repo, { ...details, name: label.name }, () => retry(() => q.query(CREATE_LABEL, { input: { repositoryId: repoId, ...label } })));
+  await recorded(w, idOf(w, g), "label-create", repo, { ...details, name: label.name }, () => retry(() => q.query(CREATE_LABEL, { input: { repositoryId: repoId, ...label } })));
 }
 
 export type LabelWrite = { number: number; id: string; labelIds: string[]; names: string[]; /** The guard that let this item's labels through (an item grant, or the repo grant of a conversation card). */ g: GuardedItem | GuardedRepo };
@@ -565,12 +588,11 @@ export async function addLabels(w: Writer, q: Querier, repo: string, items: Labe
   const ids: number[] = [];
   // Paced or stopped partway: the rows already added were never sent.
   const unsent = async (): Promise<void> => {
-    for (const id of ids) {
-      untrack(id);
-      await w.db.run(w.db.k.deleteFrom("audit").where(kx.rowid("audit"), "=", id));
-    }
+    for (const id of ids) untrack(id);
+    await abandonWrites(w.db, ids);
   };
   try {
+    effect("github-write");
     for (const it of items) ids.push(await begin(w, "labels-apply", refOf(repo, it.number), await det(it), undefined, unsent));
   } catch (e) {
     await unsent();
@@ -601,9 +623,19 @@ const GH_URL = /https:\/\/github\.com\/\S+/;
 /** The result of a gh write the job made before it resumed: success, with the URL gh printed. */
 const ghReplay = (d: Details): ExecResult => ({ code: 0, stdout: typeof d.url === "string" ? `${d.url}\n` : "", stderr: "" });
 
-/** `once`: the key of a creating write, made once per job (Once), with other keys the earlier run may have made it under. */
-async function viaGh(w: Writer, identity: string, exec: Exec, action: string, target: string, details: Details, args: string[], input?: string, once?: string | { key: string; also: string[] }): Promise<ExecResult> {
-  return recorded(w, identity, action, target, details, () => exec("gh", args, input === undefined && identity !== "legacy" ? undefined : { ...(input === undefined ? {} : { input }), ...(identity === "legacy" ? { inherit: true } : {}) }),
+/** `gh` as a read that throws when it fails. */
+const ghRead = (exec: Exec): GhRead => async (args) => {
+  const r = await exec("gh", args);
+  if (r.code !== 0) throw new Error(oneLine(r.stderr || r.stdout) || `exit code ${r.code}`);
+  return r.stdout;
+};
+
+/** `once`: the key of a creating write, made once per job (Once), with other keys the earlier run may have made it under, or how to find it on GitHub. */
+async function viaGh(w: Writer, identity: string | Promise<string>, exec: Exec, action: string, target: string, details: Details, args: string[], input?: string, once?: string | Pick<Once<ExecResult>, "key" | "also" | "lasting" | "find">): Promise<ExecResult> {
+  return recorded(w, identity, action, target, details, async () => {
+    const legacy = await identity === "legacy";
+    return exec("gh", args, input === undefined && !legacy ? undefined : { ...(input === undefined ? {} : { input }), ...(legacy ? { inherit: true } : {}) });
+  },
     (r) => ({ url: r.stdout.match(GH_URL)?.[0] }),
     (r) => (r.code === 0 ? null : oneLine(r.stderr || r.stdout) || `exit code ${r.code}`),
     once === undefined ? undefined : typeof once === "string" ? { key: once, replay: ghReplay } : { ...once, replay: ghReplay });
@@ -619,8 +651,19 @@ export async function ghComment(w: Writer, g: CommentGrant, exec: Exec, action: 
   covers(g, o.repo, o.number);
   exec = await laneExec(w, g, exec);
   const body = posted(note, text);
-  return viaGh(w, await idOf(w, g), exec, action, refOf(o.repo, o.number), { ...details, text: body },
-    [o.pr ? "pr" : "issue", "comment", String(o.number), "--repo", `${slugOf(o.repo)}`, "--body-file", "-"], body, onceKey(body, ...answered(details)));
+  return viaGh(w, idOf(w, g), exec, action, refOf(o.repo, o.number), { ...details, text: body },
+    [o.pr ? "pr" : "issue", "comment", String(o.number), "--repo", `${slugOf(o.repo)}`, "--body-file", "-"], body,
+    { key: onceKey(body, ...answered(details)), lasting: answersOne(details), find: async (since, taken) => { const url = await commentMade(ghRead(exec), { repo: o.repo, number: o.number, body, since, mine: await byUs(w.db), taken }); return url === null ? null : { url }; } });
+}
+
+/** Adds the follow-ups of a later head of a PR approved for merge to the PR's follow-up issue (`issue`), as a comment there. Audited as `premerge-followup`, aimed at the PR. */
+export async function ghFollowupComment(w: Writer, g: Guarded<"followups">, exec: Exec, o: { issue: number }, note: Note, text: string, details: Details = {}): Promise<ExecResult> {
+  covers(g, g.repo, g.number);
+  exec = await laneExec(w, g, exec);
+  const body = posted(note, text);
+  return viaGh(w, idOf(w, g), exec, "premerge-followup", refOf(g.repo, g.number), { ...details, issue: o.issue, text: body },
+    ["issue", "comment", String(o.issue), "--repo", `${slugOf(g.repo)}`, "--body-file", "-"], body,
+    { key: onceKey(body, String(o.issue)), find: async (since, taken) => { const url = await commentMade(ghRead(exec), { repo: g.repo, number: o.issue, body, since, mine: await byUs(w.db), taken }); return url === null ? null : { url }; } });
 }
 
 /** Replaces the body of a comment we posted (`commentId` is the number in its `#issuecomment-` URL). */
@@ -628,13 +671,13 @@ export async function ghEditComment(w: Writer, g: CommentGrant, exec: Exec, acti
   covers(g, o.repo, o.number);
   exec = await laneExec(w, g, exec);
   const body = posted(note, text);
-  return viaGh(w, await idOf(w, g), exec, action, refOf(o.repo, o.number), { ...details, text: body, comment: o.commentId },
+  return viaGh(w, idOf(w, g), exec, action, refOf(o.repo, o.number), { ...details, text: body, comment: o.commentId },
     ["api", "-X", "PATCH", `repos/${slugOf(o.repo)}/issues/comments/${o.commentId}`, "-F", "body=@-"], body);
 }
 
 /**
  * Deletes a comment of ours (`commentId` is the number in its `#issuecomment-` URL). The comment's author must be one of
- * `logins` (the box account and the app's bot names); a comment that is already gone counts as done (the audit row carries `gone: true`).
+ * `logins` (the box account and the app's bot names, lower case); a comment that is already gone counts as done (the audit row carries `gone: true`).
  */
 export async function ghDeleteComment(w: Writer, g: CommentGrant, exec: Exec, action: string, o: { repo: string; number: number; commentId: string; logins: ReadonlySet<string> }, details: Details = {}): Promise<ExecResult> {
   covers(g, o.repo, o.number);
@@ -642,12 +685,12 @@ export async function ghDeleteComment(w: Writer, g: CommentGrant, exec: Exec, ac
   const path = `repos/${slugOf(o.repo)}/issues/comments/${o.commentId}`;
   const gone = (r: ExecResult): boolean => r.code !== 0 && /404|not found/i.test(`${r.stderr} ${r.stdout}`);
   const goneResult: ExecResult = { code: 0, stdout: "gone", stderr: "" };
-  return recorded(w, await idOf(w, g), action, refOf(o.repo, o.number), { ...details, comment: o.commentId },
+  return recorded(w, idOf(w, g), action, refOf(o.repo, o.number), { ...details, comment: o.commentId },
     async () => {
       const author = await exec("gh", ["api", path, "--jq", ".user.login"]);
       if (gone(author)) return goneResult;
       if (author.code !== 0) return author;
-      if (!o.logins.has(author.stdout.trim())) return { code: 1, stdout: "", stderr: "the comment is not ours" };
+      if (!isOwnLogin(o.logins, author.stdout.trim())) return { code: 1, stdout: "", stderr: "the comment is not ours" };
       const del = await exec("gh", ["api", "-X", "DELETE", path]);
       return gone(del) ? goneResult : del;
     },
@@ -661,7 +704,7 @@ export async function ghOpenPr(w: Writer, g: Grant, exec: Exec, action: string, 
   exec = await laneExec(w, g, exec);
   const body = posted(note, o.body);
   // GitHub keeps one open PR per head and base: a resumed job's PR is the one its earlier run opened, whatever the text.
-  return viaGh(w, await idOf(w, g), exec, action, o.target, { ...details, text: body, ...(o.draft && { draft: true }) },
+  return viaGh(w, idOf(w, g), exec, action, o.target, { ...details, text: body, ...(o.draft && { draft: true }) },
     ["pr", "create", "--repo", `${slugOf(o.repo)}`, "--base", o.base, "--head", o.head, "--title", scrub(o.title), "--body-file", "-", ...(o.draft ? ["--draft"] : [])], body, onceKey(o.repo, o.base, o.head));
 }
 
@@ -669,7 +712,7 @@ export async function ghClosePr(w: Writer, g: Grant, exec: Exec, o: { repo: stri
   covers(g, o.repo, o.number);
   exec = await laneExec(w, g, exec, "close");
   const comment = posted(note, text);
-  return viaGh(w, await idOf(w, g, "close"), exec, "batch-pr-close", refOf(o.repo, o.number), { ...details, text: comment },
+  return viaGh(w, idOf(w, g, "close"), exec, "batch-pr-close", refOf(o.repo, o.number), { ...details, text: comment },
     ["pr", "close", String(o.number), "--repo", `${slugOf(o.repo)}`, "--comment", comment], undefined, onceKey(comment));
 }
 
@@ -678,66 +721,98 @@ export async function ghFork(w: Writer, g: GuardedRepo, exec: Exec, repo: string
   covers(g, repo);
   // An app has no account to own a fork: its branches go to the base repository (forkOf returns it), so no fork is made.
   if (await inAppLane(w, g)) return Promise.resolve({ code: 1, stdout: "", stderr: "app identity: the app has no fork; push to the base repository" });
-  return viaGh(w, await idOf(w, g), exec, "fork-create", repo, details, ["repo", "fork", `${slugOf(repo)}`, "--clone=false"]);
+  return viaGh(w, idOf(w, g), exec, "fork-create", repo, details, ["repo", "fork", `${slugOf(repo)}`, "--clone=false"]);
 }
 
-/** `clear`: GitHub refused the request, so no issue can exist. Otherwise the outcome is unknown (a timeout, a lost response, a success without a URL). */
+/** `clear`: GitHub refused the request or it never went out, so no issue can exist. Otherwise the outcome is unknown (a timeout, a lost response, a success without a URL, an answer that could not be recorded). */
 export class IssueError extends Error {
   clear: boolean;
-  /** The write pacing held the create back (WritePacedError): nothing was sent and a later run may simply try again. */
-  paced: boolean;
-  /** Nothing was sent: no token could be minted (`noAccess`: the installation does not reach the repo) or the write was not the app's. */
+  /** Nothing was made and a later run may simply try again: the write pacing (WritePacedError) or a rate limit of GitHub held the create back, or it failed before its request. */
+  later: boolean;
+  /** Nothing was sent: something before the request failed (`noAccess`: the installation does not reach the repo), or GitHub's rate limit refused it. */
   unsent: boolean;
   noAccess: boolean;
-  constructor(message: string, clear: boolean, paced = false, o: { unsent?: boolean; noAccess?: boolean } = {}) {
-    super(message); this.clear = clear; this.paced = paced; this.unsent = o.unsent ?? false; this.noAccess = o.noAccess ?? false;
+  /** This call sent nothing: whether an earlier try made the issue is not known (UnsettledError). */
+  unsettled: boolean;
+  constructor(message: string, clear: boolean, later = false, o: { unsent?: boolean; noAccess?: boolean; unsettled?: boolean } = {}) {
+    super(message); this.clear = clear; this.later = later; this.unsent = o.unsent ?? false; this.noAccess = o.noAccess ?? false; this.unsettled = o.unsettled ?? false;
   }
 }
 
-// gh's own wording when GitHub rejects the request before creating anything.
-const REFUSED = /issues are disabled|has disabled issues|could not resolve to a repository|not found|forbidden|must have (?:admin|write|push)|permission|requires authentication|bad credentials|gh auth login|HTTP (?:401|403|404|410|422)|validation failed/i;
+/**
+ * What a create that threw says about the issue. Only an error from before the request (marked unsent, the pacing's included) shows that this
+ * call made none: anything else may have come after GitHub made it, a failed write of the audit row included.
+ */
+function issueErrorOf(e: unknown): IssueError {
+  const unsent = isUnsent(e), unsettled = e instanceof UnsettledError;
+  return new IssueError(oneLine(String((e as Error).message ?? e)), unsent, unsent && !(e instanceof AppNoAccessError), { unsent, noAccess: (unsettled ? e.cause : e) instanceof AppNoAccessError, unsettled });
+}
+
+/** The same of a create whose command failed. */
+function issueFailed(r: ExecResult): IssueError {
+  const m = oneLine(r.stderr || r.stdout) || `exit code ${r.code}`;
+  const unsent = r.sent === false || rateLimited(m);
+  return new IssueError(m, unsent || refusedWrite(m), rateLimited(m), { unsent });
+}
 
 /**
  * Opens an issue; returns its number and URL. Throws an IssueError when `gh` fails or prints no issue URL; `clear` tells
  * whether the failure certainly left no issue behind. `target` is the item the issue follows up.
  */
-export async function createIssue(w: Writer, g: Grant, exec: Exec, o: { repo: string; target: string; title: string; body: string; /** The audit action; the post-merge step's by default. */ action?: string }, note: Note, details: Details = {}): Promise<{ number: number; url: string }> {
+export async function createIssue(w: Writer, g: Grant | Guarded<"followups">, exec: Exec, o: { repo: string; target: string; title: string; body: string; /** The audit action; the post-merge step's by default. */ action?: string; /** Labels the issue gets; each must exist in the repo (ensureLabel). */ labels?: string[] }, note: Note, details: Details = {}): Promise<{ number: number; url: string }> {
   covers(g, o.repo);
-  exec = await laneExec(w, g, exec);
   const body = posted(note, o.body);
   let r: ExecResult;
   try {
-    r = await viaGh(w, await idOf(w, g), exec, o.action ?? "postmerge-file", o.target, { ...details, title: scrub(o.title), text: body },
-      ["issue", "create", "--repo", `${slugOf(o.repo)}`, "--title", scrub(o.title), "--body-file", "-"], body, onceKey(o.repo, scrub(o.title), body));
+    const run = await laneExec(w, g, exec);
+    r = await viaGh(w, idOf(w, g), run, o.action ?? "postmerge-file", o.target, { ...details, title: scrub(o.title), text: body },
+      ["issue", "create", "--repo", `${slugOf(o.repo)}`, "--title", scrub(o.title), ...(o.labels ?? []).flatMap((l) => ["--label", l]), "--body-file", "-"], body,
+      { key: onceKey(o.repo, scrub(o.title), body), find: async (since, taken) => { const made = await issueMade(ghRead(run), { repo: o.repo, title: scrub(o.title), body, since, mine: await byUs(w.db), taken }); return made === null ? null : { url: made.url }; } });
   } catch (e) {
-    // exec rejects only when the command could not be started; the pacing rejects before anything is sent.
-    throw new IssueError(oneLine(String((e as Error).message ?? e)), true, e instanceof WritePacedError);
+    throw issueErrorOf(e);
   }
   const url = r.stdout.match(/https:\/\/github\.com\/\S+\/issues\/(\d+)/);
-  // A failed app-token mint never sent the request (`sent: false`).
-  if (r.code !== 0) { const m = oneLine(r.stderr || r.stdout) || `exit code ${r.code}`; throw new IssueError(m, r.sent === false || REFUSED.test(m)); }
+  if (r.code !== 0) throw issueFailed(r);
   if (!url) throw new IssueError(oneLine(r.stderr || r.stdout) || "gh printed no issue URL", false);
   return { number: Number(url[1]), url: url[0] };
 }
+
+/** Creates a label in the repo, or updates its colour and description when it exists (`gh label create --force`); audited as `label-create`. Throws when gh fails. */
+export async function ensureLabel(w: Writer, g: GuardedRepo, exec: Exec, o: { repo: string; name: string; color: string; description: string }): Promise<void> {
+  covers(g, o.repo);
+  const run = await laneExec(w, g, exec);
+  const r = await viaGh(w, idOf(w, g), run, "label-create", o.repo, { name: o.name },
+    ["label", "create", o.name, "--repo", `${slugOf(o.repo)}`, "--color", o.color, "--description", o.description, "--force"]);
+  if (r.code !== 0) throw new Error(oneLine(r.stderr || r.stdout) || `exit code ${r.code}`);
+}
+
+/** `found`: an earlier press made the issue and lost its answer; when that press's write began. */
+export type FiledIssue = { number: number; url: string; found?: string };
 
 /**
  * Opens an issue as a Discord reporter (the person's own token is in `exec`'s environment): audited under their GitHub
  * login as `discord-issue-open`, with the URL and number but not the text. Throws an IssueError like createIssue.
  */
 /** Files an issue with a Discord reporter's own token; `w.login` is the reporter's GitHub login. */
-export async function createReporterIssue(w: Writer, exec: Exec, o: { repo: string; title: string; body: string }): Promise<{ number: number; url: string }> {
+export async function createReporterIssue(w: Writer, exec: Exec, o: { repo: string; title: string; body: string }): Promise<FiledIssue> {
   let r: ExecResult;
+  let found: string | undefined;
   try {
     r = await recorded(w, `user:${w.login}`, "discord-issue-open", o.repo, {}, () => exec("gh", ["issue", "create", "--repo", slugOf(o.repo), "--title", o.title, "--body-file", "-"], { input: o.body }),
       (x) => { const m = x.stdout.match(/https:\/\/github\.com\/\S+\/issues\/(\d+)/); return m ? { url: m[0], number: Number(m[1]) } : {}; },
-      (x) => (x.code === 0 && /https:\/\/github\.com\/\S+\/issues\/\d+/.test(x.stdout) ? null : oneLine(x.stderr || x.stdout) || `exit code ${x.code}`));
+      (x) => (x.code === 0 && /https:\/\/github\.com\/\S+\/issues\/\d+/.test(x.stdout) ? null : oneLine(x.stderr || x.stdout) || `exit code ${x.code}`),
+      { key: onceKey(o.repo, w.login, o.title, o.body), replay: ghReplay, find: async (since, taken) => {
+        const made = await issueMade(ghRead(exec), { repo: o.repo, title: o.title, body: o.body, since, mine: (login) => login?.toLowerCase() === w.login.toLowerCase(), taken });
+        if (made) found = since;
+        return made;
+      } });
   } catch (e) {
-    throw new IssueError(oneLine(String((e as Error).message ?? e)), true);
+    throw issueErrorOf(e);
   }
   const url = r.stdout.match(/https:\/\/github\.com\/\S+\/issues\/(\d+)/);
-  if (r.code !== 0) { const m = oneLine(r.stderr || r.stdout) || `exit code ${r.code}`; throw new IssueError(m, REFUSED.test(m)); }
+  if (r.code !== 0) throw issueFailed(r);
   if (!url) throw new IssueError(oneLine(r.stderr || r.stdout) || "gh printed no issue URL", false);
-  return { number: Number(url[1]), url: url[0] };
+  return { number: Number(url[1]), url: url[0], ...(found !== undefined && { found }) };
 }
 
 /** Adds a label to an issue a Discord reporter filed, with their token; audited as `discord-issue-label`. A refusal is recorded and returned as false, never thrown. */
@@ -764,29 +839,35 @@ async function asBot(w: Writer, g: GuardedFiling, exec: Exec, args: string[], in
  * Opens an issue as the GitHub App for a Discord reporter who chose "Submit for me": audited as `discord-issue-bot`
  * with the grant's identity, with the URL and number but not the text. Throws an IssueError like createIssue.
  */
-export async function createBotIssue(w: Writer, g: GuardedFiling, exec: Exec, o: { repo: string; title: string; body: string }, note: Note): Promise<{ number: number; url: string }> {
+export async function createBotIssue(w: Writer, g: GuardedFiling, exec: Exec, o: { repo: string; title: string; body: string }, note: Note): Promise<FiledIssue> {
   covers(g, o.repo);
   const body = posted(note, o.body);
   const title = scrub(o.title);
   let r: ExecResult;
+  let found: string | undefined;
   try {
-    r = await recorded(w, await idOf(w, g), "discord-issue-bot", o.repo, {}, () => asBot(w, g, exec, ["issue", "create", "--repo", `${g.owner}/${g.repo}`, "--title", title, "--body-file", "-"], body),
+    r = await recorded(w, idOf(w, g), "discord-issue-bot", o.repo, {}, () => asBot(w, g, exec, ["issue", "create", "--repo", `${g.owner}/${g.repo}`, "--title", title, "--body-file", "-"], body),
       (x) => { const m = x.stdout.match(/https:\/\/github\.com\/\S+\/issues\/(\d+)/); return m ? { url: m[0], number: Number(m[1]) } : {}; },
-      (x) => (x.code === 0 && /https:\/\/github\.com\/\S+\/issues\/\d+/.test(x.stdout) ? null : oneLine(x.stderr || x.stdout) || `exit code ${x.code}`), undefined, g.owner);
+      (x) => (x.code === 0 && /https:\/\/github\.com\/\S+\/issues\/\d+/.test(x.stdout) ? null : oneLine(x.stderr || x.stdout) || `exit code ${x.code}`),
+      { key: onceKey(o.repo, title, body), replay: ghReplay, find: async (since, taken) => {
+        const made = await issueMade(ghRead((_cmd, args) => asBot(w, g, exec, args)), { repo: o.repo, title, body, since, mine: await byUs(w.db), taken });
+        if (made) found = since;
+        return made;
+      } }, g.owner);
   } catch (e) {
-    throw new IssueError(oneLine(String((e as Error).message ?? e)), true, e instanceof WritePacedError, { unsent: true, noAccess: e instanceof AppNoAccessError });
+    throw issueErrorOf(e);
   }
   const url = r.stdout.match(/https:\/\/github\.com\/\S+\/issues\/(\d+)/);
-  if (r.code !== 0) { const m = oneLine(r.stderr || r.stdout) || `exit code ${r.code}`; throw new IssueError(m, r.sent === false || REFUSED.test(m), false, { unsent: r.sent === false }); }
+  if (r.code !== 0) throw issueFailed(r);
   if (!url) throw new IssueError(oneLine(r.stderr || r.stdout) || "gh printed no issue URL", false);
-  return { number: Number(url[1]), url: url[0] };
+  return { number: Number(url[1]), url: url[0], ...(found !== undefined && { found }) };
 }
 
 /** Adds a label to an issue the GitHub App filed for a Discord reporter; audited as `discord-issue-label` with the grant's identity. A refusal is recorded and returned as false, never thrown. */
 export async function labelBotIssue(w: Writer, g: GuardedFiling, exec: Exec, o: { repo: string; number: number; label: string }): Promise<boolean> {
   try {
     covers(g, o.repo);
-    const r = await recorded(w, await idOf(w, g), "discord-issue-label", refOf(o.repo, o.number), { label: o.label },
+    const r = await recorded(w, idOf(w, g), "discord-issue-label", refOf(o.repo, o.number), { label: o.label },
       () => asBot(w, g, exec, ["issue", "edit", String(o.number), "--repo", `${g.owner}/${g.repo}`, "--add-label", o.label]), undefined, (x) => (x.code === 0 ? null : oneLine(x.stderr || x.stdout) || `exit code ${x.code}`), undefined, g.owner);
     return r.code === 0;
   } catch {
@@ -797,7 +878,7 @@ export async function labelBotIssue(w: Writer, g: GuardedFiling, exec: Exec, o: 
 /** Approves one Actions run that waits for a maintainer's approval (a run from an outside contributor's PR). */
 export async function ghApproveRun(w: Writer, exec: Exec, g: Guarded<"approve-ci">, runId: number, details: Details = {}): Promise<ExecResult> {
   exec = await laneExec(w, g, exec);
-  return viaGh(w, await idOf(w, g), exec, "ci-run-approve", refOf(g.repo, g.number), { ...details, run: runId },
+  return viaGh(w, idOf(w, g), exec, "ci-run-approve", refOf(g.repo, g.number), { ...details, run: runId },
     ["api", "-X", "POST", `repos/${slugOf(g.repo)}/actions/runs/${runId}/approve`], undefined, onceKey(runId));
 }
 
@@ -826,7 +907,7 @@ export async function ghRerunFailed(w: Writer, exec: Exec, g: Guarded<"cifix">, 
   exec = await laneExec(w, g, exec);
   const run = await rerunOf(await idOf(w, g), exec, g.repo, runId, g.head);
   if ("off" in run) return run.off;
-  return viaGh(w, await idOf(w, g), exec, "ci-rerun", refOf(g.repo, g.number), { ...details, run: runId },
+  return viaGh(w, idOf(w, g), exec, "ci-rerun", refOf(g.repo, g.number), { ...details, run: runId },
     ["run", "rerun", String(runId), "--failed", "--repo", `${slugOf(g.repo)}`], undefined, run);
 }
 
@@ -836,7 +917,7 @@ export async function ghRerunMainFailed(w: Writer, g: GuardedRepo, exec: Exec, o
   exec = await laneExec(w, g, exec);
   const run = await rerunOf(await idOf(w, g), exec, o.repo, o.runId, o.head);
   if ("off" in run) return run.off;
-  return viaGh(w, await idOf(w, g), exec, "ci-rerun", `${o.repo}:${o.head.slice(0, 8)}`, { ...details, run: o.runId },
+  return viaGh(w, idOf(w, g), exec, "ci-rerun", `${o.repo}:${o.head.slice(0, 8)}`, { ...details, run: o.runId },
     ["run", "rerun", String(o.runId), "--failed", "--repo", `${slugOf(o.repo)}`], undefined, run);
 }
 
@@ -874,7 +955,7 @@ export function pushOwnBranch(w: Writer, g: Grant | Guarded<"implement">, git: P
   // A new branch has no PR yet: its outcome is matched to the PR by commit once the PR's checks arrive.
   return pushed(w, g, git, action, o.number === undefined ? `${o.repo}:${o.branch}` : refOf(o.repo, o.number), o, lease, details, { repo: o.repo, number: g.scope === "pr" ? g.number : null }, asBox).then(async (r) => {
     // Without this row the pipeline's own PR at this commit is not counted as its own (a person is asked), so a failed write only holds it.
-    if (r.code === 0) try { await w.db.run(w.db.k.insertInto("main.own_commits").values({ repo: o.repo, sha: o.sha, action, at: new Date().toISOString() }).onConflict((oc) => oc.doNothing())); } catch (e) { console.error(`own commit not recorded: ${oneLine(String((e as Error).message ?? e))}`); }
+    if (r.code === 0) try { await addOwnCommits(w.db, [{ repo: o.repo, sha: o.sha, action }]); } catch (e) { console.error(`own commit not recorded: ${oneLine(String((e as Error).message ?? e))}`); }
     return r;
   });
 }
@@ -883,16 +964,23 @@ async function pushed(w: Writer, g: Guarded | Grant, git: Pick<Git, "git">, acti
   // A contributor's fork is outside the installation: that push keeps the installation-wide token.
   if (!asBox) git = await laneGit(w, g, git, o.remote.toLowerCase() === slugOf(g.repo).toLowerCase() ? undefined : { wide: true });
   // A box-account push (an advisory's private fork) is audited as legacy whatever the repo's identity.
-  const identity = asBox ? "legacy" : await idOf(w, g);
+  const identity = asBox ? "legacy" : idOf(w, g);
+  const own = typeof details.from === "string" && pr.number !== null
+    ? { repo: pr.repo, number: pr.number, from: details.from, to: o.sha, action, lines: typeof details.changed === "number" ? details.changed : null } : null;
   const r = await recorded(w, identity, action, target, { ...details, branch: o.branch, remote: o.remote, commit: o.sha },
-    () => git.git(["push", "--quiet", lease, `https://github.com/${o.remote}.git`, `${o.sha}:refs/heads/${o.branch}`]),
+    async () => {
+      // Without this row the new head would look like someone else's push, so a push that cannot be recorded is not made.
+      if (own) try { await addOwnPush(w.db, own); } catch (e) { throw markUnsent(e); }
+      return await git.git(["push", "--quiet", lease, `https://github.com/${o.remote}.git`, `${o.sha}:refs/heads/${o.branch}`]);
+    },
     undefined,
     (r) => (r.code === 0 ? null : oneLine(r.stderr) || `exit code ${r.code}`),
     { key: onceKey(o.remote, o.branch, o.sha), replay: () => ({ code: 0, stdout: "", stderr: "" }) });
-  // Also for a push the job's earlier run made: that run may have stopped before recording it (recordPush records once).
+  // Also for a push the job's earlier run made: that run may have stopped before recording it (a push is recorded once).
   if (r.code === 0) {
     // The push stands even when its bookkeeping cannot be written; the outcome stays unknown then.
-    try { await recordPush(w.db, action, { ...pr, from: typeof details.from === "string" ? details.from : null, to: o.sha, base: typeof details.base === "string" ? details.base : null }); } catch (e) { console.error(`push outcome not recorded: ${oneLine(String((e as Error).message ?? e))}`); }
+    if (own) try { await landOwnPush(w.db, own); } catch (e) { console.error(`push not recorded as done: ${oneLine(String((e as Error).message ?? e))}`); }
+    try { await addPushOutcomes(w.db, [{ action, ...pr, from: typeof details.from === "string" ? details.from : null, to: o.sha, base: typeof details.base === "string" ? details.base : null }]); } catch (e) { console.error(`push outcome not recorded: ${oneLine(String((e as Error).message ?? e))}`); }
   }
   return r;
 }
@@ -942,7 +1030,8 @@ export async function ghAdvisoryCreate(w: Writer, g: Grant, exec: Exec, o: { rep
     (r) => ({ ghsa: r.stdout.trim() || undefined }),
     (r) => (r.code === 0 && r.stdout.trim() ? null : oneLine(r.stderr || r.stdout) || `exit code ${r.code}`),
     // One draft advisory per finding.
-    { key: onceKey(o.repo), replay: (d) => ({ code: 0, stdout: typeof d.ghsa === "string" ? d.ghsa : "", stderr: "" }) });
+    { key: onceKey(o.repo), lasting: true, replay: (d) => ({ code: 0, stdout: typeof d.ghsa === "string" ? d.ghsa : "", stderr: "" }),
+      find: async (since, taken) => { const ghsa = await advisoryMade(ghRead((cmd, args) => exec(cmd, args, { inherit: true })), { repo: o.repo, summary: o.summary, description: o.description, since, taken }); return ghsa === null ? null : { ghsa }; } });
   return { ghsa: result.code === 0 ? result.stdout.trim() || null : null, result };
 }
 
@@ -1012,6 +1101,7 @@ export async function mergeViaCommand(w: Writer, run: (cmd: string, args: string
   const method: string = o.method;
   const base = { ...details, method, identity: await idOf(w, g, "merge"), ...jobOf() };
   const target = refOf(repo, g.number);
+  effect("github-write");
   const id = await begin(w, "merge", target, base);
   let r: CommandResult;
   try {
@@ -1096,4 +1186,14 @@ export function removeInstallation(w: Writer, o: { app: Pick<AppSecrets, "client
   const gone = (e: unknown): boolean => { if (e instanceof AppError && e.status === 404) return true; throw e; };
   return recorded(w, identity, "app-install-removed", o.account, { installation: o.installationId, account: o.account, accountId: o.accountId, found: o.found },
     () => call(o.apiBase ?? GITHUB_API, `/app/installations/${o.installationId}`, appJwt(o.app), "DELETE").then(() => false, gone), (already) => (already ? { already: true } : {}), undefined, undefined, o.account);
+}
+
+/**
+ * Asks GitHub to send a webhook delivery that failed again (`POST /app/hook/deliveries/{id}/attempts`), as the app itself; audited as
+ * `webhook-redeliver` on the delivery's GUID. A redelivery is safe to receive twice: it queues re-reads, and a comment's command once.
+ */
+export function redeliverWebhook(w: Writer, o: { app: Pick<AppSecrets, "clientId" | "privateKey"> & { owner?: AppOwner | null }; id: string; guid: string; event: string; apiBase?: string }): Promise<void> {
+  const identity = "app";
+  return recorded(w, identity, "webhook-redeliver", o.guid, { delivery: o.id, event: o.event },
+    () => call(o.apiBase ?? GITHUB_API, `/app/hook/deliveries/${o.id}/attempts`, appJwt(o.app), "POST").then(() => undefined), undefined, undefined, undefined, o.app.owner?.login);
 }

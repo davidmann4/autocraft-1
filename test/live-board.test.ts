@@ -1,12 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { buildKind, live } from "../src/dash/api/live.ts";
-import { now } from "../src/dash/api/now.ts";
 import { insertRun } from "../src/agents/runs.ts";
 import type { Req } from "../src/dash/types.ts";
-import { connectDb } from "../src/db/open.ts";
-import { setupBox } from "./accounts-fixture.ts";
-import { syncAccounts } from "../src/agents/accounts.ts";
+import { connectDb } from "./helpers/raw-db.ts";
 import { parseStatus, storeStatus } from "../src/remote/helpers.ts";
 import { setSettings } from "../src/dash/api/user-settings.ts";
 
@@ -42,15 +39,14 @@ test("build steps are sorted into kinds by name", () => {
   assert.deepEqual(["npm ci", "cargo build", "cargo test", "clippy", "tsc", "deploy"].map(buildKind), ["setup", "build", "tests", "lint", "lint", "other"]);
 });
 
-test("viewers see no account label and no progress line that names a repo hidden from them, on the Live board and the Now feed", async () => {
+test("viewers see no progress line that names a repo hidden from them on the Live board", async () => {
   const db = await connectDb(":memory:");
   await db.run(db.k.insertInto("repos").values([{ name: "app", visibility: "public" }, { name: "secret", visibility: "private" }]));
   await db.run(db.k.insertInto("tracked_repos").values([{ name: "app" }, { name: "secret" }]).onConflict((oc) => oc.doNothing()));
-  await db.run(db.k.insertInto("claude_accounts").values({ id: "acc", label: "Team account B" }));
   const job = (await db.get(db.k.insertInto("jobs").values({ step: "review", params: "{}", requested_by: "pipeline", requested_at: ago(5), state: "running", started_at: ago(5), progress: "Reviewing app#7" }).returning("id")))!.id;
   await db.run(db.k.insertInto("job_items").values({ job_id: job, repo: "app", number: 7, at: ago(5) }));
   const run = async (jobId: number | null, progress: string) => {
-    const id = await insertRun(db, { jobId, step: "review", stage: 1, promptId: "p", promptVersion: "1", provider: "claude", model: "opus", accountId: "acc", items: [{ repo: "app", number: 7 }], prompt: "p" });
+    const id = await insertRun(db, { jobId, step: "review", stage: 1, promptId: "p", promptVersion: "1", provider: "claude", model: "opus", items: [{ repo: "app", number: 7 }], prompt: "p" });
     await db.run(db.k.updateTable("agent_runs").set({ state: "running", started_at: ago(4), progress }).where("id", "=", id));
   };
   await run(job, "Reading app/src/main.rs");
@@ -60,18 +56,10 @@ test("viewers see no account label and no progress line that names a repo hidden
   const board = (await live(db, as("viewer"))).lanes;
   assert.deepEqual(board.flatMap((l) => l.ops.map((o) => o.detail)), ["Review", "Review"]);
   assert.equal(board.find((l) => l.key.startsWith("run:"))?.line, null);
-  const feed = (await now(db, as("viewer"))).entries.flatMap((e) => [e, ...e.children]).filter((e) => e.kind === "call");
-  assert.deepEqual(feed.map((e) => [e.what, e.progress]), [["opus", null], ["opus", "Reading app/src/main.rs"]]);
-  // Operators see the account.
-  assert.match((await live(db, as("operator"))).lanes[0]!.ops[0]!.detail ?? "", /on Team account B$/);
-  assert.doesNotMatch((await live(db, as("maintainer"))).lanes[0]!.ops[0]!.detail ?? "", / on /);
 });
 
-test("the worker view: staff see shared runners with owner, slots and models, private runners as one neutral row, box accounts for operators; never a hostname", async () => {
+test("the worker view: staff see shared runners with owner, slots and models, private runners as one neutral row; never a hostname", async () => {
   const db = await connectDb(":memory:");
-  setupBox(["acc"]);
-  await syncAccounts(db);
-  await db.run(db.k.updateTable("claude_accounts").set({ enabled: 1, label: "Box account" }).where("id", "=", "acc"));
   await db.run(db.k.insertInto("repos").values([{ name: "app", visibility: "public" }, { name: "secret", visibility: "private" }]));
   await db.run(db.k.insertInto("tracked_repos").values([{ name: "app" }, { name: "secret" }]).onConflict((oc) => oc.doNothing()));
   const token = async (login: string, label: string, hostname: string) => (await db.get(db.k.insertInto("mcp_tokens").values({
@@ -90,8 +78,8 @@ test("the worker view: staff see shared runners with owner, slots and models, pr
   await setSettings(db, as("maintainer", "bob", { runnerPrivate: true }));
   assert.ok(await db.get(db.k.selectFrom("audit").select("at").where("action", "=", "runner-private").where("login", "=", "bob")), "the switch is audited");
 
-  const call = async (o: { account?: string; runner?: { token: number; login: string }; repo?: string; started: number; ended?: number }) => {
-    const id = await insertRun(db, { jobId: null, step: "review", stage: 1, promptId: "p", promptVersion: "1", provider: "claude", model: "opus", accountId: o.account ?? null, items: [{ repo: o.repo ?? "app", number: 7 }], prompt: "p" });
+  const call = async (o: { runner?: { token: number; login: string }; repo?: string; started: number; ended?: number }) => {
+    const id = await insertRun(db, { jobId: null, step: "review", stage: 1, promptId: "p", promptVersion: "1", provider: "claude", model: "opus", items: [{ repo: o.repo ?? "app", number: 7 }], prompt: "p" });
     const ended = o.ended === undefined ? null : ago(o.ended);
     await db.run(db.k.updateTable("agent_runs").set({ state: ended ? "done" : "running", started_at: ago(o.started), ended_at: ended, input_tokens: 100, user_login: o.runner?.login ?? null }).where("id", "=", id));
     if (o.runner) await db.run(db.k.insertInto("remote_calls").values({
@@ -105,9 +93,12 @@ test("the worker view: staff see shared runners with owner, slots and models, pr
   await call({ runner: { token: alice, login: "alice" }, started: 300, ended: 200 }); // before the window
   await call({ runner: { token: alice, login: "alice" }, repo: "secret", started: 9, ended: 8 });
   const bobs = await call({ runner: { token: bob, login: "bob" }, started: 5 });
-  await call({ account: "acc", started: 30, ended: 25 });
 
   assert.equal((await live(db, as("viewer"))).workers, undefined, "viewers get no workers");
+  const steps = async (login: string) => (await live(db, as("operator", login))).lanes.flatMap((l) => l.ops.map((o) => o.detail));
+  assert.ok((await steps("u")).some((d) => d?.endsWith(" on alice")), "an operator's lanes name the shared runner's owner");
+  assert.ok(!(await steps("u")).some((d) => d?.includes("bob")), "and not the private one's");
+  assert.ok((await steps("bob")).some((d) => d?.endsWith(" on bob")), "except to its owner");
   const board = await live(db, as("maintainer"));
   const rows = board.workers!;
   const a = rows.find((w) => w.key === `runner:${alice}`)!;
@@ -118,11 +109,9 @@ test("the worker view: staff see shared runners with owner, slots and models, pr
   assert.deepEqual([p.name, p.login, p.harness, p.slots, p.models, p.calls.map((c) => c.id)], ["Private Task Runner", null, null, null, [], [bobs]]);
   assert.ok(!rows.some((w) => w.login === "bob" || w.key === `runner:${bob}`), "no row names the private runner's owner");
   assert.doesNotMatch(JSON.stringify(rows), /bob/, "the private runner's login and label go nowhere");
-  assert.ok(!rows.some((w) => w.kind === "account"), "maintainers get no box account rows");
   assert.equal(rows.find((w) => w.key === `runner:${bob}`), undefined);
   const own = (await live(db, as("maintainer", "bob"))).workers!.find((w) => w.key === `runner:${bob}`)!;
   assert.deepEqual([own.login, own.calls.map((c) => c.id)], ["bob", [bobs]], "the owner sees their own private runner");
   const op = await live(db, as("operator"));
-  assert.deepEqual(op.workers!.find((w) => w.key === "account:acc")!.calls.length, 1);
   for (const r of [board, op, await live(db, as("maintainer", "bob"))]) assert.doesNotMatch(JSON.stringify(r), /alice-host|carol-box|bob-host/, "no hostname in any reply");
 });

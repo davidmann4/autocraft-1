@@ -1,14 +1,12 @@
 // The item page's story: one oldest-first list of what people, Opus and the harness did to the item. People's answers and messages and
 // Opus's reviews and replies are turns; the harness's work (jobs, checks, writes, fix-ups, merges) is lines the page folds into runs.
 // Redaction: viewers get lines without prompts, texts, model calls or job errors; a quiet pull request keeps what the trace context already veils.
-import { featureOn } from "../../build/features.ts";
 import type { HistoryCall, TimelineEntry, TimelineTone } from "../../../web/src/api/types.ts";
 import type { Preapproval } from "../../../web/src/api/types.ts";
 import { GITHUB_ACTIONS } from "../../github/actions.ts";
-import { filingOutcome, heldOf, HELD_STUCK_MS } from "../../conversations/held.ts";
+import { filingOutcome, HELD_STUCK_MS } from "../../conversations/held.ts";
+import type { ItemPageFacts } from "../../data/views/item-page.ts";
 import { arr, clip, stepTitle, type Ctx, type Ev } from "./trace.ts";
-import type { Db } from "../../db/index.ts";
-import { inList, jsonNum } from "../../db/kx.ts";
 import { implementationLines, implementationRunIds, type ImplementationData } from "./item-implementation.ts";
 
 const short = (s: string | null | undefined): string => (s ?? "").slice(0, 7);
@@ -17,13 +15,13 @@ const modelCall = (e: Ev): HistoryCall => ({
   label: `${e.call?.step ?? e.summary} (${e.call?.model ?? e.actor.name})`, kind: "model", costUsd: e.call?.costUsd ?? null,
   ...(e.call?.via && { via: e.call.via }), ...(validRunId(e.ref.runId) && { runId: e.ref.runId }),
 });
-const VERDICT: Record<string, string> = { take: "take", "take-fix": "take with fixes", hold: "hold", close: "close" };
+const VERDICT: Record<string, string> = { take: "take", "take-fix": "take with fixes", hold: "not ready", close: "close" };
 const VERDICT_TONE: Record<string, TimelineTone> = { take: "ok", "take-fix": "warn", hold: "warn", close: "bad" };
 const BAD = /fail|error|refus|reject|broke|too-large/i;
 const toneOf = (s: string): TimelineTone => (BAD.test(s) ? "bad" : /merged|pushed|passed|ok\b|approve|done|green/i.test(s) ? "ok" : "neutral");
 
 const base = (id: string, at: string, kind: TimelineEntry["kind"], actor: string, icon: TimelineEntry["icon"], text: string): TimelineEntry => ({
-  id, at, kind, actor, icon, text, tone: "neutral", costUsd: null, major: false, jobId: null, reviewId: null, githubId: null, commit: null, preapproval: null, calls: [], body: null, markdown: false, lines: [], feedback: null,
+  id, at, kind, actor, icon, text, tone: "neutral", costUsd: null, major: false, jobId: null, reviewId: null, githubId: null, commit: null, preapproval: null, calls: [], body: null, markdown: false, lines: [],
 });
 
 /** What a job did, in the page's words; the job's own outcome is internal wording and shows only when it failed. */
@@ -37,8 +35,8 @@ const PLAIN: Record<string, string> = {
 const PLAIN_BY_TITLE = new Map(Object.entries(PLAIN).map(([id, text]) => [stepTitle(id), text]));
 
 /** The page's timeline. `ev` is the item trace; `preapprovals` are the item's rows, oldest first; `impl` the issue's implementation attempt. */
-export async function timelineOf(c: Ctx, ev: Ev[], preapprovals: Preapproval[], impl: ImplementationData | null = null): Promise<TimelineEntry[]> {
-  const { db, repo, n, staff } = c;
+export function timelineOf(c: Ctx, ev: Ev[], preapprovals: Preapproval[], impl: ImplementationData | null, f: ItemPageFacts, prBuildsOn: boolean): TimelineEntry[] {
+  const { staff } = c;
   const out: TimelineEntry[] = [];
   // The implementation's model calls show on its own lines (implementationLines), not on its jobs' lines.
   const implRuns = implementationRunIds(impl);
@@ -47,14 +45,15 @@ export async function timelineOf(c: Ctx, ev: Ev[], preapprovals: Preapproval[], 
     !staff ? [] : ev.filter((x) => x.kind === "model-call" && x.ref.jobId === jobId && !ownLine(x)).map(modelCall);
   const callCost = (calls: HistoryCall[]): number | null => (calls.some((x) => x.costUsd !== null) ? calls.reduce((s, x) => s + (x.costUsd ?? 0), 0) : null);
   const fixSteps = ev.filter((e) => e.kind === "step" && /^(fixup|cifix|conflict):/.test(e.id));
-  const stepOfJob = new Map((await db.all(db.k.selectFrom("jobs").select(["id", "step"]).where(jsonNum(db, "params", "$.number"), "=", n).where("repo", "=", repo)
-    .union(db.k.selectFrom("job_items as ji").innerJoin("jobs as j", "j.id", "ji.job_id").select(["j.id", "j.step"]).where("ji.number", "=", n).where("ji.repo", "=", repo)))).map((j) => [j.id, j.step]));
+  const stepOfJob = new Map<number, string>([...f.trace.jobTrail.map((j): [number, string] => [j.job_id, j.step]), ...f.activeJobs.map((j): [number, string] => [j.id, j.step]), ...f.failedJobs.map((j): [number, string] => [j.id, j.step])]);
   const jobsWithCalls = new Set(ev.filter((e) => e.kind === "job").map((e) => e.ref.jobId));
   const mergeSteps = ev.filter((e) => e.kind === "step" && e.id.startsWith("merge:"));
+  // A review that exists all the same has its own line.
+  const asApproved = f.landed?.why === null && !f.trace.review?.postmerge;
   const near = (a: string, b: string, ms: number) => Math.abs(Date.parse(a) - Date.parse(b)) <= ms;
   // The model calls named by the reader-filtered review refs, read once.
   const reviewRunIds = ev.flatMap((e) => e.kind === "review" ? (e.ref.runIds ?? (validRunId(e.ref.runId) ? [e.ref.runId] : [])) : []).filter(validRunId);
-  const calls = staff ? await runRows(db, reviewRunIds) : new Map<number, RunRow>();
+  const calls = staff ? runRows(f, reviewRunIds) : new Map<number, RunRow>();
 
   for (const e of ev) {
     const after = e.summary.includes(": ") ? e.summary.slice(e.summary.indexOf(": ") + 2) : e.summary;
@@ -129,7 +128,7 @@ export async function timelineOf(c: Ctx, ev: Ev[], preapprovals: Preapproval[], 
       } else if (e.id.startsWith("merge:")) {
         const m = /: (\w+)(?:, (.*))?$/.exec(e.summary);
         const merged = m?.[1] === "merged";
-        const t = base(e.id, e.at, "harness", "AutoCraft", "merge", merged ? "Merged" : `Merge attempt: ${m?.[1] ?? "no result"}${m?.[2] && staff ? `, ${m[2]}` : ""}`);
+        const t = base(e.id, e.at, "harness", "AutoCraft", "merge", merged ? (asApproved ? "Merged as approved, no post-merge review" : "Merged") : `Merge attempt: ${m?.[1] ?? "no result"}${m?.[2] && staff ? `, ${m[2]}` : ""}`);
         t.major = true; t.tone = merged ? "ok" : toneOf(m?.[1] ?? ""); t.githubId = e.id;
         out.push(t);
       } else {
@@ -142,61 +141,38 @@ export async function timelineOf(c: Ctx, ev: Ev[], preapprovals: Preapproval[], 
   }
 
   // Our build failed where upstream CI passed: a note on the item (from pr_builds, not a stage row, so it never becomes the latest stage).
-  for (const b of await db.all(db.k.selectFrom("main.pr_builds").select(["head_sha", "summary", "finished_at"]).where("repo", "=", repo).where("number", "=", n).where("disagree", "=", 1)
-    .where("finished_at", "is not", null).$narrowType<{ finished_at: string }>())) {
-    if (!await featureOn(db, "pr-builds", repo)) break;
-    const t = base(`pr-build:${b.head_sha}`, b.finished_at, "harness", "AutoCraft", "check", `Our build failed at ${short(b.head_sha)} where CI passed${staff && b.summary ? `: ${clip(b.summary, 140)}` : ""}`);
+  const b = f.prBuild;
+  if (b && b.disagree && b.finishedAt && prBuildsOn) {
+    const t = base(`pr-build:${b.headSha}`, b.finishedAt, "harness", "AutoCraft", "check", `Our build failed at ${short(b.headSha)} where CI passed${staff && b.summary ? `: ${clip(b.summary, 140)}` : ""}`);
     t.tone = "bad";
     out.push(t);
   }
   // Screenshot runs (staff only, as the images are): planned when the run was queued, then its outcome. From screenshot_runs, not stage rows.
   if (staff && !c.veiled) {
-    for (const r of await db.all(db.k.selectFrom("main.screenshot_runs").select((eb) => ["head_sha", "state", "reason", "verdict", "clear", "comparison", "held", eb("plan", "is not", null).as("has_plan"), "created_at", "finished_at"])
-      .where("repo", "=", repo).where("number", "=", n))) {
+    for (const r of f.screenshots) {
       if (r.state === "skipped" || r.state === "stale") continue;
-      const id = `screenshots:${r.head_sha}`;
-      if (r.has_plan) {
-        const planned = base(`${id}:planned`, r.created_at, "harness", "AutoCraft", "check", `Screenshots planned at ${short(r.head_sha)}`);
+      const id = `screenshots:${r.headSha}`;
+      if (r.plan !== null) {
+        const planned = base(`${id}:planned`, r.createdAt, "harness", "AutoCraft", "check", `Screenshots planned at ${short(r.headSha)}`);
         if (r.reason && r.state !== "error") planned.body = clip(r.reason, 200);
         out.push(planned);
       }
-      if (!r.finished_at || r.state === "planned" || r.state === "running") continue;
-      const done = base(`${id}:done`, r.finished_at, "harness", "AutoCraft", "check", r.state === "error" ? "Screenshots failed" : r.held === 1 ? "Screenshot regression: held" : "Screenshots compared");
-      done.tone = r.state === "error" ? "warn" : r.held === 1 ? "bad" : "neutral"; done.major = r.held === 1;
-      done.body = clip((r.state === "error" ? r.reason : r.comparison) ?? "", 300) || null;
+      if (!r.finishedAt || r.state === "planned" || r.state === "running") continue;
+      const done = base(`${id}:done`, r.finishedAt, "harness", "AutoCraft", "check", r.state === "error" ? "Screenshots failed" : r.held ? "Screenshot regression: held" : "Screenshots compared");
+      done.tone = r.state === "error" ? "warn" : r.held ? "bad" : "neutral"; done.major = r.held;
+      done.body = clip(String((r.state === "error" ? r.reason : r.comparison) ?? ""), 300) || null;
       out.push(done);
     }
   }
-  // People answer and post: one line each, with the option's label.
-  const decisions = await db.all(db.k.selectFrom("decisions").select(["id", "question", "options", "answer", "answer_note", "answered_by", "answered_at", "answered_role"]).where("repo", "=", repo).where("number", "=", n)
-    .where("answered_at", "is not", null).$narrowType<{ answered_at: string }>().where("answered_role", "is not", null).where("answer", "not in", ["withdrawn", "superseded"]));
-  for (const d of decisions) {
-    const label = arr<{ key: string; label: string }>(d.options).find((o) => o.key === d.answer)?.label ?? d.answer ?? "";
-    const t = base(`decision:${d.id}:answered`, d.answered_at, "person", d.answered_by ?? "someone", "person", `chose: ${label}`);
+  // People answer and post: one line each.
+  for (const w of f.trace.workflowEvents.filter((e) => e.kind === "answered")) {
+    const t = base(`workflow:${w.id}:answered`, w.at, "person", w.login, "person", staff && w.line ? `chose: ${w.line}` : "answered");
     t.major = true;
-    if (staff) { t.body = d.answer_note; t.lines = [`Question: ${d.question}`]; }
     out.push(t);
   }
   if (staff) {
-    const ops = await db.all(db.k.selectFrom("decision_opinions as o").innerJoin("decisions as d", "d.id", "o.decision_id").select(["o.id", "o.decision_id", "o.login", "o.option", "o.note", "o.at", "o.permission", "d.options", "d.answer"])
-      .where("d.repo", "=", repo).where("d.number", "=", n));
-    for (const o of ops) {
-      const label = o.option ? arr<{ key: string; label: string }>(o.options).find((x) => x.key === o.option)?.label ?? o.option : null;
-      const t = base(`opinion:${o.id}`, o.at, "person", o.login, "chat", `suggested${label ? `: ${label}` : ""}${o.note && !label ? `: ${clip(o.note, 100)}` : ""}`);
-      t.major = true; t.body = o.note;
-      t.feedback = { source: `decision-opinion:${o.id}`, decisionId: o.decision_id, pick: o.option, write: o.permission === "write", open: o.answer === null };
-      out.push(t);
-    }
-    for (const cm of await db.all(db.k.selectFrom("decision_comments as c").innerJoin("decisions as d", "d.id", "c.decision_id").select(["c.id", "c.decision_id", "c.login", "c.body", "c.at", "d.answer"])
-      .where("d.repo", "=", repo).where("d.number", "=", n))) {
-      const t = base(`comment:${cm.id}`, cm.at, "person", cm.login, "chat", clip(cm.body, 110));
-      t.major = true; t.body = cm.body.length > 110 ? cm.body : null;
-      t.feedback = { source: `decision-comment:${cm.id}`, decisionId: cm.decision_id, pick: null, write: false, open: cm.answer === null };
-      out.push(t);
-    }
     // Opus's messages that answer a person are conversation; the others (a refreshed summary of the question) are the harness's work.
-    const turns = await db.all(db.k.selectFrom("conversation_turns").select(["id", "kind", "login", "at", "body", "status", "error", "seq"]).where("repo", "=", repo).where("number", "=", n)
-      .orderBy("seq", (o) => o.asc().nullsFirst()).orderBy("id"));
+    const turns = f.thread?.turns ?? [];
     turns.forEach((t, i) => {
       // System lines repeat what the press, pre-approval and fix-up lines say.
       if (t.kind === "system") return;
@@ -226,13 +202,14 @@ export async function timelineOf(c: Ctx, ev: Ev[], preapprovals: Preapproval[], 
   });
 
   // Issues a card held until the merge: the press, and what became of it. A filed one is the "Opened issue" write line.
-  for (const h of await heldOf(db, repo, n)) {
+  for (const h of f.held) {
     const t = base(`held:${h.id}`, h.at, "person", h.by, "person", `After the merge: open an issue in ${h.issue_repo}`);
     t.major = true;
     if (staff && !c.veiled) { t.body = h.title; if (h.state === "held" && h.reason) t.lines = [`Waiting: ${h.reason}`]; }
     out.push(t);
-    // A stopped create the Act step cannot settle from its audit row (filingOutcome) stays unknown.
-    const stuck = h.state === "filing" && Date.parse(h.updated_at) < Date.now() - HELD_STUCK_MS && await filingOutcome(db, h) === null;
+    // A create that was begun and that the Act step cannot settle from its audit row stays unknown.
+    const now = Date.now();
+    const stuck = h.state === "filing" && Date.parse(h.updated_at) < now - HELD_STUCK_MS && filingOutcome({ ...h, filingAudit: f.heldAudits.get(h.id) ?? null }, now) === null;
     if (h.state !== "dropped" && h.state !== "failed" && !stuck) continue;
     const end = base(`held:${h.id}:end`, h.updated_at, "harness", "AutoCraft", "github",
       h.state === "dropped" ? `Held issue dropped: ${h.reason ?? "no reason recorded"}` : stuck ? "Held issue: the create's outcome is unknown, check GitHub" : `Held issue not opened${staff && h.reason ? `: ${clip(h.reason, 120)}` : ""}`);
@@ -247,9 +224,10 @@ export async function timelineOf(c: Ctx, ev: Ev[], preapprovals: Preapproval[], 
 }
 
 type RunRow = { id: number; step: string; model: string; cost_usd: number | null; user_login: string | null; harness: string | null; reported_model: string | null };
-async function runRows(db: Db, ids: number[]): Promise<Map<number, RunRow>> {
-  if (!ids.length) return new Map();
-  return new Map((await db.all(db.k.selectFrom("agent_runs").select(["id", "step", "model", "cost_usd", "user_login", "harness", "reported_model"]).where(inList(db, "id", ids, "bigint")))).map((r) => [r.id, r]));
+/** The item's runs among `ids`, by id. */
+function runRows(f: ItemPageFacts, ids: number[]): Map<number, RunRow> {
+  const want = new Set(ids);
+  return new Map(f.trace.runs.filter((r) => want.has(r.id)).map((r) => [r.id, { id: r.id, step: r.step, model: r.model, cost_usd: r.costUsd, user_login: r.userLogin, harness: r.harness, reported_model: r.reportedModel }]));
 }
 
 /** The calls of the runs `ids` that exist, in id order. */

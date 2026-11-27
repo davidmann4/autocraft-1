@@ -3,17 +3,25 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync } from "node:fs";
 import { join } from "node:path";
 import { describe, test } from "node:test";
-import { planHistory, prunePlanHistory, refreshPlanCache } from "../src/core/plan-cache.ts";
+import { decideItem } from "../src/core/decide-item.ts";
+import { decidePr } from "../src/core/decide.ts";
+import { planRows, prunePlanHistory, refreshPlanCache, writePlanCache, type PlanView } from "../src/core/plan-cache.ts";
+import type { PlanSet } from "../src/core/plan-set.ts";
+import { loadPlanHistory } from "../src/data/planner/index.ts";
+import { connectDb, type Db } from "./helpers/raw-db.ts";
 import { detectAutopilot, planDue, setEnabled } from "../src/runner/autopilot.ts";
 import { SCRATCH } from "./scratch.ts";
 import { mapSeq } from "../src/async-seq.ts";
-import { connectDb } from "../src/db/open.ts";
 import { excluded } from "../src/db/kx.ts";
 import { sqliteOnly } from "./test-db.ts";
+import { itemFacts, prFacts } from "./world.ts";
 
 mkdirSync(SCRATCH, { recursive: true });
 const dir = mkdtempSync(join(SCRATCH, "plan-cache-"));
 const T0 = "2026-01-01T00:00:00Z";
+
+/** An item's plan history, oldest first. */
+const planHistory = async (db: Db, repo: string, number: number) => (await loadPlanHistory(db, [`${repo}#${number}`])).get(`${repo}#${number}`)?.reverse() ?? [];
 
 describe("Plan cache", async () => {
   const db = await connectDb(join(dir, "t.db"));
@@ -65,7 +73,7 @@ describe("Plan cache", async () => {
   test("with the pipeline off a wake time that has passed makes one pass due, not every tick", async () => {
     await setEnabled(db, false, "op");
     await planDue(db);
-    await db.run(db.k.insertInto("settings").values({ key: "pipeline_wake_at", value: new Date(Date.now() - 60_000).toISOString() }).onConflict((oc) => oc.column("key").doUpdateSet(excluded(["value"]))));
+    await db.run(db.k.insertInto("lane_state").values({ kind: "mark", step: "wake_at", repo: "", value: new Date(Date.now() - 60_000).toISOString(), at: new Date().toISOString() }).onConflict((oc) => oc.columns(["kind", "step", "repo"]).doUpdateSet(excluded(["value", "at"]))));
     assert.equal(await planDue(db), true);
     assert.equal(await planDue(db), false);
   });
@@ -113,5 +121,52 @@ describe("the cached next step of a PR outside the pipeline's scope", () => {
     const next = async (n: number) => JSON.parse((await db.get(db.k.selectFrom("item_plans").select("view").where("repo", "=", "off").where("number", "=", n)))!.view).next;
     assert.deepEqual(await mapSeq([1, 2, 3, 4], next), ["Needs a person", "Fix-up", "Merge queue", "Review"]);
     assert.equal((await db.get(db.k.selectFrom("item_plans").select("state").where("number", "=", 3)))!.state, "out-of-scope");
+  });
+});
+
+describe("the stored row of a plan whose work is refused", () => {
+  type Over = Parameters<typeof prFacts>[0];
+  const planSet = (over: Over, item?: Parameters<typeof itemFacts>[0]): PlanSet => {
+    const f = prFacts({ ...over, workflow: null });
+    const i = item && itemFacts({ kind: "pr", number: f.number, repo: f.repo, ...item });
+    return { run: "r1", now: f.now, pass: { rereadPaceAt: 0 }, prs: [{ facts: f, plan: decidePr(f) }], items: i ? [{ facts: i, plan: decideItem(i) }] : [] };
+  };
+  const rowOf = (over: Over, item?: Parameters<typeof itemFacts>[0]) => {
+    const r = planRows(planSet(over, item), T0)[0]!;
+    const v = JSON.parse(r.view) as PlanView;
+    return { actions: (JSON.parse(r.actions) as { kind: string; refused?: string }[]).map((a) => [a.kind, a.refused ?? null]), wait: [r.wait, v.waitKind ?? null, v.waitCode ?? null] };
+  };
+
+  test("it keeps each refusal's code and waits on what ends the first", () => {
+    assert.deepEqual(rowOf({}), { actions: [["merge", null]], wait: [null, null, null] });
+    assert.deepEqual(rowOf({ may: { repoMerge: null } }), { actions: [["merge", "repo-approval"]], wait: ["merge approval for the repo", "person", "repo-approval"] });
+    assert.deepEqual(rowOf({ tripped: { merge: "main is red" } }), { actions: [["merge", "breaker"]], wait: ["the circuit breaker of merge to be resumed", "person", "breaker"] });
+  });
+
+  test("a label or a review comment that is refused leaves the wait as it is, and other work that may run ends it", () => {
+    const post = { post: { postable: true, posted: null }, repoFacts: { commentApproved: false } };
+    const ci = rowOf({ ...post, ci: "pending" });
+    assert.deepEqual(ci.actions, [["post-review", "repo-approval"]]);
+    assert.equal(ci.wait[2], "ci");
+    const label = { repoFacts: { labelsApproved: false }, labels: { existing: [] } };
+    assert.deepEqual(rowOf({ ci: "pending" }, label).wait[2], "ci");
+    assert.deepEqual(rowOf({ tripped: { merge: "x" } }, { ...label, embeddedHash: null }).wait, [null, null, null], "the item is embedded first");
+    const issue = decideItem(itemFacts({ ...label, openPr: { number: 4, closes: true } as never }));
+    assert.deepEqual([issue.actions.map((a) => [a.kind, a.permission?.ok]), issue.waitCode], [[["label", false]], "open-pr"]);
+  });
+
+  test("a flip of the pipeline switch changes no row", () => {
+    for (const over of [{}, { may: { repoMerge: null } }] as Over[]) assert.deepEqual(planRows(planSet({ ...over, pipelineOn: false }), T0), planRows(planSet(over), T0));
+  });
+
+  test("a row without the codes is rewritten once", async () => {
+    const db = await connectDb(join(mkdtempSync(join(SCRATCH, "plan-cache-codes-")), "t.db"));
+    const plans = planSet({ may: { repoMerge: null } });
+    await writePlanCache(db, plans, T0);
+    const r = (await db.get(db.k.selectFrom("item_plans").select(["view"])))!;
+    const { waitCode: _, ...view } = JSON.parse(r.view) as PlanView;
+    await db.run(db.k.updateTable("item_plans").set({ actions: '[{"kind":"merge","head":"h1"}]', view: JSON.stringify(view) }));
+    assert.deepEqual(await writePlanCache(db, plans, T0), { written: 1, deleted: 0 });
+    assert.deepEqual(await writePlanCache(db, plans, T0), { written: 0, deleted: 0 });
   });
 });

@@ -10,7 +10,7 @@ import { rustPlan } from "../src/worker/rust.ts";
 import { resolveI18nRev } from "../src/worker/gate.ts";
 import { crateFilesOf } from "../src/worker/cache.ts";
 import { buildScripts, editable } from "../src/fixup/patch.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb } from "./helpers/raw-db.ts";
 
 const sha = (c: string) => c.repeat(40);
 

@@ -68,12 +68,24 @@ export function fts5Query(s: Search): string {
   return [`(${pos.join(" ")})`, ...s.neg.map((n) => `NOT ${term(n)}`)].join(" ");
 }
 
-/** to_tsquery text for `s`: words reduced to letters and digits and quoted, a phrase as `<->`; `weight` limits every lexeme to it. */
+/** Words joined by a character that is no space: what Postgres's parser may keep as one lexeme (a path, a file or host name, a version). */
+const JOINED = /[\p{L}\p{N}][^\p{L}\p{N}\s]+[\p{L}\p{N}]/u;
+
+/**
+ * to_tsquery text for `s`: words reduced to letters and digits and quoted, a phrase as `<->`; `weight` limits every lexeme to it.
+ * A term with joined words also matches as written, quoted: Postgres parses it as it parsed the stored text, where `src/lib.rs`
+ * is one lexeme and none of its words is.
+ */
 export function tsQueryText(s: Search, weight = ""): string {
+  const quoted = (w: string, prefix: boolean): string => `'${w}'${prefix || weight ? `:${prefix ? "*" : ""}${weight}` : ""}`;
   const term = (t: SearchTerm): string => {
     const words = t.text.split(/[^\p{L}\p{N}]+/u).filter(Boolean);
-    const lex = words.map((w, i) => `'${w}'${(t.prefix && i === words.length - 1) || weight ? `:${t.prefix && i === words.length - 1 ? "*" : ""}${weight}` : ""}`);
-    return lex.length > 1 ? `(${lex.join(" <-> ")})` : lex[0]!;
+    const lex = words.map((w, i) => quoted(w, t.prefix && i === words.length - 1));
+    if (lex.length === 1) return lex[0]!;
+    const phrase = `(${lex.join(" <-> ")})`;
+    if (!JOINED.test(t.text)) return phrase;
+    const raw = t.text.replace(/[\u0000-\u001f]/g, " ").replace(/[\\']/g, (c) => c + c);
+    return `(${phrase} | ${quoted(raw, t.prefix)})`;
   };
   // FTS5 joins adjacent terms with AND, which binds tighter than OR.
   const groups: string[][] = [[]];

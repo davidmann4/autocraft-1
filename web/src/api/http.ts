@@ -1,6 +1,6 @@
 import type { Api } from "./client";
 import { requestProject, SCOPE_HEADER } from "./scope";
-import type { ConversationCard, DecisionFilter, ItemFilter, MySettings, MySettingsChange, PendingRunnerLogin, User } from "./types";
+import type { MySettings, MySettingsChange, PendingRunnerLogin, User } from "./types";
 
 /** Query string from the set fields; booleans as 1 / 0. */
 function qs(f: object): string {
@@ -86,34 +86,6 @@ export function createHttpApi(): Api {
     changed();
     return v;
   }
-  const conv = (repo: string, n: number, rest = "") => `/api/conversations/${encodeURIComponent(repo)}/${encodeURIComponent(String(n))}${rest}`;
-  const dec = (id: string, rest = "") => `/api/decisions/${encodeURIComponent(id)}${rest}`;
-
-  function query(f: DecisionFilter): string {
-    const q = new URLSearchParams();
-    if (f.status) q.set("status", f.status);
-    if (f.repo?.length) q.set("repo", f.repo.join(","));
-    if (f.kind?.length) q.set("kind", f.kind.join(","));
-    if (f.minAge) q.set("minAge", String(f.minAge));
-    if (f.all) q.set("all", "1");
-    if (f.number !== undefined) q.set("number", String(f.number));
-    if (f.limit !== undefined) q.set("limit", String(f.limit));
-    if (f.after) q.set("after", f.after);
-    if (f.offset !== undefined) q.set("offset", String(f.offset));
-    const s = q.toString();
-    return s ? `?${s}` : "";
-  }
-
-  function itemQuery(f: ItemFilter): string {
-    const q = new URLSearchParams();
-    for (const [k, v] of Object.entries(f)) {
-      if (v === undefined || v === "" || (Array.isArray(v) && !v.length)) continue;
-      q.set(k, Array.isArray(v) ? v.join(",") : typeof v === "boolean" ? (v ? "1" : "0") : String(v));
-    }
-    const s = q.toString();
-    return s ? `?${s}` : "";
-  }
-
   return {
     me: Object.assign(() => get<User>("/api/me"), {
       settings: {
@@ -123,55 +95,6 @@ export function createHttpApi(): Api {
     }),
     repos: () => get("/api/repos"),
     repoOwners: () => get("/api/repos/owners"),
-    decisions: {
-      list: (filter) => get(`/api/decisions${query(filter)}`),
-      openCounts: () => get("/api/decisions/open-counts"),
-      get: (id) => get(dec(id)),
-      forItem: (repo, number, kind) => get(`/api/items/${encodeURIComponent(repo)}/${encodeURIComponent(String(number))}/decision${qs({ kind })}`),
-      answer: (id, input) => post(dec(id, "/answer"), input),
-      undo: (id) => post(dec(id, "/undo")),
-      retry: (id) => post(dec(id, "/retry")),
-      dispute: (id, reason) => post(dec(id, "/dispute"), { reason }),
-      keepAnswer: (id) => post(dec(id, "/keep")),
-      snooze: (id, on) => post(dec(id, "/snooze"), { on }),
-      reopen: (id) => post(dec(id, "/reopen")),
-      feedback: (id, input) => post(dec(id, "/feedback"), input),
-      retract: (id) => post(dec(id, "/retract")),
-      reprepare: (id) => post(dec(id, "/reprepare")),
-      adopt: (id, opinionId, textsHash) => post(dec(id, "/adopt"), { opinionId, textsHash }),
-      // A claim changes nothing anyone is looking at, so open views don't refetch.
-      claim: (id) => call("POST", dec(id, "/claim")),
-      thread: (id) => get(dec(id, "/thread")),
-    },
-    release: async (repo, number, action) => {
-      await post(`/api/items/${encodeURIComponent(repo)}/${encodeURIComponent(String(number))}/${action}`);
-    },
-    stopFix: async (repo, number, answer) => {
-      await post(`/api/items/${encodeURIComponent(repo)}/${encodeURIComponent(String(number))}/stop-fix`, { answer });
-    },
-    backlogItem: (repo, number) => post(`/api/items/${encodeURIComponent(repo)}/${encodeURIComponent(String(number))}/backlog`),
-    conversations: {
-      get: (repo, number) => get(conv(repo, number)),
-      say: (repo, number, text, ask) => post(conv(repo, number, "/messages"), ask === false ? { text, ask: false } : { text }),
-      include: (repo, number, source, on) => post(conv(repo, number, "/includes"), { source, on }),
-      withdraw: (repo, number) => post(conv(repo, number, "/withdraw")),
-      editCard: (id, edit) => post(`/api/conversation-cards/${id}/edit`, edit),
-      cancelPreapproval: (repo, n) => post(`/api/items/${repo}/${n}/preapproval/cancel`),
-      retryPreapproval: (repo, n) => post(`/api/items/${repo}/${n}/preapproval/retry`),
-      doCard: (id, opts) => post(`/api/conversation-cards/${id}/do`, { digest: opts.digest, ...(opts.skip?.length && { skip: opts.skip }), ...(opts.note && { note: opts.note }) }),
-      dismissCard: (id) => post(`/api/conversation-cards/${id}/dismiss`),
-      disputeCard: (id, reason) => post(`/api/conversation-cards/${id}/dispute`, { reason }),
-      keepCard: (id) => post(`/api/conversation-cards/${id}/keep`),
-      // A finding's choices are built from its actions (no decision row): the answer is the finding action itself.
-      doChoice: async (choiceId, body) => {
-        const f = /^ch-f-(.+)-(\d+)-/.exec(choiceId);
-        if (!f) return post(`/api/decision-choices/${encodeURIComponent(choiceId)}/do`, body);
-        const action = body.core === "backlog" ? "backlog" : body.core.slice(2);
-        await post(`/api/security/findings/${encodeURIComponent(f[1]!)}/${f[2]}`, { action, reason: body.note ?? body.params?.reason });
-        const at = new Date().toISOString();
-        return { id: 0, digest: "", kind: "resolution", title: action, label: "Do it", headline: action, steps: [], canSettle: true, state: "done", fromChoice: true, by: "", at, done: { at, link: "", label: action } } as ConversationCard;
-      },
-    },
     areas: {
       get: (repo) => get(`/api/areas/${encodeURIComponent(repo)}`),
       edit: (repo, edit) => post(`/api/areas/${encodeURIComponent(repo)}/edit`, edit),
@@ -181,31 +104,30 @@ export function createHttpApi(): Api {
         await post(`/api/area-proposals/${id}/dismiss`);
       },
     },
-    now: () => get("/api/now"),
-    live: () => get("/api/live"),
-    nowFeed: (before) => get(`/api/now/feed${qs({ before })}`),
+    live: () => get("/api/live-board"),
+    health: () => get("/api/health"),
     item: (repo, number) => get(`/api/items/${encodeURIComponent(repo)}/${encodeURIComponent(String(number))}`),
     itemTrace: (repo, number, q = {}) =>
       get(`/api/items/${encodeURIComponent(repo)}/${encodeURIComponent(String(number))}/trace${qs({ ...q, kinds: q.kinds?.join(",") })}`),
     itemTraceDetail: (repo, number, id) => get(`/api/items/${encodeURIComponent(repo)}/${encodeURIComponent(String(number))}/trace/event${qs({ id })}`),
     activity: (q = {}) => get(`/api/activity${qs({ ...q, kinds: q.kinds?.join(",") })}`),
     search: (q) => (q.trim() ? get(`/api/search?${new URLSearchParams({ q })}`) : Promise.resolve([])),
-    items: (f) => get(`/api/items${itemQuery(f)}`),
     progress: () => get("/api/progress"),
-    home: () => get("/api/home"),
     maintain: {
       home: () => get("/api/maintain/home"),
       queue: () => get("/api/maintain/queue"),
       stats: (period) => get(`/api/maintain/stats${qs({ period })}`),
       items: (q) => get(`/api/maintain/items${qs({ ...q, filters: undefined, filter: q.filters?.join(","), areas: undefined, area: q.areas?.join(","), refs: q.refs?.join(",") })}`),
-      command: (text) => post("/api/commands", { text }),
+      browse: (q) => get(`/api/maintain/browse${qs({ ...q, refs: q.refs?.join(",") })}`),
+      command: (text, asked) => post("/api/commands", { text, asked }),
       repos: () => get("/api/maintain/repos"),
+      asked: () => get("/api/maintain/asked"),
       control: (input) => post("/api/controls", input),
     },
     maintainItem: {
       get: (repo, number) => get(`/api/maintain/items/${encodeURIComponent(repo)}/${encodeURIComponent(String(number))}`),
-      command: async (repo, number, text) => {
-        const r = await post<{ items: { outcome: string }[]; lines: string[] }>(`/api/items/${encodeURIComponent(repo)}/${encodeURIComponent(String(number))}/command`, { text });
+      command: async (repo, number, text, asked) => {
+        const r = await post<{ items: { outcome: string }[]; lines: string[] }>(`/api/items/${encodeURIComponent(repo)}/${encodeURIComponent(String(number))}/command`, { text, asked });
         return { ok: r.items.length > 0 && r.items.every((i) => i.outcome === "run"), lines: r.lines };
       },
       control: async (body) => {
@@ -214,8 +136,12 @@ export function createHttpApi(): Api {
       },
     },
     itemPage: (repo, number, since) => get(`/api/items/${encodeURIComponent(repo)}/${number}/page${qs({ since })}`),
+    itemChat: {
+      get: (repo, number, since) => get(`/api/items/${encodeURIComponent(repo)}/${number}/chat${qs({ since })}`),
+      send: (repo, number, conversation, text) => post(`/api/items/${encodeURIComponent(repo)}/${number}/chat`, { conversation, text }),
+      withdraw: (repo, number) => post(`/api/items/${encodeURIComponent(repo)}/${number}/chat/withdraw`),
+    },
     itemPeek: (repo, number) => get(`/api/items/${encodeURIComponent(repo)}/${encodeURIComponent(String(number))}/peek`),
-    itemStatusList: (f) => get(`/api/items/status${qs({ q: f.q, phase: f.phase, kind: f.kind, repo: f.repo?.join(","), area: f.area?.join(","), discord: f.discord ? "1" : undefined, cursor: f.cursor })}`),
     securityList: () => get("/api/security/findings"),
     findingPage: (repo, number) => get(`/api/security/findings/${encodeURIComponent(repo)}/${number}/page`),
     mainCi: () => get("/api/main-ci"),
@@ -241,8 +167,6 @@ export function createHttpApi(): Api {
       track: (name) => post("/api/repos/track", { name }),
       untrack: (name) => post("/api/repos/untrack", { name }),
       approveMerging: (name, approved) => post(approved ? "/api/repos/merge-approve" : "/api/repos/merge-revoke", { name }),
-      singleMerge: () => get("/api/merge/single"),
-      setSingleMerge: (max) => put("/api/merge/single", { max }),
       approvePushing: (name, approved) => post(approved ? "/api/repos/push-approve" : "/api/repos/push-revoke", { name }),
       approveCommenting: (name, approved) => post(approved ? "/api/repos/comment-approve" : "/api/repos/comment-revoke", { name }),
       approveFixing: (name, approved) => post(approved ? "/api/repos/fixissue-approve" : "/api/repos/fixissue-revoke", { name }),
@@ -257,6 +181,8 @@ export function createHttpApi(): Api {
     inference: {
       get: () => get("/api/settings/inference"),
       put: (body) => put("/api/settings/inference", body),
+      jev: () => get("/api/settings/jev"),
+      setJev: (enabled) => put("/api/settings/jev", { enabled }),
     },
     mcp: {
       tokens: () => get("/api/mcp/tokens"),
@@ -305,6 +231,7 @@ export function createHttpApi(): Api {
       setContact: (contact) => put("/api/admin/discord/contact", { contact }),
       setReact: (on) => put("/api/admin/discord/react", { on }),
       setReactEmoji: (emoji) => put("/api/admin/discord/react", { emoji }),
+      setRolePanel: (panel) => put("/api/admin/discord/role-panel", panel ?? { off: true }),
       removeLink: (id) => post("/api/admin/discord/unlink", { id }),
       addFilingRepo: (repo) => post("/api/admin/discord/filing-repos/add", { repo }),
       removeFilingRepo: (repo) => post("/api/admin/discord/filing-repos/remove", { repo }),
@@ -331,29 +258,10 @@ export function createHttpApi(): Api {
       resetLimit: (step) => post(`/api/pipeline/limits/${encodeURIComponent(step)}/reset`),
       ackDeadline: (step) => post(`/api/pipeline/steps/${encodeURIComponent(step)}/deadline-ack`),
       resumeTrip: (stage) => post(`/api/pipeline/trips/${encodeURIComponent(stage)}/resume`),
-      setPilot: (items) => put("/api/pipeline/pilot", { items }),
+      heldAuthors: () => get("/api/pipeline/outside/held"),
+      releaseAuthor: (author) => post("/api/pipeline/outside/release", { author }),
       setOutsideLimits: (input) => put("/api/pipeline/outside-limits", input),
-      releaseOutsideAuthor: async (author) => void (await post("/api/pipeline/outside/release", { author })),
-      setJudgementModel: (model) => put("/api/pipeline/judgement-model", { model }),
       setBlockers: (input) => put("/api/pipeline/blocker-thresholds", input),
-    },
-    accounts: {
-      list: () => get("/api/accounts"),
-      pause: () => get("/api/accounts/pause"),
-      setPause: (input) => put("/api/accounts/pause", input),
-      jev: () => get("/api/accounts/jev"),
-      setJev: (input) => put("/api/accounts/jev", input),
-      update: (id, input) => put(`/api/accounts/${encodeURIComponent(id)}`, input),
-      add: (label) => post("/api/accounts", { label }),
-      loginStart: (id) => post(`/api/accounts/${encodeURIComponent(id)}/login`),
-      loginCode: (id, code) => post(`/api/accounts/${encodeURIComponent(id)}/login/code`, { code }),
-      loginCancel: (id) => post(`/api/accounts/${encodeURIComponent(id)}/login/cancel`),
-      tokenStart: (id) => post(`/api/accounts/${encodeURIComponent(id)}/token`),
-      tokenCode: (id, code) => post(`/api/accounts/${encodeURIComponent(id)}/token/code`, { code }),
-      tokenCancel: (id) => post(`/api/accounts/${encodeURIComponent(id)}/token/cancel`),
-      tokenRemove: (id) => post(`/api/accounts/${encodeURIComponent(id)}/token/remove`),
-      signOut: (id) => post(`/api/accounts/${encodeURIComponent(id)}/sign-out`),
-      refresh: (id) => post(`/api/accounts/${encodeURIComponent(id)}/refresh`),
     },
     envs: {
       list: () => get("/api/envs"),
@@ -370,6 +278,7 @@ export function createHttpApi(): Api {
       grid: () => get("/api/nightly"),
       series: (repo, bench) => get(`/api/nightly/bench/${encodeURIComponent(repo)}/${encodeURIComponent(bench)}`),
       select: (input) => post("/api/nightly/select", input),
+      openIssue: (input) => post("/api/nightly/issue", input),
     },
     screenshotSetup: {
       list: () => get("/api/build/screenshots"),
@@ -387,22 +296,22 @@ export function createHttpApi(): Api {
       list: (f) => get(`/api/tasks${qs(f)}`),
       get: (id) => get(`/api/tasks/${id}`),
       cancel: (id) => post(`/api/tasks/${id}/cancel`),
-      summary: () => get("/api/build/summary"),
     },
     agents: {
       list: (f) => get(`/api/agents${qs(f)}`),
       get: (id) => get(`/api/agents/${id}`),
+      refusals: (window) => get(`/api/agents/refusals${qs({ window })}`),
+      transcript: (runId, id) => get(`/api/agents/${runId}/transcripts/${id}`),
+    },
+    transcriptStore: {
+      status: () => get("/api/admin/transcript-store"),
+      save: (input) => put("/api/admin/transcript-store", input),
+      clear: () => del("/api/admin/transcript-store"),
+      test: (input) => post("/api/admin/transcript-store/test", input ?? {}),
     },
     rates: (window) => get(`/api/rates${qs({ window })}`),
     prompts: () => get("/api/prompts"),
-    queue: (f) => get(`/api/queue${qs(f)}`),
-    needs: (f) => get(`/api/needs${qs(f)}`),
-    needsOutside: (author) => get(`/api/needs/outside/${encodeURIComponent(author)}`),
-    releaseOutside: async (repo, number) => void (await post(`/api/items/${encodeURIComponent(repo)}/${encodeURIComponent(String(number))}/release-outside`)),
-    needsFixes: (repo, cursor) => get(`/api/needs/fixes/${encodeURIComponent(repo)}${qs({ cursor })}`),
-    queueBatches: (f) => get(`/api/queue/batches${qs(f)}`),
     batch: (id) => get(`/api/batches/${id}`),
-    flow: (repo) => get(`/api/flow${repo ? `?repo=${encodeURIComponent(repo)}` : ""}`),
     async signOut() {
       await call("POST", "/api/signout");
       location.assign("/auth/signed-out");
@@ -411,23 +320,12 @@ export function createHttpApi(): Api {
       listeners.add(fn);
       return () => void listeners.delete(fn);
     },
-    similar: (repo, number, limit) => get(`/api/similar/${encodeURIComponent(repo)}/${encodeURIComponent(String(number))}${qs({ limit })}`),
     semanticSearch: (q) => get(`/api/search?${new URLSearchParams({ q, mode: "semantic" })}`),
-    work: (f) => get(`/api/work${qs(f)}`),
-    pipelineRepos: () => get("/api/repos/pipeline"),
-    fastTrack: () => get("/api/fast-track"),
-    heldMerges: () => get("/api/merge/held"),
     next: () => get("/api/next"),
     mention: () => get("/api/mention"),
     queuePage: (f) => get(`/api/queue/page${qs(f)}`),
     controls: { run: (input) => post("/api/controls", input) },
     queueControl: {
-      fastTrackAdd: (item) => post("/api/fast-track", { item }),
-      fastTrackRemove: (item) => post("/api/fast-track/remove", { item }),
-      fastTrackWeight: (item, weight) => post("/api/fast-track/weight", { item, weight }),
-      add: (item, weight) => post("/api/queue/add", { item, weight }),
-      hold: async (item) => void (await post("/api/merge/hold", { item })),
-      release: async (item) => void (await post("/api/merge/release", { item })),
       batchRemove: async (item) => void (await post("/api/merge/batch-remove", { item })),
       stopBatch: async (id) => void (await post(`/api/queue/batches/${id}/stop`)),
     },

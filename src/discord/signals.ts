@@ -3,12 +3,16 @@
 // unavailable, under a daily dollar cap. The text is used for that call only: only a flag is kept on the mention row, the
 // recorded prompt and reply are deleted when the call ends, and an edit asks again. A deleted message takes its row, and
 // so its flag, with it (store.ts). Display only: nothing in the pipeline reads the flag.
+import { setting } from "../data/control/index.ts";
+import { loadMentionCounts, loadMentionsOfItems, loadMessageMentions, setSignals } from "../data/discord/index.ts";
+import { loadStepSpend, removeRunTexts } from "../data/inference/index.ts";
+import { loadShown } from "../data/mirror/index.ts";
 import { jevAvailable } from "../agents/jev.ts";
 import { runModelStep, type ClaudeStep, type JevStep } from "../agents/step.ts";
 import { JEV_PROMPTS } from "../prompts/index.ts";
 import type { DiscordKeys } from "./keys.ts";
 import { jevSignal, parseSignal, signalBand, signalState, type SignalAsk } from "./signal-ask.ts";
-import { isWatched, trackedRepos, type DiscordLink } from "./store.ts";
+import { isWatched, mentionLinks, trackedRepos, type DiscordLink } from "./store.ts";
 import { messageText, parseRefs, type ItemKey } from "./refs.ts";
 import type { Db } from "../db/index.ts";
 import { DISCORD_TAKE_WAIT_MS } from "./limits.ts";
@@ -56,21 +60,19 @@ export const modelJudge: Judge = {
 };
 
 export async function signalCapUsd(db: Db): Promise<number> {
-  const v = Number((await db.get(db.k.selectFrom("settings").select("value").where("key", "=", SIGNAL_CAP_KEY)))?.value);
+  const v = Number(await setting(db, SIGNAL_CAP_KEY));
   return Number.isFinite(v) && v >= 0 ? v : DEFAULT_SIGNAL_CAP_USD;
 }
 
 /** What today's (UTC) signal calls cost, from the agent runs. */
 export async function signalSpentUsd(db: Db, now: number): Promise<number> {
   const day = new Date(now).toISOString().slice(0, 10);
-  return Number((await db.get(db.k.selectFrom("agent_runs").select((eb) => eb.fn.coalesce(eb.fn.sum<number>("cost_usd"), eb.lit(0)).as("c"))
-    .where("step", "=", "discord-signal").where("started_at", ">=", day)))!.c);
+  return (await loadStepSpend(db, ["discord-signal"], day)).get("discord-signal") ?? 0;
 }
 
 /** The prompt and reply of a signal call hold the message. Rows of finished calls are removed; `all` (at startup, when no call can be running) removes every row. */
 export async function dropSignalTexts(db: Db, all = false): Promise<void> {
-  await db.run(db.k.deleteFrom("agent_run_texts").where("run_id", "in", (eb) => eb.selectFrom("agent_runs").select("id").where("step", "=", "discord-signal")
-    .$if(!all, (q) => q.where("state", "<>", "running"))));
+  await removeRunTexts(db, { steps: ["discord-signal"], finishedOnly: !all });
 }
 
 export type SignalDeps = { db: Db; keys: DiscordKeys; log: (line: string) => void; judge?: Judge; now?: () => number };
@@ -129,15 +131,18 @@ export class Signals {
 
   async #check(hash: string, text: string, refs: ItemKey[]): Promise<void> {
     const { db } = this.#d;
+    const [shown, mentions] = await db.together(() => Promise.all([loadShown(db, refs.map((r) => ({ repo: r.repo, number: r.number }))), loadMessageMentions(db, [hash])]));
+    const named = new Set((mentions.get(hash) ?? []).map((m) => `${m.repo}#${m.number}`));
+    const verdicts: { msgHash: string; repo: string; number: number; signal: boolean }[] = [];
     for (const r of refs) {
-      const it = await db.get(db.k.selectFrom("main.items").select("title").where("repo", "=", r.repo).where("number", "=", r.number));
+      const key = `${r.repo}#${r.number}`;
       // No row: the message was deleted, or the item is not named any more.
-      if (!it || !await db.get(db.k.selectFrom("discord_mentions").select((eb) => eb.lit(1).as("one"))
-        .where("msg_hash", "=", hash).where("repo", "=", r.repo).where("number", "=", r.number))) continue;
-      const v = await this.#asks({ ref: `${r.repo}#${r.number}`, title: it.title ?? "", text });
-      // A delete during the call removed the row, so this changes nothing then.
-      if (v !== null) await db.run(db.k.updateTable("discord_mentions").set({ signal: v ? 1 : 0 }).where("msg_hash", "=", hash).where("repo", "=", r.repo).where("number", "=", r.number));
+      if (!shown.has(key) || !named.has(key)) continue;
+      const v = await this.#asks({ ref: key, title: shown.get(key)!.title ?? "", text });
+      if (v !== null) verdicts.push({ msgHash: hash, repo: r.repo, number: r.number, signal: v });
     }
+    // A delete during the calls removed the rows, so this changes nothing then.
+    await setSignals(db, verdicts);
   }
 
   /** True when the message asks for attention, false when it does not, null when no model answered (the flag stays as it was). */
@@ -167,17 +172,12 @@ export class Signals {
   }
 }
 
-const open = (url: { guildId: string; channelId: string; messageId: string }): string => `https://discord.com/channels/${url.guildId}/${url.channelId}/${url.messageId}`;
 
 /** Messages that asked for attention on an item, newest first. Empty when the key is missing or a row does not open. */
 export async function signalLinks(db: Db, keys: DiscordKeys | null, repo: string, number: number): Promise<DiscordLink[]> {
   if (!keys) return [];
-  const rows = await db.all(db.k.selectFrom("discord_mentions").select(["msg_hash", "sealed"]).where("repo", "=", repo).where("number", "=", number).where("signal", "=", 1).orderBy("msg_hash"));
-  return rows.flatMap((r) => {
-    const v = keys.open(r.sealed, r.msg_hash);
-    return v ? [{ url: open(v), at: v.at }] : [];
-  }).sort((a, b) => b.at.localeCompare(a.at));
+  return mentionLinks(keys, ((await loadMentionsOfItems(db, [`${repo}#${number}`])).get(`${repo}#${number}`) ?? []).filter((r) => r.signal));
 }
 
 export const signalCountOf = async (db: Db, repo: string, number: number): Promise<number> =>
-  (await db.get(db.k.selectFrom("discord_mentions").select((eb) => eb.fn.countAll<number>().as("n")).where("repo", "=", repo).where("number", "=", number).where("signal", "=", 1)))!.n;
+  (await loadMentionCounts(db, [`${repo}#${number}`])).get(`${repo}#${number}`)?.signals ?? 0;

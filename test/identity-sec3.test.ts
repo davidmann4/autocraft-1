@@ -11,7 +11,7 @@ import { writeItemNode } from "../src/mirror.ts";
 import { contributors, isWhitelisted, setOverride, tierKey, tiersOf } from "../src/whitelist.ts";
 import { SCRATCH } from "./scratch.ts";
 import { T0, world, type World } from "./world-db.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb } from "./helpers/raw-db.ts";
 
 let current: World | null = null;
 afterEach(() => current?.close());
@@ -52,7 +52,7 @@ test("history and an allow count only for their own account, and the pipeline's 
   const w = (current = await (await world()).repo());
   await w.db.run(w.db.k.insertInto("settings").values({ key: "pipeline_login", value: "pipeline-bot" }));
   await (await w.pr(9, { author: "pipeline-bot", head: "a".repeat(40) })).review(9, { verdict: "take", head: "a".repeat(40) });
-  await w.db.run(w.db.k.insertInto("fix_attempts").values({ repo: "app", number: 3, main_sha: "m", text_hash: "h", state: "pr-opened", created_at: T0, updated_at: T0, pr_url: "https://github.com/storytold/app/pull/9" }));
+  await w.db.run(w.db.k.insertInto("main_fixes").values({ repo: "app", head_sha: "m", check: "ci", verdict: "broken", state: "pr-opened", pr_number: 9, created_at: T0, updated_at: T0 }));
   const prTier = async () => (await loadPrFact(w.db, "app", 9))?.tier;
   assert.equal(await prTier(), "not", "no record that the pipeline pushed this head");
   await w.db.run(w.db.k.insertInto("own_commits").values({ repo: "app", sha: "a".repeat(40), action: "fixissue-push", at: T0 }));

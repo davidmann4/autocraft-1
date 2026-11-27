@@ -42,7 +42,8 @@
   [role="button"] {
     border-radius: 3px;
   }
-  svg[viewBox="0 0 256 256"] {
+  /* Phosphor icons default to 1.15em. :where() keeps the rule at zero specificity, so size and display utilities on an icon apply. */
+  :where(svg[viewBox="0 0 256 256"]) {
     display: inline-block;
     width: 1.15em;
     height: 1.15em;
@@ -233,26 +234,3 @@
   max-width: none;
   margin: 0 auto;
 }
-
-/* Swimlane diagram (Swimlane.tsx): lane colours follow the actor kinds. */
-.sw-container { container-type: inline-size; }
-/* Wider than the text column: up to 1240px, centred on the column, shrinking to 1100px before it scrolls. */
-.sw-frame { width: min(1240px, 100cqw - 32px); margin-left: calc(50% - min(1240px, 100cqw - 32px) / 2); }
-.sw { display: block; max-width: none; margin: 0 auto; font-size: 12px; width: 100%; min-width: 1100px; height: auto; }
-.sw-band { fill: transparent; stroke: none; }
-.sw-band.alt { fill: rgb(var(--st-fg-rgb) / 0.035); }
-.sw-head { font-size: 14px; font-weight: 700; fill: rgb(var(--st-fg-rgb)); }
-.sw-card rect { fill: var(--st-raised); stroke: rgb(var(--st-fg-rgb) / 0.35); stroke-width: 1.5; }
-.sw-card.sw-lane-models rect { fill: rgb(var(--st-accent-rgb) / 0.2); stroke: rgb(var(--st-accent-rgb)); }
-.sw-card.sw-lane-sandbox rect { fill: rgb(var(--st-ok-rgb) / 0.2); stroke: rgb(var(--st-ok-rgb)); }
-.sw-card.sw-lane-operator rect { fill: rgb(var(--st-warn-rgb) / 0.2); stroke: rgb(var(--st-warn-rgb)); }
-.sw-card.sw-lane-writes rect { fill: rgb(var(--st-bad-rgb) / 0.2); stroke: rgb(var(--st-bad-rgb)); }
-.sw-title { font-size: 13px; font-weight: 700; fill: rgb(var(--st-fg-rgb)); }
-.sw-detail { font-size: 12px; fill: rgb(var(--st-fg-rgb) / 0.85); }
-.sw-appr { font-size: 11px; font-style: italic; fill: rgb(var(--st-fg-rgb) / 0.75); }
-.sw-edge { fill: none; stroke: rgb(var(--st-fg-rgb) / 0.6); stroke-width: 1.4; }
-.sw-edge.dashed { stroke-dasharray: 5 4; stroke-width: 1.2; }
-.sw-edge.main { stroke: rgb(var(--st-fg-rgb) / 0.9); stroke-width: 2.6; }
-.sw-arrowhead { fill: rgb(var(--st-fg-rgb) / 0.75); }
-.sw-label rect { fill: var(--st-sunken); stroke: var(--st-line-strong); stroke-width: 1; }
-.sw-label text { font-size: 11px; fill: rgb(var(--st-fg-rgb)); }

@@ -6,11 +6,11 @@ import { after, test } from "node:test";
 import { setCallContext } from "../src/agents/call.ts";
 import { createTask } from "../src/build/tasks.ts";
 import { itemJobs, jobItem } from "../src/runner/job-items.ts";
+import { flushJobItems } from "../src/data/jobs/index.ts";
 import { JOB_KEEP_MS, pruneJobs } from "../src/runner/jobs.ts";
-import { askMergeDecisions } from "../src/merge/index.ts";
 import { SCRATCH } from "./scratch.ts";
 import { world } from "./world-db.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb } from "./helpers/raw-db.ts";
 
 mkdirSync(SCRATCH, { recursive: true });
 const db = await connectDb(join(mkdtempSync(join(SCRATCH, "job-items-")), "t.db"));
@@ -26,6 +26,7 @@ test("a job records the items it handled, tags their log lines, and stamps the b
   await jobItem(db, "o/app", 7, "pushed\nabc", (l) => lines.push(l));
   await jobItem(db, "o/app", 8, "held", (l) => lines.push(l));
   assert.deepEqual(lines, ["[o/app#7] outside a job", "[o/app#7] pushed abc", "[o/app#8] held"]);
+  await flushJobItems(db, job);
   assert.deepEqual((await itemJobs(db, "o/app", 7)).map((r) => [r.jobId, r.outcome]), [[job, "pushed abc"]]);
 
   const sha = "a".repeat(40);
@@ -34,19 +35,4 @@ test("a job records the items it handled, tags their log lines, and stamps the b
 
   await pruneJobs(db, Date.parse("2020-01-02T00:00:00Z") + JOB_KEEP_MS);
   assert.deepEqual(await itemJobs(db, "o/app", 7), [], "a pruned job takes its item rows");
-});
-
-test("merge-ask records the PR it asked about together with the decision id", async () => {
-  const w = await (await (await (await (await (await world()).repo()).pr(1)).review(1, { sure: false })).verified(1)).premerge(1, "clean");
-  try {
-    const job = (await w.db.get(w.db.k.insertInto("jobs").values({ step: "merge-ask", params: "{}", requested_by: "cli", requested_at: "t", state: "running" }).returning("id")))!.id;
-    setCallContext({ jobId: job, step: "merge-ask", stage: 10, cancelled: async () => false });
-    const ids = await askMergeDecisions(w.db, { log: () => {} });
-    assert.equal(ids.length, 1);
-    const rows = await w.db.all(w.db.k.selectFrom("job_items").select(["repo", "number", "outcome", "ref"]).where("job_id", "=", job));
-    assert.deepEqual(rows.map((r) => ({ ...r })), [{ repo: "app", number: 1, outcome: "asked Merge?", ref: ids[0] }]);
-  } finally {
-    setCallContext(null);
-    w.close();
-  }
 });

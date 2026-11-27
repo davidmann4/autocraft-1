@@ -33,6 +33,9 @@ export function modelLabel(id: string | null | undefined): string {
   return t || "unknown model";
 }
 
+/** Characters of one fix or follow-up title line. */
+const PART_LINE_MAX = 200;
+
 const VERDICT_LINE: Record<string, string> = {
   take: "No blocking problems found.",
   "take-fix": "Small fixes needed:",
@@ -95,19 +98,28 @@ export type RecommendInput = {
   verdict: string;
   /** The PR's merge queue entry (take and take-fix reviews only), or null when it has none. */
   queue: { path: MergePath; state: string } | null;
+  /** A person or the repo approved the merge (src/core/may.ts). */
   mergeApproved: boolean;
-  /** Push approval for the repo and maintainers allow edits on the PR. */
+  /** Our pushes to the PR are approved and its branch accepts them. */
   canPush: boolean;
+  /** On a PR approved for merge whose review found what does not block it: how many fixes still block it, how many points are follow-ups, and whether they will be filed. */
+  followUps?: { blocking: number; later: number; filed: boolean } | null;
 };
 
 const WAIT = "Recommendation: wait for maintainer feedback.";
 
 /** The closing line of the review. Plain wording only: no rule details, tiers or account names. */
 export function recommendation(r: RecommendInput): string {
+  const fu = r.followUps?.later ? r.followUps : null;
+  if (fu) {
+    const filed = fu.filed ? (fu.blocking ? "; the follow-ups will be filed as an issue" : "; the follow-ups above will be filed as an issue") : "";
+    if (!fu.blocking) return `Recommendation: merge after CI and checks pass${filed}.`;
+    return r.canPush ? `Recommendation: merge after the fixes above, which may be pushed to this branch${filed}.` : `Recommendation: merge after the fixes above${filed}.`;
+  }
   switch (r.verdict) {
     case "take":
-      if (!r.queue || r.queue.state === "declined" || r.queue.state === "merged") return WAIT;
-      return r.queue.path === "rule" && r.mergeApproved
+      if (!r.queue || r.queue.state === "merged") return WAIT;
+      return r.queue.path !== null && r.mergeApproved
         ? "Recommendation: merge after CI and checks pass."
         : "Recommendation: merge, after a maintainer's decision.";
     case "take-fix":
@@ -137,12 +149,18 @@ export type ReviewPostInput = {
   claims?: { claim: string; status: string; evidence: string }[];
   /** The closing `Recommendation: …` line (see `recommendation`). */
   recommendation: string;
+  /**
+   * On a PR approved for merge whose review found what does not block it: the titles of the fixes made before the merge, and of the
+   * points filed as a follow-up issue instead (`notFiled`: why they will not be). With no fix left the verdict line says that nothing blocks the approved merge.
+   */
+  followUps?: { fixes: string[]; later: string[]; notFiled?: string | null } | null;
 };
 
 export function reviewBody(r: ReviewPostInput): string {
   const short = (h: string) => (/^[0-9a-f]+$/i.test(h) ? h.slice(0, 7) : h);
   const fixedIn = r.fixedIn ? short(r.fixedIn) : null;
-  const head = verdictLine(r.verdict, r.sure, fixedIn && r.verdict === "take-fix" ? `Small fixes needed, made in ${fixedIn}:` : undefined);
+  const fu = r.followUps?.later.length ? r.followUps : null;
+  const head = verdictLine(r.verdict, r.sure, fu && !fu.fixes.length ? "Nothing found that blocks the approved merge:" : fixedIn && r.verdict === "take-fix" ? `Small fixes needed, made in ${fixedIn}:` : undefined);
   const foot = `Reviewed at ${short(r.head)}.${fixedIn ? ` Fixes pushed in ${fixedIn}.` : ""}`;
   // One line first: the code spans and escapes stripLinks sees are the ones the posted line has.
   const clean = (t: string, max?: number): string => cleanLine(stripLinks(t.replace(/\s+/g, " "), r.owner), max);
@@ -158,7 +176,12 @@ export function reviewBody(r: ReviewPostInput): string {
   });
   const rec = r.recommendation;
   const claimBlock = claims.length ? `Claims checked:\n${claims.join("\n")}\n\n` : "";
-  const fixed = NOTE_RESERVE + head.length + rec.length + foot.length + summary.length + claimBlock.length + 8;
+  const list = (title: string, xs: readonly string[]): string => {
+    const lines = xs.slice(0, MAX_POINTS).flatMap((x) => { const line = clean(x, PART_LINE_MAX); return line ? [`- ${line}`] : []; });
+    return lines.length ? `${title}\n${lines.join("\n")}\n\n` : "";
+  };
+  const fuBlock = fu ? list("Fixes before the merge:", fu.fixes) + list(fu.notFiled ? "Follow-ups (not filed by AutoCraft):" : "Follow-ups, to be filed as an issue:", fu.later) : "";
+  const fixed = NOTE_RESERVE + head.length + rec.length + foot.length + summary.length + claimBlock.length + fuBlock.length + 8;
   const kept: string[] = [];
   let used = fixed;
   for (const line of items) {
@@ -169,5 +192,5 @@ export function reviewBody(r: ReviewPostInput): string {
     kept.push(line);
     used += line.length + 1;
   }
-  return `${head}\n\n${summary ? `${summary}\n\n` : ""}${kept.length ? `${kept.join("\n")}\n\n` : ""}${claimBlock}${foot}\n\n${rec}`;
+  return `${head}\n\n${summary ? `${summary}\n\n` : ""}${kept.length ? `${kept.join("\n")}\n\n` : ""}${claimBlock}${fuBlock}${foot}\n\n${rec}`;
 }

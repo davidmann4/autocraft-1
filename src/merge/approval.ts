@@ -1,29 +1,40 @@
-// Per-repo approval for the pipeline to merge pull requests there. Set only
-// from the dashboard by an operator (src/dash/api/admin.ts). Tracked repos
-// include ones we do not maintain, so merging is opt-in per repo.
-import { audit } from "../dash/audit.ts";
-import { setting } from "../settings-read.ts";
+// Merge approval. A repo's `merge` step approval lets the pipeline merge PRs nobody approved one by one (the automatic
+// path); an operator, or a maintainer of the repo, turns it on (src/dash/api/admin.ts). A live workflow carries the
+// approval of its own PR, or of the PR that implements its issue. `mergeVerdicts` asks the merge's permission (src/core/authority.ts) on the
+// facts the planner decides on, read now.
+import { setStepApproval } from "../data/control/index.ts";
+import { permit } from "../core/authority.ts";
+import { loadPrFacts } from "../core/facts.ts";
+import { memberRefusal } from "../core/guard.ts";
+import type { Permission, PrFacts } from "../core/plan.ts";
 import type { Db } from "../db/index.ts";
-
-export type MergeApproval = { by: string; at: string };
-const key = (repo: string) => `merge_approved:${repo}`;
-
-export async function mergeApprovalOf(db: Db, repo: string): Promise<MergeApproval | null> {
-  const value = await setting(db, key(repo));
-  if (value === undefined) return null;
-  try {
-    return JSON.parse(value) as MergeApproval;
-  } catch {
-    return null;
-  }
-}
 
 // Returns false when nothing changed.
 export async function setMergeApproval(db: Db, by: string, repo: string, approved: boolean): Promise<boolean> {
-  if (!await db.get(db.k.selectFrom("main.tracked_repos").select("name").where("name", "=", repo))) throw new Error(`${repo} is not tracked`);
-  if ((await mergeApprovalOf(db, repo) !== null) === approved) return false;
-  if (approved) await db.run(db.k.insertInto("main.settings").values({ key: key(repo), value: JSON.stringify({ by, at: new Date().toISOString() }) }));
-  else await db.run(db.k.deleteFrom("main.settings").where("key", "=", key(repo)));
-  await audit(db, by, approved ? "merge-approve" : "merge-revoke", repo);
-  return true;
+  return await setStepApproval(db, [{ repo, step: "merge", on: approved }], by) > 0;
 }
+
+const refuse = (code: "other" | "scope", text: string): Permission => ({ ok: false, why: { code, who: "system", text } });
+
+/** Whether the PR may merge at `head`, on whose say and as whom. `batch`: as a member of an integration batch. Pure. */
+export function mergeVerdict(f: PrFacts | undefined, head: string, o: { batch?: boolean } = {}): Permission {
+  if (!f) return refuse("scope", "not an open PR the pipeline tracks");
+  if (f.ghState !== "OPEN") return refuse("other", `no longer open (${f.ghState.toLowerCase()})`);
+  if (f.head !== head) return refuse("other", `its head is ${(f.head ?? "unknown").slice(0, 7)}, not ${head.slice(0, 7)}`);
+  const may = permit(f, { kind: "merge" });
+  const out = may.ok && o.batch ? memberRefusal(f) : null;
+  return out ? refuse("other", out) : may;
+}
+
+/** Whether each PR of the repo may merge at the given head (`mergeVerdict`), from one load of the facts. */
+export async function mergeVerdicts(db: Db, repo: string, items: { number: number; head: string }[], o: { batch?: boolean } = {}): Promise<Map<number, Permission>> {
+  if (!items.length) return new Map();
+  const facts = new Map((await loadPrFacts(db, { repo, refs: items.map((i) => `${repo}#${i.number}`) })).map((f) => [f.number, f]));
+  return new Map(items.map((i) => [i.number, mergeVerdict(facts.get(i.number), i.head, o)]));
+}
+
+/** `repo#n: why` of the first PR that may not merge, or null when all may. */
+export const firstRefusal = (verdicts: Map<number, Permission>, repo: string): string | null => {
+  for (const [n, v] of verdicts) if (!v.ok) return `${repo}#${n}: ${v.why.text}`;
+  return null;
+};

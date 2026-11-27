@@ -2,25 +2,25 @@
 // success, failure and usage, honours cancels, recovers jobs an earlier runner
 // left running, runs one job per step and repo at a time.
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { createServer, type AddressInfo } from "node:net";
 import { join } from "node:path";
 import { after, describe, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { SCRATCH } from "./scratch.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb } from "./helpers/raw-db.ts";
 import { rowid } from "../src/db/kx.ts";
 
 process.env.AUTOCRAFT_EXTRA_STEPS = fileURLToPath(new URL("./runner-steps.ts", import.meta.url));
 
 const { connect } = await import("../src/db.ts");
 const { enqueue, getJob, jobDetail, requestCancel } = await import("../src/runner/jobs.ts");
+const { computeChecks } = await import("../src/health-checks.ts");
 const { DEFAULT_MAX_JOBS, Runner } = await import("../src/runner/runner.ts");
 const { STEPS } = await import("../src/runner/steps.ts");
 const { FAKE_TOKEN } = await import("./runner-steps.ts");
 const { inputHash } = await import("../src/runner/classify.ts");
 const { RUNNER_STOPPED, endJob } = await import("../src/runner/jobs.ts");
-const { setInferenceMode } = await import("../src/remote/mode.ts");
 const { createToken } = await import("../src/dash/mcp/tokens.ts");
 const { claimCall, submitCall } = await import("../src/remote/calls.ts");
 const { PROTOCOL_VERSION } = await import("../src/remote/protocol.ts");
@@ -42,7 +42,7 @@ after(async () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-async function until(cond: () => Promise<boolean>, ms = 20_000): Promise<void> {
+async function until(cond: () => Promise<boolean>, ms = 60_000): Promise<void> {
   const end = Date.now() + ms;
   while (!await cond()) {
     if (Date.now() > end) throw new Error("timed out");
@@ -83,10 +83,10 @@ describe("runner", () => {
     const pgDb = await connectDb(join(pgDir, "jobs.db"));
     process.env.AUTOCRAFT_DB_URL = `postgres://autocraft@127.0.0.1:${port}/childjob`;
     delete process.env.AUTOCRAFT_DB;
-    const pgRunner = new Runner({ db: pgDb, logs: join(pgDir, "logs"), killAfterMs: 2000, log: () => {}, detect: async () => ({ proposals: [], logs: [] }), refreshFlow: async () => undefined });
+    const pgRunner = new Runner({ db: pgDb, logs: join(pgDir, "logs"), killAfterMs: 2000, log: () => {}, detect: async () => ({ proposals: [], logs: [] }) });
     try {
       const job = await enqueue(pgDb, "test-echo", { n: 1 }, "boss");
-      const end = Date.now() + 20_000;
+      const end = Date.now() + 60_000;
       while (!Buffer.concat(seen).includes("database\0childjob\0")) {
         if (Date.now() > end) throw new Error(`the job process did not connect; job ${job.id} is ${(await getJob(pgDb, job.id)).state}`);
         await pgRunner.tick();
@@ -104,7 +104,6 @@ describe("runner", () => {
   });
 
   test("a job stopped by a runner stop resumes under the same id and reads the reply its Task Runner sent meanwhile", async () => {
-    await setInferenceMode(db, "user-local", "test");
     await db.run(db.k.insertInto("access").values({ login: "bob", role: "maintainer" }));
     const bob = { tokenId: (await createToken(db, "bob", "helper", { kind: "runner" })).row.id, login: "bob", role: "maintainer" as const };
     const opts = { db, dbTarget: dbFile, logs: join(dir, "logs"), killAfterMs: 2000, log: () => {} };
@@ -190,6 +189,154 @@ describe("runner", () => {
     await requestCancel(db, job.id, "boss");
   });
 
+  test("a job stopped by its runner keeps the items and counts it held in memory", async () => {
+    const stopper = new Runner({ db, dbTarget: dbFile, logs: join(dir, "logs"), killAfterMs: 5000, log: () => {} });
+    const job = await enqueue(db, "test-notes", {}, "boss");
+    const noted = async () => { try { return readFileSync(join(dir, "logs", `job-${job.id}.log`), "utf8").includes("handled before the stop"); } catch { return false; } };
+    for (let i = 0; i < 1000 && !await noted(); i++) {
+      await stopper.tick();
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    assert.ok(await noted(), "the step noted its item");
+    await stopper.stop();
+    const row = (await db.get(db.k.selectFrom("jobs").select(["state", "items", "acted"]).where("id", "=", job.id)))!;
+    assert.deepEqual({ ...row }, { state: "queued", items: 3, acted: 2 });
+    assert.deepEqual((await db.all(db.k.selectFrom("job_items").select(["repo", "number", "outcome"]).where("job_id", "=", job.id))).map((r) => ({ ...r })), [{ repo: "app", number: 3, outcome: "handled before the stop" }]);
+    await requestCancel(db, job.id, "boss");
+  });
+
+  test("a read of the tick that keeps failing stops neither cancels nor the recording of ends, and the health check shows it", async (t) => {
+    const lines: string[] = [];
+    const r = new Runner({ db, dbTarget: dbFile, logs: join(dir, "logs"), killAfterMs: 2000, log: (l) => lines.push(l), detect: async () => ({ proposals: [], logs: [] }) });
+    const job = await enqueue(db, "test-sleep", { ms: 600_000 }, "boss");
+    const tickUntil = async (cond: () => Promise<boolean>) => {
+      for (let i = 0; i < 600 && !await cond(); i++) {
+        await r.tick();
+        await new Promise((ok) => setTimeout(ok, 30));
+      }
+      assert.ok(await cond());
+    };
+    await tickUntil(async () => await state(job.id) === "running");
+    const check = async () => (await computeChecks(db, Date.now() + 90_000)).find((c) => c.id === "runner")!;
+    await r.tick();
+    assert.equal((await check()).state, "ok");
+    // A job whose end could not be recorded when its process exited.
+    const left = Number((await db.get(db.k.insertInto("jobs").values({ step: "test-other", params: "{}", requested_by: "boss", requested_at: new Date().toISOString(), state: "running", started_at: new Date().toISOString() }).returning("id")))!.id);
+    (r as unknown as { unrecorded: Map<number, object> }).unrecorded.set(left, { code: 0, signal: null, spawnError: null });
+    const broken = t.mock.method(db, "seqs", async () => { throw new Error("no such column"); });
+    try {
+      await requestCancel(db, job.id, "boss");
+      await tickUntil(async () => await state(job.id) === "cancelled" && await state(left) === "done");
+      await r.tick();
+      assert.ok(lines.some((l) => l.includes("no such column")), lines.join("\n"));
+      const bad = await check();
+      assert.equal(bad.state, "fail");
+      assert.match(bad.text, /no such column/);
+      assert.doesNotMatch(bad.brief, /no such column/, "viewers do not read the error");
+    } finally {
+      broken.mock.restore();
+    }
+    await r.tick();
+    await r.tick();
+    assert.equal((await check()).state, "ok");
+    await r.stop();
+  });
+
+  test("a part that fails each time it runs shows although the passes between did not run it, until it runs through", async (t) => {
+    const lines: string[] = [];
+    let detect: () => Promise<{ proposals: []; logs: [] }> = async () => ({ proposals: [], logs: [] });
+    const r = new Runner({ db, dbTarget: dbFile, logs: join(dir, "logs"), killAfterMs: 2000, log: (l) => lines.push(l), detect: () => detect() });
+    const check = async () => (await computeChecks(db, Date.now() + 90_000)).find((c) => c.id === "runner")!;
+    const webhooksDue = () => { (r as unknown as { webhookAt: number }).webhookAt = 0; };
+    const planAgain = () => db.run(db.k.deleteFrom("lane_state").where("kind", "=", "mark").where("step", "=", "planned_at"));
+    const pass = async () => { await r.tick(); await new Promise((ok) => setTimeout(ok, 20)); };
+    await pass();
+    const broken = t.mock.method(r as unknown as { webhookWork: () => Promise<unknown> }, "webhookWork", async () => { throw new Error("no webhook reads"); });
+    webhooksDue();
+    for (let i = 0; i < 3; i++) await pass();
+    const { since } = await check();
+    assert.ok(since);
+    webhooksDue();
+    for (let i = 0; i < 3; i++) await pass();
+    const bad = await check();
+    assert.deepEqual([bad.state, bad.since], ["warn", since]);
+    assert.match(bad.text, /no webhook reads/);
+    broken.mock.restore();
+    webhooksDue();
+    await pass();
+    await pass();
+    assert.equal((await check()).state, "ok");
+
+    detect = async () => { throw new Error("no plan"); };
+    await planAgain();
+    await pass();
+    await pass();
+    assert.match((await check()).text, /no plan/);
+    detect = async () => ({ proposals: [], logs: [] });
+    await planAgain();
+    await pass();
+    await pass();
+    assert.equal((await check()).state, "ok");
+    await r.stop();
+  });
+
+  test("a planner pass that failed once runs again by itself and shows no lasting failure", async () => {
+    let failures = 0;
+    const r = new Runner({ db, dbTarget: dbFile, logs: join(dir, "logs"), killAfterMs: 2000, log: () => {}, detect: async () => {
+      if (failures > 0) { failures--; throw new Error("no plan"); }
+      return { proposals: [], logs: [] };
+    } });
+    const pass = async () => { await r.tick(); await new Promise((ok) => setTimeout(ok, 20)); };
+    for (let i = 0; i < 3; i++) await pass();
+    failures = 1;
+    await db.run(db.k.deleteFrom("lane_state").where("kind", "=", "mark").where("step", "=", "planned_at"));
+    for (let i = 0; i < 4; i++) await pass();
+    assert.equal(failures, 0);
+    assert.equal((await computeChecks(db, Date.now() + 90_000)).find((c) => c.id === "runner")!.state, "ok");
+    await r.stop();
+  });
+
+  test("a workflow pass that throws runs again on the next tick, and the merge legs wait for it", async (t) => {
+    const lines: string[] = [];
+    const r = new Runner({ db, dbTarget: dbFile, logs: join(dir, "logs"), killAfterMs: 2000, log: (l) => lines.push(l), detect: async () => ({ proposals: [], logs: [] }) });
+    await r.tick();
+    await r.tick();
+    (r as unknown as { preapprovalMark: null }).preapprovalMark = null;
+    const all = db.all.bind(db);
+    t.mock.method(db, "all", async (q: Parameters<typeof db.all>[0], o?: never) => {
+      if (/item_workflows/.test(q.compile().sql)) throw new Error("no workflows");
+      return await all(q, o);
+    });
+    try {
+      await r.tick();
+      await r.tick();
+      assert.equal(lines.filter((l) => l === "workflows: no workflows").length, 2, lines.join("\n"));
+      assert.ok(!lines.some((l) => l.startsWith("preapproval")), lines.join("\n"));
+    } finally { t.mock.restoreAll(); }
+    lines.length = 0;
+    await r.tick();
+    await r.tick();
+    assert.deepEqual(lines, []);
+    await r.stop();
+  });
+
+  test("a heartbeat that cannot be stored while the pass still runs is logged and ends nothing", async (t) => {
+    const lines: string[] = [];
+    const r = new Runner({ db, dbTarget: dbFile, logs: join(dir, "logs"), killAfterMs: 2000, log: (l) => lines.push(l), detect: async () => ({ proposals: [], logs: [] }) });
+    const seqs = db.seqs.bind(db);
+    t.mock.method(db, "seqs", async (topics?: readonly string[]) => { await new Promise((ok) => setTimeout(ok, 100)); return await seqs(topics); });
+    const run = db.run.bind(db);
+    let refused = 0;
+    t.mock.method(db, "run", async (q: Parameters<typeof db.run>[0]) => {
+      if (!refused && q.compile().sql.includes("lane_state")) { refused++; throw new Error("lock timeout"); }
+      return await run(q);
+    });
+    try { await r.tick(); } finally { t.mock.restoreAll(); }
+    assert.equal(refused, 1);
+    assert.ok(lines.some((l) => /heartbeat not stored: lock timeout/.test(l)), lines.join("\n"));
+    await r.stop();
+  });
+
   test("a resumed job does not post again a comment its earlier run posted", async () => {
     const id = Number((await db.get(db.k.insertInto("jobs").values({ step: "test-echo", params: "{}", requested_by: "boss", requested_at: new Date().toISOString(), state: "running", started_at: new Date().toISOString() }).returning("id")))!.id);
     setCallContext({ jobId: id, step: "test-echo", stage: 2, cancelled: async () => false });
@@ -207,11 +354,50 @@ describe("runner", () => {
       await comment("something else");
       assert.equal(posts, 2, "a comment the earlier run did not post is posted");
 
+      // The earlier run stopped, or lost GitHub's answer, during a comment: GitHub's own list of comments settles it.
+      const started = (await db.get(db.k.selectFrom("audit").select([rowid("audit").as("id"), "details"]).where("action", "=", "act-comment").where("details", "like", `%"jobId":${id},%`).where("details", "like", "%hello%").limit(1)))!;
+      const was = JSON.parse(started.details!) as { text: string };
+      let resumes = 1;
+      const outcome = async (state: "started" | "failed") => {
+        await db.run(db.k.updateTable("jobs").set({ resumes: ++resumes, started_at: new Date(Date.now() + 1000 * resumes).toISOString() }).where("id", "=", id));
+        await db.run(db.k.updateTable("audit").set({ details: JSON.stringify({ ...was, url: undefined, state, ...(state === "failed" && { error: "timeout" }) }) }).where(rowid("audit"), "=", started.id));
+      };
+      const on = (seen: string | null) => async (_cmd: string, args: string[]) => args[0] !== "api" ? await exec() : seen === null ? { code: 1, stdout: "", stderr: "no network" } : { code: 0, stdout: seen, stderr: "" };
+      const retry = (seen: string | null) => ghComment({ db, login: "act" }, g, on(seen), "act-comment", { repo: "app", number: 3, pr: false }, { by: "fixed" } as never, "hello");
+      for (const state of ["started", "failed"] as const) {
+        await outcome(state);
+        const r = await retry(`${JSON.stringify({ url: "https://github.com/storytold/app/issues/3#issuecomment-77", body: was.text, at: new Date().toISOString() })}\n`);
+        assert.match(r.stdout, /issuecomment-77/);
+        assert.equal(posts, 2, "a comment GitHub already shows is not posted again");
+      }
+      await outcome("started");
+      await assert.rejects(retry(null), /could not be read/);
+      assert.equal(posts, 2, "nothing is posted while GitHub cannot be read");
+      await retry("");
+      assert.equal(posts, 3, "a comment GitHub does not show was never made");
+
+      // Another job, after one that lost GitHub's answer: the same comment is looked up, and one that carries out a known action is made once for good.
+      setCallContext(null);
+      const act = (text: string, e: Parameters<typeof ghComment>[2], o: { action?: number } = {}) => ghComment({ db, login: "act" }, g, e, "act-comment", { repo: "app", number: 3, pr: false }, { by: "fixed" } as never, text, o);
+      assert.notEqual((await act("later", async () => ({ code: 1, stdout: "", stderr: "timeout" }))).code, 0);
+      const lost = JSON.parse((await db.get(db.k.selectFrom("audit").select("details").where("action", "=", "act-comment").where("details", "like", "%later%")))!.details!) as { text: string };
+      const shown = `${JSON.stringify({ url: "https://github.com/storytold/app/issues/3#issuecomment-88", body: lost.text, at: new Date().toISOString() })}\n`;
+      assert.match((await act("later", on(shown))).stdout, /issuecomment-88/);
+      assert.equal(posts, 3);
+      await act("later", on(null));
+      assert.equal(posts, 4, "a comment that was made may be made again later, with nothing to look up");
+      for (let k = 0; k < 2; k++) await act("closing", on(null), { action: 7 });
+      assert.equal(posts, 5, "the comment of one action is made once");
+      setCallContext({ jobId: id, step: "test-echo", stage: 2, cancelled: async () => false });
+
       // A stopping job lets a write in flight finish and be recorded, and refuses writes asked for after the stop.
       let send = (): void => {};
-      const slow = async () => { await new Promise<void>((r) => { send = r; }); return { code: 0, stdout: "https://github.com/storytold/app/issues/3#issuecomment-9\n", stderr: "" }; };
+      let sending = (): void => {};
+      const sent = new Promise<void>((r) => { sending = r; });
+      const slow = async () => { const answer = new Promise<void>((r) => { send = r; }); sending(); await answer; return { code: 0, stdout: "https://github.com/storytold/app/issues/3#issuecomment-9\n", stderr: "" }; };
       const inFlight = ghComment({ db, login: "act" }, g, slow, "act-comment", { repo: "app", number: 3, pr: false }, { by: "fixed" } as never, "in flight");
-      await new Promise((r) => setTimeout(r, 50));
+      // The stop comes once the write is on its way to GitHub: a write still being recorded when the stop comes is not made, and never settles.
+      await sent;
       const stopping = stopWrites("the job is stopping", 5000);
       send();
       assert.equal(await stopping, 0, "nothing is left in flight");

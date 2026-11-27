@@ -13,19 +13,22 @@ import { createToken } from "../src/dash/mcp/tokens.ts";
 import { RateLimiter } from "../src/dash/server/util.ts";
 import type { User } from "../src/dash/types.ts";
 import { SAMPLE_OPUS_PRS } from "../src/prompts/samples.ts";
-import { bundleOf, claimableCalls, claimCall, CLAIM_RETRY_S, enqueueCall, expireLeases, heartbeat, leaseState, withdrawCall, submitCall, type Caller } from "../src/remote/calls.ts";
+import { awaitCall, bundleOf, claimableCalls, claimCall, CLAIM_RETRY_S, enqueueCall, expireLeases, heartbeat, leaseState, RELEASE_SKIP_MS, releaseCall, SETUP_RETRY_MS, withdrawCall, submitCall, type Caller } from "../src/remote/calls.ts";
 import { stampAlive } from "../src/remote/liveness.ts";
 import { clearCooloff } from "../src/remote/cooloff.ts";
 import * as userSettings from "../src/dash/api/user-settings.ts";
 import type { Req } from "../src/dash/types.ts";
 import { listHelpers, parseStatus, storeStatus } from "../src/remote/helpers.ts";
 import { remoteRoom } from "../src/remote/room.ts";
-import { setAcceptedModels, setInferenceMode } from "../src/remote/mode.ts";
+import { setAcceptedModels } from "../src/remote/mode.ts";
 import { PROTOCOL_VERSION, type Claim } from "../src/remote/protocol.ts";
 import { SCRATCH } from "./scratch.ts";
+import { checkoutForPr } from "../src/sandbox/index.ts";
 import { mapSeq } from "../src/async-seq.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb } from "./helpers/raw-db.ts";
 import { excluded } from "../src/db/kx.ts";
+import { dropQueueCache } from "../src/data/runners/calls-shared.ts";
+import { markHelperIdle } from "../src/data/runners/index.ts";
 
 mkdirSync(SCRATCH, { recursive: true });
 const dir = mkdtempSync(join(SCRATCH, "remote-calls-"));
@@ -33,7 +36,6 @@ const dir = mkdtempSync(join(SCRATCH, "remote-calls-"));
 describe("user-local remote calls", async () => {
   const db = await connectDb(join(dir, "t.db"));
   allocation.pollMs = 10;
-  await setInferenceMode(db, "user-local", "test");
   const T0 = new Date().toISOString();
   await db.run(db.k.insertInto("items").values({ repo: "photocraft", number: 1287, kind: "pr", state: "OPEN", title: "t", author: "alice", created_at: T0, updated_at: T0 }));
   await db.run(db.k.insertInto("pr_commits").values({ repo: "photocraft", number: 1287, oid: "abc", committed_at: T0, author: "carol", co_authors: JSON.stringify(["carol", "Dave"]) }));
@@ -47,11 +49,11 @@ describe("user-local remote calls", async () => {
   const claim = (): Claim => ({ requestId: `test-claim-${String(++claims).padStart(4, "0")}`, protocol: PROTOCOL_VERSION, helperVersion: "1.2.0", harness: "claude", harnessVersion: "2.1", tiers: { top: "opus" } });
   const canWrite = async () => true;
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-  const leaseFor = async (login: string) => {
+  const leaseFor = async (login: string, extra: Partial<Claim> = {}) => {
     for (let i = 0; i < 200; i++) {
       // A call queued before the claim and not leased by it: nothing for this login. One queued while the claim ran is tried again.
       const queued = !!await db.get(db.k.selectFrom("remote_calls").select((eb) => eb.lit(1).as("one")).where("state", "=", "queued"));
-      const r = await claimCall(db, callers[login]!, claim(), canWrite);
+      const r = await claimCall(db, callers[login]!, { ...claim(), ...extra }, canWrite);
       if (r.lease) return r.lease;
       if (queued) return null;
       await sleep(5);
@@ -60,9 +62,13 @@ describe("user-local remote calls", async () => {
   };
   /** `login`'s helper asked for top-tier work a moment ago and found none; its write permission on the repo is cached. */
   const idle = async (login: string) => {
-    await db.run(db.k.updateTable("mcp_tokens").set({ idle_claim_at: Date.now(), idle_tiers: '["top"]', idle_repos: null }).where("login", "=", login));
+    await markHelperIdle(db, callers[login]!, { now: Date.now(), tiers: ["top"], repos: null });
     await db.run(db.k.insertInto("repo_permissions").values({ login, repo: "photocraft", permission: "write", checked_at: new Date().toISOString() })
       .onConflict((oc) => oc.columns(["login", "repo"]).doUpdateSet(excluded(["permission", "checked_at"]))));
+  };
+  const noneIdle = async () => {
+    await db.run(db.k.updateTable("remote_helpers").set({ idle_claim_at: null }));
+    dropQueueCache(db);
   };
   const req = (login: string, role: string, json?: unknown) => ({ user: { login, role, canWrite: async () => true }, json }) as unknown as Req;
   const done = async (secret: string, text: string) => await submitCall(db, secret, { ok: true, text, model: "claude-opus-4-5", usage: { inputTokens: 100, outputTokens: 20 }, modelUsage: { "claude-opus-4-5": { inputTokens: 90, outputTokens: 15 }, "claude-haiku-4-5": { inputTokens: 10, outputTokens: 5 } }, costUsd: 0.25,
@@ -94,20 +100,93 @@ describe("user-local remote calls", async () => {
     assert.equal((await db.get(db.k.selectFrom("remote_calls").select("reply").where("id", "=", lease.id)))!.reply, null, "the raw reply is not kept");
     assert.equal(r?.usage.input, 90);
     assert.deepEqual(r?.usage.extra?.map((e) => [e.model, e.usage.input]), [["haiku", 10]]);
-    const run = await db.get(db.k.selectFrom("agent_runs").select(["state", "user_login", "harness", "reported_model", "account_id", "cost_usd"])
+    const run = await db.get(db.k.selectFrom("agent_runs").select(["state", "user_login", "harness", "reported_model", "cost_usd"])
       .where("id", "=", (eb) => eb.selectFrom("remote_calls").select("run_id").where("remote_calls.id", "=", lease.id)));
-    assert.deepEqual({ ...run }, { state: "done", user_login: "bob", harness: "claude", reported_model: "claude-opus-4-5", account_id: null, cost_usd: 0.25 });
+    assert.deepEqual({ ...run }, { state: "done", user_login: "bob", harness: "claude", reported_model: "claude-opus-4-5", cost_usd: 0.25 });
     const tool = await db.prepare("SELECT seq, tool, args, result_bytes, started_at FROM agent_run_tools WHERE run_id = (SELECT run_id FROM remote_calls WHERE id = ?)").get(lease.id) as Record<string, unknown>;
     assert.deepEqual({ ...tool }, { seq: 1, tool: "mcp__items__item", args: '{"ref":"photocraft#1"}', result_bytes: 300, started_at: "2026-11-19T10:00:00.000Z" });
   });
 
   test("with no other helper asking for work, the PR's author gets the review", async () => {
-    await db.run(db.k.updateTable("mcp_tokens").set({ idle_claim_at: null }));
+    await noneIdle();
     const ask = askClaude("review.opus", "opus", SAMPLE_OPUS_PRS, db);
     const lease = (await leaseFor("alice"))!;
     assert.ok(lease, "the author's helper takes it");
     await done(lease.secret, "by the author");
     assert.equal((await ask)?.text, "by the author");
+  });
+
+  test("the author does not give way to a helper whose write permission is not known", async () => {
+    const ask = askClaude("review.opus", "opus", SAMPLE_OPUS_PRS, db);
+    await idle("bob");
+    await db.run(db.k.deleteFrom("repo_permissions").where("login", "=", "bob"));
+    const lease = (await leaseFor("alice"))!;
+    assert.ok(lease, "nobody else is known to be able to take it");
+    await done(lease.secret, "by the author");
+    assert.equal((await ask)?.text, "by the author");
+    await noneIdle();
+  });
+
+  const queue = async () => await enqueueCall(db, {
+    promptId: "review.opus", promptVersion: "1", tier: "top", effort: "medium", askedModel: "opus", items: [{ repo: "photocraft", number: 1287 }], level: 0, maxAttempts: 2,
+    bundle: { stdin: "x", timeoutSeconds: 600, mcpServers: [], hints: {}, mounts: [], keepSession: false, system: null } as never,
+  });
+
+  test("a waiting caller gets the helper's progress lines, each once", async () => {
+    const id = await queue();
+    const lines: string[] = [];
+    const out = awaitCall(db, id, { onProgress: (l) => void lines.push(l) });
+    const lease = (await leaseFor("bob"))!;
+    for (const progress of ["reading a.rs", "reading a.rs", "reading b.rs"]) {
+      await heartbeat(db, lease.secret, { progress });
+      await sleep(60);
+    }
+    await done(lease.secret, "ok");
+    assert.equal((await out).state, "done");
+    assert.deepEqual(lines, ["reading a.rs", "reading b.rs"]);
+  });
+
+  test("a lost lease that cannot be expired fails its own caller; another call's reply of the same poll is delivered", async (t) => {
+    const ids = [await queue(), await queue()];
+    const leases = [(await leaseFor("bob"))!, (await leaseFor("bob"))!];
+    assert.deepEqual(leases.map((l) => l.id).sort((a, b) => a - b), ids);
+    const [finished, lost] = ids.map((id) => awaitCall(db, id).then((o) => (o.state === "done" ? o.text : o.state), (e: Error) => e.message)) as [Promise<string>, Promise<string>];
+    const write = db.write.bind(db);
+    let failed = false;
+    t.mock.method(db, "write", (async (fn: () => Promise<unknown>, ...rest: []) => {
+      if (!failed && new Error().stack!.includes("expireLeases")) {
+        failed = true;
+        throw new Error("the expiry failed");
+      }
+      return await write(fn, ...rest);
+    }) as typeof db.write);
+    await write(async () => {
+      await db.run(db.k.updateTable("remote_calls").set({ state: "done", reply: "the reply", ended_at: Date.now(), lease_secret_hash: null }).where("id", "=", ids[0]!));
+      await db.run(db.k.updateTable("remote_calls").set((eb) => ({ heartbeat_at: eb("heartbeat_at", "-", 3 * 60000) })).where("id", "=", ids[1]!));
+    });
+    assert.equal(await finished, "the reply");
+    assert.equal(await lost, "the expiry failed");
+    await withdrawCall(db, ids[1]!, "test over");
+  });
+
+  test("a reply goes to one await: a second await of the call that starts while the reply is taken does not get it", async (t) => {
+    const id = await queue();
+    const lease = (await leaseFor("bob"))!;
+    const text = (o: Promise<Awaited<ReturnType<typeof awaitCall>>>) => o.then((r) => (r.state === "done" ? r.text : r.state));
+    const first = text(awaitCall(db, id));
+    let second: Promise<string> | null = null;
+    const run = db.run.bind(db);
+    t.mock.method(db, "run", (async (...args: Parameters<typeof db.run>) => {
+      if (!second && new Error().stack!.includes("takeReplies")) {
+        second = text(awaitCall(db, id));
+        await sleep(50);
+      }
+      return await run(...args);
+    }) as typeof db.run);
+    await done(lease.secret, "the reply");
+    assert.equal(await first, "the reply");
+    assert.ok(second, "the reply was taken");
+    assert.notEqual(await second, "the reply");
   });
 
   test("a lease without heartbeats goes back to the queue and the next claim gets it; the old secret is dead", async () => {
@@ -138,9 +217,11 @@ describe("user-local remote calls", async () => {
     let erin: Caller = { tokenId: tokens[0]!, login: "erin", role: "maintainer" };
     const mine = async () => (await claimCall(db, erin, claim(), canWrite)).lease;
     const lose = async (id: number, now: number) => {
-      // The helper heartbeat after its claim, then went quiet.
-      await db.run(db.k.updateTable("remote_calls").set({ leased_at: now - 4 * 60000, heartbeat_at: now - 3 * 60000 }).where("id", "=", id));
-      await expireLeases(db, now);
+      // The helper heartbeat after its claim, then went quiet. One transaction: the caller's own poll expires a lost lease at the real time.
+      await db.write(async () => {
+        await db.run(db.k.updateTable("remote_calls").set({ leased_at: now - 4 * 60000, heartbeat_at: now - 3 * 60000 }).where("id", "=", id));
+        await expireLeases(db, now);
+      });
     };
     const ask = askClaude("review.opus", "opus", SAMPLE_OPUS_PRS, db);
     const t0 = Date.now();
@@ -192,7 +273,7 @@ describe("user-local remote calls", async () => {
 
   test("the session tools count what the login may claim, and show a lease only to its holder", async () => {
     const env = (login: string, run = true): McpEnv => ({
-      db, baseUrl: null, limiter: new RateLimiter(10, 60_000), canAnswer: false, expensive: () => 0,
+      db, baseUrl: null, canAnswer: false, expensive: () => 0,
       user: async () => ({ login, role: "maintainer" }) as unknown as User,
       ...(run && { run: { canWrite } }),
     });
@@ -250,7 +331,7 @@ describe("user-local remote calls", async () => {
   });
 
   test("a user's repo picks limit their claims and next_task; the helper's own list narrows them, never widens them", async () => {
-    await db.run(db.k.updateTable("mcp_tokens").set({ idle_claim_at: null }));
+    await noneIdle();
     await db.prepare("INSERT INTO tracked_repos (name, pipeline) VALUES ('photocraft', 1), ('fontcraft', 1), ('gridcraft', 0) ON CONFLICT (name) DO UPDATE SET pipeline = excluded.pipeline").run();
     const pick = (repos: string[]) => userSettings.setSettings(db, req("bob", "maintainer", { repos }));
     const got = await pick(["fontcraft", "gridcraft"]);
@@ -259,12 +340,12 @@ describe("user-local remote calls", async () => {
     const ask = askClaude("review.opus", "opus", SAMPLE_OPUS_PRS, db);
     while (!await db.get(db.k.selectFrom("remote_calls").select((eb) => eb.lit(1).as("one")).where("state", "=", "queued"))) await sleep(5);
     assert.equal((await claimCall(db, callers.bob!, claim(), canWrite)).lease, null, "photocraft is not picked");
-    assert.equal((await db.get(db.k.selectFrom("mcp_tokens").select("idle_repos").where("id", "=", callers.bob!.tokenId)))!.idle_repos, '["fontcraft","gridcraft"]', "the idle helper records what it takes");
+    assert.equal((await db.get(db.k.selectFrom("remote_helpers").select("idle_repos").where("token_id", "=", callers.bob!.tokenId)))!.idle_repos, '["fontcraft","gridcraft"]', "the idle helper records what it takes");
     assert.equal(await claimableCalls(db, callers.bob!, {}, canWrite), 0);
     await pick(["photocraft"]);
     assert.equal(await claimableCalls(db, callers.bob!, {}, canWrite), 1);
     assert.equal((await claimCall(db, callers.bob!, { ...claim(), repos: ["fontcraft"] }, canWrite)).lease, null, "the helper's list narrows");
-    assert.equal((await db.get(db.k.selectFrom("mcp_tokens").select("idle_repos").where("id", "=", callers.bob!.tokenId)))!.idle_repos, "[]");
+    assert.equal((await db.get(db.k.selectFrom("remote_helpers").select("idle_repos").where("token_id", "=", callers.bob!.tokenId)))!.idle_repos, "[]");
     const lease = (await claimCall(db, callers.bob!, { ...claim(), repos: ["photocraft", "fontcraft"] }, canWrite)).lease!;
     assert.match(lease.title, /photocraft#1287/);
     await done(lease.secret, "picked");
@@ -275,7 +356,7 @@ describe("user-local remote calls", async () => {
   const stateOf = async (id: number) => (await db.get(db.k.selectFrom("remote_calls").select("state").where("id", "=", id)))!.state;
 
   test("a repeated claim gets the same lease, and a dashboard outage ends no lease", async () => {
-    await db.run(db.k.updateTable("mcp_tokens").set({ idle_claim_at: null }));
+    await noneIdle();
     const ask = askClaude("review.opus", "opus", SAMPLE_OPUS_PRS, db);
     while (!await db.get(db.k.selectFrom("remote_calls").select((eb) => eb.lit(1).as("one")).where("state", "=", "queued"))) await sleep(5);
     const c = claim();
@@ -324,20 +405,102 @@ describe("user-local remote calls", async () => {
     }
   });
 
+  test("a review on a server with no local sandbox (AUTOCRAFT_NO_SANDBOX=1, no claude) still gets its checkout as a mount and tool mode", async () => {
+    const restore = setWorkspace(async () => []);
+    const saved = { no: process.env.AUTOCRAFT_NO_SANDBOX, bin: process.env.AUTOCRAFT_CLAUDE_BIN };
+    process.env.AUTOCRAFT_NO_SANDBOX = "1";
+    process.env.AUTOCRAFT_CLAUDE_BIN = join(dir, "no-claude");
+    const sha = "d".repeat(40);
+    mkdirSync(join(SCRATCH, "checkouts", "photocraft", sha), { recursive: true });
+    try {
+      const checkout = await checkoutForPr("photocraft", 1287, sha);
+      assert.ok(checkout, "the existing checkout is used");
+      const ask = askClaude("review.opus", "opus", SAMPLE_OPUS_PRS, db, { checkout, itemTools: null });
+      await idle("bob");
+      const lease = (await leaseFor("bob"))!;
+      const b = (await bundleOf(db, lease.secret))!;
+      assert.ok(b.mounts.some((m) => m.path === "/repo"), "the checkout is mounted");
+      assert.ok(b.maxTurns !== null && b.maxTurns > 0);
+      const args = b.hints.claude!.args;
+      assert.ok(args[args.indexOf("--tools") + 1]!.includes("Read"), "file tools are given");
+      await done(lease.secret, JSON.stringify({ verdict: "take", summary: "s", why: "w", public: { summary: "ok", points: [] } }));
+      await ask;
+    } finally {
+      process.env.AUTOCRAFT_NO_SANDBOX = saved.no;
+      process.env.AUTOCRAFT_CLAUDE_BIN = saved.bin;
+      if (saved.no === undefined) delete process.env.AUTOCRAFT_NO_SANDBOX;
+      if (saved.bin === undefined) delete process.env.AUTOCRAFT_CLAUDE_BIN;
+      restore();
+    }
+  });
+
   test("a failed reply sends the call back to the queue with its next attempt, for another user's helper; the old secret answers 410", async () => {
     const ask = askClaude("review.opus", "opus", SAMPLE_OPUS_PRS, db);
     const first = (await leaseFor("bob"))!;
     assert.equal(await heartbeat(db, first.secret, { phase: "running" }), true);
-    assert.deepEqual(await submitCall(db, first.secret, { ok: false, error: "harness crashed", durationMs: 5 }), { accepted: true });
+    const runId = (await db.get(db.k.selectFrom("remote_calls").select("run_id").where("id", "=", first.id)))!.run_id!;
+    const failure = { ok: false, error: "model error the run stopped (exit 1)", stopReason: "max_tokens", subtype: "error_during_execution", usage: { inputTokens: 900, outputTokens: 128000 }, durationMs: 5 };
+    assert.deepEqual(await submitCall(db, first.secret, failure), { accepted: true });
+    // The attempt's run records why it stopped and what it used.
+    const run = (await db.get(db.k.selectFrom("agent_runs").select(["state", "error", "output_tokens"]).where("id", "=", runId)))!;
+    assert.equal(run.state, "failed");
+    assert.match(run.error ?? "", /stop_reason max_tokens.*subtype error_during_execution.*128000 output tokens.*the run stopped/);
+    assert.equal(Number(run.output_tokens), 128000);
     assert.deepEqual({ ...await db.get(db.k.selectFrom("remote_calls").select(["state", "attempt", "released_by", "started_at"]).where("id", "=", first.id)) }, { state: "queued", attempt: 2, released_by: "bob", started_at: null });
     assert.deepEqual(await leaseState(db, first.secret), { id: first.id, live: false });
     assert.equal((await claimCall(db, callers.bob!, claim(), canWrite)).lease, null, "not offered to the user whose helper failed it");
     assert.equal((await db.get(db.k.selectFrom("remote_cooloffs").select("failures").where("login", "=", "bob")))!.failures, 1, "counts toward bob's cool-off");
-    await db.run(db.k.updateTable("mcp_tokens").set({ idle_claim_at: null }));
+    await noneIdle();
     const second = (await leaseFor("alice"))!;
     assert.equal(second.id, first.id);
     await done(second.secret, "second try");
     assert.equal((await ask)?.text, "second try");
+  });
+
+  test("after a give-back for a local setup failure the same user's runner takes the call again within minutes, up to its attempts; other give-backs keep it away longer", async () => {
+    const ask = askClaude("review.opus", "opus", SAMPLE_OPUS_PRS, db);
+    let lease = (await leaseFor("bob"))!;
+    const id = lease.id;
+    const ago = async (ms: number) => {
+      await db.run(db.k.updateTable("remote_calls").set((eb) => ({ released_at: eb("released_at", "-", ms) })).where("id", "=", id));
+      dropQueueCache(db);
+    };
+    const bobGets = async () => (await claimCall(db, callers.bob!, claim(), canWrite)).lease;
+    assert.equal(await releaseCall(db, lease.secret, { reason: "the provider refused the run for its usage limit" }), true);
+    await ago(SETUP_RETRY_MS + 1000);
+    assert.equal(await bobGets(), null, "a give-back for another reason keeps the long skip");
+    await ago(RELEASE_SKIP_MS);
+    lease = (await leaseFor("bob"))!;
+    const { max_attempts } = (await db.get(db.k.selectFrom("remote_calls").select("max_attempts").where("id", "=", id)))!;
+    for (let i = 0; i < Number(max_attempts); i++) {
+      assert.equal(await releaseCall(db, lease.secret, { reason: "setting up the files failed: could not fetch", setup: true }), true);
+      assert.equal(await bobGets(), null, "not at once");
+      await ago(SETUP_RETRY_MS + 1000);
+      lease = (await leaseFor("bob"))!;
+      assert.equal(lease.id, id);
+    }
+    assert.equal(await releaseCall(db, lease.secret, { reason: "setting up the files failed: could not fetch", setup: true }), true);
+    await ago(SETUP_RETRY_MS + 1000);
+    assert.equal(await bobGets(), null, "past the call's attempts a setup failure keeps the long skip");
+    await ago(RELEASE_SKIP_MS);
+    lease = (await leaseFor("bob"))!;
+    await done(lease.secret, "after the retries");
+    assert.equal((await ask)?.text, "after the retries");
+  });
+
+  test("an Opus review gets its task budget when a Task Runner whose Claude Code takes the flag leases it, and not from the queued call or for an older one", async () => {
+    const REVIEW = JSON.stringify({ verdict: "take", summary: "s", why: "w", public: { summary: "ok", points: [] } });
+    for (const [version, budget] of [["2.1.323", true], ["2.1", false]] as const) {
+      const ask = askClaude("review.opus", "opus", SAMPLE_OPUS_PRS, db);
+      const lease = (await leaseFor("bob", { harnessVersion: version }))!;
+      const queued = (await db.get(db.k.selectFrom("remote_calls").select("bundle").orderBy("id", "desc").limit(1)))!;
+      assert.equal(queued.bundle.includes("--task-budget"), false, "a server of an earlier version leasing the queued call hands on no flag");
+      const args = (await bundleOf(db, lease.secret))!.hints.claude!.args;
+      const i = args.indexOf("--task-budget");
+      assert.equal(i >= 0 ? args[i + 1] : null, budget ? "80000" : null, `Claude Code ${version}`);
+      await done(lease.secret, REVIEW);
+      await ask;
+    }
   });
 
   test("gating calls go first, the fast lane takes only gating and small calls, and Max calls at once stops new leases but lets a session finish", async () => {

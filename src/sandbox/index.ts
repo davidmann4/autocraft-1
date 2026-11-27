@@ -1,7 +1,7 @@
 // Sandboxed tool access for model calls: what a call needs to run claude with
 // read-only file tools on a checkout, and the default way to get a checkout of
 // a pull request's head commit from the cached bare clone.
-import { accessSync, constants, existsSync, readFileSync, realpathSync } from "node:fs";
+import { accessSync, constants, existsSync, realpathSync } from "node:fs";
 import { delimiter, join } from "node:path";
 import { exec, fixupDir, Git } from "../fixup/git.ts";
 import { SHARED_NAME } from "./command.ts";
@@ -27,32 +27,20 @@ export function resolveClaudeBin(): string | null {
   return null;
 }
 
-/** Whether tool mode can run on this machine: bubblewrap and the claude binary are present. */
+/**
+ * Whether this process can run a sandboxed local Claude call: bubblewrap and the claude binary are present and
+ * AUTOCRAFT_NO_SANDBOX=1 does not say it never does. Model calls run on Task Runners, whose helpers sandbox them on their
+ * own machines, so the checkouts and tool mode of those calls do not depend on this.
+ */
 export function sandboxAvailable(): boolean {
   return envVar("NO_SANDBOX") !== "1" && existsSync("/usr/bin/bwrap") && resolveClaudeBin() !== null;
 }
 
-/** A sandboxed call needs at least this much token lifetime left, because the sandbox never refreshes; the call waits for an account that has it. */
-export const TOKEN_MARGIN_MS = 30 * 60_000;
-
-/**
- * True when the access token in the credentials file at `file` expires within
- * the margin or its expiry can't be read. Reads only the expiry field; nothing
- * else of the file is kept, logged or put in an error.
- */
-export function tokenNearExpiry(file: string, now = Date.now(), marginMs = TOKEN_MARGIN_MS): boolean {
-  try {
-    const exp = (JSON.parse(readFileSync(file, "utf8")) as { claudeAiOauth?: { expiresAt?: unknown } }).claudeAiOauth?.expiresAt;
-    return typeof exp !== "number" || !Number.isFinite(exp) || exp - now < marginMs;
-  } catch {
-    return true;
-  }
-}
-
 /**
  * A checkout of the head commit of `repo#number` (instruction files left out) for a sandboxed call, or null
- * (with the reason logged) when tool mode is unavailable, the head moved, or
- * the tree is too large; the caller then asks without tools.
+ * (with the reason logged) when the repo name is not a plain one, the head moved, the fetch failed or the tree is too
+ * large; the caller then asks without tools. It needs only the cached clone, not a local sandbox: the call runs on a
+ * Task Runner, which gets the checkout as a mount.
  */
 export async function checkoutForPr(repo: string, number: number, sha: string, log: (line: string) => void = () => {}): Promise<string | null> {
   return checkoutOf(repo, sha, `${repo}#${number}`, log, async (g) => {
@@ -67,7 +55,7 @@ export async function checkoutForCommit(repo: string, branch: string, sha: strin
 }
 
 async function checkoutOf(repo: string, sha: string, label: string, log: (line: string) => void, fetch: (g: Git) => Promise<string | null>): Promise<string | null> {
-  if (!sandboxAvailable() || !SHARED_NAME.test(repo)) return null;
+  if (!SHARED_NAME.test(repo)) return null;
   try {
     const dest = join(checkoutRoot(), repo, sha);
     pruneCheckouts(checkoutRoot(), MAX_AGE_MS);

@@ -264,8 +264,6 @@ export type FixupPr = {
   diff: string;
   /** An operator's instructions (a maintainer of the project, not the PR's author): trusted text that replaces the fix list. */
   operator?: string;
-  /** For a carry-over: the PRs closed as duplicates, their diffs and the parts to port onto this one. */
-  carried_from?: { ref: string; points: string[]; diff: string }[];
   /** Present when an earlier patch for these fixes failed the lint check: that patch and the lint findings on the lines it changed. */
   previous?: LintPrevious;
 };

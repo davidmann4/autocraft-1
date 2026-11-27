@@ -65,7 +65,7 @@ CREATE INDEX IF NOT EXISTS fresh_x ON fresh(x);`;
 });
 
 test("a migration that must drop a trigger under a long read holds other writers back only briefly, and finishes after the read", { skip: needsPg, timeout: 60_000 }, async () => {
-  const t = await testDatabase();
+  const t = await testDatabase("", "postgres", { empty: true });
   const pg = await loadPg();
   const client = async (app: string) => {
     const c = new pg.Client({ connectionString: t.target, application_name: app });

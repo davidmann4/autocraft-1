@@ -1,15 +1,13 @@
 // The dashboard's access list. The Access API and the CLI both write through
 // these functions, so every change ends the login's sessions and is audited.
-import { MAINTAINER_WRITES_KEY, maintainerWritesOn, setMaintainerWrites } from "./settlers.ts";
-import { audit } from "./dash/audit.ts";
 import type { Role } from "./dash/types.ts";
-import { endAnswerTokens, endTokens } from "./dash/mcp/tokens.ts";
-import { dropUserTokens } from "./dash/server/user-tokens.ts";
+import * as access from "./data/access/index.ts";
+import { AccessRefused } from "./data/access/index.ts";
+import type { AccessRow } from "./data/access/index.ts";
 import type { Db } from "./db/index.ts";
-import * as kx from "./db/kx.ts";
 import { openDb } from "./db/open.ts";
 
-export type AccessRow = { login: string; role: Role; added_by: string | null; added_at: string | null; note: string | null };
+export type { AccessRow };
 
 export const LOGIN = /^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$/;
 
@@ -18,114 +16,48 @@ export const isRole = (v: unknown): v is Role => (ROLES as readonly unknown[]).i
 
 export class AccessError extends Error {}
 
-export async function listAccess(db: Db): Promise<AccessRow[]> {
-  return await db.all(db.k.selectFrom("access").select(["login", "role", "added_by", "added_at", "note"]).$narrowType<{ role: Role }>()
-    .orderBy(kx.nocase(db, "login")));
+/** The module refuses with a reason; the dashboard and the CLI show its message as an AccessError. */
+async function refusing<T>(f: () => Promise<T>): Promise<T> {
+  try {
+    return await f();
+  } catch (e) {
+    if (e instanceof AccessRefused) throw new AccessError(e.message);
+    throw e;
+  }
 }
+
+export const listAccess = access.listAccess;
 
 // The access entry's GitHub id is stored when the entry is added (or, for an
 // entry added without one, at the first sign-in). Sign-ins must present the
 // same id: a login that was renamed or released and taken by someone else is
 // not the person who was added.
-export async function checkGithubId(db: Db, login: string, id: number): Promise<"ok" | "bound" | "mismatch"> {
-  const row = await db.get(db.k.selectFrom("access").select("github_id").where("login", "=", login));
-  if (!row) return "mismatch";
-  if (row.github_id === null) {
-    const r = await db.run(db.k.updateTable("access").set({ github_id: id }).where("login", "=", login).where("github_id", "is", null));
-    if (r.changes) return "bound";
-    return await checkGithubId(db, login, id);
-  }
-  return Number(row.github_id) === id ? "ok" : "mismatch";
-}
+export const checkGithubId = access.bindGithubId;
 
 export async function getAccess(db: Db, login: string): Promise<AccessRow | undefined> {
-  return await db.get(db.k.selectFrom("access").select(["login", "role", "added_by", "added_at", "note"]).$narrowType<{ role: Role }>()
-    .where("login", "=", login));
-}
-
-async function endSessions(db: Db, login: string): Promise<number> {
-  await db.run(db.k.deleteFrom("repo_permissions").where("login", "=", login));
-  return Number((await db.run(db.k.deleteFrom("sessions").where("login", "=", login))).changes);
-}
-
-/** Org setup links are an operator's: they end when their creator stops being one (the link flow also checks the creator's role). */
-async function endSetupLinks(db: Db, login: string): Promise<number> {
-  return Number((await db.run(db.k.updateTable("github_setup_links").set({ revoked_at: new Date().toISOString() })
-    .where((eb) => kx.ciEq(db, "created_by", eb.val(login))).where("revoked_at", "is", null).where("used_at", "is", null))).changes);
-}
-
-async function tx<T>(db: Db, f: () => Promise<T>): Promise<T> {
-  return await db.write(async () => {
-    const r = await f();
-    return r;
-  });
+  return (await access.loadAccess(db, [login])).get(login.toLowerCase());
 }
 
 export async function addLogin(db: Db, by: string, login: string, role: Role, note: string | null, githubId: number | null = null): Promise<void> {
   if (!LOGIN.test(login)) throw new AccessError(`not a GitHub login: ${JSON.stringify(login)}`);
   if (!isRole(role)) throw new AccessError(`role must be ${ROLES.join(", ")}`);
-  await tx(db, async () => {
-    if (await getAccess(db, login)) throw new AccessError(`${login} is already on the access list`);
-    await db.run(db.k.insertInto("access").values({ login, role, added_by: by, added_at: new Date().toISOString(), note: note || null, github_id: githubId }));
-    await audit(db, by, "access-add", login, { role });
-  });
-}
-
-// Refuses a change that would leave the dashboard without an operator. The
-// dashboard applies it to every access write; the CLI doesn't, because only
-// someone with a shell on the host runs it.
-async function keepAnOperator(db: Db, row: AccessRow): Promise<void> {
-  if (row.role === "operator" && await operatorCount(db) <= 1) throw new AccessError("That would leave no operator. Add another operator first.");
+  await refusing(() => access.addLogin(db, by, { login, role, note, githubId }));
 }
 
 export type AccessWriteOptions = { keepOperator?: boolean };
 
 export async function removeLogin(db: Db, by: string, login: string, opts: AccessWriteOptions = {}): Promise<void> {
-  await tx(db, async () => {
-    const row = await getAccess(db, login);
-    if (!row) throw new AccessError(`${login} is not on the access list`);
-    if (opts.keepOperator) await keepAnOperator(db, row);
-    await db.run(db.k.deleteFrom("access").where("login", "=", login));
-    const sessions = await endSessions(db, login);
-    // Re-adding the login later must not bring its old agent tokens back.
-    const mcpTokens = await endTokens(db, login);
-    // The GitHub App user token goes with the login; its grant is revoked at GitHub later (the vault's sweep).
-    const userTokens = await dropUserTokens(db, row.login);
-    // A linked Discord account acts as the login (presses, alerts); the delete trigger takes the alert opt-ins with the links.
-    // Matched in any letter case: the access list is, and the removal may name the login in another case than the link stores.
-    const discordLinks = Number((await db.run(db.k.deleteFrom("discord_links").where((eb) => kx.ciEq(db, "login", eb.val(row.login))))).changes);
-    await db.run(db.k.deleteFrom("discord_link_codes").where((eb) => kx.ciEq(db, "login", eb.val(row.login))));
-    const setupLinks = await endSetupLinks(db, row.login);
-    await audit(db, by, "access-remove", row.login, { role: row.role, sessions, ...(mcpTokens ? { mcpTokens } : {}), ...(userTokens ? { userTokens } : {}), ...(discordLinks ? { discordLinks } : {}), ...(setupLinks ? { setupLinks } : {}) });
-  });
+  await refusing(() => access.removeLogin(db, by, login, opts));
 }
-
-const RANK: Record<Role, number> = { viewer: 0, maintainer: 1, operator: 2 };
 
 export async function setRole(db: Db, by: string, login: string, role: Role, opts: AccessWriteOptions = {}): Promise<boolean> {
   if (!isRole(role)) throw new AccessError(`role must be ${ROLES.join(", ")}`);
-  return await tx(db, async () => {
-    const row = await getAccess(db, login);
-    if (!row) throw new AccessError(`${login} is not on the access list`);
-    if (row.role === role) return false;
-    if (opts.keepOperator) await keepAnOperator(db, row);
-    await db.run(db.k.updateTable("access").set({ role }).where("login", "=", login));
-    const sessions = await endSessions(db, login);
-    // A lowered role ends the login's answering tokens: they would work again if the login is promoted again.
-    const answerTokens = RANK[role] < RANK[row.role] ? await endAnswerTokens(db, login) : 0;
-    // A role change ends the sessions, so the login's GitHub App user token goes too and the next sign-in makes a new one.
-    const userTokens = await dropUserTokens(db, row.login);
-    const setupLinks = role === "operator" ? 0 : await endSetupLinks(db, row.login);
-    await audit(db, by, "access-role", row.login, { from: row.role, to: role, sessions, ...(answerTokens ? { answerTokens } : {}), ...(userTokens ? { userTokens } : {}), ...(setupLinks ? { setupLinks } : {}) });
-    return true;
-  });
+  return await refusing(() => access.setRole(db, by, login, role, opts));
 }
 
-export async function operatorCount(db: Db): Promise<number> {
-  return Number((await db.get(db.k.selectFrom("access").select((eb) => eb.fn.countAll<number>().as("n")).where("role", "=", "operator")))!.n);
-}
+export const operatorCount = access.countOperators;
 
-const USAGE = "usage: autocraft-server access list | add <login> [--operator|--maintainer] [--note TEXT] | remove <login> | role <login> operator|maintainer|viewer | maintainer-writes [on|off]";
+const USAGE = "usage: autocraft-server access list | add <login> [--operator|--maintainer] [--note TEXT] | remove <login> | role <login> operator|maintainer|viewer";
 
 async function run(args: string[]): Promise<void> {
   const [sub, login, ...rest] = args;
@@ -154,18 +86,6 @@ async function run(args: string[]): Promise<void> {
         console.log(`added ${login} as ${role}`);
         return;
       }
-      case "maintainer-writes": {
-        // Maintainers with write access settle decisions on repos that use the app's identity (src/settlers.ts).
-        if (login === undefined) {
-          console.log(`maintainer-writes: ${await maintainerWritesOn(db) ? "on" : "off"}`);
-          return;
-        }
-        if (login !== "on" && login !== "off") break;
-        const changed = await setMaintainerWrites(db, login === "on");
-        if (changed) await audit(db, "cli", "maintainer-writes", MAINTAINER_WRITES_KEY, { value: login });
-        console.log(changed ? `maintainer-writes: ${login}` : `maintainer-writes was already ${login}`);
-        return;
-      }
       case "remove":
         if (!login) break;
         await removeLogin(db, "cli", login);
@@ -190,5 +110,5 @@ async function run(args: string[]): Promise<void> {
 }
 
 export const commands = {
-  access: { summary: "dashboard access list: list | add <login> [--operator|--maintainer] [--note] | remove <login> | role <login> operator|maintainer|viewer | maintainer-writes [on|off]", run },
+  access: { summary: "dashboard access list: list | add <login> [--operator|--maintainer] [--note] | remove <login> | role <login> operator|maintainer|viewer", run },
 };

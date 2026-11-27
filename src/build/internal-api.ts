@@ -4,8 +4,7 @@
 // login the token names. Without the key (no secrets file on the runner) every request is refused.
 import { readFile } from "node:fs/promises";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { ACCOUNT_ACTIONS } from "../agents/account-actions.ts";
-import { AccountError, listAccounts } from "../agents/accounts.ts";
+import { loadArtifactFiles } from "../data/build/index.ts";
 import type { Db } from "../db/index.ts";
 import { INTERNAL_HEADER, verifyInternal } from "../remote/runner-client.ts";
 import { absolute, implementationShotPath, SHOT_FILE } from "./artifacts.ts";
@@ -48,8 +47,8 @@ export async function handleInternal(db: Db, key: string | null, req: IncomingMe
   if (art && method === "GET") {
     let name: string;
     try { name = decodeURIComponent(art[2]!); } catch { return send(res, 404, { error: "no such artifact" }); }
-    const row = await db.get(db.k.selectFrom("build_artifacts").select("file").where("task_id", "=", Number(art[1])).where("name", "=", name));
-    const path = row && absolute(row.file);
+    const file = (await loadArtifactFiles(db, [{ taskId: Number(art[1]), name }])).get(`${art[1]}/${name}`);
+    const path = file && absolute(file);
     if (!path) return send(res, 404, { error: "no such artifact" });
     let data: Buffer;
     try { data = await readFile(path); } catch { return send(res, 404, { error: "the artifact file is gone" }); }
@@ -66,19 +65,5 @@ export async function handleInternal(db: Db, key: string | null, req: IncomingMe
     return void res.end(data);
   }
 
-  const acc = /^\/internal\/accounts\/([a-z-]{1,20})$/.exec(url.pathname);
-  if (acc && method === "POST") {
-    let args: { id?: unknown; input?: unknown; sync?: unknown };
-    try { args = body ? (JSON.parse(body) as typeof args) : {}; } catch { return send(res, 400, { error: "the body is not valid JSON" }); }
-    try {
-      if (acc[1] === "list") return send(res, 200, await listAccounts(db, Date.now(), args.sync !== false));
-      const action = Object.hasOwn(ACCOUNT_ACTIONS, acc[1]!) ? ACCOUNT_ACTIONS[acc[1]!] : undefined;
-      if (!action) return send(res, 404, { error: "no such account action" });
-      return send(res, 200, await action(db, args.id ?? undefined, args.input ?? undefined, login));
-    } catch (e) {
-      if (e instanceof AccountError) return send(res, e.status, { error: e.message, account: true });
-      throw e;
-    }
-  }
   return send(res, 404, { error: "no such endpoint" });
 }

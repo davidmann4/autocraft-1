@@ -19,6 +19,8 @@
 import type { TokenBox } from "./crypto.ts";
 import type { Provider, Refused, Tokens } from "./provider.ts";
 import { failUserTokens, readUserTokens, swapUserTokens } from "./user-tokens.ts";
+import * as access from "../../data/access/index.ts";
+import type { Sealed } from "../../data/access/index.ts";
 import type { Db } from "../../db/index.ts";
 
 const EXPIRY_MARGIN = 60_000;
@@ -66,9 +68,7 @@ export async function readCopies(db: Db, box: TokenBox, login: string): Promise<
   const out: Copy[] = [];
   const u = await readUserTokens(db, box, login);
   if (u) out.push({ kind: "user", ...u });
-  const rows = await db.all(db.k.selectFrom("sessions").select(["id_hash", "token_enc"]).$narrowType<{ token_enc: string }>()
-    .where("login", "=", login).where("token_enc", "is not", null));
-  for (const r of rows) out.push({ kind: "session", idHash: r.id_hash, enc: r.token_enc, tokens: openSession(box, r.token_enc, r.id_hash) });
+  for (const r of await access.loadSessionSealedOf(db, login)) out.push({ kind: "session", idHash: r.idHash, enc: r.sealed, tokens: openSession(box, r.sealed, r.idHash) });
   return out;
 }
 
@@ -103,7 +103,7 @@ export function refreshShared(db: Db, box: TokenBox, provider: Provider, login: 
         for (const c of copies) {
           if (!isTarget(c) && !(c.tokens?.refresh && used.includes(c.tokens.refresh))) continue;
           if (c.kind === "user") await swapUserTokens(db, box, login, c.version, next);
-          else await db.run(db.k.updateTable("sessions").set({ token_enc: box.seal(JSON.stringify(next), c.idHash) }).where("id_hash", "=", c.idHash).where("token_enc", "=", c.enc));
+          else await access.swapSessionTokens(db, [{ idHash: c.idHash, old: c.enc as Sealed, sealed: box.seal(JSON.stringify(next), c.idHash) as Sealed }]);
         }
       });
       return { ok: true, tokens: next };
@@ -152,7 +152,7 @@ export function refreshShared(db: Db, box: TokenBox, provider: Provider, login: 
     };
     if (!held()) return await settle();
     if (mine.kind === "session") {
-      const ended = Number((await db.run(db.k.deleteFrom("sessions").where("id_hash", "=", mine.idHash).where("token_enc", "=", mine.enc))).changes) > 0;
+      const ended = !!mine.enc && await access.endSessionIf(db, mine.idHash, mine.enc as Sealed);
       return ended ? { ok: false, transient: false, why: "refresh-failed" } : await settle();
     }
     if (!live) return { ok: false, transient: false, why: "refresh-failed" };

@@ -2,11 +2,15 @@
 // and on every repo when broken pushes come from several repos (an operator resumes it).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { activeTrips, evaluatePushBreaker, trip } from "../src/push-outcomes.ts";
+import { evaluatePushBreakers, loadTrips, tripStage } from "../src/data/control/index.ts";
+import { connectDb, type Db } from "./helpers/raw-db.ts";
 import { resumeTrip } from "../src/dash/api/pipeline.ts";
 import { loadItemFact } from "../src/core/issue-facts.ts";
 import { gates } from "../src/core/gates.ts";
-import { connectDb } from "../src/db/open.ts";
+
+const trip = async (db: Db, key: string, reason: string, evidence: string[], at: string): Promise<void> => void await tripStage(db, [{ key, reason, evidence, at }]);
+const evaluatePushBreaker = async (db: Db, stage: string, repo: string, at: string): Promise<void> => void await evaluatePushBreakers(db, [{ stage, repo }], at);
+const activeTrips = async (db: Db): Promise<Record<string, string>> => Object.fromEntries([...await loadTrips(db, { active: true })].map(([k, t]) => [k, t.reason]));
 
 const as = (role: string, stage: string, writable: string[]) => ({
   method: "POST", path: "", params: { stage }, query: new URLSearchParams(), form: new URLSearchParams(), csrf: "", nonce: "",
@@ -39,7 +43,7 @@ test("broken pushes on one repo stop Implement there; broken pushes on two repos
     at: t(m), stage: "implement", action: "implement-push", repo, number, from_oid: null, to_oid: `${repo}${number}`.padEnd(40, "0"), before_res: "green", after_res: outcome === "broke" ? "red" : "green", outcome, resolved_at: t(m),
   }));
   for (const repo of ["a", "b"]) {
-    await db.prepare("INSERT INTO tracked_repos (name) VALUES (?)").run(repo);
+    await db.prepare("INSERT INTO tracked_repos (name, pipeline) VALUES (?, 1)").run(repo);
     await db.run(db.k.insertInto("items").values({ repo, number: 10, kind: "issue", state: "OPEN", title: "Crash on start" }));
   }
   // Two broken pushes on a and one on b: a's own breaker stops a, and a's pushes then no longer count for every repo.

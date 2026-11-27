@@ -1,7 +1,7 @@
 // A batch of 12 PRs in mixed states (one removed, one failed, the rest in), for the batch detail page.
 import type { BatchDetail, BatchMemberDetail } from "../types";
 import { NOW } from "./fixtures";
-import { queueBatchList } from "./queueFixtures";
+import { queueBatches } from "./queueFixtures";
 
 const iso = (minAgo: number) => new Date(NOW - minAgo * 60_000).toISOString();
 const TITLES = [
@@ -48,7 +48,7 @@ function rich(): BatchDetail {
 export const batchDetailMock = (id: number): BatchDetail => {
   if (id === 98) return rich();
   if (id === 97) return { ...rich(), id: 97, buildState: "skipped", buildSkipped: "the combined diff is binary", taskId: null, events: rich().events.filter((e) => e.kind !== "task") };
-  const b = queueBatchList({ limit: 100 }).batches.find((x) => x.id === id);
+  const b = queueBatches().find((x) => x.id === id);
   if (!b) throw new Error(`no batch ${id}`);
   return {
     id: b.id, repo: b.repo, branch: b.branch, fork: b.fork, state: b.state, baseSha: b.baseSha, commitSha: b.baseSha, parentId: null, childIds: [], prNumber: b.prNumber, prUrl: b.prUrl,

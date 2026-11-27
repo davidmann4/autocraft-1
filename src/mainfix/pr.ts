@@ -12,7 +12,7 @@ import { guardRepo } from "../core/guard.ts";
 import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { errorFiles, patchFromFailure, type CifixDeps } from "../cifix/index.ts";
-import { isQuiet } from "../security/quiet.ts";
+import { loadQuiet } from "../data/security/index.ts";
 import { readFailure } from "../cifix/logs.ts";
 import type { CifixPr } from "../cifix/types.ts";
 import { forkOf } from "../github/fork.ts";
@@ -31,13 +31,13 @@ import { MAIN_FIX_BRANCH_PREFIX } from "../mainci/index.ts";
 import type { Gh } from "../merge/safe-merge.ts";
 import { cleanLine } from "../review/post-template.ts";
 import type { FixRow } from "./index.ts";
-import type { MainFixVerdict } from "./types.ts";
-import * as kx from "../db/kx.ts";
 import { optionalChecks } from "../optional-checks.ts";
 import { ownerOf, slugOf } from "../owners.ts";
 import { POOL_MAX, pool } from "../classify/run.ts";
 import { isHalt, poolRoom } from "../agents/call.ts";
-import { pushesUnsettled } from "../push-outcomes.ts";
+import { pushesAreUnsettled } from "../fixup/unsettled.ts";
+import { loadMainFixes, loadOpenFixPr } from "../data/changes/index.ts";
+import { listItems } from "../data/mirror/index.ts";
 import { someSeq } from "../async-seq.ts";
 import type { Db } from "../db/index.ts";
 
@@ -53,10 +53,9 @@ export type FixPrDeps = Pick<CifixDeps, "ask" | "check" | "root"> & {
 
 const PATCH_MODEL = CLAUDE_PROMPTS["cifix.patch"].models[0]!;
 
-/** Whether a repo has stored patches to collect: the lint task of one ended, or its head is not the current one. */
-export async function lintReady(db: Db, repo: string, current: string): Promise<boolean> {
-  const rows = await db.all(db.k.selectFrom("main_fixes").select(["head_sha", "lint_task"]).where("repo", "=", repo).where("state", "=", "linting"));
-  return await someSeq(rows, async (r) => r.head_sha !== current || r.lint_task === null || (await readLint(db, r.lint_task)).kind !== "pending");
+/** Whether the repo has stored patches to collect: the lint task of one ended, or its head is not the current one. `lintingHeads` are the repo's `linting` rows (`loadMainFixDue`). */
+export async function lintReadyIn(db: Db, lintingHeads: { headSha: string; lintTask: number | null }[], current: string): Promise<boolean> {
+  return await someSeq(lintingHeads, async (r) => r.headSha !== current || r.lintTask === null || (await readLint(db, r.lintTask)).kind !== "pending");
 }
 
 /** The default branch's head as the polls show it. */
@@ -101,17 +100,9 @@ export function prBody(r: { head: string; checks: { name: string; runUrl: string
  * open PR updated after the red that names a failing check or changes a file the failure names.
  */
 async function coveringPr(c: Ctx, checks: string[], files: string[], since: string): Promise<number | null> {
-  const ours = await c.db.get(c.db.k.selectFrom("main_fixes as f")
-    .leftJoin("items as i", (j) => j.onRef("i.repo", "=", "f.repo").onRef("i.number", "=", "f.pr_number"))
-    .select("f.pr_number as n").distinct()
-    .where("f.repo", "=", c.repo).where("f.state", "=", "pr-opened").where("f.pr_number", "is not", null).where("f.updated_at", ">=", since)
-    .where((eb) => eb(eb.fn.coalesce("i.state", eb.val("OPEN")), "=", "OPEN"))
-    .orderBy("f.pr_number").limit(1));
-  if (ours) return ours.n;
-  const prs = await c.db.all(c.db.k.selectFrom("items").select(["number", "title", "body"])
-    .where("repo", "=", c.repo).where("kind", "=", "pr").where("state", "=", "OPEN")
-    .where((eb) => eb.or([eb(eb.fn.coalesce("updated_at", eb.val("")), ">", since), eb(eb.fn.coalesce("created_at", eb.val("")), ">", since)]))
-    .orderBy("number").limit(MAX_PRS));
+  const ours = await loadOpenFixPr(c.db, c.repo, since);
+  if (ours !== null) return ours;
+  const prs = (await listItems(c.db, { repos: [c.repo], kind: "pr", states: ["OPEN"], updatedSince: since }, "text")).slice(0, MAX_PRS);
   const names = checks.map((x) => x.toLowerCase());
   for (const p of prs) {
     const text = `${p.title ?? ""}\n${p.body ?? ""}`.toLowerCase();
@@ -136,7 +127,7 @@ type Outcome = "opened" | "skipped" | "failed" | "waiting" | "linting";
  */
 async function attempt(c: Ctx, rows: FixRow[], count: () => void, ledger: SessionLedger): Promise<Outcome> {
   const at = (): string => c.now().toISOString();
-  const head = rows[0]!.head_sha;
+  const head = rows[0]!.headSha;
   const set = async (list: FixRow[], state: "nothing-to-do" | "fix-failed", reason: string): Promise<"skipped" | "failed"> => {
     const why = scrubReason(oneLine(reason), c.fix.root);
     for (const r of list) await c.setState(r, state, why, at());
@@ -152,6 +143,8 @@ async function attempt(c: Ctx, rows: FixRow[], count: () => void, ledger: Sessio
     if (now.headSha !== head) return await done("nothing-to-do", "main moved to a newer head");
     const reading = await readFailure(c.gh, c.repo, head, await optionalChecks(c.db, c.repo));
     if (reading.kind === "skip") return await done("nothing-to-do", reading.why);
+    // A log GitHub does not serve yet (the run goes on): the row waits, as for a running check.
+    if (reading.kind === "unread") return "waiting";
     const failing = new Map(reading.failure.checks.map((x) => [x.name, x]));
     for (const r of rows.filter((x) => !failing.has(x.check))) await set([r], "nothing-to-do", "the check no longer fails at this head");
     const live = rows.filter((r) => failing.has(r.check));
@@ -162,7 +155,7 @@ async function attempt(c: Ctx, rows: FixRow[], count: () => void, ledger: Sessio
     if (covered !== null) return await set(live, "nothing-to-do", `an open PR already covers it: #${covered}`);
 
     const stored = live[0]!.state === "linting";
-    const w = stored ? { patch: live[0]!.patch ?? "", files: JSON.parse(live[0]!.files ?? "[]") as string[], task: live[0]!.lint_task, round: live[0]!.lint_round ?? 1, state: live[0]!.lint_state, session: live[0]!.session } : null;
+    const w = stored ? { patch: live[0]!.patch ?? "", files: JSON.parse(live[0]!.files ?? "[]") as string[], task: live[0]!.lintTask, round: live[0]!.lintRound ?? 1, state: live[0]!.lintState, session: live[0]!.session } : null;
     const res = w ? await readLint(c.db, w.task ?? -1) : null;
     if (res?.kind === "pending") return "waiting";
     if (!stored) count();
@@ -178,14 +171,14 @@ async function attempt(c: Ctx, rows: FixRow[], count: () => void, ledger: Sessio
       finally { rmSync(scratch, { recursive: true, force: true }); }
     };
     const store = async (patch: string, files: string[], task: number, state: "pending" | "requeued", round: number, session: string | null): Promise<void> => {
-      for (const r of live) await c.setState(r, "linting", null, at(), { patch, files: JSON.stringify(files), lint_task: task, lint_round: round, lint_state: state, session });
+      for (const r of live) await c.setState(r, "linting", null, at(), { patch, files: JSON.stringify(files), lintTask: task, lintRound: round, lintState: state, session });
     };
 
     type Made = { ok: true; patch: string; files: string[]; changed: number; shown: CifixPr["files"]; model: string; applied: Awaited<ReturnType<typeof treeOf>> } | { ok: false; reason: string };
     /** A model patch (with the earlier patch and its findings after a lint round), applied and checked. */
     const generate = async (previous: { patch: string; findings: string[] } | null, round: number, ses: SessionAsk = {}): Promise<Made> => {
       const made = await patchFromFailure(c.db, c.fix, {
-        git, ref, title, repo: c.repo, number: 0, base: head, ...(now.culpritPr && await isQuiet(c.db, c.repo, now.culpritPr) ? { quiet: true } : {}), head, round, failure: { head, checks }, diffText: "", ...(previous ? { previous } : {}), session: ses,
+        git, ref, title, repo: c.repo, number: 0, base: head, ...(now.culpritPr && (await loadQuiet(c.db, [`${c.repo}#${now.culpritPr}`])).size > 0 ? { quiet: true } : {}), head, round, failure: { head, checks }, diffText: "", ...(previous ? { previous } : {}), session: ses,
         runId: `main-fix-${c.repo}-${at().replace(/[-:]/g, "").slice(0, 15)}`, actor: PR_ACTOR, at,
         reviewReason: `The default branch fails the check${names.length > 1 ? "s" : ""} ${names.join(", ")} at this head. The patch must make ${names.length > 1 ? "them" : "it"} pass without changing what the code is meant to do.`,
         checkout: async () => c.fix.checkout?.(c.repo, now.branch, head),
@@ -280,18 +273,23 @@ async function attempt(c: Ctx, rows: FixRow[], count: () => void, ledger: Sessio
     const fork = await forkOf({ db: c.db, login: PR_ACTOR }, g, c.exec, who.login, c.repo);
     const owner = fork.split("/")[0]!;
     const sel = await ownPrSelect(c.db, c.repo, [owner], now.branch);
-    const found = await c.exec("gh", ["pr", "list", "--repo", `${slugOf(c.repo)}`, "--state", "open", "--head", branch, "--json", sel.json, "--jq", sel.jq]);
-    let url = found.code === 0 ? found.stdout.trim().split("\n")[0] ?? "" : "";
+    const openPr = async (): Promise<string> => {
+      const found = await c.exec("gh", ["pr", "list", "--repo", `${slugOf(c.repo)}`, "--state", "open", "--head", branch, "--json", sel.json, "--jq", sel.jq]);
+      return found.code === 0 ? found.stdout.trim().split("\n")[0] ?? "" : "";
+    };
+    let url = await openPr();
     if (!(url && urlOk(url, c.repo))) {
       const push = await pushOwnBranch({ db: c.db, login: PR_ACTOR }, g, git, "main-fix-push", { repo: c.repo, remote: fork, branch, sha: commit }, { fork, head });
       if (push.code !== 0) return await set(live, "fix-failed", `push failed: ${oneLine(push.stderr)}`);
-      const body = prBody({ head, checks: live.map((r) => ({ name: r.check, runUrl: r.run_url })), culprit: now.culprit, culpritPr: now.culpritPr, files: patchFiles, changed });
+      const body = prBody({ head, checks: live.map((r) => ({ name: r.check, runUrl: r.runUrl })), culprit: now.culprit, culpritPr: now.culpritPr, files: patchFiles, changed });
       const pr = await ghOpenPr({ db: c.db, login: PR_ACTOR }, g, c.exec, "main-fix-pr", { repo: c.repo, target: ref, base: now.branch, head: `${owner}:${branch}`, title, body },
         { by: "model", kind: "pull request", model }, { branch, files: patchFiles });
       url = pr.stdout.trim().split("\n").pop() ?? "";
-      if (pr.code !== 0 || !urlOk(url, c.repo)) return await set(live, "fix-failed", `the pull request was not opened: ${oneLine(pr.stderr || pr.stdout)}`);
+      // A create whose answer was lost may have opened it.
+      if (pr.code !== 0 || !urlOk(url, c.repo)) url = await openPr();
+      if (!urlOk(url, c.repo)) return await set(live, "fix-failed", `the pull request was not opened: ${oneLine(pr.stderr || pr.stdout)}`);
     }
-    for (const r of live) await c.setState(r, "pr-opened", r.reason, at(), { pr_number: Number(url.split("/").pop()), pr_url: url });
+    for (const r of live) await c.setState(r, "pr-opened", r.reason, at(), { prNumber: Number(url.split("/").pop()), prUrl: url });
     c.log(`  ${c.repo}: ${names.join(", ")}: opened ${url}`);
     return "opened";
   } catch (e) {
@@ -303,12 +301,10 @@ async function attempt(c: Ctx, rows: FixRow[], count: () => void, ledger: Sessio
 /** Takes the repo's `needs-fix` and `linting` rows head by head; `onHandled` is called once per head that reaches the model work. */
 export async function openFixPrs(c: Ctx, onHandled?: () => void): Promise<{ opened: number; skipped: number; failed: number; linting: number }> {
   const out = { opened: 0, skipped: 0, failed: 0, linting: 0 };
-  const rows = await c.db.all(c.db.k.selectFrom("main_fixes").select(kx.cols("main_fixes")).$narrowType<{ verdict: MainFixVerdict }>()
-    .where("repo", "=", c.repo).where("state", "in", ["needs-fix", "linting"]).where("verdict", "=", "code")
-    .orderBy("created_at").orderBy("head_sha").orderBy("check"));
+  const rows = await loadMainFixes(c.db, { repo: c.repo, states: ["needs-fix", "linting"], verdict: "code" });
   const byHead = new Map<string, FixRow[]>();
   const ledger = new SessionLedger();
-  for (const r of rows) (byHead.get(r.head_sha) ?? byHead.set(r.head_sha, []).get(r.head_sha)!).push(r);
+  for (const r of rows) (byHead.get(r.headSha) ?? byHead.set(r.headSha, []).get(r.headSha)!).push(r);
   try {
     await sweepSessions(c.db, c.now());
     let stopLogged = false;
@@ -318,14 +314,12 @@ export async function openFixPrs(c: Ctx, onHandled?: () => void): Promise<{ open
         if (!stopLogged) { stopLogged = true; c.log(`  ${c.repo}: stopping, no new heads started`); }
         return;
       }
-      if (await pushesUnsettled(c.db, c.repo, c.log)) return;
-      const release = await leaseItem(c.db, `head:${c.repo}@${group[0]!.head_sha}`, c.log);
+      if (await pushesAreUnsettled(c.db, c.repo, c.log)) return;
+      const release = await leaseItem(c.db, `head:${c.repo}@${group[0]!.headSha}`, c.log);
       if (!release) return;
       try {
         // Another job may have moved the rows on before the lease was taken.
-        const now = await c.db.all(c.db.k.selectFrom("main_fixes").select(kx.cols("main_fixes")).$narrowType<{ verdict: MainFixVerdict }>()
-          .where("repo", "=", c.repo).where("head_sha", "=", group[0]!.head_sha).where("state", "in", ["needs-fix", "linting"]).where("verdict", "=", "code")
-          .orderBy("created_at").orderBy("check"));
+        const now = await loadMainFixes(c.db, { repo: c.repo, states: ["needs-fix", "linting"], verdict: "code", head: group[0]!.headSha });
         if (!now.length) return;
         // Rows that turned red after the patch was stored wait until it is collected.
         const stored = now.filter((r) => r.state === "linting");

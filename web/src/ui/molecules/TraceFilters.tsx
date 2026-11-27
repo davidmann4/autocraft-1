@@ -6,15 +6,17 @@ import { useIsPhone } from "../../shell/useMedia";
 import { TRACE_KIND, TRACE_KINDS } from "../../lib/trace";
 
 /** Kind chips (none active means every kind) and the "Only AutoCraft" chip. On phones the kinds sit behind one "Show" button. */
-export function TraceFilters({ kinds, onKinds, autocraftOnly, onAutocraftOnly }: {
+export function TraceFilters({ kinds, onKinds, autocraftOnly, onAutocraftOnly, choices = TRACE_KINDS }: {
   kinds: TraceKind[];
   onKinds: (k: TraceKind[]) => void;
   autocraftOnly: boolean;
   onAutocraftOnly: (v: boolean) => void;
+  /** The kinds offered as chips. */
+  choices?: readonly TraceKind[];
 }) {
   const phone = useIsPhone();
   const toggle = (k: TraceKind) => onKinds(kinds.includes(k) ? kinds.filter((x) => x !== k) : [...kinds, k]);
-  const chips = TRACE_KINDS.map((k) => (
+  const chips = choices.map((k) => (
     <Chip key={k} active={kinds.includes(k)} onClick={() => toggle(k)}>
       {TRACE_KIND[k].label}
     </Chip>

@@ -1,17 +1,9 @@
 // Liveness and readiness probes for the dashboard and the runner. No auth and no data in the answer.
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { parseListen } from "./dash/server/config.ts";
-import type { Db } from "./db/index.ts";
+import { pingDb } from "./data/control/index.ts";
 
-/** True when the database answers a trivial query. */
-export async function dbReady(db: Db): Promise<boolean> {
-  try {
-    await db.get(db.k.selectNoFrom((eb) => eb.lit(1).as("one")));
-    return true;
-  } catch {
-    return false;
-  }
-}
+export const dbReady = pingDb;
 
 /** Headers every probe answer carries: no sniffing, no framing, no loading of anything. */
 export const PROBE_HEADERS = { "x-content-type-options": "nosniff", "x-frame-options": "DENY", "content-security-policy": "default-src 'none'" };

@@ -12,15 +12,14 @@ import type { User } from "./api/types";
 import { UserContext } from "./shell/UserContext";
 import { AppShell } from "./shell/AppShell";
 import { initTheme } from "./shell/theme";
-import { allModules, classicModules, selectModules } from "./registry";
-import { RailShell } from "./shell/RailShell";
+import { modules } from "./registry";
 import { preloadAll, preloadRoute } from "./registry/lazyView";
 import { setRepoOwners } from "./lib/links";
 
 initTheme();
 // The page's own chunks load beside the sign-in request, not after it.
-preloadRoute(classicModules, window.location.pathname);
-preloadAll(allModules);
+preloadRoute(modules, window.location.pathname);
+preloadAll(modules);
 // The panels library would set the drag cursor with an injected <style>, which
 // the server's CSP refuses; the resize handles set their own cursor.
 disableGlobalCursorStyles();
@@ -43,8 +42,6 @@ function App({ api }: { api: Api }) {
   useEffect(() => void api.repoOwners().then(setRepoOwners, () => {}).finally(() => setOwnersLoaded(true)), [api]);
   if (error) return <div className="p-8 text-ink/60">The dashboard could not load: {error}</div>;
   if (!user || !ownersLoaded) return null;
-  // The user's `ui_v2` switch picks the dashboard; the module list is set before anything renders.
-  selectModules(user.uiV2);
   return (
     <ApiContext.Provider value={api}>
       <QueryClientProvider client={queryClient}>
@@ -52,7 +49,7 @@ function App({ api }: { api: Api }) {
           <UserContext.Provider value={user}>
             <Tooltip.Provider delayDuration={0} skipDelayDuration={0}>
               <BrowserRouter>
-                {user.uiV2 ? <RailShell /> : <AppShell />}
+                <AppShell />
               </BrowserRouter>
             </Tooltip.Provider>
           </UserContext.Provider>

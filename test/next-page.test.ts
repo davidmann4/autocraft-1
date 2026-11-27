@@ -7,7 +7,7 @@ import { plannedItems } from "../src/core/select-items.ts";
 import { nextPage } from "../src/dash/api/next.ts";
 import { detectAutopilot, INPUT_TOPICS, LANE_KINDS, LANES, NO_ITEM_LANES, setEnabled, setLimit } from "../src/runner/autopilot.ts";
 import { SCRATCH } from "./scratch.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb } from "./helpers/raw-db.ts";
 import { excluded } from "../src/db/kx.ts";
 
 mkdirSync(SCRATCH, { recursive: true });

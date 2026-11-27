@@ -6,7 +6,6 @@ import type { MockRole } from "./fixtures";
 const MOCK_ROLES: [MockRole, string][] = [
   ["operator", "Operator"],
   ["maintainer", "Maintainer (write on 6 repos)"],
-  ["settler", "Maintainer who settles (write on 6 repos)"],
   ["viewer", "Viewer (no write access)"],
 ];
 

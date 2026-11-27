@@ -6,15 +6,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createToken } from "../src/dash/mcp/tokens.ts";
 import { claimCall, enqueueCall, type Caller } from "../src/remote/calls.ts";
-import { setInferenceMode } from "../src/remote/mode.ts";
 import { PROTOCOL_VERSION, type Claim, type TaskBundle } from "../src/remote/protocol.ts";
 import { connectDb } from "../src/db/open.ts";
+import { queryDb } from "../src/db/query-db.ts";
 
 const CALLS = 500, REPOS = 25, IDLE = 50, ROUNDS = 40;
 const dir = mkdtempSync(join(tmpdir(), "claim-bench-"));
 try {
-  const db = await connectDb(join(dir, "bench.db"));
-  await setInferenceMode(db, "user-local", "bench");
+  const db = queryDb(await connectDb(join(dir, "bench.db")));
   const now = Date.now(), iso = new Date(now).toISOString();
   const bundle: Omit<TaskBundle, "callId"> = { promptId: "review.opus", promptVersion: "1", tier: "top", effort: "medium", timeoutSeconds: 600, maxTurns: 10, stdin: "x".repeat(20_000), system: null, mounts: [], mcpServers: [], keepSession: false, hints: {} };
   const perm = db.prepare("INSERT OR REPLACE INTO repo_permissions (login, repo, permission, checked_at) VALUES (?, ?, ?, ?)");

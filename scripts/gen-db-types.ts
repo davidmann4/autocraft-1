@@ -7,6 +7,7 @@
 // NOT NULL is `| null`; an INTEGER PRIMARY KEY of a rowid table or a column with a default is `Generated<>`, so inserts may
 // leave it out. Virtual tables (full-text search) are left out: queries reach them only through src/db/kx.ts.
 //
+// `BYTES_COLUMNS` lists the columns that hold bytes (bytea on Postgres), for src/db/bytes-read.ts.
 // `COLUMNS` lists each table's and view's columns in table order, without rowid or dropped columns, for `kx.cols`.
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -52,7 +53,7 @@ export function renderDbTypes(): string {
         "",
       ];
       const names: Rel[] = [];
-      const columns: string[] = [];
+      const columns: string[] = [], bytes: string[] = [];
       for (const r of rels) {
         if (virtual.includes(r.name) || shadow(r.name)) continue;
         const cols = db.prepare(`PRAGMA table_info(${JSON.stringify(r.name)})`).all() as Col[];
@@ -70,6 +71,7 @@ export function renderDbTypes(): string {
           if (!c.notnull && !c.pk && t !== "unknown") t += " | null";
           const intKey = rowidTable && pks.length === 1 && c.pk === 1 && c.type.toUpperCase() === "INTEGER";
           if (intKey || c.dflt_value !== null) t = `Generated<${t}>`;
+          if (t.includes("Uint8Array") && r.type === "table") bytes.push(where);
           out.push(`  ${key(c.name)}: ${t};`);
         }
         out.push("}", "");
@@ -82,6 +84,8 @@ export function renderDbTypes(): string {
       out.push("}", "");
       out.push("/** Each table's and view's columns in table order (no rowid), for selecting a whole row: `kx.cols`. */");
       out.push("export const COLUMNS = {", ...columns, "} as const;", "");
+      out.push("/** The columns that hold bytes: BLOB on SQLite, bytea on Postgres. */");
+      out.push(`export const BYTES_COLUMNS = [${bytes.map((b) => JSON.stringify(b)).join(", ")}] as const;`, "");
       return out.join("\n");
     } finally {
       db.close();

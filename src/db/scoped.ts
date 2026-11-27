@@ -7,6 +7,7 @@
 //   `search_path=scoped,<app schema>`, so unqualified names find the views first, and its statements turn `main.x` into
 //   `<app schema>.x` (src/db/params.ts rewriteForPostgres).
 import { jsonEach, jsonText } from "./portable.ts";
+import { DROP_RETIRED, RETIRED_TABLES } from "./retired-names.ts";
 import type { Dialect } from "./index.ts";
 
 /** The schema of the Postgres views. */
@@ -20,7 +21,7 @@ function views(d: Dialect): [string, string][] {
   // A batch (repo NULL) is hidden when any of its items is in an untracked repo.
   const items = d === "postgres" ? "CASE WHEN items IS JSON ARRAY THEN items ELSE '[]' END" : "CASE WHEN json_valid(items) THEN items ELSE '[]' END";
   const batch = `repo IS NULL AND NOT EXISTS (SELECT 1 FROM ${jsonEach(d, items, "j")} WHERE ${jsonText(d, "j.value", "$.repo")} NOT ${TRACKED})`;
-  return [
+  const all: [string, string][] = [
     ["repos", byRepo("name")],
     ["items", byRepo("repo")],
     ["comments", byRepo("repo")],
@@ -29,6 +30,7 @@ function views(d: Dialect): [string, string][] {
     ["decisions", `${byRepo("repo")} OR (${batch})`],
     ["token_usage", `repo IS NULL OR ${byRepo("repo")}`],
   ];
+  return all.filter(([t]) => !DROP_RETIRED || !RETIRED_TABLES.includes(t));
 }
 
 /** Every table name a scoped handle shadows with a view; writes to them go through `main.`. */

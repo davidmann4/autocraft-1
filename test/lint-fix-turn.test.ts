@@ -1,50 +1,41 @@
 // The reply-lint fix turn is one tool-less turn that returns only the flagged fields, merged into the first reply;
 // problems only in internal text skip it.
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync } from "node:fs";
 import { join } from "node:path";
 import { describe, test } from "node:test";
-import { askClaude, FIX_TURN_MAX_TURNS, setRunner } from "../src/classify/run.ts";
+import { askClaude, FIX_TURN_MAX_TURNS } from "../src/classify/run.ts";
 import { SAMPLE_OPUS_PRS } from "../src/prompts/samples.ts";
 import { mergeFixFields, type Lint } from "../src/replylint.ts";
-import { useTestAccount } from "./accounts-fixture.ts";
+import { fakeTaskRunner } from "./fake-runner.ts";
 import { SCRATCH } from "./scratch.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb } from "./helpers/raw-db.ts";
 
 mkdirSync(SCRATCH, { recursive: true });
 const dir = mkdtempSync(join(SCRATCH, "lint-fix-"));
-process.env.AUTOCRAFT_CLAUDE_BIN = "/usr/bin/true";
+process.env.AUTOCRAFT_CHECKOUT_DIR = join(dir, "checkouts");
+const checkout = join(dir, "checkouts", "photocraft", "a".repeat(40));
 
 describe("reply lint fix turn", async () => {
   const db = await connectDb(join(dir, "t.db"));
-  const box = await useTestAccount(db);
-  mkdirSync(box.configDir + "t", { recursive: true });
-  writeFileSync(join(box.configDir + "t", ".credentials.json"), JSON.stringify({ claudeAiOauth: { accessToken: "a", refreshToken: "b", expiresAt: Date.now() + 6 * 3600_000 } }));
   const first = JSON.stringify({ verdict: "take", summary: "too long", why: "fine.", public: { summary: "ok", points: ["a leaky point", "second"] } });
-  const result = (text: string) => JSON.stringify({ type: "result", result: text, session_id: "s1", num_turns: 1, usage: {} });
 
   const run = async (lint: Lint, fixReply: string) => {
-    const calls: string[][] = [];
-    const messages: string[] = [];
-    const restore = setRunner(async (_cmd, args, stdin) => {
-      calls.push(args);
-      messages.push(stdin);
-      return { code: 0, stdout: result(calls.length === 1 ? first : fixReply), stderr: "" };
-    });
+    const runner = await fakeTaskRunner(db, (c) => ({ text: c.resume ? fixReply : first, sessionId: "s1", turns: 1 }));
     try {
-      const r = await askClaude("review.opus", "opus", SAMPLE_OPUS_PRS, db, { checkout: dir, lint });
-      return { r: r!, calls, messages };
-    } finally { restore(); }
+      const r = await askClaude("review.opus", "opus", SAMPLE_OPUS_PRS, db, { checkout, lint });
+      return { r: r!, calls: runner.calls.map((c) => ({ resume: c.resume, args: c.hints.claude!.args })), messages: runner.calls.map((c) => c.stdin) };
+    } finally { await runner.stop(); }
   };
 
   test("the fix turn has no tool permission and one turn, asks for the flagged field only and merges it", async () => {
     const lint: Lint = (text, stage) => (stage === "first" ? [{ field: "public.points[0]", message: "mentions the reference folder", text: "a leaky point" }] : JSON.parse(text).public.points[0] === "clean point" ? [] : null);
     const { r, calls, messages } = await run(lint, '{"public.points[0]": "clean point"}');
     assert.equal(calls.length, 2);
-    assert.ok(calls[1]!.includes("--resume"));
-    assert.ok(!calls[1]!.includes("--allowedTools"), "no tool is allowed");
-    assert.equal(calls[1]![calls[1]!.indexOf("--max-turns") + 1], String(FIX_TURN_MAX_TURNS));
-    assert.ok(calls[0]!.includes("--allowedTools"));
+    assert.ok(calls[1]!.resume, "the fix turn continues the first call's session");
+    assert.ok(!calls[1]!.args.includes("--allowedTools"), "no tool is allowed");
+    assert.equal(calls[1]!.args[calls[1]!.args.indexOf("--max-turns") + 1], String(FIX_TURN_MAX_TURNS));
+    assert.ok(calls[0]!.args.includes("--allowedTools"));
     assert.match(messages[1]!, /public\.points\[0\]/);
     assert.ok(!messages[1]!.includes("verdict"), "only the flagged field is named");
     const merged = JSON.parse(r.text);

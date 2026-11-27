@@ -22,20 +22,33 @@ export class DiscordKeys {
     return createHmac("sha256", this.#mac).update(`sign:${purpose}:${data}`).digest("base64url");
   }
   seal(ref: MessageRef, aad: string): string {
+    return this.sealText(JSON.stringify(ref), aad);
+  }
+  open(sealed: string, aad: string): MessageRef | null {
+    const text = this.openText(sealed, aad);
+    if (text === null) return null;
+    try {
+      const v = JSON.parse(text) as MessageRef;
+      return typeof v.messageId === "string" ? v : null;
+    } catch {
+      return null;
+    }
+  }
+  /** AES-256-GCM over `text`; `aad` binds the sealed value to where it is stored. */
+  sealText(text: string, aad: string): string {
     const iv = randomBytes(12);
     const c = createCipheriv("aes-256-gcm", this.#enc, iv);
     c.setAAD(Buffer.from(aad));
-    const body = Buffer.concat([c.update(JSON.stringify(ref), "utf8"), c.final()]);
+    const body = Buffer.concat([c.update(text, "utf8"), c.final()]);
     return Buffer.concat([iv, c.getAuthTag(), body]).toString("base64url");
   }
-  open(sealed: string, aad: string): MessageRef | null {
+  openText(sealed: string, aad: string): string | null {
     try {
       const buf = Buffer.from(sealed, "base64url");
       const d = createDecipheriv("aes-256-gcm", this.#enc, buf.subarray(0, 12), { authTagLength: 16 });
       d.setAAD(Buffer.from(aad));
       d.setAuthTag(buf.subarray(12, 28));
-      const v = JSON.parse(Buffer.concat([d.update(buf.subarray(28)), d.final()]).toString("utf8")) as MessageRef;
-      return typeof v.messageId === "string" ? v : null;
+      return Buffer.concat([d.update(buf.subarray(28)), d.final()]).toString("utf8");
     } catch {
       return null;
     }
@@ -57,7 +70,8 @@ export function readKeyFile(path: string): DiscordKeys {
   return new DiscordKeys(text);
 }
 
-function readSecretFile(path: string, what: string): string {
+/** A secret file's trimmed text; refuses a missing file and one open to group or others. */
+export function readSecretFile(path: string, what: string): string {
   let mode: number;
   try {
     mode = statSync(path).mode;

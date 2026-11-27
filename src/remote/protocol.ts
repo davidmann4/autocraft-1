@@ -27,6 +27,8 @@ export const ROUTES = {
   heartbeat: "/api/remote/heartbeat",
   /** Lease secret. Body `Submit`, reply `SubmitReply`. */
   submit: "/api/remote/submit",
+  /** Lease secret of an attempt just submitted. Body `TranscriptUpload`, reply `{ ok: true }`, or 410 when no transcript is awaited for it (none asked, already sent, or past TRANSCRIPT_WAIT_S). */
+  transcript: "/api/remote/transcript",
   /** Lease secret. Body `Release`, reply `{ ok: true }`: the call goes back to the queue without using an attempt (the helper is too old, or its platform or harness login is missing). */
   release: "/api/remote/release",
   /** Lease secret. A private repo's checkout or a workspace entry as a tar stream: `?repo=<name>&sha=<sha>`. */
@@ -92,8 +94,9 @@ export type Claim = {
   /** A claim from a slot or the fast lane of a helper that also runs an own lane: the calls bound to its user are left to that lane. */
   withOwnLane?: boolean;
   /**
-   * Only calls whose timeout is at most this many seconds: the helper's harness login is refreshed before a longer call could
-   * finish. Absent: any timeout. A server without the field offers any call, and the helper gives back one that does not fit.
+   * The room left on the helper's harness login before its refresh, in seconds: no call may run longer. With enough room the
+   * server leases a longer call with its bundle's `timeoutSeconds` cut to the room (calls.ts LOGIN_CUT_MIN_MS); with less it
+   * leases only calls that fit. Absent: any timeout. A server without the field offers any call, and the helper gives back one that does not fit.
    */
   maxTimeoutSeconds?: number;
   /**
@@ -202,12 +205,12 @@ export type RunnerInfo = HelperInfo & {
   createdAt: string;
   /** When the credential expires unless used (ISO time); each use moves it on. */
   expiresAt: string;
-  /** Agent access: the credential may also use /mcp (inbox, decisions, feedback, merge queue). */
+  /** Agent access: the credential may also use /mcp (its tools). */
   agent: boolean;
-  /** The credential may answer decisions and approve merges on /mcp (with agent access, while answering is available and the user's role settles decisions). */
+  /** The credential may send commands on /mcp (with agent access, while the user may act). */
   answer: boolean;
 };
-/** `answering`: whether the signed-in user may let a runner answer (answering is available and the user settles decisions). */
+/** `answering`: whether the signed-in user may let a runner send commands. */
 export type RunnersReply = { runners: RunnerInfo[]; answering: boolean };
 
 /** GET /api/runners/pending?code=<user code> (session route): a device login waiting for approval, or 404. Times are ISO. */
@@ -248,7 +251,7 @@ export type TaskBundle = {
   promptVersion: string;
   tier: Tier;
   effort: "low" | "medium" | "high" | "xhigh" | "max";
-  /** Wall-clock limit for the whole harness run. */
+  /** Wall-clock limit for the whole harness run: the call's own, or the lease's when cut to the claim's login room. */
   timeoutSeconds: number;
   maxTurns: number | null;
   /** The text sent on stdin. */
@@ -261,11 +264,13 @@ export type TaskBundle = {
   mcpServers: string[];
   /** Whether the helper keeps the harness session after the call: a follow-up turn (lint fix, check reminder, resume) may continue it. */
   keepSession: boolean;
+  /** The server stores the call's full session, set only on an instance with a transcript store: whatever the outcome, once the submit is accepted the helper sends it to ROUTES.transcript (helpers from 1.5.2). */
+  transcriptAfter?: boolean;
   /** A follow-up turn: resume this helper's session of the parent call instead of starting one. The helper resumes with the session id it recorded; the hints never carry `--resume`. */
   resume?: { parentCallId: number };
   /** Exact arguments for adapters that can use them; an adapter without hints builds its own from the fields above. */
   hints: {
-    /** `claude` arguments as the server would run them (src/prompts `claudeArgs`), for the fixed sandbox paths or below the claim's `root`. The model name is replaced by the claim's model for the tier. */
+    /** `claude` arguments as the server would run them (src/prompts `claudeArgs`), for the fixed sandbox paths or below the claim's `root`, with the prompt's `--task-budget` added at lease time only when the claim's Claude Code is at least the first that takes it. The model name is replaced by the claim's model for the tier. */
     claude?: { args: string[]; /** The `--agents` file content when the call has the explorer. */ agents?: string };
   };
 };
@@ -284,9 +289,21 @@ export type Usage = { inputTokens: number; outputTokens: number; cacheReadTokens
 /** One tool use of the call, as the harness recorded it: the same fields a local run stores (src/agents/tools.ts). */
 export type SubmitTool = { name: string; /** The input as JSON, at most 4000 characters. */ args: string; /** Size of the result; null when no result came back. */ resultBytes: number | null; isError: boolean; startedAt?: string; endedAt?: string };
 
+/**
+ * The full session, for the call's transcript (src/transcripts): gzip of JSONL, base64. Each line is `{"at": <ISO time the
+ * line arrived>, "event": <one JSON event the harness streamed>}`, in order; a helper that had to cut a long session
+ * keeps its start and end and puts `{"at", "omitted": <events left out>}` between them. At most TRANSCRIPT_MAX characters.
+ * Helpers 1.5.0 and 1.5.1 send it in `Submit.transcript`, which the server still stores when the submit fits its limit.
+ */
+export const TRANSCRIPT_MAX = 16 * 1024 * 1024;
+export type TranscriptUpload = { transcript: string };
+/** How long after an accepted submit the server takes the attempt's transcript. */
+export const TRANSCRIPT_WAIT_S = 10 * 60;
+
 export type Submit =
-  | { ok: true; text: string; /** The full model id the harness reported (e.g. from the CLI's result); matched by family against the claim's model for the tier. */ model: string; usage: Usage; /** Per model id, subagents (the explorer) included; `usage` is the whole call when this is absent. */ modelUsage?: Record<string, Usage>; /** The harness's cost for the whole call at list price, when it reports one (the Claude CLI's `total_cost_usd`). */ costUsd?: number; turns?: number; /** The harness session id, kept by the helper for follow-ups. */ sessionId?: string; /** Tool uses in order, subagents included. */ tools?: SubmitTool[]; durationMs: number }
-  | { ok: false; error: string; usage?: Usage; durationMs: number; /** The model's safety filter declined the request: the server runs the call once more on another Task Runner or a lower tier, without using an attempt. */ refused?: boolean };
+  | { ok: true; text: string; /** The full model id the harness reported (e.g. from the CLI's result); matched by family against the claim's model for the tier. */ model: string; usage: Usage; /** Per model id, subagents (the explorer) included; `usage` is the whole call when this is absent. */ modelUsage?: Record<string, Usage>; /** The harness's cost for the whole call at list price, when it reports one (the Claude CLI's `total_cost_usd`). */ costUsd?: number; turns?: number; /** The harness session id, kept by the helper for follow-ups. */ sessionId?: string; /** Tool uses in order, subagents included. */ tools?: SubmitTool[]; transcript?: string; durationMs: number }
+  | { ok: false; /** What went wrong, with the harness's own refusal or error text. */ error: string; /** The tokens the run used before it stopped. */ usage?: Usage; durationMs: number; transcript?: string; /** The model's safety filter declined the request: the server runs the call once more on another Task Runner or a lower tier, without using an attempt. */ refused?: boolean;
+      /** Why the harness's last model turn stopped, as it reports it (Claude: the result's `stop_reason`, such as refusal or max_tokens); helpers from 1.4.3. */ stopReason?: string; /** The harness's kind of result (Claude: the result's `subtype`, such as error_max_turns or error_during_execution); helpers from 1.4.3. */ subtype?: string };
 
 export type SubmitReply = { accepted: boolean; reason?: string };
 
@@ -299,7 +316,10 @@ export type ToolReply = { content: ToolContent[]; isError?: boolean };
 export const toolContent = (r: { text: string; images?: readonly { data: string; mimeType: string }[] }): ToolContent[] =>
   [{ type: "text", text: r.text }, ...(r.images ?? []).map((i): ToolContent => ({ type: "image", data: i.data, mimeType: i.mimeType }))];
 
-export type Release = { /** Why the helper gives the lease back, shown on the call. */ reason: string };
+export type Release = {
+  /** Why the helper gives the lease back, shown on the call. */ reason: string;
+  /** Setting up the call's files or slot failed on the helper (a fetch, git, disk): the same login may take the call again after SETUP_RETRY_MS instead of RELEASE_SKIP_MS (src/remote/calls.ts). */ setup?: boolean;
+};
 
 /** The machine a Task Runner runs on, as Node's `os.hostname()`, `process.platform` and `process.arch` give it. */
 export type Machine = { hostname: string; platform: string; arch: string };
@@ -308,7 +328,7 @@ export type Machine = { hostname: string; platform: string; arch: string };
  * Device-style login: the runner makes its own credential (`acrun_` + 32 random bytes, base64url), keeps it, and sends only
  * its hash, lowercase hex SHA-256 of the whole credential string. A signed-in user approves the shown `userCode` on the dashboard.
  */
-/** `agent`: the credential may also use /mcp; `answer`: it may answer decisions and approve merges there. */
+/** `agent`: the credential may also use /mcp; `answer`: it may send commands there. */
 export type LoginScopes = { agent: boolean; answer: boolean };
 /** `scopes`: what the runner asks for; `agent` counts as true and `answer` as false when left out. */
 export type LoginStart = { credentialHash: string; /** The name the runner is listed under; the approving user may change it. */ label: string; machine: Machine; helperVersion: string; scopes?: Partial<LoginScopes> };

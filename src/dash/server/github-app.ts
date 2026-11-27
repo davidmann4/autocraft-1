@@ -3,6 +3,7 @@
 // returned code into the app's keys. The keys are stored sealed in the database
 // (src/github/app-keys.ts) only; no response, log line or audit row carries the
 // private key or client secret.
+import * as access from "../../data/access/index.ts";
 import { mentionName } from "../../github/slugs.ts";
 import type { IncomingMessage } from "node:http";
 import type { GithubAppStatus } from "../../../web/src/api/types.ts";
@@ -43,13 +44,13 @@ export function githubAppRoutes(config: Config, deps: AppDeps, mint?: (owner: st
       return { json: { identity, signIn: "/auth/signin" } };
     },
   }, {
-    method: "GET", pattern: "/api/admin/github-app", operator: true,
+    method: "GET", pattern: "/api/admin/github-app", operator: true, external: true,
     handler: async (db, r): Promise<Res> => ({
       json: {
         ...(await githubAppStatus(db, config, deps)),
         csrf: r.csrf,
         // Whether the signed-in operator has let the app act as them (their user token is stored and still good).
-        authorized: config.secrets.app ? !!await db.get(db.k.selectFrom("user_tokens").select("login").where("login", "=", r.user.login).where("status", "=", "ok")) : null,
+        authorized: config.secrets.app ? (await access.loadUserTokenStatus(db, [r.user.login])).get(r.user.login.toLowerCase()) === "ok" : null,
       },
     }),
   }, {
@@ -60,12 +61,14 @@ export function githubAppRoutes(config: Config, deps: AppDeps, mint?: (owner: st
       if (!app) return { status: 409, json: { error: "No app is registered." } };
       if (await githubIdentity(db) === "app") return { status: 409, json: { error: "GitHub writes and sign-in use the GitHub App. Switch the GitHub identity back to the box account first." } };
       const keys = boundAppKeys(config.secrets);
-      if (keys) await keys.clear();
-      else config.secrets.app = null;
-      await db.run(db.k.deleteFrom("github_app_states"));
-      // The stored user tokens belong to the removed app.
-      await db.run(db.k.deleteFrom("user_tokens"));
-      await audit(db, r.user.login, "github-app-remove", app.slug, { slug: app.slug, owner: app.owner?.login ?? null });
+      await db.write(async () => {
+        if (keys) await keys.clear();
+        else config.secrets.app = null;
+        await access.clearAppStates(db);
+        // The stored user tokens belong to the removed app, so there is nothing to revoke.
+        await access.dropAllUserTokens(db, { queue: false });
+        await audit(db, r.user.login, "github-app-remove", app.slug, { slug: app.slug, owner: app.owner?.login ?? null });
+      });
       return { json: { settingsUrl: settingsUrl(app.slug, app.owner) } };
     },
   }, {
@@ -162,8 +165,7 @@ export async function startRegistration(db: Db, config: Config, req: IncomingMes
   const replace = form.get("replace_unreadable") === "1";
   if (boundAppKeys(config.secrets)?.unreadable() && !replace) return refuse(nonce, 409, `${UNREADABLE} Tick the confirmation to replace them.`);
   const state = (replace ? REPLACE_PREFIX : "") + randomToken(24);
-  await db.run(db.k.deleteFrom("github_app_states").where("created_at", "<=", new Date(Date.now() - STATE_TTL_MS).toISOString()));
-  await db.run(db.k.insertInto("github_app_states").values({ state, login: session.login, session_hash: session.idHash, created_at: new Date().toISOString() }));
+  await access.addAppState(db, { state, login: session.login, sessionHash: session.idHash, createdAt: new Date().toISOString() }, { expireBefore: new Date(Date.now() - STATE_TTL_MS).toISOString() });
   const manifest = JSON.stringify(appManifest(name, publicBase(config, req)));
   const body = `<p class="muted">Sending the app's manifest to GitHub. Confirm the app there.</p>
 <form id="f" method="post" action="${esc(registrationUrl(state, org))}"><input type="hidden" name="manifest" value="${esc(manifest)}"><button>Continue to GitHub</button></form>
@@ -188,7 +190,7 @@ export async function finishRegistration(db: Db, config: Config, deps: AppDeps, 
   const state = url.searchParams.get("state") ?? "", code = url.searchParams.get("code") ?? "";
   const stale = "This registration link is unknown, used or expired. Start again from the GitHub App page.";
   // The session and login are checked before the state row is consumed, so another session cannot burn it.
-  const found = await db.get(db.k.selectFrom("github_app_states").select(["login", "session_hash", "created_at"]).where("state", "=", state));
+  const found = await access.loadAppState(db, state);
   if (!found || !code || found.login !== session.login || found.session_hash !== session.idHash || Date.now() - Date.parse(found.created_at) > STATE_TTL_MS) return refuse(nonce, 400, stale);
   return await convertAndStore(db, config, deps, code, state, nonce, { login: session.login, back: "/admin/github-app", backLabel: "GitHub App", redirect: "/admin/github-app" }, stale);
 }
@@ -205,7 +207,7 @@ export async function convertAndStore(db: Db, config: Config, deps: AppDeps, cod
   const refuseTo = (status: number, text: string): Res => refuse(nonce, status, text, actor);
   const keys = boundAppKeys(config.secrets);
   if (config.secrets.app || !keys || converting.has(config)) return refuseTo(409, "An app is already registered, or there is nowhere to keep its keys.");
-  if ((await db.run(db.k.deleteFrom("github_app_states").where("state", "=", state))).changes !== 1) return refuseTo(400, stale);
+  if (!await access.takeAppState(db, state)) return refuseTo(400, stale);
   converting.add(config);
   try {
     let converted: Awaited<ReturnType<typeof convertManifest>>;

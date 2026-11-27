@@ -1,25 +1,24 @@
 // Part 2 of the Verify stage: result collection from finished tasks, the failure summary, the retry of
 // an infrastructure error and the cancel of tasks whose PR moved on. Part 1 (index.ts) only plans and queues.
 // Pass or fail comes from the tasks' exit codes, never from a model; Haiku only describes a failure.
-import { setAsideAnswerBeforeFailure } from "../merge/verify-override.ts";
 import { leaseItem } from "../runner/leases.ts";
-import type { BuildTask, TaskResult, TaskStep } from "../../web/src/api/types.ts";
+import type { TaskResult, TaskStep } from "../../web/src/api/types.ts";
 import { BuildError } from "../build/envs.ts";
-import { TERMINAL, cancelTask, getTask } from "../build/tasks.ts";
-import { add, askClaude, POOL_MAX, pool, saveUsage, type Usage } from "../classify/run.ts";
+import { cloneTasks } from "../build/tasks.ts";
+import { cancelTasks, loadLogTails, loadQueuedWarmBuilds, loadRetriesOf, loadTasks, TERMINAL, type TaskRecord } from "../data/build/index.ts";
+import { addStageEvents } from "../data/planner/index.ts";
+import { loadLatestMainHeads } from "../data/mirror/index.ts";
+import { listVerifications as listMergeVerifications, loadPendingVerifications, loadVerifications, loadVerifyDue, restartVerifications, settleVerifications, type StageRow, type VerificationState, type VerificationView } from "../data/merge/index.ts";
+import { askClaude, POOL_MAX, pool, saveUsage, type Usage } from "../classify/run.ts";
 import { poolRoom } from "../agents/call.ts";
 import { CLAUDE_PROMPTS } from "../prompts/index.ts";
 import { scrub } from "../runner/scrub.ts";
-import { cloneTask } from "./tasks.ts";
 import { MAX_SUMMARY_WORDS, SUMMARY_LOG_BYTES, type VerifySummaryInput } from "./types.ts";
-import { pilotExprFor } from "../pilot.ts";
-import { backlogHeldExpr } from "../dupes/held.ts";
 import { jobItem } from "../runner/job-items.ts";
-import { collectScreenshots, movedRun, screenshotsDue, type ScreenshotDeps } from "./screenshots.ts";
-import { mapSeq } from "../async-seq.ts";
-import type { AliasableExpression } from "kysely";
+import { collectScreenshots, type ScreenshotDeps } from "./screenshots.ts";
+import { featureOn } from "../build/features.ts";
+import { someSeq } from "../async-seq.ts";
 import type { Db } from "../db/index.ts";
-import { cols, rowArray, type Eb } from "../db/kx.ts";
 
 const PROMPT = CLAUDE_PROMPTS["verify.summary"];
 const ACTOR = "verify";
@@ -28,94 +27,38 @@ const FETCH = "fetch deps";
 /** An automatic retry per head: the new tasks run once more, then an error stays. */
 export const MAX_RETRIES = 1;
 export const NOT_FAILING_REASON = "regression test passes on base";
-/** The PR's current head, as src/review/candidates.ts headOf picks it: the checks table's when fetched after the mirror last saw the PR change. */
-/** The PR's current head as an expression on `i` (items) and `c` (pr_checks, left joined). */
-export const currentHeadExpr = (eb: Eb): AliasableExpression<string | null> => eb.case()
-  .when(eb.and([eb("c.head_oid", "is not", null), eb("c.fetched_at", "is not", null), eb.or([eb("i.updated_at", "is", null), eb("c.fetched_at", ">", eb.ref("i.updated_at"))])]))
-  .then(eb.ref("c.head_oid")).else(eb.fn.coalesce("i.head_oid", "c.head_oid")).end();
 const ERROR_LIMIT = 200;
 
-export const VERIFICATION_STATES = ["planned", "running", "passed", "failed", "error", "ci-enough", "stale", "unavailable"] as const;
-export type VerificationState = (typeof VERIFICATION_STATES)[number];
+export { VERIFICATION_STATES, type VerificationState, type VerificationTask, type VerificationView } from "../data/merge/index.ts";
+
+/** A task as `outcomeOf` reads it: any task record, or the task of a verification view. */
+export type FinishedTask = Pick<TaskRecord, "state" | "plan" | "results" | "summary">;
 
 // ---- reading -----------------------------------------------------------------
 
-export type VerificationTask = { id: number; role: "head" | "base"; state: BuildTask["state"]; results: TaskResult[]; summary: string | null; endedAt: string | null };
-export type VerificationView = {
-  repo: string; number: number; headSha: string; baseSha: string | null;
-  kind: string; reason: string; plan: unknown; model: string | null;
-  state: VerificationState;
-  /** Why it failed or errored; for a failure written by Haiku. Null otherwise. */
-  summary: string | null;
-  /** On a pass: what the result does not show, such as a regression test that also passes on the base. */
-  note: string | null;
-  createdAt: string; finishedAt: string | null;
-  /** Head task first, then the base task of a regression. After a retry these are the newest tasks. */
-  tasks: VerificationTask[];
-};
-
-type Row = {
-  repo: string; number: number; head_sha: string; base_sha: string | null; kind: string; reason: string; plan: string | null; model: string | null;
-  head_task_id: number | null; base_task_id: number | null; state: VerificationState; summary: string | null; note: string | null;
-  created_at: string; finished_at: string | null;
-};
-
-async function viewOf(db: Db, r: Row): Promise<VerificationView> {
-  const tasks: VerificationTask[] = [];
-  for (const [role, id] of [["head", r.head_task_id], ["base", r.base_task_id]] as const) {
-    const t = id === null ? null : await getTask(db, id);
-    if (t) tasks.push({ id: t.id, role, state: t.state, results: t.results, summary: t.summary, endedAt: t.endedAt });
-  }
-  let plan: unknown = null;
-  try { plan = r.plan === null ? null : JSON.parse(r.plan); } catch { /* stored by our own code; keep null */ }
-  return {
-    repo: r.repo, number: r.number, headSha: r.head_sha, baseSha: r.base_sha, kind: r.kind, reason: r.reason, plan, model: r.model, state: r.state,
-    summary: r.summary, note: r.note, createdAt: r.created_at, finishedAt: r.finished_at, tasks,
-  };
-}
-
 /** The verification of one PR head, or null. */
 export async function verificationOf(db: Db, repo: string, number: number, headSha: string): Promise<VerificationView | null> {
-  const r = await db.get(db.k.selectFrom("verifications").select(cols("verifications")).$narrowType<{ state: VerificationState }>()
-    .where("repo", "=", repo).where("number", "=", number).where("head_sha", "=", headSha));
-  return r ? await viewOf(db, r) : null;
+  return (await loadVerifications(db, [{ repo, number }])).get(headKey(repo, number, headSha)) ?? null;
 }
 
 /** Verifications in the given states (all when none), newest first. */
 export async function listVerifications(db: Db, o: { states?: VerificationState[]; repo?: string; limit?: number } = {}): Promise<VerificationView[]> {
-  const rows = await db.all(db.k.selectFrom("verifications").select(cols("verifications")).$narrowType<{ state: VerificationState }>()
-    .$if(!!o.states?.length, (q) => q.where("state", "in", o.states!))
-    .$if(!!o.repo, (q) => q.where("repo", "=", o.repo!))
-    .orderBy("created_at", "desc").orderBy("number", "desc").limit(Math.min(o.limit ?? 100, 1000)));
-  return await mapSeq(rows, async (r) => await viewOf(db, r));
+  return await listMergeVerifications(db, o);
 }
+
+const headKey = (repo: string, number: number, head: string): string => `${repo}#${number}@${head}`;
 
 // ---- when to run -------------------------------------------------------------
 
 /**
- * Whether a collection run has work: a pending verification whose PR head moved or closed, whose tasks are all
- * finished, or that is still `planned` while a task has started. One query on the state index.
+ * Whether a collection run has work: a pending verification, in scope or not, whose PR head moved or closed, whose tasks are all
+ * finished, or that is still `planned` while a task has started; the same for screenshot runs, which also stop when
+ * their repo's switch went off. One statement, plus one switch read per repo with a run in flight.
  */
 export async function collectDue(db: Db): Promise<boolean> {
-  const due = db.k.selectFrom("verifications as v")
-    .leftJoin("items as i", (j) => j.onRef("i.repo", "=", "v.repo").onRef("i.number", "=", "v.number"))
-    .leftJoin("pr_checks as c", (j) => j.onRef("c.repo", "=", "v.repo").onRef("c.number", "=", "v.number"))
-    .leftJoin("build_tasks as h", "h.id", "v.head_task_id")
-    .leftJoin("build_tasks as b", "b.id", "v.base_task_id")
-    .select((eb) => eb.lit(1).as("one"))
-    .where("v.state", "in", ["planned", "running"])
-    .where((eb) => pilotExprFor(db, eb, "v.repo", "v.number"))
-    .where((eb) => eb.not(backlogHeldExpr(db, eb, "v")))
-    .where((eb) => eb.or([
-      eb("i.state", "is distinct from", "OPEN"),
-      eb(currentHeadExpr(eb), "is distinct from", eb.ref("v.head_sha")),
-      eb.and([eb("h.state", "in", TERMINAL), eb.or([eb("b.id", "is", null), eb("b.state", "in", TERMINAL)])]),
-      eb.and([eb("v.state", "=", "planned"), eb.or([eb("h.state", "in", ["claimed", "running"]), eb("b.state", "in", ["claimed", "running"])])]),
-    ]))
-    .limit(1);
-  // Read with the screenshot runs' own check in one statement.
-  const r = (await db.get(db.k.selectNoFrom([rowArray(db, due).as("verification"), rowArray(db, movedRun(db)).as("screenshots")])))!;
-  return r.verification !== null || await screenshotsDue(db, r.screenshots !== null);
+  const due = await loadVerifyDue(db);
+  if (due.verifications || due.screenshots) return true;
+  return await someSeq(due.shotRepos, async (repo) => !await featureOn(db, "screenshots", repo));
 }
 
 // ---- judging tasks -----------------------------------------------------------
@@ -129,7 +72,7 @@ export const oneLine = (s: string): string => scrub(s).replace(/\s+/g, " ").trim
 const ok = (r: TaskResult): boolean => r.exitCode === 0 && !r.timedOut;
 
 /** What a finished task says, from its state and exit codes. Callers pass only terminal tasks. */
-export function outcomeOf(t: BuildTask): Outcome {
+export function outcomeOf(t: FinishedTask): Outcome {
   if (t.state === "cancelled") return { kind: "error", reason: "the build task was cancelled" };
   if (t.state === "done") {
     return t.results.length === t.plan.length && t.results.every(ok) ? { kind: "pass" } : { kind: "error", reason: "the build task finished without a result for every step" };
@@ -160,8 +103,6 @@ export function verdictOf(head: Outcome, base: Outcome | null): Verdict {
 
 export type CollectDeps = {
   model: string;
-  /** The head commit of a repo's default branch, or null; used to cancel queued warm builds of a branch that moved on. */
-  mainHead?: (repo: string, branch: string) => Promise<string | null>;
   /** The screenshot comparison, replaceable in tests. */
   screenshots?: ScreenshotDeps;
 };
@@ -174,34 +115,15 @@ export type CollectSummary = {
 const now = (): string => new Date().toISOString();
 const cut = (s: string): string => s.trim().split(/\s+/).slice(0, MAX_SUMMARY_WORDS).join(" ");
 
-async function stageRow(db: Db, v: Row, stage: string, at: string, note: string): Promise<void> {
-  await db.run(db.k.insertInto("main.stages").values({ repo: v.repo, number: v.number, stage, at, actor: ACTOR, note: note.slice(0, 300) }));
-  if (stage !== "hold") await jobItem(db, v.repo, v.number, note, () => {});   // the caller logs the outcome itself
-}
-
-/** The last bytes of the log chunks one step wrote. */
-async function stepLog(db: Db, id: number, step: string): Promise<string> {
-  const parts: string[] = [];
-  let size = 0;
-  const rows = await db.all(db.k.selectFrom("build_task_logs").select("chunk").where("task_id", "=", id).where("step", "=", step).orderBy("seq", "desc"));
-  for (const c of rows) {
-    parts.push(c.chunk);
-    size += Buffer.byteLength(c.chunk);
-    if (size >= SUMMARY_LOG_BYTES) break;
-  }
-  const all = Buffer.from(parts.reverse().join(""));
-  return all.subarray(-SUMMARY_LOG_BYTES).toString("utf8");
-}
-
 const fallbackSummary = (f: NonNullable<Verdict["failed"]>): string =>
   `${f.step} ${f.timedOut ? "timed out" : `failed with exit code ${f.exitCode ?? "none"}`}`;
 
 /** Haiku's account of a failed step, or null. The log and the command are untrusted and scrubbed before they leave and before the reply is stored. */
 export async function summariseFailure(db: Db, v: { repo: string; number: number }, taskId: number, f: NonNullable<Verdict["failed"]>, deps: CollectDeps, runId: string): Promise<string> {
-  const task = await getTask(db, taskId);
-  const step = task?.plan.find((s: TaskStep) => s.name === f.step);
+  const [tasks, tails] = await db.together(() => Promise.all([loadTasks(db, [taskId]), loadLogTails(db, [{ id: taskId, step: f.step }], { maxBytes: SUMMARY_LOG_BYTES })]));
+  const step = tasks.get(taskId)?.plan.find((s: TaskStep) => s.name === f.step);
   const input: VerifySummaryInput = {
-    ref: `${v.repo}#${v.number}`, step: f.step, command: scrub((step?.cmd ?? []).join(" ")), log: scrub(await stepLog(db, taskId, f.step)),
+    ref: `${v.repo}#${v.number}`, step: f.step, command: scrub((step?.cmd ?? []).join(" ")), log: scrub(tails.get(taskId)?.text ?? ""),
   };
   const start = now();
   const reply = await askClaude("verify.summary", deps.model, [input], db);
@@ -212,32 +134,17 @@ export async function summariseFailure(db: Db, v: { repo: string; number: number
 
 /** Cancels the tasks of a verification that are not finished. */
 export async function cancelOpen(db: Db, ids: (number | null)[]): Promise<void> {
-  for (const id of ids) {
-    const t = id === null ? null : await getTask(db, id);
-    if (t && !TERMINAL.includes(t.state)) await cancelTask(db, t.id, ACTOR);
-  }
+  await cancelTasks(db, { ids: ids.filter((id): id is number => id !== null) }, ACTOR);
 }
 
-/** Head tasks created for this head: the first plus one per retry. */
-const retriesOf = async (db: Db, v: Row): Promise<number> =>
-  (await db.get(db.k.selectFrom("build_tasks").select((eb) => eb.fn.countAll<number>().as("n"))
-    .where("step", "=", "verify").where("repo", "=", v.repo).where("number", "=", v.number).where("head_sha", "=", v.head_sha).where("warm_role", "=", "use")))!.n - 1;
-
 export async function runCollect(db: Db, params: { dryRun?: boolean; /** True when no new item should start (cancel, deadline, pipeline off). */ stopping?: () => Promise<boolean> } = {}, log: (line: string) => void = console.log, deps?: CollectDeps): Promise<CollectSummary> {
-  const d: CollectDeps = deps ?? { model: PROMPT.models[0]!, mainHead: (await import("./index.ts")).defaultDeps().mainHead };
+  const d: CollectDeps = deps ?? { model: PROMPT.models[0]! };
   const runId = `verify-collect-${now().replace(/[-:]/g, "").slice(0, 15)}`;
   const s: CollectSummary = { runId, looked: 0, passed: 0, failed: 0, errors: 0, retried: 0, stale: 0, running: 0, warmCancelled: 0, shots: 0, changed: 0 };
-  const rows = await db.all(db.k.selectFrom("verifications as v")
-    .leftJoin("items as i", (j) => j.onRef("i.repo", "=", "v.repo").onRef("i.number", "=", "v.number"))
-    .leftJoin("pr_checks as c", (j) => j.onRef("c.repo", "=", "v.repo").onRef("c.number", "=", "v.number"))
-    .select((eb) => [...cols("verifications", "v"), "i.state as item_state", currentHeadExpr(eb).as("item_head")])
-    .$narrowType<{ state: VerificationState }>()
-    .where("v.state", "in", ["planned", "running"])
-    .where((eb) => pilotExprFor(db, eb, "v.repo", "v.number"))
-    .where((eb) => eb.not(backlogHeldExpr(db, eb, "v")))
-    .orderBy("v.created_at").orderBy("v.number"));
+  const rows = await loadPendingVerifications(db);
   s.looked = rows.length;
   if (params.dryRun) { log(`verify-collect: ${rows.length} pending; dry run`); return s; }
+  const retries = await loadRetriesOf(db, rows.map((v) => ({ step: "verify", repo: v.repo, number: v.number, headSha: v.headSha })));
 
   let stoppedLogged = false;
   const stopped = async (): Promise<boolean> => {
@@ -253,31 +160,34 @@ export async function runCollect(db: Db, params: { dryRun?: boolean; /** True wh
     try {
       if (await stopped()) return;
       const ref = `${v.repo}#${v.number}`;
-      const finish = async (state: string, summary: string | null, note: string | null): Promise<boolean> => {
-        const r = await db.run(db.k.updateTable("verifications").set({ state, summary, note, finished_at: now() })
-          .where("repo", "=", v.repo).where("number", "=", v.number).where("head_sha", "=", v.head_sha).where("state", "in", ["planned", "running"]));
-        const changed = Number(r.changes) > 0;
-        if (changed && (state === "failed" || state === "error")) await setAsideAnswerBeforeFailure(db, v.repo, v.number, v.head_sha, now());
-        return changed;
-      };
+      const key = headKey(v.repo, v.number, v.headSha);
+      const sha7 = v.headSha.slice(0, 7);
+      const stageOf = (stage: string, at: string, note: string): StageRow => ({ repo: v.repo, number: v.number, stage, at, actor: ACTOR, note: note.slice(0, 300) });
+      /** Settles the row while it is still planned or running; the stage events are written with it. `hold` follows a failure. */
+      const finish = async (state: VerificationState, summary: string | null, note: string | null, stage?: StageRow, hold?: StageRow): Promise<boolean> =>
+        await db.write(async () => {
+          const changed = (await settleVerifications(db, [{ key, from: ["planned", "running"], set: { state, summary, note, finishedAt: now() }, ...(stage ? { stage } : {}) }])).has(key);
+          if (changed && hold) await addStageEvents(db, [{ ...hold, stage: "hold" }]);
+          return changed;
+        });
+      const noted = async (stage: StageRow): Promise<void> => await jobItem(db, v.repo, v.number, stage.note ?? "", () => {});   // the caller logs the outcome itself
 
-      if (v.item_state !== "OPEN" || v.item_head !== v.head_sha) {
-        await cancelOpen(db, [v.head_task_id, v.base_task_id]);
-        if (await finish("stale", v.summary, v.note)) { s.stale++; s.changed++; await jobItem(db, v.repo, v.number, `stale (${v.item_state === "OPEN" ? "head moved" : "no longer open"})`, log); }
+      if (v.itemState !== "OPEN" || v.currentHead !== v.headSha) {
+        await cancelOpen(db, [v.headTask, v.baseTask]);
+        if (await finish("stale", v.summary, v.note)) { s.stale++; s.changed++; await jobItem(db, v.repo, v.number, `stale (${v.itemState === "OPEN" ? "head moved" : "no longer open"})`, log); }
         return;
       }
 
-      const head = v.head_task_id === null ? null : await getTask(db, v.head_task_id);
-      const base = v.base_task_id === null ? null : await getTask(db, v.base_task_id);
-      const tasks = [head, base].filter((t): t is BuildTask => t !== null);
+      const head = v.tasks.find((t) => t.role === "head");
+      const base = v.tasks.find((t) => t.role === "base");
       if (!head) {
-        if (await finish("error", "the build task is gone", null)) { s.errors++; s.changed++; await stageRow(db, v, "verify-error", now(), `${v.kind} at ${v.head_sha.slice(0, 7)}: the build task is gone`); }
+        const st = stageOf("verify-error", now(), `${v.kind} at ${sha7}: the build task is gone`);
+        if (await finish("error", "the build task is gone", null, st)) { s.errors++; s.changed++; await noted(st); }
         return;
       }
-      if (tasks.some((t) => !TERMINAL.includes(t.state))) {
-        if (v.state === "planned" && tasks.some((t) => t.state === "claimed" || t.state === "running")) {
-          await db.run(db.k.updateTable("verifications").set({ state: "running" })
-            .where("repo", "=", v.repo).where("number", "=", v.number).where("head_sha", "=", v.head_sha).where("state", "=", "planned"));
+      if (v.tasks.some((t) => !TERMINAL.includes(t.state))) {
+        if (v.state === "planned" && v.tasks.some((t) => t.state === "claimed" || t.state === "running")) {
+          await settleVerifications(db, [{ key, from: ["planned"], set: { state: "running" } }]);
           s.running++; s.changed++;
         }
         return;
@@ -285,13 +195,13 @@ export async function runCollect(db: Db, params: { dryRun?: boolean; /** True wh
 
       const verdict = verdictOf(outcomeOf(head), base ? outcomeOf(base) : null);
       const at = now();
-      const sha7 = v.head_sha.slice(0, 7);
 
-      if (verdict.state === "error" && await retriesOf(db, v) < MAX_RETRIES) {
+      if (verdict.state === "error" && (retries.get(`verify|${ref}|${v.headSha}`) ?? 1) - 1 < MAX_RETRIES) {
         try {
-          const ids = await mapSeq([v.head_task_id, v.base_task_id], async (id) => (id === null ? null : await cloneTask(db, id)));
-          await db.run(db.k.updateTable("verifications").set({ head_task_id: ids[0] ?? null, base_task_id: ids[1] ?? null, state: "planned" })
-            .where("repo", "=", v.repo).where("number", "=", v.number).where("head_sha", "=", v.head_sha));
+          await db.write(async () => {
+            const cloned = await cloneTasks(db, [v.headTask, v.baseTask].filter((id): id is number => id !== null));
+            await restartVerifications(db, [{ key, headTask: v.headTask === null ? null : cloned.get(v.headTask) ?? null, baseTask: v.baseTask === null ? null : cloned.get(v.baseTask) ?? null }]);
+          });
           s.retried++; s.changed++;
           await jobItem(db, v.repo, v.number, `${verdict.reason}; queued the tasks again`, log);
           return;
@@ -302,20 +212,17 @@ export async function runCollect(db: Db, params: { dryRun?: boolean; /** True wh
       }
 
       if (verdict.state === "passed") {
-        if (await finish("passed", null, verdict.note ?? null)) {
-          s.passed++; s.changed++;
-          await stageRow(db, v, "verified", at, `${v.kind} at ${sha7} passed${verdict.note ? `: ${verdict.note}` : ""}`);
-        }
+        const st = stageOf("verified", at, `${v.kind} at ${sha7} passed${verdict.note ? `: ${verdict.note}` : ""}`);
+        if (await finish("passed", null, verdict.note ?? null, st)) { s.passed++; s.changed++; await noted(st); }
       } else if (verdict.state === "error") {
         const why = oneLine(verdict.reason ?? "error");
-        if (await finish("error", why, null)) { s.errors++; s.changed++; await stageRow(db, v, "verify-error", at, `${v.kind} at ${sha7}: ${why}`); }
+        const st = stageOf("verify-error", at, `${v.kind} at ${sha7}: ${why}`);
+        if (await finish("error", why, null, st)) { s.errors++; s.changed++; await noted(st); }
       } else {
-        const summary = verdict.failed ? await summariseFailure(db, v, v.head_task_id!, verdict.failed, d, runId) : oneLine(verdict.reason ?? "failed");
-        if (await finish("failed", summary, null)) {
-          s.failed++; s.changed++;
-          await stageRow(db, v, "verify-failed", at, `${v.kind} at ${sha7}: ${summary}`);
-          await stageRow(db, v, "hold", at, `verify failed: ${summary}`);
-        }
+        // No model call for an item the pipeline does not work.
+        const summary = verdict.failed ? !v.inScope ? fallbackSummary(verdict.failed) : await summariseFailure(db, v, v.headTask!, verdict.failed, d, runId) : oneLine(verdict.reason ?? "failed");
+        const st = stageOf("verify-failed", at, `${v.kind} at ${sha7}: ${summary}`);
+        if (await finish("failed", summary, null, st, stageOf("hold", at, `verify failed: ${summary}`))) { s.failed++; s.changed++; await noted(st); }
       }
       log(`  ${ref}: ${verdict.state}`);
     } finally { await release(); }
@@ -329,21 +236,22 @@ export async function runCollect(db: Db, params: { dryRun?: boolean; /** True wh
   // Screenshot runs: one read of an empty table while the Screenshots feature has never run.
   s.shots = await collectScreenshots(db, d, log, runId, params.stopping);
   s.changed += s.shots;
-  s.warmCancelled = await cancelMovedWarmBuilds(db, d, log);
+  s.warmCancelled = await cancelMovedWarmBuilds(db, log);
   s.changed += s.warmCancelled;
   log(`verify-collect: ${s.looked} pending: ${s.passed} passed, ${s.failed} failed, ${s.errors} errors, ${s.retried} retried, ${s.stale} stale, ${s.running} running; ${s.warmCancelled} warm builds cancelled`);
   return s;
 }
 
-/** Cancels queued warm builds whose branch head is no longer the commit they would build. */
-async function cancelMovedWarmBuilds(db: Db, d: CollectDeps, log: (line: string) => void): Promise<number> {
-  if (!d.mainHead) return 0;
-  const queued = await db.all(db.k.selectFrom("build_tasks as t").leftJoin("repos as r", "r.name", "t.repo")
-    .select(["t.id", "t.repo", "t.head_sha", "r.default_branch"]).where("t.warm_role", "=", "build").where("t.state", "=", "queued").orderBy("t.id"));
-  let n = 0;
-  for (const t of queued) {
-    const main = await d.mainHead(t.repo, t.default_branch ?? "main");
-    if (main && main !== t.head_sha) { await cancelTask(db, t.id, ACTOR); n++; log(`  warm build ${t.id} of ${t.repo}: ${t.default_branch ?? "main"} moved on; cancelled`); }
-  }
+/**
+ * Cancels queued warm builds whose branch head is no longer the commit they would build: only on a main-CI reading made after the
+ * build was queued, since Verify queues it at the head GitHub gave it, which an earlier poll had not seen.
+ */
+async function cancelMovedWarmBuilds(db: Db, log: (line: string) => void): Promise<number> {
+  const queued = await loadQueuedWarmBuilds(db);
+  const heads = await loadLatestMainHeads(db, [...new Set(queued.map((t) => t.repo))]);
+  const ids = queued.filter((t) => { const main = heads.get(t.repo); return !!main && main.head_sha !== t.headSha && main.updated_at > t.queuedAt; }).map((t) => t.id);
+  const out = await cancelTasks(db, { ids }, ACTOR);
+  const n = out.filter((o) => o.result === "cancelled").length;
+  for (const o of out) if (o.result === "cancelled") log(`  warm build ${o.id} of ${o.repo}: the branch moved on; cancelled`);
   return n;
 }

@@ -4,7 +4,7 @@ import { openDb } from "./db/open.ts";
 type Command = { summary: string; run: (args: string[]) => Promise<void> | void };
 type Module = { commands: Record<string, Command> };
 
-const MODULES = ["./mirror.ts", "./whitelist.ts", "./decisions.ts", "./access.ts", "./repos.ts", "./classify/index.ts", "./labels/index.ts", "./decide/index.ts", "./review/index.ts", "./merge/index.ts", "./merge/single.ts", "./dash/index.ts", "./runner/index.ts", "./worker/index.ts", "./embed/index.ts", "./agents/index.ts", "./build/cli.ts", "./act/index.ts", "./fixup/index.ts", "./postmerge/index.ts", "./premerge/index.ts", "./verify/index.ts", "./priority/index.ts", "./dupes/index.ts", "./rank/index.ts", "./review/opus.ts", "./merge/batch.ts", "./merge/safe-merge.ts", "./review/post.ts", "./operator-actions.ts", "./dupes/compare.ts", "./sandbox/workspace.ts", "./fasttrack.ts", "./merge/controls.ts", "./conversations/index.ts", "./itemtools/index.ts", "./areas/index.ts", "./merge/ci-approval.ts", "./reference.ts", "./cifix/index.ts", "./prepush/cli.ts", "./mainci/index.ts", "./mainfix/index.ts", "./optional-checks.ts", "./github/app-cli.ts", "./security/cli.ts", "./discord/index.ts", "./liveness.ts", "./remote/cli.ts", "./db/cli.ts", "./periodic.ts", "./cratemirror/server.ts", "./warm/cli.ts", "./implement/cli.ts", "./workflow/cli.ts"];
+const MODULES = ["./mirror.ts", "./whitelist.ts", "./access.ts", "./repos.ts", "./classify/index.ts", "./labels/index.ts", "./review/index.ts", "./merge/index.ts", "./merge/single.ts", "./dash/index.ts", "./runner/index.ts", "./worker/index.ts", "./embed/index.ts", "./agents/index.ts", "./build/cli.ts", "./act/index.ts", "./fixup/index.ts", "./postmerge/index.ts", "./premerge/index.ts", "./verify/index.ts", "./priority/index.ts", "./dupes/index.ts", "./rank/index.ts", "./review/opus.ts", "./merge/batch.ts", "./merge/safe-merge.ts", "./review/post.ts", "./operator-actions.ts", "./dupes/compare.ts", "./sandbox/workspace.ts", "./workflow/batch.ts", "./conversations/index.ts", "./itemtools/index.ts", "./areas/index.ts", "./merge/ci-approval.ts", "./reference.ts", "./cifix/index.ts", "./prepush/cli.ts", "./mainci/index.ts", "./mainfix/index.ts", "./optional-checks.ts", "./github/app-cli.ts", "./security/cli.ts", "./discord/index.ts", "./liveness.ts", "./remote/cli.ts", "./db/cli.ts", "./periodic.ts", "./cratemirror/server.ts", "./warm/cli.ts", "./implement/cli.ts", "./workflow/cli.ts", "./eval/index.ts"];
 
 async function main(): Promise<void> {
   const commands: Record<string, Command> = {};
@@ -27,7 +27,6 @@ async function main(): Promise<void> {
   const { cliRequest, runCliJob } = await import("./runner/cli-job.ts");
   const req = cliRequest(name!, args, await loadSteps());
   if (req) {
-    const { connect } = await import("./db.ts");
     const { scopeToTracked } = await import("./repos.ts");
     const db = await openDb();
     await scopeToTracked(db);

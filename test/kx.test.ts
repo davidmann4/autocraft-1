@@ -3,8 +3,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { Generated } from "kysely";
-import type { Db, Dialect } from "../src/db/index.ts";
+import type { Dialect } from "../src/db/index.ts";
+import { queryDb } from "../src/db/query-db.ts";
+import type { Db } from "./helpers/raw-db.ts";
 import * as kx from "../src/db/kx.ts";
+import { namedKeys, registerKeySource, resolveKeys, type KeySource } from "../src/data/keys.ts";
 import { parseSearch } from "../src/db/search.ts";
 import { TEST_PG_URL, testDatabase } from "./test-db.ts";
 
@@ -52,16 +55,27 @@ both("JSON fields read as SQLite's json_extract, json_type, json_valid and json_
     kx.jsonBool(db, "j", "$.ok").as("ok"), kx.jsonBool(db, "j", "$.no").as("no"), kx.jsonType(db, "j", "$.a").as("ta"),
     kx.jsonType(db, "j", "$.arr").as("tarr"), kx.jsonType(db, "j", "$.n").as("tn"), kx.jsonType(db, "j", "$.r").as("tr"),
     kx.jsonType(db, "j", "$.ok").as("tok"), kx.jsonType(db, "j", "$.nul").as("tnul"), kx.jsonType(db, "j", "$.missing").as("tmissing"),
-    kx.jsonType(db, kx.json([])).as("whole"), kx.jsonArrayLength(db, kx.jsonText(db, "j", "$.objs")).as("len"),
+    kx.jsonType(db, kx.json([])).as("whole"),
     kx.jsonText(db, kx.jsonRemoveKey(db, "j", "a"), "$.a").as("removed"), kx.jsonNum(db, kx.jsonRemoveKey(db, "j", "a"), "$.n").as("kept"),
   ]));
   assert.deepEqual(row, {
     ab: "x", cd: "y", arr1: "q", missing: null, n: 5, r: 1.5, ok: 1, no: 0, ta: "object", tarr: "array", tn: "integer", tr: "real",
-    tok: "true", tnul: "null", tmissing: null, whole: "array", len: 2, removed: null, kept: 5,
+    tok: "true", tnul: "null", tmissing: null, whole: "array", removed: null, kept: 5,
   });
   const valid = await db.all(k(db).selectFrom("t").select(["id", kx.jsonValid(db, "j").as("ok")]).where(kx.jsonValid(db, "j")).orderBy("id"));
   assert.deepEqual(valid, [{ id: 1, ok: 1 }, { id: 2, ok: 1 }]);
   return [row, valid];
+});
+
+both("jsonEachField reads one key of each object and takes any other text for an empty list", async (db) => {
+  const of = async (text: string) => {
+    const f = kx.jsonEachField(db, "v.j", "name", "e");
+    return (await db.all(k(db).selectFrom(kx.valuesTable(db, [{ j: text }], { j: "text" }, "v")).crossJoin(f.from).select(f.value.as("name")))).map((r) => r.name).sort();
+  };
+  assert.deepEqual(await of('[{"name":"b","x":1},{"name":"a"}]'), ["a", "b"]);
+  assert.deepEqual(await of('[{"x":1},"s",5,null,[1]]'), [null, null, null, null, null]);
+  for (const text of ['{"name":"a"}', "not json", "", "5"]) assert.deepEqual(await of(text), [], text);
+  return null;
 });
 
 both("jsonEach joins array elements as `value` after the table it reads", async (db) => {
@@ -262,4 +276,75 @@ both("tupleIn matches rows of any width against a list of tuples; an empty list 
   const none = await db.all(k(db).selectFrom("r").select("repo").where(() => kx.tupleIn(db, ["repo", "number", "v"], [], ["text", "bigint", "text"])));
   assert.deepEqual(none, []);
   return [three, ci, none];
+});
+
+both("jsonRows returns a subselect's rows as one JSON array in order, [] when none", async (db) => {
+  const rows = await db.all(k(db).selectFrom("t as a").select([
+    "a.id",
+    kx.jsonRows(db, k(db).selectFrom("r").select(["r.repo", "r.number", "r.v"]).where("r.number", "<=", kx.ref<number>("a.id")).orderBy("r.v", "desc")).as("rs"),
+  ]).orderBy("a.id"));
+  const parsed = rows.map((r) => ({ id: r.id, rs: kx.parseJsonRows(r.rs) }));
+  assert.deepEqual(parsed, [
+    { id: 1, rs: [{ repo: "app", number: 1, v: "one" }, { repo: "lib", number: 1, v: "three" }].sort((a, b) => (a.v < b.v ? 1 : -1)) },
+    { id: 2, rs: [{ repo: "app", number: 2, v: "two" }, { repo: "lib", number: 1, v: "three" }, { repo: "app", number: 1, v: "one" }] },
+    { id: 3, rs: [{ repo: "app", number: 2, v: "two" }, { repo: "lib", number: 1, v: "three" }, { repo: "app", number: 1, v: "one" }] },
+  ]);
+  const none = await db.get(db.k.selectNoFrom(kx.jsonRows(db, k(db).selectFrom("r").select("v").where("v", "=", "zzz")).as("x")));
+  assert.deepEqual(kx.parseJsonRows(none?.x), []);
+  return parsed;
+});
+
+both("valuesTable binds rows as one parameter, typed per column", async (db) => {
+  const rows = [{ id: 2, label: "b" }, { id: 1, label: "a" }, { id: 7, label: null }];
+  const joined = await db.all(k(db).selectFrom("t").innerJoin(kx.valuesTable(db, rows, { id: "bigint", label: "text" }, "v"), (j) => j.onRef("v.id", "=", "t.id"))
+    .select(["t.name", "v.label"]).orderBy("v.id"));
+  assert.deepEqual(joined, [{ name: "alice", label: "a" }, { name: "Bob", label: "b" }]);
+  const empty = await db.all(k(db).selectFrom(kx.valuesTable(db, [], { id: "bigint" }, "v")).select("v.id"));
+  assert.deepEqual(empty, []);
+  return [joined, empty];
+});
+
+both("updateFrom sets different values on many rows in one statement and counts the rows changed", async (db) => {
+  const changed = await kx.updateFrom(db, "t", ["id"], [{ id: 1, name: "one", n: 10 }, { id: 3, name: "three", n: null }, { id: 99, name: "none", n: 1 }]);
+  assert.equal(changed, 2);
+  assert.equal(await kx.updateFrom(db, "t", ["id"], []), 0);
+  await kx.updateFrom(db, "t", ["id"], [{ id: 2, name: "x", n: 5 }], ["name"]);
+  const rows = await db.all(k(db).selectFrom("t").select(["id", "name", "n"]).orderBy("id"));
+  assert.deepEqual(rows, [{ id: 1, name: "one", n: 10 }, { id: 2, name: "x", n: null }, { id: 3, name: "three", n: null }]);
+  return rows;
+});
+
+both("blobTable carries blobs and NULLs beside keys", async (db) => {
+  const v = kx.blobTable(db, [{ id: 1, vec: new Uint8Array([1, 2]), name: "one" }, { id: 3, vec: new Uint8Array([]), name: null }], { id: "bigint", vec: "bytea", name: "text" }, "v");
+  const rows = await db.all(k(db).selectFrom("t").innerJoin(v, (j) => j.onRef("v.id", "=", "t.id")).select(["t.id", "t.login", "v.vec", "v.name"]).orderBy("t.id"));
+  const seen = rows.map((r) => [r.id, r.login, [...r.vec], r.name]);
+  assert.deepEqual(seen, [[1, "Alice", [1, 2], "one"], [3, "Carol", [], null]]);
+  return seen;
+});
+
+both("byteLength counts UTF-8 bytes; isoMinusHours keeps toISOString's form", async (db) => {
+  const row = await db.get(k(db).selectFrom("t").where("id", "=", 1).select((eb) => [
+    kx.byteLength(db, kx.literal("naïve ✓")).as("bytes"), kx.isoMinusHours(db, kx.literal("2026-03-01T00:30:00.250Z"), 1).as("before"), kx.isoMinusHours(db, eb.val(null), 1).as("none"),
+  ]));
+  assert.deepEqual({ ...row, bytes: Number(row!.bytes) }, { bytes: Buffer.byteLength("naïve ✓"), before: "2026-02-28T23:30:00.250Z", none: null });
+  return row;
+});
+
+test("chunks slices a list, 10,000 by default", () => {
+  assert.deepEqual(kx.chunks([1, 2, 3, 4, 5], 2), [[1, 2], [3, 4], [5]]);
+  assert.deepEqual(kx.chunks([]), []);
+  assert.equal(kx.chunks(Array.from({ length: 25_000 }, (_, i) => i)).length, 3);
+});
+
+registerKeySource("test.repoKeys", (d, args: { repo: string }) => queryDb(d).k.withTables<T>().selectFrom("r").select(["repo", "number"]).where("repo", "=", args.repo) as never);
+
+both("resolveKeys turns a ref list or a registered descriptor into a (repo, number) table", async (db) => {
+  const keys = async (ks: KeySource) => await db.all(k(db).selectFrom(resolveKeys(db, ks, "ks")).select(["ks.repo", "ks.number"]).orderBy("ks.repo").orderBy("ks.number"));
+  const list = await keys([{ repo: "app", number: 2 }, { repo: "lib", number: 1 }]);
+  assert.deepEqual(list, [{ repo: "app", number: 2 }, { repo: "lib", number: 1 }]);
+  assert.deepEqual(await keys([]), []);
+  const named = await keys(namedKeys("test.repoKeys", { repo: "app" }));
+  assert.deepEqual(named, [{ repo: "app", number: 1 }, { repo: "app", number: 2 }]);
+  assert.throws(() => resolveKeys(db, namedKeys("test.unregistered", {}), "ks"), /test\.unregistered/);
+  return [list, named];
 });

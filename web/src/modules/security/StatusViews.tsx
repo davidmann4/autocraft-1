@@ -8,7 +8,7 @@ import { Badge } from "../../ui/atoms/Badge";
 import { Pending } from "../../ui/atoms/Pending";
 import { TimeAgo } from "../../ui/atoms/TimeAgo";
 import { CodeBlock } from "../../ui/molecules/CodeBlock";
-import { ChoiceGroup } from "../item/ChoiceGroup";
+import { FindingActions } from "./FindingActions";
 import { Section } from "../../ui/molecules/Section";
 import { StatusLine } from "../../ui/molecules/StatusLine";
 import { SecurityPage } from "./SecurityPage";
@@ -65,13 +65,12 @@ export function SecurityListView(_: ViewProps) {
 }
 
 function Question({ d }: { d: FindingPageData }) {
-  const user = useUser();
-  if (!d.decision || !d.choices) return null;
+  if (!d.question) return null;
   return (
     <section className="border-b border-line px-4 pb-4 md:px-6" aria-label="Open question">
       <article className="rounded-md border border-line-strong px-3 py-3 md:px-4">
-        <p className="text-pretty text-[15px] font-semibold leading-6">{d.decision.question}</p>
-        <ChoiceGroup d={d.decision} user={user} choices={d.choices} />
+        <p className="text-pretty text-[15px] font-semibold leading-6">{d.question.text}</p>
+        <FindingActions q={d.question} repo={d.finding.repo} number={d.finding.number} />
       </article>
     </section>
   );

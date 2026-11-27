@@ -1,7 +1,7 @@
-// Agents, accounts and rates on fake data: three accounts (one disabled), twelve runs in flight and a few hundred finished ones.
+// Model calls and rates on fake data: twelve runs in flight and a few hundred finished ones.
 import { traceRunDetail } from "./traceMock";
 import type { Api } from "../client";
-import type { AgentRun, AgentRunDetail, ClaudeAccount, JevStatus, Rates, UsagePause, User } from "../types";
+import type { AgentRun, AgentRunDetail, AgentRunTranscript, Rates, RefusalBreakdown, RefusalGroup, RefusalWindow, TranscriptEntry, TranscriptStoreStatus, TranscriptView } from "../types";
 import { NOW, REPOS } from "./fixtures";
 
 const wait = <T>(v: T, ms = 60) => new Promise<T>((r) => setTimeout(() => r(structuredClone(v)), ms));
@@ -14,30 +14,10 @@ const rnd = () => ((seedN = (seedN * 48271) % 2147483647) / 2147483647);
 const pick = <T,>(a: T[]): T => a[Math.floor(rnd() * a.length)]!;
 
 const STEPS = [
-  { step: "decide", stage: 3, title: "Ask decisions", promptId: "decide.prepare", provider: "claude" as const, model: "opus" },
+  { step: "fixup", stage: 6, title: "Fix-up pull requests", promptId: "fixup.patch", provider: "claude" as const, model: "opus" },
   { step: "opus-review", stage: 5, title: "Review pull requests", promptId: "review.opus", provider: "claude" as const, model: "opus" },
   { step: "classify-new", stage: 2, title: "Classify new and changed items", promptId: "classify.haiku", provider: "claude" as const, model: "haiku" },
   { step: "classify-new", stage: 2, title: "Classify new and changed items", promptId: "classify.jev", provider: "jev" as const, model: "jev" },
-];
-
-const AUTH = { loggedIn: true, method: "claude.ai", plan: "max", expiresAt: new Date(NOW + 40 * 24 * HOUR).toISOString(), checkedAt: new Date(NOW - 3 * MIN).toISOString() };
-const NO_TOKEN = { state: "none" as const, setAt: null, expiresAt: null, rejectedAt: null };
-const accounts: ClaudeAccount[] = [
-  {
-    id: "b", label: "Team account B", enabled: true, maxConcurrent: 4, running: 0,
-    usage: { fiveHourPct: 62, fiveHourResetsAt: iso(-(2 * HOUR + 40 * MIN)), weeklyPct: 41, weeklyResetsAt: iso(-(3 * 24 * HOUR + 5 * HOUR)), readAt: iso(2 * MIN) },
-    pausedReason: null, auth: AUTH, login: null, token: { state: "set", setAt: iso(3 * 24 * HOUR + 4 * HOUR), expiresAt: iso(-(362 * 24 * HOUR)), rejectedAt: null },
-  },
-  {
-    id: "c", label: "Team account C", enabled: true, maxConcurrent: 3, running: 0,
-    usage: { fiveHourPct: 93, fiveHourResetsAt: iso(-(55 * MIN)), weeklyPct: 78, weeklyResetsAt: iso(-(1 * 24 * HOUR + 2 * HOUR)), readAt: iso(1 * MIN) },
-    pausedReason: "5-hour use 93 % (pauses at 80 %)", auth: { ...AUTH, expiresAt: new Date(NOW + 6 * 24 * HOUR).toISOString() }, login: null, token: { state: "rejected", setAt: iso(40 * 24 * HOUR), expiresAt: iso(-(325 * 24 * HOUR)), rejectedAt: iso(50 * MIN) },
-  },
-  {
-    id: "d", label: "Spare account D", enabled: false, maxConcurrent: 2, running: 0,
-    usage: { fiveHourPct: 8, fiveHourResetsAt: iso(-(4 * HOUR)), weeklyPct: 12, weeklyResetsAt: iso(-(5 * 24 * HOUR)), readAt: iso(95 * MIN) },
-    pausedReason: "disabled by an operator", auth: { loggedIn: false, method: null, plan: null, expiresAt: null, checkedAt: iso(3 * MIN) }, login: null, token: NO_TOKEN,
-  },
 ];
 
 const OUTPUT = `{"verdicts":[{"repo":"photocraft","number":2214,"verdict":"take","reason":"Small, tested fix."},{"repo":"photocraft","number":2230,"verdict":"hold","reason":"Needs a rebase; touches the export path."}]}`;
@@ -50,8 +30,6 @@ const shown = (i: { repo: string; number: number }): AgentRun["items"][number] =
 
 function makeRun(id: number, startedMsAgo: number, running: boolean): AgentRun {
   const s = pick(STEPS);
-  const remote = s.provider === "claude" && id % 3 === 0;
-  const acct = s.provider === "jev" || remote ? null : running ? pick(accounts.filter((a) => a.enabled)) : pick(accounts);
   const n = s.step === "classify-new" ? 1 + Math.floor(rnd() * 30) : s.step === "opus-review" ? 1 + Math.floor(rnd() * 4) : 1 + Math.floor(rnd() * 8);
   const repo = pick(REPOS);
   const items = Array.from({ length: Math.min(n, 50) }, (_, i) => ({ repo: i % 3 === 2 ? pick(REPOS) : repo, number: 1000 + Math.floor(rnd() * 1400) })).map(shown);
@@ -60,18 +38,17 @@ function makeRun(id: number, startedMsAgo: number, running: boolean): AgentRun {
   const tokens = Math.round(n * (1500 + rnd() * 3000));
   return {
     id, jobId: 40 + Math.floor(id / 40) % 9, step: s.step, stage: s.stage, promptId: s.promptId, promptVersion: `v${1 + (id % 3)}-${(id * 2654435761 % 0xffffff).toString(16).padStart(6, "0")}`,
-    provider: s.provider, model: s.model, costUsd: running ? null : Math.round(tokens * 0.6) / 100_000, accountId: acct?.id ?? null, accountLabel: acct?.label ?? null,
+    provider: s.provider, model: s.model, costUsd: running ? null : Math.round(tokens * 0.6) / 100_000,
     items, itemCount: n, state: running ? "running" : failed ? "failed" : "done",
     startedAt: iso(startedMsAgo), endedAt: running ? null : iso(startedMsAgo - dur),
     inputTokens: tokens, outputTokens: running ? Math.round(tokens * 0.03) : Math.round(tokens * 0.08),
     cacheReadTokens: s.provider === "jev" ? null : Math.round(tokens * 0.5), cacheWriteTokens: s.provider === "jev" ? null : Math.round(tokens * 0.1),
-    ...(remote && { via: { login: pick(["kiri-n", "ochre-fox", "mara-t"]), harness: pick(["claude", "claude", "codex"]), model: s.model === "opus" ? "claude-opus-4-5" : "claude-haiku-4-5" } }),
+    ...(s.provider === "claude" && { via: { login: pick(["kiri-n", "ochre-fox", "mara-t"]), harness: pick(["claude", "claude", "codex"]), model: s.model === "opus" ? "claude-opus-4-5" : "claude-haiku-4-5" } }),
     summary: running ? null : failed ? "timeout after 600 s" : s.step === "classify-new" ? `${n} classified` : `${Math.max(0, n - 1)} take, ${Math.min(1, n)} hold`,
   };
 }
 
 const RUNNING: AgentRun[] = Array.from({ length: 12 }, (_, i) => makeRun(5000 + i, (1 + i * 1.7) * MIN + rnd() * 30_000, true));
-for (const r of RUNNING) if (r.accountId) accounts.find((a) => a.id === r.accountId)!.running++;
 RUNNING[0]!.itemCount = 64;
 RUNNING[0]!.items = Array.from({ length: 50 }, (_, i) => ({ repo: REPOS[i % REPOS.length]!, number: 1100 + i * 7 })).map(shown);
 RUNNING[0]!.step = "classify-new";
@@ -79,13 +56,57 @@ RUNNING[0]!.promptId = "classify.haiku";
 RUNNING[0]!.model = "haiku";
 const RECENT: AgentRun[] = Array.from({ length: 360 }, (_, i) => makeRun(4999 - i, 2 * MIN + i * 4.2 * MIN + rnd() * MIN, false));
 
+// Calls a model's safety filter refused: the refused run sits just after (older than) the run that retried it.
+const REFUSED_ERROR = "helper: model error API Error: Opus's safeguards flagged this message as potentially violating our usage policy.";
+function refuse(i: number, o: { promptId: string; step: string; repo: string; login: string; retry: "done" | "failed" | "refused" | null }) {
+  const r = RECENT[i]!;
+  const via = { login: o.login, harness: "claude", model: "claude-opus-4-5" };
+  Object.assign(r, { promptId: o.promptId, step: o.step, model: "opus", provider: "claude", state: "failed", via, items: [shown({ repo: o.repo, number: 1300 + i })], itemCount: 1 });
+  r.summary = o.retry === null ? `refused by opus on ${o.login}'s Task Runner` : `refused by opus on ${o.login}'s Task Runner; retried on another Task Runner`;
+  if (o.retry === null) {
+    r.refusal = { outcome: "failed", retry: null };
+    return;
+  }
+  const next = RECENT[i - 1]!;
+  const other = o.login === "kiri-n" ? "ochre-fox" : "kiri-n";
+  Object.assign(next, { promptId: o.promptId, step: o.step, model: "opus", provider: "claude", items: r.items, itemCount: 1, via: { ...via, login: other }, state: o.retry === "done" ? "done" : "failed" });
+  next.summary = o.retry === "refused" ? `refused by opus on ${other}'s Task Runner` : o.retry === "done" ? "1 take" : "timeout after 600 s";
+  if (o.retry === "refused") next.refusal = { outcome: "failed", retry: null };
+  r.refusal = { outcome: "retried", retry: { id: next.id, state: next.state } };
+}
+refuse(4, { promptId: "review.opus", step: "opus-review", repo: REPOS[1]!, login: "kiri-n", retry: "done" });
+refuse(9, { promptId: "premerge.opus", step: "premerge", repo: REPOS[1]!, login: "ochre-fox", retry: null });
+refuse(21, { promptId: "review.opus", step: "opus-review", repo: REPOS[2]!, login: "kiri-n", retry: "refused" });
+refuse(48, { promptId: "cifix.patch", step: "cifix", repo: REPOS[0]!, login: "ochre-fox", retry: "done" });
+refuse(130, { promptId: "premerge.opus", step: "premerge", repo: REPOS[1]!, login: "kiri-n", retry: null });
+
+const WINDOW_MS: Record<RefusalWindow, number> = { "24h": 24 * HOUR, "7d": 7 * 24 * HOUR, "30d": 30 * 24 * HOUR };
+const inWindow = (r: AgentRun, w: RefusalWindow | undefined) => !w || NOW - Date.parse(r.startedAt) <= WINDOW_MS[w];
+
+function refusals(window: RefusalWindow): RefusalBreakdown {
+  const runs = RECENT.filter((r) => r.refusal && inWindow(r, window));
+  const by = (key: (r: AgentRun) => string | null): RefusalGroup[] => {
+    const m = new Map<string | null, RefusalGroup>();
+    for (const r of runs) {
+      const g = m.get(key(r)) ?? m.set(key(r), { key: key(r), n: 0, failed: 0 }).get(key(r))!;
+      g.n++;
+      if (r.refusal!.outcome === "failed") g.failed++;
+    }
+    return [...m.values()].sort((a, b) => b.n - a.n);
+  };
+  return {
+    window, total: runs.length, failed: runs.filter((r) => r.refusal!.outcome === "failed").length, capped: false,
+    byPrompt: by((r) => r.promptId), byRepo: by((r) => r.items[0]?.repo ?? null), byModel: by((r) => r.via?.model ?? r.model), byLogin: by((r) => r.via?.login ?? null),
+  };
+}
+
 function rates(window: "24h" | "7d"): Rates {
   const hourly = window === "24h";
   const n = hourly ? 24 : 7;
   const step = hourly ? HOUR : 24 * HOUR;
   const t = (i: number) => iso((n - 1 - i) * step);
   const stages = [
-    ["classify-new", "Classify new and changed items", 30], ["decide", "Ask decisions", 6], ["opus-review", "Review pull requests", 9], ["merge", "Merge queued pull requests", 1.5],
+    ["classify-new", "Classify new and changed items", 30], ["fixup", "Fix-up pull requests", 6], ["opus-review", "Review pull requests", 9], ["merge", "Merge queued pull requests", 1.5],
   ].map(([s, title, base]) => ({
     step: s as string, title: title as string,
     buckets: Array.from({ length: n }, (_, i) => {
@@ -95,144 +116,51 @@ function rates(window: "24h" | "7d"): Rates {
       return { t: t(i), items, runs, failed: rnd() < 0.15 ? 1 + Math.floor(rnd() * 2) : 0 };
     }),
   }));
-  const ns = hourly ? 24 : 28;
-  const sstep = hourly ? HOUR : 6 * HOUR;
-  const accts = accounts.slice(0, 3).map((a, k) => ({
-    id: a.id, label: a.label,
-    samples: Array.from({ length: ns }, (_, i) => {
-      const ago = (ns - 1 - i) * sstep;
-      const cycle = ((ago / HOUR + k * 1.3) % 5) / 5; // 5-hour window position
-      const five = a.enabled ? Math.min(100, Math.round(((a.usage.fiveHourPct ?? 0) * (1 - cycle) * 1.1) + 8 + rnd() * 6)) : 8;
-      const week = a.enabled ? Math.round((a.usage.weeklyPct ?? 0) * (1 - (ago / (7 * 24 * HOUR)) * 0.8)) : 12;
-      return { t: iso(ago), fiveHourPct: five, weeklyPct: week };
-    }),
-  }));
-  return { window, bucket: hourly ? "hour" : "day", stages, accounts: accts };
+  return { window, bucket: hourly ? "hour" : "day", stages };
 }
 
-export function createAgentsMock(me: User, changed: () => void): Pick<Api, "accounts" | "agents" | "rates"> {
-  const find = (id: string) => {
-    if (me.role !== "operator") throw new Error("only operators change accounts");
-    const a = accounts.find((x) => x.id === id);
-    if (!a) throw new Error("no such account");
-    return a;
-  };
-  let pause: UsagePause = { fiveHour: 80, weekly: 80 };
-  let jev: JevStatus = { enabled: true, unavailable: null };
-  const visible = () => accounts.filter((a) => me.role === "operator" || a.enabled);
+// Every finished claude run carries one transcript; a failed one has a first attempt too.
+const transcriptsOf = (r: AgentRun): AgentRunTranscript[] => {
+  if (r.provider !== "claude" || r.state === "running") return [];
+  const one = (id: number, attempt: number, outcome: AgentRunTranscript["outcome"]): AgentRunTranscript => ({
+    id, attempt, outcome, bytes: 38_400 + (r.id % 7) * 9_100, rawBytes: 412_000 + (r.id % 7) * 88_000, lines: 64 + (r.id % 11), toolCount: 9 + (r.id % 5), lastTool: "mcp__build__check", createdAt: r.endedAt ?? r.startedAt,
+  });
+  return r.state === "failed" ? [one(r.id * 10, 0, "failed"), one(r.id * 10 + 1, 1, "failed")] : [one(r.id * 10, 0, "done")];
+};
+
+const TRANSCRIPT_ENTRIES = (r: AgentRun): TranscriptEntry[] => {
+  const t = (s: number) => new Date(Date.parse(r.startedAt) + s * 1000).toISOString();
+  return [
+    { at: t(1), kind: "system", text: "Session started: claude-opus-4, 14 tools" },
+    { at: t(4), kind: "thinking", text: "The diff touches the export path. Read the encoder first, then check whether the quality flag reaches it." },
+    { at: t(5), kind: "tool", name: "Read", text: JSON.stringify({ file_path: "crates/export/src/webp.rs" }, null, 2) },
+    { at: t(6), kind: "result", text: "   1\tuse crate::Quality;\n   2\t\n   3\tpub fn encode(img: &Image, q: Quality) -> Vec<u8> {\n   4\t    let lossy = q.value() < 100;\n   5\t    webp::Encoder::new(img).encode(q.value() as f32)\n   6\t}" },
+    { at: t(9), kind: "tool", name: "Grep", text: JSON.stringify({ pattern: "Quality::from", path: "crates" }, null, 2), sub: true },
+    { at: t(10), kind: "result", text: "crates/export/src/dialog.rs:88:    let q = Quality::from(self.slider);\ncrates/export/src/cli.rs:41:    let q = Quality::from(args.quality);", sub: true },
+    { at: t(14), kind: "text", text: "The quality value reaches the encoder unchanged, but `lossy` is computed and never used: quality 100 still encodes lossy." },
+    { at: t(18), kind: "tool", name: "mcp__build__check", text: JSON.stringify({ command: "cargo test -p export" }, null, 2) },
+    { at: t(141), kind: "result", text: "test webp::tests::lossless_at_100 ... FAILED\n\nfailures:\n    webp::tests::lossless_at_100\n\ntest result: FAILED. 11 passed; 1 failed", isError: true },
+    { at: t(150), kind: "text", text: "Confirmed with the failing test. Writing the review." },
+    { at: t(152), kind: "final", text: "success, 6 turns\n\n{\"verdict\": \"request-changes\", \"reason\": \"Quality 100 must encode lossless (crates/export/src/webp.rs:4).\"}" },
+  ];
+};
+
+let store: TranscriptStoreStatus = {
+  active: { kind: "s3", source: "settings", dir: null, endpoint: "https://0123456789abcdef.r2.cloudflarestorage.com", bucket: "autocraft-transcripts", prefix: "prod/", accessKeyId: "a1b2c3d4e5f6" },
+  saved: { kind: "s3", endpoint: "https://0123456789abcdef.r2.cloudflarestorage.com", bucket: "autocraft-transcripts", prefix: "prod/", accessKeyId: "a1b2c3d4e5f6", secretSet: true },
+  environment: false,
+  problem: null,
+};
+const LOCAL_DIR = "/data/transcripts";
+
+export function createAgentsMock(): Pick<Api, "agents" | "rates" | "transcriptStore"> {
   return {
-    accounts: {
-      list: () => wait(visible()),
-      pause: () => wait({ ...pause }),
-      jev: () => wait({ ...jev }),
-      async setJev(input) {
-        if (me.role !== "operator") throw new Error("only operators change accounts");
-        jev = { enabled: input.enabled, unavailable: input.enabled ? null : { reason: "switched off", since: iso(0) } };
-        changed();
-        return wait({ ...jev });
-      },
-      async setPause(input) {
-        if (me.role !== "operator") throw new Error("only operators change accounts");
-        for (const n of [input.fiveHour, input.weekly]) if (!Number.isInteger(n) || n < 1 || n > 100) throw new Error("pause levels must be whole numbers from 1 to 100");
-        pause = { ...input };
-        changed();
-        return wait({ ...pause });
-      },
-      async update(id, input) {
-        if (me.role !== "operator") throw new Error("only operators change accounts");
-        const a = accounts.find((x) => x.id === id);
-        if (!a) throw new Error("no such account");
-        if (input.label !== undefined) {
-          if (!input.label.trim() || input.label.length > 60 || input.label.includes("@")) throw new Error("label must be 1 to 60 characters and not an email address");
-          a.label = input.label.trim();
-        }
-        if (input.maxConcurrent !== undefined) {
-          if (!Number.isInteger(input.maxConcurrent) || input.maxConcurrent < 1 || input.maxConcurrent > 100) throw new Error("max concurrent must be a whole number from 1 to 100");
-          a.maxConcurrent = input.maxConcurrent;
-        }
-        if (input.enabled !== undefined) {
-          a.enabled = input.enabled;
-          a.pausedReason = input.enabled ? null : "disabled by an operator";
-        }
-        changed();
-        return wait(a, 30);
-      },
-      async add(label) {
-        if (me.role !== "operator") throw new Error("only operators change accounts");
-        if (!label.trim() || label.length > 40 || /[@<>]/.test(label)) throw new Error("label must be 1 to 40 characters without @, < or > (never an email address)");
-        const a: ClaudeAccount = {
-          id: `a${accounts.length + 1}`, label: label.trim(), enabled: false, maxConcurrent: 2, running: 0,
-          usage: { fiveHourPct: null, fiveHourResetsAt: null, weeklyPct: null, weeklyResetsAt: null, readAt: null },
-          pausedReason: "disabled by an operator", auth: { loggedIn: null, method: null, plan: null, expiresAt: null, checkedAt: null }, login: null, token: NO_TOKEN,
-        };
-        accounts.push(a);
-        changed();
-        return wait(a, 30);
-      },
-      async loginStart(id) {
-        const a = find(id);
-        a.login = { state: "waiting", url: "https://claude.example/oauth/authorize?state=demo", message: null, kind: "login" };
-        changed();
-        return wait(a, 200);
-      },
-      async loginCode(id, code) {
-        const a = find(id);
-        if (!/^[A-Za-z0-9#_.~+/=-]{1,512}$/.test(code)) throw new Error("the code has letters, digits and # _ . ~ + / = - only");
-        a.login = { state: "done", url: null, message: "signed in", kind: "login" };
-        a.auth = { ...AUTH, checkedAt: iso(0) };
-        changed();
-        return wait(a, 300);
-      },
-      async loginCancel(id) {
-        const a = find(id);
-        a.login = { state: "cancelled", url: null, message: null, kind: a.login?.kind ?? "login" };
-        changed();
-        return wait(a, 30);
-      },
-      async tokenStart(id) {
-        const a = find(id);
-        a.login = { state: "waiting", url: "https://claude.example/oauth/authorize?state=token-demo", message: null, kind: "token" };
-        changed();
-        return wait(a, 200);
-      },
-      async tokenCode(id, code) {
-        const a = find(id);
-        if (!/^[A-Za-z0-9#_.~+/=-]{1,512}$/.test(code)) throw new Error("the code has letters, digits and # _ . ~ + / = - only");
-        a.login = { state: "done", url: null, message: "token saved", kind: "token" };
-        a.token = { state: "set", setAt: iso(0), expiresAt: iso(-(365 * 24 * HOUR)), rejectedAt: null };
-        changed();
-        return wait(a, 300);
-      },
-      async tokenCancel(id) {
-        const a = find(id);
-        a.login = { state: "cancelled", url: null, message: null, kind: "token" };
-        changed();
-        return wait(a, 30);
-      },
-      async tokenRemove(id) {
-        const a = find(id);
-        a.token = NO_TOKEN;
-        changed();
-        return wait(a, 60);
-      },
-      async signOut(id) {
-        const a = find(id);
-        a.auth = { loggedIn: false, method: null, plan: null, expiresAt: null, checkedAt: iso(0) };
-        changed();
-        return wait(a, 100);
-      },
-      async refresh(id) {
-        const a = find(id);
-        a.usage.readAt = iso(0);
-        changed();
-        return wait(a, 200);
-      },
-    },
     agents: {
       list(f) {
-        if (f.state === "running") return wait({ runs: RUNNING.filter((r) => (!f.step || r.step === f.step) && (!f.account || r.accountId === f.account)), nextCursor: null });
+        if (f.state === "running") return wait({ runs: RUNNING.filter((r) => (!f.step || r.step === f.step)), nextCursor: null });
         const rows = RECENT.filter(
-          (r) => (!f.state || f.state === "recent" || r.state === f.state) && (!f.step || r.step === f.step) && (!f.account || r.accountId === f.account) && (!f.repo || r.items.some((i) => i.repo === f.repo)) && (!f.cursor || r.id < Number(f.cursor)),
+          (r) => (!f.state || f.state === "recent" || r.state === f.state) && (!f.step || r.step === f.step) && (!f.repo || r.items.some((i) => i.repo === f.repo)) && (!f.cursor || r.id < Number(f.cursor))
+            && (!f.refused || (!!r.refusal && inWindow(r, f.window))),
         );
         const limit = f.limit ?? 50;
         const runs = rows.slice(0, limit);
@@ -255,8 +183,38 @@ export function createAgentsMock(me: User, changed: () => void): Pick<Api, "acco
         if (traced) return wait(traced);
         if (!r) throw new Error(`no agent run ${id}`);
         const old = NOW - Date.parse(r.startedAt) > 90 * 24 * HOUR || id < 4850;
-        const d: AgentRunDetail = { ...r, prompt: old ? null : PROMPT(r), output: old || r.state === "running" ? null : OUTPUT, error: r.state === "failed" ? "claude -p exited after 600 s without output" : null, tools: [] };
+        const error = r.refusal ? (r.refusal.outcome === "failed" ? `refused by the model's safety filter: ${r.summary!.slice("refused by ".length)}; no other Task Runner or tier could take the call. ${REFUSED_ERROR}` : REFUSED_ERROR)
+          : r.state === "failed" ? "claude -p exited after 600 s without output" : null;
+        const d: AgentRunDetail = { ...r, prompt: old ? null : PROMPT(r), output: old || r.state === "running" || r.refusal ? null : OUTPUT, error, tools: [], transcripts: transcriptsOf(r) };
         return wait(d);
+      },
+      refusals: (w) => wait(refusals(w), 80),
+      transcript(runId, id) {
+        const r = [...RUNNING, ...RECENT].find((x) => x.id === runId);
+        const t = r && transcriptsOf(r).find((x) => x.id === id);
+        if (!r || !t) return Promise.reject(new Error(`run ${runId} has no transcript ${id}`));
+        const v: TranscriptView = { runId, transcript: t, entries: TRANSCRIPT_ENTRIES(r), omitted: 0 };
+        return wait(v);
+      },
+    },
+    transcriptStore: {
+      status: () => wait(store),
+      save(input) {
+        if (input.kind === "local") store = { ...store, active: { kind: "local", source: "settings", dir: LOCAL_DIR, endpoint: null, bucket: null, prefix: "", accessKeyId: null }, saved: { kind: "local", endpoint: "", bucket: "", prefix: "", accessKeyId: "", secretSet: false } };
+        else {
+          if (!input.secretAccessKey && !store.saved?.secretSet) return Promise.reject(new Error("Enter the secret access key."));
+          store = { ...store, active: { kind: "s3", source: "settings", dir: null, endpoint: input.endpoint, bucket: input.bucket, prefix: input.prefix, accessKeyId: input.accessKeyId }, saved: { kind: "s3", endpoint: input.endpoint, bucket: input.bucket, prefix: input.prefix, accessKeyId: input.accessKeyId, secretSet: true } };
+        }
+        return wait(store);
+      },
+      clear() {
+        store = { ...store, saved: null, active: null };
+        return wait(store);
+      },
+      test(input) {
+        const kind = (input ?? store.active)?.kind;
+        if (!kind) return wait({ ok: false, detail: "Transcripts are off: no store is configured." }, 300);
+        return wait({ ok: true, detail: kind === "s3" ? `Wrote, read and deleted a probe object in ${input?.kind === "s3" ? input.bucket : store.active?.bucket}.` : `Wrote, read and deleted a probe file in ${LOCAL_DIR}.` }, 300);
       },
     },
     rates: (w) => wait(rates(w), 80),

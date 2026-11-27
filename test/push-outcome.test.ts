@@ -3,8 +3,8 @@ import assert from "node:assert/strict";
 import { breakerTripped, classifyPush, requiredResult } from "../src/core/push-outcome.ts";
 import { join } from "node:path";
 import { tmpdir } from "./world-db.ts";
-import { pushesUnsettled, recordPush, resolvePushes } from "../src/push-outcomes.ts";
-import { connectDb } from "../src/db/open.ts";
+import { addPushOutcomes, pushesUnsettled, resolvePushes, UNSETTLED_PUSHES_MAX } from "../src/data/control/index.ts";
+import { connectDb } from "./helpers/raw-db.ts";
 
 test("push outcome: green to red is broke, red to green is fixed, optional checks are ignored", () => {
   const green = [{ name: "gate", state: "success" }, { name: "sonar", state: "failure" }];
@@ -28,17 +28,18 @@ test("push outcome: green to red is broke, red to green is fixed, optional check
 
 test("a new branch takes the CI result of its base commit, not the latest main CI", async () => {
   const db = await connectDb(join(tmpdir("push-base"), "t.db"));
+  await db.run(db.k.insertInto("tracked_repos").values({ name: "o/r", added_by: "op", added_at: "2026-11-01T00:00:00Z" }));
   const ci = async (sha: string, state: string, at: string) => await db.run(db.k.insertInto("main_ci").values({ repo: "o/r", head_sha: sha, branch: "main", state, failing: "[]", checks: "[]", committed_at: at, first_seen_at: at, state_changed_at: at, updated_at: at }));
   await ci("base", "red", "2026-11-01T00:00:00Z");
   await ci("latest", "green", "2026-11-02T00:00:00Z");
   const before = async () => (await db.get(db.k.selectFrom("push_outcomes").select("before_res").orderBy("id", "desc").limit(1)))!.before_res;
-  await recordPush(db, "implement-push", { repo: "o/r", number: null, from: null, to: "c1", base: "base" });
+  await addPushOutcomes(db, [{ action: "implement-push", repo: "o/r", number: null, from: null, to: "c1", base: "base" }]);
   assert.equal(await before(), "red");
-  await recordPush(db, "implement-push", { repo: "o/r", number: null, from: null, to: "c2", base: "gone" });
+  await addPushOutcomes(db, [{ action: "implement-push", repo: "o/r", number: null, from: null, to: "c2", base: "gone" }]);
   assert.equal(await before(), "green", "no row for the base: the latest main CI");
-  await recordPush(db, "implement-push", { repo: "o/r", number: null, from: null, to: "c3" });
+  await addPushOutcomes(db, [{ action: "implement-push", repo: "o/r", number: null, from: null, to: "c3" }]);
   assert.equal(await before(), "green");
-  const rows = [{ repo: "o/r", number: 5, head_oid: "c1", checks: [{ name: "gate", state: "failure" }] }];
+  const rows = [{ repo: "o/r", number: 5, head_oid: "c1", checks: JSON.stringify([{ name: "gate", state: "failure" }]) }];
   await resolvePushes(db, rows);
   assert.equal((await db.get(db.k.selectFrom("push_outcomes").select("outcome").where("to_oid", "=", "c1")))!.outcome, "still-red");
 });
@@ -55,8 +56,9 @@ test("the unsettled-push gate counts only recent pushes whose PR is open at the 
   await push(null, "h3", "2026-11-07T11:30:00Z");
   for (const n of [4, 5, 6]) { await item(n, "OPEN", `h${n}`); await checks(n, `h${n}`); }
   await push(4, "h4", "2026-11-07T11:30:00Z"); await push(5, "h5", "2026-11-07T11:30:00Z");
-  assert.equal(await pushesUnsettled(db, "app", () => {}, now), false);
+  const unsettled = async (at: Date): Promise<boolean> => ((await pushesUnsettled(db, ["app"], at.getTime())).get("app") ?? 0) >= UNSETTLED_PUSHES_MAX;
+  assert.equal(await unsettled(now), false);
   await push(6, "h6", "2026-11-07T11:40:00Z");
-  assert.equal(await pushesUnsettled(db, "app", () => {}, now), true);
-  assert.equal(await pushesUnsettled(db, "app", () => {}, new Date("2026-11-07T14:00:00Z")), false, "pushes older than 2 hours no longer count");
+  assert.equal(await unsettled(now), true);
+  assert.equal(await unsettled(new Date("2026-11-07T14:00:00Z")), false, "pushes older than 2 hours no longer count");
 });

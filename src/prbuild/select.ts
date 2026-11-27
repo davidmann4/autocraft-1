@@ -1,75 +1,69 @@
 // The PRs that get our own build (pr-builds feature): open, non-draft PRs of a public repo whose head has no build yet.
 // Scope per repo (settings `pr_builds_scope:<repo>`): "outside" (default) builds only outside authors' PRs, "all" every PR.
-import { isOutsideAuthor, holdMap } from "../outside.ts";
-import { currentHeadExpr } from "../verify/results.ts";
-import { baseScopeRepos } from "../pilot.ts";
-import { isFastTracked } from "../fasttrack.ts";
+import { loadHolds, isOutsideAuthor, loadInsiders } from "../data/intake/index.ts";
+import { config, readConfig, saveSettings, withConfig } from "../data/control/index.ts";
+import { loadPrBuildStates } from "../data/merge/index.ts";
+import { listItems, loadRepos, openItemKeys } from "../data/mirror/index.ts";
 import { cachedRust, type RustCheck } from "../verify/candidates.ts";
-import { setting as settingValue } from "../settings-read.ts";
 import type { Db } from "../db/index.ts";
-import { excluded } from "../db/kx.ts";
 
 export type PrBuildScope = "outside" | "all";
 export const DEFAULT_PER_DAY = 10;
 export const DAY_MS = 24 * 3600_000;
-const SCOPE_KEY = (repo: string): string => `pr_builds_scope:${repo}`;
-const PER_DAY_KEY = "pr_builds_per_day";
-
-const setting = async (db: Db, key: string): Promise<string | null> =>
-  await settingValue(db, key) ?? null;
 
 export async function scopeOf(db: Db, repo: string): Promise<PrBuildScope> {
-  return await setting(db, SCOPE_KEY(repo)) === "all" ? "all" : "outside";
+  return (await readConfig(db, [`pr_builds_scope:${repo}`])).repo(repo).prBuildsScope;
 }
 
-export async function setScope(db: Db, repo: string, scope: PrBuildScope): Promise<void> {
-  await db.run(db.k.insertInto("main.settings").values({ key: SCOPE_KEY(repo), value: scope }).onConflict((oc) => oc.column("key").doUpdateSet(excluded(["value"]))));
+export async function setScope(db: Db, repo: string, scope: PrBuildScope, by = "system"): Promise<void> {
+  await saveSettings(db, [{ key: "pr_builds_scope", repo, value: scope }], by, { action: "build-feature", target: "pr-builds", details: { feature: "pr-builds", scope, repo } });
 }
 
 /** Builds a repo may start in 24 hours; 0 starts none. */
 export async function perDayOf(db: Db): Promise<number> {
-  const v = Number(await setting(db, PER_DAY_KEY));
-  return await setting(db, PER_DAY_KEY) !== null && Number.isInteger(v) && v >= 0 ? v : DEFAULT_PER_DAY;
+  return (await readConfig(db, ["pr_builds_per_day"])).prBuildsPerDay;
 }
 
-export async function setPerDay(db: Db, n: number): Promise<void> {
-  await db.run(db.k.insertInto("main.settings").values({ key: PER_DAY_KEY, value: String(n) }).onConflict((oc) => oc.column("key").doUpdateSet(excluded(["value"]))));
+export async function setPerDay(db: Db, n: number, by = "system"): Promise<void> {
+  await saveSettings(db, [{ key: "pr_builds_per_day", value: String(n) }], by, { action: "build-feature", target: "pr-builds", details: { feature: "pr-builds", perDay: n } });
 }
 
 export type PrBuildCandidate = { repo: string; number: number; head: string; /** Whether the repo is known to be a Rust workspace at the head; null before its crate list was fetched. */ rust: boolean | null };
 
-/** Whether the worker would claim a build task for the PR: its repo is in the pipeline's scope, or the PR is fast-tracked (as `claim` in src/build/tasks.ts). */
-export async function inBuildScope(db: Db, repo: string, number: number, scope?: Set<string>): Promise<boolean> {
-  if (scope === undefined) scope = await baseScopeRepos(db);
-  return scope.has(repo) || await isFastTracked(db, repo, number);
+/** The numbers among `numbers` whose PR the worker would claim a build task for: the PR is in the pipeline's scope. One statement. */
+export async function buildScope(db: Db, repo: string, numbers: number[]): Promise<Set<number>> {
+  if (numbers.length === 0) return new Set();
+  return new Set((await listItems(db, { repos: [repo], numbers, inScope: true }, "ref")).map((i) => i.number));
 }
 
-/** The PRs to build now, oldest first, within the repo's daily cap. Writes nothing. */
-export async function selectPrBuilds(db: Db, repo: string, o: { rust?: RustCheck; now?: number } = {}): Promise<PrBuildCandidate[]> {
-  if (!await db.get(db.k.selectFrom("repos").select((eb) => eb.lit(1).as("one")).where("name", "=", repo).where("visibility", "=", "public"))) return [];
-  const rust = o.rust ?? cachedRust;
-  const used = (await db.get(db.k.selectFrom("main.pr_builds").select((eb) => eb.fn.countAll<number>().as("n")).where("repo", "=", repo)
-    .where("created_at", ">", new Date((o.now ?? Date.now()) - DAY_MS).toISOString())))!.n;
-  const room = await perDayOf(db) - used;
-  if (room <= 0) return [];
-  const rows = await db.all(db.k.selectFrom("items as i").leftJoin("pr_checks as c", (j) => j.onRef("c.repo", "=", "i.repo").onRef("c.number", "=", "i.number"))
-    .select((eb) => ["i.number", "i.author", "i.author_association", "i.author_type", currentHeadExpr(eb).as("head")])
-    .where("i.repo", "=", repo).where("i.kind", "=", "pr").where("i.state", "=", "OPEN").where((eb) => eb(eb.fn.coalesce("i.is_draft", eb.lit(0)), "=", 0))
-    .orderBy("i.created_at", (o) => o.asc().nullsFirst()).orderBy("i.number"));
-  const all = await scopeOf(db, repo) === "all";
-  const held = await holdMap(db);
-  const have = async (number: number, head: string) => await db.get(db.k.selectFrom("main.pr_builds").select((eb) => eb.lit(1).as("one"))
-    .where("repo", "=", repo).where("number", "=", number).where("head_sha", "=", head));
-  const scope = await baseScopeRepos(db);
-  const out: PrBuildCandidate[] = [];
-  for (const r of rows) {
-    if (!r.head || await have(r.number, r.head) || held.has(`${repo}#${r.number}`)) continue;
-    if (!await inBuildScope(db, repo, r.number, scope)) continue;
-    if (!all && !await isOutsideAuthor(db, r)) continue;
-    const isRust = rust(repo, r.head);
-    if (isRust === false) continue;
-    out.push({ repo, number: r.number, head: r.head, rust: isRust });
-    if (out.length >= room) break;
-  }
-  return out;
+/** The PRs to build now per repo, oldest first, within each repo's daily cap. Writes nothing. */
+export async function selectPrBuildsIn(db: Db, repos: readonly string[], o: { rust?: RustCheck; now?: number } = {}): Promise<Map<string, PrBuildCandidate[]>> {
+  const out = new Map<string, PrBuildCandidate[]>();
+  if (!repos.length) return out;
+  return await withConfig(db, async () => {
+    const [rows, states] = await db.together(() => Promise.all([loadRepos(db, { names: [...repos] }), loadPrBuildStates(db, repos, (o.now ?? Date.now()) - DAY_MS)]));
+    const roomOf = (repo: string): number => config(db).prBuildsPerDay - (states.get(repo)?.usedSince ?? 0);
+    const all = (repo: string): boolean => config(db).repo(repo).prBuildsScope === "all";
+    const building = repos.filter((r) => rows.get(r)?.visibility === "public" && roomOf(r) > 0);
+    if (!building.length) return out;
+    const [items, held, insiders] = await db.together(() => Promise.all([
+      listItems(db, { repos: building, kind: "pr", states: ["OPEN"], inScope: true }, "text"),
+      loadHolds(db, openItemKeys({ repos: building, kind: "pr" })),
+      building.every(all) ? Promise.resolve(new Set<string>()) : loadInsiders(db),
+    ]));
+    const open = items.filter((i) => !i.is_draft && i.head_oid && !states.get(i.repo)?.have.has(`${i.number}@${i.head_oid}`))
+      .sort((a, b) => (a.created_at === b.created_at ? 0 : a.created_at === null ? -1 : b.created_at === null ? 1 : a.created_at < b.created_at ? -1 : 1) || a.number - b.number);
+    const rust = o.rust ?? cachedRust;
+    for (const r of open) {
+      const repo = r.repo, list = out.get(repo) ?? out.set(repo, []).get(repo)!;
+      if (list.length >= roomOf(repo) || held.has(`${repo}#${r.number}`)) continue;
+      if (!all(repo) && !isOutsideAuthor(r, insiders)) continue;
+      const isRust = rust(repo, r.head_oid!);
+      if (isRust === false) continue;
+      list.push({ repo, number: r.number, head: r.head_oid!, rust: isRust });
+    }
+    return out;
+  });
 }
+
+export const selectPrBuilds = async (db: Db, repo: string, o: { rust?: RustCheck; now?: number } = {}): Promise<PrBuildCandidate[]> => (await selectPrBuildsIn(db, [repo], o)).get(repo) ?? [];

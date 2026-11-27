@@ -4,7 +4,7 @@ import { labelsApproval } from "../src/dash/api/admin.ts";
 import { cancel } from "../src/dash/api/pipeline.ts";
 import { actOnFinding, continueScan, startScan } from "../src/dash/api/security.ts";
 import type { Req } from "../src/dash/types.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb } from "./helpers/raw-db.ts";
 
 // A maintainer who writes to `alpha` (and no other repo).
 const as = (login: string, role: "viewer" | "maintainer" | "operator", json: unknown = {}, params: Record<string, string> = {}): Req => ({

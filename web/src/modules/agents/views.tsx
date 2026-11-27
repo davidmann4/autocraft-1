@@ -1,11 +1,17 @@
 // The Agents page: model calls running now, recent calls with server-side filters and keyset paging,
-// and a detail panel with the rendered prompt and the output.
+// and a detail panel with the rendered prompt and the output. Operators and maintainers also filter the
+// calls a model's safety filter refused, with their counts per prompt, repo, model and Task Runner user.
 import { useState, type ReactNode } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { Dialog } from "radix-ui";
 import { CaretDownIcon, CaretRightIcon, XIcon } from "@phosphor-icons/react";
 import { usePagedQuery, useQuery } from "../../api/client";
-import type { AgentRun, AgentRunDetail, AgentRunFilter, AgentRunPage, AgentRunState } from "../../api/types";
+import type { AgentRun, AgentRunDetail, AgentRunFilter, AgentRunPage, AgentRunRefusal, AgentRunState, RefusalGroup, RefusalWindow } from "../../api/types";
+import { t } from "../../../../src/i18n/index.ts";
+import { useUser } from "../../shell/UserContext";
+import { can } from "../../registry/permissions";
+import { Chip } from "../../ui/atoms/Chip";
+import { Segmented } from "../../ui/molecules/Segmented";
 import type { ViewProps } from "../../registry/types";
 import { nowMs, num, span } from "../../lib/format";
 import { TimeAgo } from "../../ui/atoms/TimeAgo";
@@ -17,6 +23,7 @@ import { ItemRef } from "../../ui/molecules/ItemRef";
 import { cn } from "../../ui/cn";
 import { Block, ErrorLine, Page, selectCls, useUrlState } from "../admin/parts";
 import { RunsQueueSwitch } from "./queue";
+import { TranscriptLinks } from "./transcript";
 
 const STATE_TONE: Record<AgentRunState, Tone> = { running: "accent", done: "ok", failed: "bad" };
 const STATE_LABEL: Record<AgentRunState, string> = { running: "Running", done: "Done", failed: "Failed" };
@@ -47,7 +54,7 @@ function Items({ r, max = 3, expandable }: { r: AgentRun; max?: number; expandab
   );
 }
 
-const who = (r: AgentRun): ReactNode => (r.provider === "jev" ? "Jev (no account)" : r.via ? <RemoteVia via={r.via} /> : (r.accountLabel ?? "unknown account"));
+const who = (r: AgentRun): ReactNode => (r.provider === "jev" ? "Jev" : r.via ? <RemoteVia via={r.via} /> : "–");
 
 // ---- running now ---------------------------------------------------------------
 
@@ -91,8 +98,10 @@ function useRecent(filter: Omit<AgentRunFilter, "cursor">) {
   return { rows: q.pages?.flatMap((p) => p.runs) ?? [], loading: q.loading || q.loadingMore, error: q.error?.message, more: q.hasMore, loadMore: q.loadMore };
 }
 
-function Filters({ f, update }: { f: Record<string, string | undefined>; update: (p: Record<string, string | null>) => void }) {
-  const accounts = useQuery("agents-accounts", (a) => a.accounts.list());
+const WINDOWS: RefusalWindow[] = ["24h", "7d", "30d"];
+const WINDOW_LABEL: Record<RefusalWindow, string> = { "24h": "24 hours", "7d": "7 days", "30d": "30 days" };
+
+function Filters({ f, update, staff }: { f: Record<string, string | undefined>; update: (p: Record<string, string | null>) => void; staff: boolean }) {
   const steps = useQuery("agents-steps", (a) => a.pipeline.overview());
   const repos = useQuery("agents-repos", (a) => a.repos());
   const sel = (label: string, key: string, opts: { value: string; label: string }[]) => (
@@ -110,62 +119,167 @@ function Filters({ f, update }: { f: Record<string, string | undefined>; update:
   );
   return (
     <div className="flex flex-wrap items-center gap-x-4 gap-y-2 border-b border-line px-4 py-2">
-      {sel("Step", "step", (steps.data?.steps ?? []).filter((s) => ["classify-new", "classify-all", "areas-rescan"].includes(s.name)).map((s) => ({ value: s.name, label: s.name })).concat([{ value: "decide", label: "decide" }, { value: "opus-review", label: "opus-review" }]).filter((o, i, a) => a.findIndex((x) => x.value === o.value) === i))}
-      {sel("Account", "account", (accounts.data ?? []).map((a) => ({ value: a.id, label: a.label })))}
+      {sel("Step", "step", (steps.data?.steps ?? []).filter((s) => ["classify-new", "classify-all", "areas-rescan"].includes(s.name)).map((s) => ({ value: s.name, label: s.name })).concat([{ value: "opus-review", label: "opus-review" }]).filter((o, i, a) => a.findIndex((x) => x.value === o.value) === i))}
       {sel("State", "state", [{ value: "done", label: "Done" }, { value: "failed", label: "Failed" }])}
       {sel("Repo", "repo", (repos.data ?? []).map((r) => ({ value: r, label: r })))}
+      {staff && (
+        <Chip active={f.refused === "1"} onClick={() => update({ refused: f.refused === "1" ? null : "1", window: null })} className="max-md:h-11">
+          {t("Refused")}
+        </Chip>
+      )}
+      {staff && f.refused === "1" && (
+        <Segmented
+          label={t("Time range")}
+          value={(f.window as RefusalWindow | undefined) ?? "7d"}
+          options={WINDOWS.map((w) => ({ value: w, label: t(WINDOW_LABEL[w]) }))}
+          onChange={(w) => update({ window: w === "7d" ? null : w })}
+        />
+      )}
     </div>
+  );
+}
+
+// ---- refused calls -------------------------------------------------------------
+
+function GroupTable({ title, rows, code }: { title: string; rows: RefusalGroup[]; code?: boolean }) {
+  const shown = rows.slice(0, 8);
+  return (
+    <table className="num w-full text-sm">
+      <caption className="pb-1 text-left text-xs font-semibold text-ink/65">{title}</caption>
+      <thead className="text-xs text-ink/55">
+        <tr>
+          <th scope="col" className="sr-only">{title}</th>
+          <th scope="col" className="h-7 w-16 px-2 text-right font-medium">{t("Refused")}</th>
+          <th scope="col" className="h-7 w-16 px-2 text-right font-medium">{t("Failed")}</th>
+        </tr>
+      </thead>
+      <tbody>
+        {shown.map((g) => (
+          <tr key={String(g.key)} className="border-t border-line">
+            <th scope="row" className={cn("max-w-0 truncate py-1 pr-2 text-left font-normal", code && g.key !== null && "code text-xs")} title={g.key ?? undefined}>
+              {g.key ?? <span className="text-ink/50">{t("none")}</span>}
+            </th>
+            <td className="px-2 text-right">{num(g.n)}</td>
+            <td className={cn("px-2 text-right", g.failed > 0 ? "text-bad" : "text-ink/50")}>{num(g.failed)}</td>
+          </tr>
+        ))}
+        {rows.length > shown.length && (
+          <tr className="border-t border-line">
+            <td colSpan={3} className="py-1 text-xs text-ink/50">{t("{n} more", { n: num(rows.length - shown.length) })}</td>
+          </tr>
+        )}
+      </tbody>
+    </table>
+  );
+}
+
+/** Counts of the refused calls in the range, so a cause they share stands out. */
+function RefusalCounts({ window }: { window: RefusalWindow }) {
+  const q = useQuery(`agents-refusals:${window}`, (a) => a.agents.refusals(window));
+  const b = q.data;
+  return (
+    <div className="border-b border-line px-4 py-3">
+      <ErrorLine error={q.error?.message} />
+      {b && (
+        <>
+          <p className="num text-sm" aria-live="polite">
+            {t("{n} refused in the last {range}", { n: num(b.total), range: t(WINDOW_LABEL[window]) })}
+            {b.failed > 0 && <span className="text-bad"> · {t("{n} with no other Task Runner or tier", { n: num(b.failed) })}</span>}
+            {b.capped && <span className="text-ink/55"> · {t("counts cover the newest {n}", { n: num(b.total) })}</span>}
+          </p>
+          {b.total > 0 && (
+            <div className="mt-3 grid items-start gap-x-6 gap-y-4 md:grid-cols-2">
+              <GroupTable title={t("Prompt")} rows={b.byPrompt} code />
+              <GroupTable title={t("Repo")} rows={b.byRepo} />
+              <GroupTable title={t("Model")} rows={b.byModel} />
+              <GroupTable title={t("Task Runner user")} rows={b.byLogin} />
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+/** What became of a refused call: its retry's state (linked to that run), or that nothing else could take it. */
+function RetryOutcome({ refusal }: { refusal: AgentRunRefusal }) {
+  if (refusal.outcome === "failed") return <Badge tone="bad">{t("Not retried")}</Badge>;
+  if (!refusal.retry) return <span className="text-xs text-ink/55">{t("Retried")}</span>;
+  return (
+    <Link to={`/agents/${refusal.retry.id}${location.search}`} className="relative z-10 inline-flex items-center max-md:min-h-11">
+      <Badge tone={STATE_TONE[refusal.retry.state]}>{t(STATE_LABEL[refusal.retry.state])}</Badge>
+      <span className="sr-only"> ({t("retry, run {id}", { id: refusal.retry.id })})</span>
+    </Link>
   );
 }
 
 function RecentRuns({ selected }: { selected?: number }) {
   const { state: f, update } = useUrlState();
-  const recent = useRecent({ state: (f.state as AgentRunState | undefined) ?? "recent", step: f.step, account: f.account, repo: f.repo, limit: 50 });
+  const staff = can(useUser(), "staff");
+  const refused = staff && f.refused === "1";
+  const window = refused ? ((f.window as RefusalWindow | undefined) ?? "7d") : undefined;
+  const recent = useRecent({ state: (f.state as AgentRunState | undefined) ?? "recent", step: f.step, repo: f.repo, limit: 50, ...(refused && { refused, window }) });
+  // A run open in the detail panel leaves the list narrow; the panel shows its model, Task Runner and tokens, so the list drops them for the items.
+  const open = selected !== undefined;
   useNow(recent.rows.some((r) => r.state === "running") ? 1000 : undefined);
   return (
     <Block flush title="Recent runs" aside="newest first">
-      <Filters f={f} update={update} />
+      <Filters f={f} update={update} staff={staff} />
+      {window && <RefusalCounts window={window} />}
       <ErrorLine error={recent.error} className="p-4" />
       <div className="overflow-x-auto">
-        <table className="num w-full md:min-w-[640px] text-sm">
+        <table className="num w-full text-sm">
           <thead className="bg-ink/[0.03] text-xs text-ink/55">
             <tr>
-              <th className="h-8 px-3 text-left font-medium">Started</th>
+              <th className="h-8 px-3 text-left font-medium max-md:hidden">Started</th>
               <th className="h-8 px-3 text-left font-medium">Step</th>
-              <th className="h-8 px-3 text-left font-medium max-md:hidden">Model</th>
-              <th className="h-8 px-3 text-left font-medium max-md:hidden">Account</th>
+              {!refused && !open && <th className="h-8 px-3 text-left font-medium max-md:hidden">Model</th>}
+              {!open && <th className="h-8 px-3 text-left font-medium max-md:hidden">Task Runner</th>}
+              {refused && <th className="h-8 px-3 text-left font-medium max-md:hidden">{t("Retry")}</th>}
               <th className="h-8 px-3 text-left font-medium">Items</th>
-              <th className="h-8 px-3 text-right font-medium max-md:hidden">Tokens</th>
-              <th className="h-8 px-3 text-left font-medium max-md:hidden">State</th>
+              {!refused && !open && <th className="h-8 px-3 text-right font-medium max-md:hidden">Tokens</th>}
+              {!refused && <th className="h-8 px-3 text-left font-medium max-md:hidden">State</th>}
             </tr>
           </thead>
           <tbody>
             {recent.rows.map((r) => (
               <tr key={r.id} className={cn("relative border-t border-line hover:bg-ink/[0.03]", selected === r.id && "bg-accent/10")}>
-                <td className="relative z-10 whitespace-nowrap px-3 py-1.5 text-ink/70" title={r.startedAt}>
-                  <span className={cn("mr-1.5 inline-block size-2 rounded-full md:hidden", r.state === "failed" ? "bg-bad" : r.state === "running" ? "bg-accent" : "bg-ok")} role="img" aria-label={STATE_LABEL[r.state]} />
-                  <TimeAgo iso={r.startedAt} /><span className="max-md:hidden"> ago</span>
+                <td className="relative z-10 whitespace-nowrap px-3 py-1.5 text-ink/70 max-md:hidden" title={r.startedAt}>
+                  <TimeAgo iso={r.startedAt} />
                 </td>
-                <td className="whitespace-nowrap px-3 code text-xs">
+                <td className="whitespace-nowrap px-3 py-1.5 code text-xs">
                   <Link to={`/agents/${r.id}${location.search}`} className="after:absolute after:inset-0">
                     {r.step}
                   </Link>
+                  {/* Phones: the state and start time under the step, so the items get the width. */}
+                  <div className="mt-0.5 flex items-center gap-1.5 font-sans text-ink/60 md:hidden">
+                    <span className={cn("inline-block size-2 rounded-full", r.state === "failed" ? "bg-bad" : r.state === "running" ? "bg-accent" : "bg-ok")} role="img" aria-label={STATE_LABEL[r.state]} />
+                    <TimeAgo iso={r.startedAt} />
+                  </div>
+                  {refused && r.refusal && (
+                    <div className="mt-0.5 flex items-center gap-1 font-sans text-ink/55 md:hidden">
+                      {t("Retry")} <RetryOutcome refusal={r.refusal} />
+                    </div>
+                  )}
                 </td>
-                <td className="px-3 max-md:hidden">{r.model}</td>
-                <td className="whitespace-nowrap px-3 text-ink/70 max-md:hidden">{r.provider === "jev" ? "–" : r.via ? <RemoteVia via={r.via} /> : r.accountLabel}</td>
-                <td className="px-3">
+                {!refused && !open && <td className="px-3 max-md:hidden">{r.model}</td>}
+                {!open && <td className="whitespace-nowrap px-3 text-ink/70 max-md:hidden">{r.provider === "jev" ? "–" : r.via ? <RemoteVia via={r.via} compact /> : "–"}</td>}
+                {refused && <td className="whitespace-nowrap px-3 max-md:hidden">{r.refusal && <RetryOutcome refusal={r.refusal} />}</td>}
+                <td className="px-3 md:min-w-60">
                   <Items r={r} max={2} />
                 </td>
-                <td className="px-3 text-right max-md:hidden">{tokensOf(r) === null ? "–" : num(tokensOf(r)!)}</td>
-                <td className="px-3 max-md:hidden">
-                  <Badge tone={STATE_TONE[r.state]}>{STATE_LABEL[r.state]}</Badge>
-                </td>
+                {!refused && !open && <td className="px-3 text-right max-md:hidden">{tokensOf(r) === null ? "–" : num(tokensOf(r)!)}</td>}
+                {!refused && (
+                  <td className="px-3 max-md:hidden">
+                    <Badge tone={STATE_TONE[r.state]}>{STATE_LABEL[r.state]}</Badge>
+                  </td>
+                )}
               </tr>
             ))}
           </tbody>
         </table>
       </div>
-      {!recent.loading && recent.rows.length === 0 && <p className="p-4 text-sm text-ink/55">No runs match.</p>}
+      {!recent.loading && recent.rows.length === 0 && <p className="p-4 text-sm text-ink/55">{refused ? t("No refused runs in this range.") : "No runs match."}</p>}
       {(recent.more || recent.loading) && (
         <div className="border-t border-line p-3">
           <Button size="sm" loading={recent.loading} disabled={!recent.more} onClick={recent.loadMore} className="max-md:h-11">
@@ -243,6 +357,20 @@ export function RunDetailBody({ id }: { id: number }) {
         <dd>
           <Items r={r} max={8} expandable />
         </dd>
+        {r.refusal && (
+          <>
+            <dt className="text-ink/55">{t("Refused")}</dt>
+            <dd className="flex flex-wrap items-center gap-2">
+              <span>{r.refusal.outcome === "failed" ? t("by the model's safety filter; no other Task Runner or tier could take the call") : t("by the model's safety filter; retried")}</span>
+              {r.refusal.retry && (
+                <Link to={`/agents/${r.refusal.retry.id}${location.search}`} className="inline-flex items-center gap-1.5 text-accent-ink hover:underline max-md:min-h-11">
+                  <span className="num">{t("Run {id}", { id: r.refusal.retry.id })}</span>
+                  <Badge tone={STATE_TONE[r.refusal.retry.state]}>{t(STATE_LABEL[r.refusal.retry.state])}</Badge>
+                </Link>
+              )}
+            </dd>
+          </>
+        )}
       </dl>
       {r.summary && <p className="rounded border border-line px-3 py-2 text-sm">{r.summary}</p>}
       {r.error && <p className="rounded border border-bad/30 bg-bad/5 px-3 py-2 text-sm text-bad">{r.error}</p>}
@@ -250,6 +378,7 @@ export function RunDetailBody({ id }: { id: number }) {
         <>
           <Collapsible title="Prompt" text={r.prompt} empty="Prompt text removed after ten years." />
           <Collapsible title="Output" text={r.output} empty={r.state === "running" ? "Still running." : "Output removed after ten years."} open />
+          <TranscriptLinks runId={r.id} transcripts={r.transcripts ?? []} off={!!r.transcriptsOff && !!r.via} />
         </>
       )}
     </div>
@@ -275,11 +404,11 @@ export function DetailPanel({ params }: ViewProps) {
 
 // ---- page ----------------------------------------------------------------------
 
-export function AgentsView({ params, user }: ViewProps) {
+export function AgentsView({ params }: ViewProps) {
   const id = params.id ? Number(params.id) : undefined;
   return (
     <Page title="Agents" sub="Model calls through the prompt registry">
-      {user.inference === "user-local" && <RunsQueueSwitch value="runs" />}
+      <RunsQueueSwitch value="runs" />
       <div className="mt-4 space-y-4">
         <RunningNow selected={id} />
         <RecentRuns selected={id} />
@@ -313,42 +442,3 @@ export function PhoneAgents(props: ViewProps) {
 }
 
 /** The model calls running now in a flowchart stage's steps (slot flow.panel). */
-export function FlowRunning({ params }: ViewProps) {
-  const steps = (params.steps ?? "").split(",").filter(Boolean);
-  const q = useQuery<AgentRunPage>("agents-running", (a) => a.agents.list({ state: "running" }));
-  const runs = (q.data?.runs ?? []).filter((r) => steps.includes(r.step));
-  useNow(runs.length ? 1000 : undefined);
-  if (steps.length === 0) return null;
-  return (
-    <section className="border-t border-line px-4 py-3">
-      <div className="mb-1.5 flex flex-wrap items-baseline gap-x-2">
-        <h3 className="text-xs font-semibold text-ink/60">Running now{q.data && <span className="num ml-1 font-normal text-ink/50">{runs.length}</span>}</h3>
-        <span className="ml-auto flex gap-2 text-xs">
-          {steps.map((s) => (
-            <Link key={s} to={`/agents?step=${encodeURIComponent(s)}`} className="text-accent-ink hover:underline">
-              {steps.length > 1 ? `Agents: ${s}` : "Agents page"}
-            </Link>
-          ))}
-        </span>
-      </div>
-      <ErrorLine error={q.error?.message} />
-      {q.data && runs.length === 0 && <p className="text-sm text-ink/55">No model call is running.</p>}
-      <ul className="divide-y divide-line">
-        {runs.map((r) => (
-          <li key={r.id} className="py-1.5">
-            <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-              <Link to={`/agents/${r.id}`} className="code text-sm font-medium hover:underline">{r.step}</Link>
-              <Badge tone="accent">{r.model}</Badge>
-              <span className="text-xs text-ink/70">{r.provider === "jev" ? "Jev" : r.via ? <RemoteVia via={r.via} /> : (r.accountLabel ?? "unknown account")}</span>
-              <span className="num ml-auto text-xs text-ink/70">{elapsed(r)}</span>
-            </div>
-            <div className="mt-0.5">
-              <Items r={r} />
-            </div>
-          </li>
-        ))}
-      </ul>
-    </section>
-  );
-}
-

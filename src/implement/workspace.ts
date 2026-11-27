@@ -3,6 +3,8 @@
 // queuer (calls.ts NewCall.forLogin) and runs in one of their Task Runner's normal slots (boundSlot), and each one is
 // recorded as a workspace_sessions row of kind `implement`, whose workspace the sweep keeps (keep = 1).
 import type { Db } from "../db/index.ts";
+import { addSession, patchSessions } from "../data/build/index.ts";
+import { loadRepos } from "../data/mirror/index.ts";
 import { finishRun } from "../agents/runs.ts";
 import { assertFence } from "../db/fence.ts";
 import { listEnvs } from "../build/envs.ts";
@@ -26,11 +28,18 @@ const READY_POLL_MS = 3000;
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 const iso = () => new Date().toISOString();
 
-export class WorkspaceUnavailable extends Error {}
+/** The workspace did not get ready. `startFailure` is false for a cancel: that is a person's doing, not a failed start. */
+export class WorkspaceUnavailable extends Error {
+  readonly startFailure: boolean;
+  constructor(message: string, startFailure = true) {
+    super(message);
+    this.startFailure = startFailure;
+  }
+}
 
 /** The head commit of the repo's default branch on GitHub, or null. */
 export async function mainHeadOf(db: Db, repo: string): Promise<string | null> {
-  const branch = (await db.get(db.k.selectFrom("repos").select("default_branch").where("name", "=", repo)))?.default_branch ?? "main";
+  const branch = (await loadRepos(db, { names: [repo] })).get(repo)?.default_branch ?? "main";
   try {
     const s = (await ghApi(`repos/${slugOf(repo)}/commits/${encodeURIComponent(branch)}`, ".sha")).trim();
     return SHA.test(s) ? s : null;
@@ -39,9 +48,9 @@ export async function mainHeadOf(db: Db, repo: string): Promise<string | null> {
   }
 }
 
-/** The kubernetes environment implementations run in: the one enabled kubernetes environment. */
+/** The kubernetes environment implementations run in: the one enabled kubernetes environment that is no warm producer. */
 export async function implementEnv(db: Db): Promise<string> {
-  const k = (await listEnvs(db)).filter((e) => e.kind === "kubernetes" && e.enabled);
+  const k = (await listEnvs(db)).filter((e) => e.kind === "kubernetes" && e.enabled && !e.settings?.warmWriter);
   if (k.length !== 1) throw new WorkspaceUnavailable(k.length ? `${k.length} kubernetes environments are enabled; implementations need exactly one` : "no kubernetes environment is enabled");
   return k[0]!.id;
 }
@@ -76,7 +85,7 @@ export async function readyWorkspace(ctx: StepContext, o: { repo: string; baseSh
     if (w.state === "parked" && !await resumeWorkspace(db, id)) throw new WorkspaceUnavailable(`workspace ${id} is parked and could not be resumed${w.error ? `: ${w.error}` : ""}`);
     if (!LIVE_STATES.includes(w.state as WorkspaceStateName)) throw new WorkspaceUnavailable(`workspace ${id} is ${w.state}${w.error ? `: ${w.error}` : ""}`);
     if (Date.now() - from > READY_LIMIT_MS) throw new WorkspaceUnavailable(`workspace ${id} was not ready within ${Math.round(READY_LIMIT_MS / 60_000)} min (still ${w.state})`);
-    if (await ctx.cancelled()) throw new WorkspaceUnavailable("cancelled while the workspace started");
+    if (await ctx.cancelled()) throw new WorkspaceUnavailable("cancelled while the workspace started", false);
     if (w.state !== last) {
       last = w.state;
       await ctx.progress(`workspace ${id} ${w.state}`);
@@ -96,13 +105,12 @@ export type CallResult = { callId: number; outcome: Outcome };
  */
 export async function runBoundCall(ctx: StepContext, r: BoundCall): Promise<CallResult> {
   const db = ctx.db, at = iso();
-  const session = Number((await db.get(db.k.insertInto("workspace_sessions").values({
+  const session = await addSession(db, {
     kind: SESSION_KIND, repo: r.repo, base_sha: r.baseSha, item: r.number, prompt: null, env_id: (await getWorkspace(db, r.workspaceId))?.env_id ?? "",
     keep: 1, deadline_sec: r.timeoutSeconds, workspace_id: r.workspaceId, job_id: ctx.job.id, state: "starting", requested_by: r.forLogin, created_at: at, updated_at: at,
-  }).returning("id")))!.id);
+  });
   const end = async (state: "done" | "failed", outcome: string) => {
-    const t = iso();
-    await db.run(db.k.updateTable("workspace_sessions").set({ state, outcome: outcome.slice(0, 300), ended_at: t, updated_at: t }).where("id", "=", session));
+    await patchSessions(db, [{ id: session, set: { state, outcome: outcome.slice(0, 300), ended_at: iso() } }]);
   };
   let callId: number;
   try {
@@ -111,7 +119,7 @@ export async function runBoundCall(ctx: StepContext, r: BoundCall): Promise<Call
     await end("failed", `not queued: ${(e as Error).message}`);
     throw e;
   }
-  await db.run(db.k.updateTable("workspace_sessions").set({ remote_call_id: callId, state: "running", updated_at: iso() }).where("id", "=", session));
+  await patchSessions(db, [{ id: session, set: { remote_call_id: callId, state: "running" } }]);
   ctx.log(`model call ${callId} queued for ${r.forLogin}'s Task Runner (workspace ${r.workspaceId})`);
   let outcome: Outcome;
   try {

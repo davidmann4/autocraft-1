@@ -10,7 +10,7 @@ import { accessToken, createSession, openTokens, sealTokens } from "../src/dash/
 import { dropSessionTokens, readUserTokens, saveUserTokens } from "../src/dash/server/user-tokens.ts";
 import { Vault } from "../src/github/vault.ts";
 import { SCRATCH } from "./scratch.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb } from "./helpers/raw-db.ts";
 
 const REDIRECT = "http://localhost/cb";
 

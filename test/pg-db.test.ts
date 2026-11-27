@@ -2,11 +2,16 @@
 // against a server (AUTOCRAFT_TEST_PG_URL; `pnpm test:pg` starts one) and is skipped with the reason otherwise.
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
+import { writeFileSync } from "node:fs";
+import { connect as netConnect, createServer, type AddressInfo, type Socket } from "node:net";
+import { join } from "node:path";
+import { SCRATCH } from "./scratch.ts";
 import { countQueries } from "../src/db/counter.ts";
 import { isLockTimeout } from "../src/db/errors.ts";
 import { rewriteScriptForPostgres } from "../src/db/params.ts";
-import type { Db } from "../src/db/index.ts";
-import { needsPg, testDatabase } from "./test-db.ts";
+import { connectDb, type Db } from "./helpers/raw-db.ts";
+import { needsPg, TEST_PG_URL, testDatabase } from "./test-db.ts";
 import type { Generated } from "kysely";
 
 /** The test table, for Kysely. */
@@ -223,4 +228,65 @@ test("a script is rewritten statement by statement, leaving literals and dollar-
   );
   const fn = "CREATE FUNCTION f() RETURNS trigger AS $$ BEGIN INSERT INTO main.t VALUES (1); RETURN NEW; END $$ LANGUAGE plpgsql;";
   assert.equal(rewriteScriptForPostgres(fn), fn);
+});
+
+test("a statement whose answer is lost fails after the statement timeout and its margin, the pool opens a new connection, and a connection that never opens fails too", { skip: needsPg, timeout: 30_000 }, async () => {
+  // A proxy to the test server that can drop what the server sends, as a server or proxy that vanished without closing the connection.
+  const server = new URL(TEST_PG_URL!);
+  const host = decodeURIComponent(server.hostname);
+  const to = host.startsWith("/") ? { path: `${host}/.s.PGSQL.${server.port || 5432}` } : { host, port: Number(server.port || 5432) };
+  let drop = false;
+  const sockets: Socket[] = [];
+  const proxy = createServer((client) => {
+    const up = netConnect(to);
+    sockets.push(client, up);
+    client.on("data", (b) => up.write(b));
+    up.on("data", (b) => { if (!drop) client.write(b); });
+    client.on("error", () => up.destroy());
+    up.on("error", () => client.destroy());
+    client.on("close", () => up.destroy());
+    up.on("close", () => client.destroy());
+  });
+  await new Promise<void>((r) => proxy.listen(0, "127.0.0.1", r));
+  const url = new URL(server);
+  url.host = `127.0.0.1:${(proxy.address() as AddressInfo).port}`;
+  const db = await connectDb(url.toString(), { role: "cli", migrate: false, statementTimeoutMs: 1_000 });
+  try {
+    assert.equal((await db.prepare("SELECT 1 AS n").get() as { n: number }).n, 1);
+    drop = true;
+    const t0 = Date.now();
+    await assert.rejects(db.prepare("SELECT 2 AS n").get(), /no answer from the server/);
+    assert.ok(Date.now() - t0 >= 1_000, "the answer is awaited for at least the statement timeout");
+    drop = false;
+    assert.equal((await db.prepare("SELECT 3 AS n").get() as { n: number }).n, 3, "the next statement runs on a new connection");
+    // A connection whose server never answers its startup fails within the same bound.
+    drop = true;
+    const fresh = await connectDb(url.toString(), { role: "cli", migrate: false, statementTimeoutMs: 1_000 });
+    await assert.rejects(fresh.prepare("SELECT 4 AS n").get(), /timeout/);
+    await fresh.close();
+  } finally {
+    await db.close();
+    for (const s of sockets) s.destroy();
+    await new Promise((r) => proxy.close(r));
+  }
+});
+
+test("a process whose identity cache listens for settings changes still ends when its work is done", { skip: needsPg, timeout: 30_000 }, async () => {
+  const t = await testDatabase("", "postgres", { empty: true });
+  try {
+    await (await t.open({ app: true })).close();
+    const src = (m: string) => JSON.stringify(new URL(`../src/${m}`, import.meta.url).href);
+    const script = join(SCRATCH, `listen-exit-${process.pid}.ts`);
+    writeFileSync(script, `import { connectDb } from ${src("db/open.ts")};
+import { watchIdentity } from ${src("data/access/index.ts")};
+const db = await connectDb(process.argv[2], { migrate: false });
+const sub = watchIdentity(db);
+while (!sub.listening()) await new Promise((r) => setTimeout(r, 20));
+console.log("listening");
+`);
+    const out = await new Promise<string>((resolve, reject) => execFile(process.execPath, ["--no-warnings", script, t.target], { timeout: 15_000 }, (e, stdout) => (e ? reject(e) : resolve(stdout))));
+    assert.match(out, /listening/);
+  } finally {
+    await t.close();
+  }
 });

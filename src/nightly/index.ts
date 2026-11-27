@@ -1,26 +1,31 @@
 // Nightly checks per repo (build feature "nightly"): once a day a repo's selected checks run as sandbox tasks at the
 // default branch head, below all PR work. A later run of the step reads the finished tasks (pass or fail from the exit
-// codes, never from a model), stores one result per check, parses benchmark lines, and, for a check that fails two
-// nights running, asks an operator whether to open an issue. Nothing is read, written or queued while the switch is off.
+// codes, never from a model), stores one result per check and parses benchmark lines. An operator opens an issue for a
+// failing check from the Nightly page (openNightlyIssue), one per failing streak. Nothing is read, written or queued while the switch is off.
 import { readFileSync } from "node:fs";
 import type { BuildTask } from "../../web/src/api/types.ts";
 import { absolute } from "../build/artifacts.ts";
 import { listEnvs } from "../build/envs.ts";
 import { featureOn } from "../build/features.ts";
-import { createTask, getTask, MAX_QUEUED, TERMINAL } from "../build/tasks.ts";
-import { CLI_BY, type By } from "../core/gates.ts";
+import { createTask, getTask, TERMINAL } from "../build/tasks.ts";
+import { BuildError } from "../build/envs.ts";
+import type { By } from "../core/gates.ts";
 import { guardRepo } from "../core/guard.ts";
-import { actionable, ask, getDecision } from "../decisions.ts";
-import { createIssue, IssueError } from "../github/write.ts";
+import { byUs, issueMade, type GhRead } from "../github/made.ts";
+import { createIssue, IssueError, PACE_MAX_WAIT_MS, unclearWrite } from "../github/write.ts";
+import { ghExec } from "../merge/safe-merge.ts";
 import { exec } from "../fixup/git.ts";
-import { mainCiRepos } from "../mainci/index.ts";
 import { cleanLine } from "../review/post-template.ts";
 import { scrub } from "../runner/scrub.ts";
 import { outcomeOf } from "../verify/results.ts";
 import { checkOf, NIGHTLY_CHECKS, type CheckOpts, type NightlyCheck } from "./checks.ts";
-import { filterSeq, mapSeq } from "../async-seq.ts";
+import { filterSeq } from "../async-seq.ts";
+import { loadArtifactFiles, loadTaskStates } from "../data/build/index.ts";
+import { addAudit, listAudit } from "../data/control/index.ts";
+import * as inference from "../data/inference/index.ts";
+import type { BenchPoint, NightlyResult, NightlyRun, NightlySelection, ResultState } from "../data/inference/index.ts";
+import { loadLatestMainHeads } from "../data/mirror/index.ts";
 import type { Db } from "../db/index.ts";
-import { cols, excluded } from "../db/kx.ts";
 
 export { NIGHTLY_CHECKS, checkOf } from "./checks.ts";
 export type { NightlyCheck, CheckOpts } from "./checks.ts";
@@ -33,21 +38,12 @@ const DAY_MS = 24 * 3600_000;
 export const NIGHTLY_EVERY_MS = DAY_MS;
 /** A run whose tasks never finished (no environment claims them) blocks the next night's run for this long, so tasks do not pile up. */
 export const STALE_RUN_MS = 3 * DAY_MS;
-export const BENCH_KEEP_MS = 180 * 24 * 3600_000;
+export { BENCH_KEEP_MS } from "../data/inference/index.ts";
+export type { BenchPoint, NightlyResult, NightlyRun, NightlySelection, ResultState } from "../data/inference/index.ts";
 /** A bench is judged against its last 7 nights, once at least this many are known. */
 export const BENCH_WINDOW = 7;
 export const BENCH_MIN_HISTORY = 3;
 export const BENCH_WARN_RATIO = 1.1;
-export const OPEN_ISSUE = "open-issue";
-export const NOT_NOW = "not-now";
-/** Failing nights in a row before an operator is asked. */
-export const STREAK_TO_ASK = 2;
-
-export type ResultState = "queued" | "pass" | "fail" | "error" | "skipped" | "warn";
-export type NightlyResult = { runId: number; checkId: string; taskId: number | null; state: ResultState; summary: string | null; issueNumber: number | null; decisionId: string | null; finishedAt: string | null };
-export type NightlyRun = { id: number; repo: string; sha: string; startedAt: string; state: "running" | "done" };
-export type NightlySelection = { repo: string; checkId: string; enabled: boolean; crates: string[]; targets: string[] };
-export type BenchPoint = { repo: string; bench: string; sha: string; at: string; value: number; unit: string };
 
 export type NightlyDeps = {
   now: () => Date;
@@ -55,93 +51,75 @@ export type NightlyDeps = {
   toolchains: (db: Db) => Promise<Set<string>>;
   /** The text of a finished task's artifact, or null. */
   readArtifact: (db: Db, taskId: number, name: string) => Promise<string | null>;
-  /** Opens the issue the operator asked for; throws IssueError. The default checks the repo's comment approval first. */
-  openIssue: (db: Db, o: { repo: string; title: string; body: string; decisionId: string; by: By }) => Promise<{ number: number; url: string }>;
+  /** Opens the issue `by` asked for; throws IssueError. The default checks the repo's comment approval first. */
+  openIssue: (db: Db, o: { repo: string; checkId: string; title: string; body: string; by: string }) => Promise<{ number: number; url: string }>;
+  /** Reads GitHub, to look for an issue whose create lost its answer. */
+  read: GhRead;
 };
 
-export type NightlySummary = { repo: string; queued: number; skipped: number; collected: number; asked: number; issues: number; note: string | null };
+export type NightlySummary = { repo: string; queued: number; skipped: number; collected: number; note: string | null };
 
 // ---- selection ----------------------------------------------------------------
 
-const paramsOf = (s: string | null): { crates: string[]; targets: string[] } => {
-  try {
-    const o = JSON.parse(s ?? "{}") as { crates?: unknown; targets?: unknown };
-    const list = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : []);
-    return { crates: list(o.crates), targets: list(o.targets) };
-  } catch { return { crates: [], targets: [] }; }
-};
-
 /** The repo's rows for checks the catalogue knows, in catalogue order. */
 export async function selectionOf(db: Db, repo: string): Promise<NightlySelection[]> {
-  const rows = await db.all(db.k.selectFrom("nightly_selection").select(cols("nightly_selection")).where("repo", "=", repo));
-  return NIGHTLY_CHECKS.flatMap((c) => {
-    const r = rows.find((x) => x.check_id === c.id);
-    return r ? [{ repo, checkId: c.id, enabled: r.enabled === 1, ...paramsOf(r.params) }] : [];
-  });
+  return inCatalogue((await inference.loadSelections(db, [repo])).get(repo) ?? []);
 }
+
+const inCatalogue = (rows: NightlySelection[]): NightlySelection[] => NIGHTLY_CHECKS.flatMap((c) => rows.filter((x) => x.checkId === c.id));
 
 /** Sets one check on or off for a repo, keeping its crates and targets unless new ones are given. */
 export async function setSelection(db: Db, repo: string, checkId: string, enabled: boolean, o: { crates?: string[]; targets?: string[] } = {}): Promise<void> {
   if (!checkOf(checkId)) throw new Error(`unknown nightly check ${checkId}`);
-  const old = (await selectionOf(db, repo)).find((s) => s.checkId === checkId);
-  const params = JSON.stringify({ crates: o.crates ?? old?.crates ?? [], targets: o.targets ?? old?.targets ?? [] });
-  await db.run(db.k.insertInto("nightly_selection").values({ repo, check_id: checkId, enabled: enabled ? 1 : 0, params })
-    .onConflict((oc) => oc.columns(["repo", "check_id"]).doUpdateSet(excluded(["enabled", "params"]))));
+  await inference.setSelection(db, { repo, checkId, enabled, ...o });
 }
 
-const enabledChecks = async (db: Db, repo: string): Promise<{ check: NightlyCheck; opts: CheckOpts }[]> =>
-  (await selectionOf(db, repo)).filter((s) => s.enabled).map((s) => ({ check: checkOf(s.checkId)!, opts: { crates: s.crates, targets: s.targets } }));
+const enabledOf = (rows: NightlySelection[]): { check: NightlyCheck; opts: CheckOpts }[] =>
+  inCatalogue(rows).filter((s) => s.enabled).map((s) => ({ check: checkOf(s.checkId)!, opts: { crates: s.crates, targets: s.targets } }));
 
 // ---- schedule -----------------------------------------------------------------
 
-/** The default branch head the main CI poll last read for a tracked repo, or null. */
-const headOf = async (db: Db, repo: string): Promise<string | null> => (await mainCiRepos(db)).find((r) => r.repo === repo)?.headSha ?? null;
-
-/** A run started since `since`, or one still running that started since `staleSince`. */
-const recentRun = async (db: Db, repo: string, since: string, staleSince: string): Promise<boolean> =>
-  !!await db.get(db.k.selectFrom("nightly_runs").select((eb) => eb.lit(1).as("one")).where("repo", "=", repo)
-    .where((eb) => eb.or([eb("started_at", ">", since), eb.and([eb("state", "=", "running"), eb("started_at", ">", staleSince)])])).limit(1));
-
-const nightlyDecision = (repo: string, id: string): boolean => id.startsWith(`${repo}:nightly:`);
-
 /**
- * Whether a run of the step has work for the repo: an answered issue decision, a result whose task ended, or (the
- * once-a-day schedule, in data, not a timer) a selected check, a known head and no run started in the last 24 hours.
+ * The repos among `repos` that have work for a run of the step: a result whose task ended, or (the once-a-day schedule, in data,
+ * not a timer) a selected check, a known default branch head and no run started in the last 24 hours.
  */
+async function dueAmong(db: Db, repos: string[], nowMs: number): Promise<string[]> {
+  const on = await filterSeq(repos, async (r) => await featureOn(db, "nightly", r));
+  if (!on.length) return [];
+  const [state, selections, heads] = await db.together(() => Promise.all([
+    inference.loadNightlyState(db, on, { since: new Date(nowMs - NIGHTLY_EVERY_MS).toISOString(), staleSince: new Date(nowMs - STALE_RUN_MS).toISOString() }),
+    inference.loadSelections(db, on),
+    loadLatestMainHeads(db, on),
+  ]));
+  const taskIds = [...new Set([...state.values()].flatMap((s) => s.queued.flatMap((q) => (q.taskId === null ? [] : [q.taskId]))))];
+  const tasks = await loadTaskStates(db, taskIds);
+  return on.filter((repo) => {
+    const s = state.get(repo)!;
+    if (s.queued.some((q) => q.taskId !== null && TERMINAL.includes(tasks.get(q.taskId)?.state as never))) return true;
+    if (!enabledOf(selections.get(repo) ?? []).length || s.recentRun) return false;
+    return heads.has(repo);
+  });
+}
+
+/** Whether a run of the step has work for the repo. */
 export async function nightlyDue(db: Db, repo: string, nowMs: number = Date.now()): Promise<boolean> {
-  if (!await featureOn(db, "nightly", repo)) return false;
-  if ((await actionable(db)).some((a) => a.kind === "other" && nightlyDecision(repo, a.id))) return true;
-  if (await db.get(db.k.selectFrom("nightly_results as r").innerJoin("nightly_runs as u", "u.id", "r.run_id").innerJoin("build_tasks as t", "t.id", "r.task_id")
-    .select((eb) => eb.lit(1).as("one")).where("u.repo", "=", repo).where("r.state", "=", "queued").where("t.state", "in", TERMINAL).limit(1))) return true;
-  if (!(await enabledChecks(db, repo)).length) return false;
-  const since = new Date(nowMs - NIGHTLY_EVERY_MS).toISOString();
-  if (await recentRun(db, repo, since, new Date(nowMs - STALE_RUN_MS).toISOString())) return false;
-  return await headOf(db, repo) !== null;
+  return (await dueAmong(db, [repo], nowMs)).length === 1;
 }
 
 /** The lane's candidates: tracked repos with the work above, sorted. */
 export const nightlyRepos = async (db: Db, tracked: string[], nowMs: number = Date.now()): Promise<string[]> =>
-  (await filterSeq(tracked, async (r) => await nightlyDue(db, r, nowMs))).sort();
+  (await dueAmong(db, tracked, nowMs)).sort();
 
 // ---- reading ------------------------------------------------------------------
 
-type ResRow = { run_id: number; check_id: string; task_id: number | null; state: ResultState; summary: string | null; issue_number: number | null; decision_id: string | null; finished_at: string | null };
-const resultOf = (r: ResRow): NightlyResult => ({ runId: r.run_id, checkId: r.check_id, taskId: r.task_id, state: r.state, summary: r.summary, issueNumber: r.issue_number, decisionId: r.decision_id, finishedAt: r.finished_at });
-
 /** Newest runs of a repo with their results; for the Nightly page. */
 export async function recentRuns(db: Db, repo: string, limit = 14): Promise<(NightlyRun & { results: NightlyResult[] })[]> {
-  const runs = await db.all(db.k.selectFrom("nightly_runs").select(cols("nightly_runs")).$narrowType<{ state: "running" | "done" }>()
-    .where("repo", "=", repo).orderBy("id", "desc").limit(limit));
-  return await mapSeq(runs, async (u) => ({
-    id: u.id, repo: u.repo, sha: u.sha, startedAt: u.started_at, state: u.state,
-    results: (await db.all(db.k.selectFrom("nightly_results").select(cols("nightly_results")).$narrowType<{ state: ResultState }>()
-      .where("run_id", "=", u.id).orderBy("check_id"))).map(resultOf),
-  }));
+  return (await inference.loadNightlyGrid(db, [repo], { nights: limit, sparkPoints: 0, window: 0 })).get(repo)?.runs ?? [];
 }
 
 /** A bench's points, oldest first. */
 export async function benchSeries(db: Db, repo: string, bench: string): Promise<BenchPoint[]> {
-  return await db.all(db.k.selectFrom("nightly_bench").select(cols("nightly_bench")).where("repo", "=", repo).where("bench", "=", bench).orderBy("at").orderBy("sha"));
+  return await inference.loadBenchSeries(db, repo, bench);
 }
 
 export function defaultDeps(): NightlyDeps {
@@ -149,16 +127,17 @@ export function defaultDeps(): NightlyDeps {
     now: () => new Date(),
     toolchains: async (db) => new Set((await listEnvs(db)).filter((e) => e.enabled && e.online).flatMap((e) => e.capabilities?.toolchains ?? [])),
     readArtifact: async (db, taskId, name) => {
-      const row = await db.get(db.k.selectFrom("build_artifacts").select("file").where("task_id", "=", taskId).where("name", "=", name));
-      const path = row ? absolute(row.file) : null;
+      const file = (await loadArtifactFiles(db, [{ taskId, name }])).get(`${taskId}/${name}`);
+      const path = file ? absolute(file) : null;
       if (!path) return null;
       try { return readFileSync(path, "utf8"); } catch { return null; }
     },
     openIssue: async (db, o) => {
-      const g = await guardRepo(db, o.repo, "comment", o.by, o.decisionId);
+      const g = await guardRepo(db, o.repo, "comment", { operator: o.by }, o.by);
       if ("refused" in g) throw new IssueError(g.refused, true);
-      return createIssue({ db, login: ACTOR }, g, exec, { repo: o.repo, target: `${o.repo}:nightly`, title: o.title, body: o.body }, { by: "operator", model: "haiku" }, { decision: o.decisionId });
+      return createIssue({ db, login: o.by }, g, exec, { repo: o.repo, target: issueTarget(o.repo), title: o.title, body: o.body }, { by: "fixed-operator" }, { check: o.checkId });
     },
+    read: ghExec,
   };
 }
 
@@ -182,23 +161,22 @@ const median = (xs: number[]): number => {
 
 /** Stores the points and returns the benches more than 10% above the median of their last 7 earlier nights. */
 async function storeBench(db: Db, repo: string, sha: string, at: string, points: { bench: string; value: number; unit: string }[]): Promise<{ bench: string; pct: number }[]> {
+  const prior = await inference.loadBenchPrior(db, repo, [...new Set(points.map((p) => p.bench))], { sha, at }, BENCH_WINDOW);
   const slow: { bench: string; pct: number }[] = [];
   for (const p of points) {
-    const prior = (await db.all(db.k.selectFrom("nightly_bench").select("value").where("repo", "=", repo).where("bench", "=", p.bench)
-      .where("sha", "<>", sha).where("at", "<", at).orderBy("at", "desc").limit(BENCH_WINDOW))).map((r) => r.value);
-    if (prior.length >= BENCH_MIN_HISTORY) {
-      const m = median(prior);
+    const before = prior.get(p.bench) ?? [];
+    if (before.length >= BENCH_MIN_HISTORY) {
+      const m = median(before);
       if (m > 0 && p.value > m * BENCH_WARN_RATIO) slow.push({ bench: p.bench, pct: Math.round((p.value / m - 1) * 100) });
     }
-    await db.run(db.k.insertInto("nightly_bench").values({ repo, bench: p.bench, sha, at, value: p.value, unit: p.unit })
-      .onConflict((oc) => oc.columns(["repo", "bench", "sha"]).doUpdateSet(excluded(["at", "value", "unit"]))));
   }
+  await inference.saveBenchPoints(db, points.map((p) => ({ repo, bench: p.bench, sha, at, value: p.value, unit: p.unit })));
   return slow;
 }
 
 /** Drops benchmark points older than BENCH_KEEP_MS. */
 export async function pruneBench(db: Db, nowMs: number = Date.now()): Promise<number> {
-  return (await db.run(db.k.deleteFrom("nightly_bench").where("at", "<", new Date(nowMs - BENCH_KEEP_MS).toISOString()))).changes;
+  return await inference.pruneBench(db, nowMs);
 }
 
 // ---- collecting ---------------------------------------------------------------
@@ -231,144 +209,193 @@ async function judge(db: Db, c: NightlyCheck, t: BuildTask, run: NightlyRun, at:
   return { state: "pass", summary: null };
 }
 
-/** The earlier results of one check, newest first, from runs before `runId`. */
-const history = async (db: Db, repo: string, checkId: string, runId: number): Promise<ResRow[]> =>
-  await db.all(db.k.selectFrom("nightly_results as r").innerJoin("nightly_runs as u", "u.id", "r.run_id").select(cols("nightly_results", "r")).$narrowType<{ state: ResultState }>()
-    .where("u.repo", "=", repo).where("r.check_id", "=", checkId).where("r.run_id", "<", runId).orderBy("r.run_id", "desc"));
-
-const decisionIdOf = (repo: string, checkId: string, startRun: number): string => `${repo}:nightly:${checkId}@${startRun}`;
-
 /** Issue text: fixed layout; the summary is scrubbed and, for an audit, only advisory ids. */
 export function nightlyIssueBody(c: NightlyCheck, sha: string, summary: string | null): string {
   return `The nightly check "${cleanLine(c.label, 80)}" failed on the default branch at ${sha.slice(0, 8)} on two nights in a row.${summary ? `\n\n${cleanLine(summary, 300)}` : ""}`;
 }
 const issueTitle = (c: NightlyCheck): string => `Nightly check fails: ${cleanLine(c.label, 80)}`;
 
+const issueTarget = (repo: string): string => `${repo}:nightly`;
+
+/** Failing nights in a row before an issue can be opened. */
+export const STREAK_TO_OPEN = 2;
+/** The nights the Open issue control looks back over. */
+const ISSUE_NIGHTS = 30;
+/** A create that was claimed longer ago than this is not running any more (a create takes seconds; the write pacing waits at most PACE_MAX_WAIT_MS). */
+const CLAIM_MS = Math.max(10 * 60_000, 4 * PACE_MAX_WAIT_MS);
+
+type Night = { run: NightlyRun; result: NightlyResult };
+
+/** The check's failing streak: the consecutive failed nights up to the newest (a skipped, queued or errored night says nothing; a pass or warn ends it), newest first. */
+export function failingStreak(runs: (NightlyRun & { results: NightlyResult[] })[], checkId: string): Night[] {
+  const nights = runs.flatMap((run): Night[] => { const result = run.results.find((x) => x.checkId === checkId); return result && !["error", "skipped", "queued"].includes(result.state) ? [{ run, result }] : []; });
+  const end = nights.findIndex((m) => m.result.state !== "fail");
+  return end < 0 ? nights : nights.slice(0, end);
+}
+
+/** The issue opened for the streak, or null. */
+export const issueOf = (streak: Night[]): number | null => streak.find((m) => m.result.issueNumber !== null)?.result.issueNumber ?? null;
+
+/** Whether a person may open an issue for the streak of check `c`. */
+export const mayOpenIssue = (c: NightlyCheck, streak: Night[]): boolean => !c.experimental && streak.length >= STREAK_TO_OPEN && issueOf(streak) === null;
+
+/** The Open issue control refused: the message is the presser's answer. */
+export class NightlyRefused extends Error {}
+
+const streakNow = async (db: Db, repo: string, checkId: string): Promise<Night[]> =>
+  failingStreak((await inference.loadNightlyGrid(db, [repo], { nights: ISSUE_NIGHTS, sparkPoints: 0, window: 0 })).get(repo)?.runs ?? [], checkId);
+
 /**
- * After a failure: the failing streak is the consecutive failed nights before this one (a skipped or errored night says
- * nothing; a pass or warn ends it). A streak of two asks one decision, keyed by the streak's first run, so a repeat
- * failure of an issue-opened streak asks nothing; the next streak after a green night asks again.
+ * The Open issue control: opens one issue for a check that is failing, naming the check and the failure. Refused for an experimental
+ * check, a streak shorter than STREAK_TO_OPEN, and a streak that has its issue, or one being opened. The streak's results are claimed
+ * (with the presser's audit row) before the create, and then carry the issue's number. A claim whose create stopped, or whose outcome was not
+ * known, is settled by the next press: from the create's audit row, else by looking for the issue on GitHub, and only an issue that is not
+ * there is opened again.
  */
-async function afterFailure(db: Db, c: NightlyCheck, run: NightlyRun, summary: string | null, at: string, s: NightlySummary): Promise<void> {
-  if (c.experimental) return;
-  let start = run.id, count = 1;
-  for (const h of await history(db, run.repo, c.id, run.id)) {
-    if (h.state === "error" || h.state === "skipped" || h.state === "queued") continue;
-    if (h.state !== "fail") break;
-    start = h.run_id; count++;
+export async function openNightlyIssue(db: Db, o: { repo: string; checkId: string; by: string }, deps: NightlyDeps = defaultDeps()): Promise<{ number: number; url: string }> {
+  const c = checkOf(o.checkId);
+  if (!c) throw new NightlyRefused(`unknown nightly check ${o.checkId}`);
+  if (c.experimental) throw new NightlyRefused(`no issue is opened for the experimental check ${c.id}`);
+  const press = async (state: "opening" | "unknown", why?: string) =>
+    await addAudit(db, [{ login: o.by, action: "nightly-issue", target: o.repo, at: deps.now().toISOString(), details: { check: c.id, state, ...(why && { error: why }) } }]);
+  const { streak, claimedBefore } = await db.write(async () => {
+    const streak = await streakNow(db, o.repo, c.id);
+    if (streak.length < STREAK_TO_OPEN) throw new NightlyRefused(`the nightly check ${c.id} is not failing ${STREAK_TO_OPEN} nights in a row on ${o.repo}`);
+    const had = issueOf(streak);
+    if (had !== null) throw new NightlyRefused(`issue #${had} is already open for the nightly check ${c.id} on ${o.repo}`);
+    const claimedBefore = streak.some((m) => m.result.issueClaimed);
+    if (claimedBefore) {
+      const last = (await listAudit(db, { actions: ["nightly-issue"], targets: [o.repo], order: "desc" })).find((a) => a.details?.check === c.id);
+      if (last && last.details?.state === "opening" && deps.now().getTime() - Date.parse(last.at) < CLAIM_MS) throw new NightlyRefused(`an issue for the nightly check ${c.id} on ${o.repo} is being opened`);
+    }
+    await inference.claimIssue(db, { repo: o.repo, checkId: c.id, runIds: streak.map((m) => m.run.id) });
+    await press("opening");
+    return { streak, claimedBefore };
+  });
+  const mark = async (made: { number: number; url: string }): Promise<{ number: number; url: string }> => {
+    await inference.markIssue(db, { repo: o.repo, checkId: c.id, runIds: streak.map((m) => m.run.id), issue: made.number });
+    return made;
+  };
+  const lost = async (e: unknown): Promise<never> => {
+    const why = one(String((e as Error).message ?? e));
+    await press("unknown", why);
+    throw new IssueError(`whether the issue was opened is not known: ${why}`, false);
+  };
+  if (claimedBefore) {
+    const since = streak[streak.length - 1]!.run.startedAt;
+    const began = (await listAudit(db, { actions: ["postmerge-file"], targets: [issueTarget(o.repo)], since, order: "desc" })).filter((a) => a.details?.check === c.id);
+    for (const a of began) {
+      const url = a.details?.state === "done" ? String(a.details.url ?? "") : "";
+      const m = /\/issues\/(\d+)$/.exec(url);
+      if (m) return await mark({ number: Number(m[1]), url });
+    }
+    for (const a of began.filter((a) => unclearWrite(a.details))) {
+      let made: { number: number; url: string } | null;
+      try { made = await issueMade(deps.read, { repo: o.repo, title: String(a.details?.title ?? ""), body: String(a.details?.text ?? ""), since: a.at, mine: await byUs(db) }); } catch (e) { return await lost(e); }
+      if (made) return await mark(made);
+    }
   }
-  const id = decisionIdOf(run.repo, c.id, start);
-  const known = await getDecision(db, id);
-  if (count < STREAK_TO_ASK && !known) return;
-  if (!known) {
-    await ask(db, [{
-      id, kind: "other", repo: run.repo, number: 0,
-      question: `Open an issue for the nightly check "${cleanLine(c.label, 80)}" on ${run.repo}'s default branch?`,
-      context: `The check failed ${count} nights in a row. AutoCraft can open one issue with the check name and the failure; it opens no second issue until the check has passed again.`,
-      facts: [`check: ${c.id}`, `head: ${run.sha.slice(0, 8)}`, ...(summary ? [`failure: ${cleanLine(summary, 300)}`] : [])],
-      options: [
-        { key: OPEN_ISSUE, label: "Open issue", hint: "AutoCraft opens one issue on the repo with the check and the failure." },
-        { key: NOT_NOW, label: "Not now", hint: "Nothing is posted." },
-      ],
-      recommended: OPEN_ISSUE, recommended_reason: "A failure that repeats is not a flake.",
-      public_text: nightlyIssueBody(c, run.sha, summary), asked_by: ACTOR, asked_at: at,
-    }]);
-    s.asked++;
+  const last = streak[0]!;
+  let made: { number: number; url: string };
+  try {
+    made = await deps.openIssue(db, { repo: o.repo, checkId: c.id, title: issueTitle(c), body: nightlyIssueBody(c, last.run.sha, last.result.summary), by: o.by });
+  } catch (e) {
+    if (!(e instanceof IssueError) || !e.clear) return await lost(e);
+    await inference.releaseIssue(db, { repo: o.repo, checkId: c.id });
+    throw e;
   }
-  const issue = (await db.get(db.k.selectFrom("nightly_results").select("issue_number as n").where("decision_id", "=", id).where("issue_number", "is not", null).limit(1)))?.n ?? null;
-  await db.run(db.k.updateTable("nightly_results").set({ decision_id: id, issue_number: issue }).where("run_id", "=", run.id).where("check_id", "=", c.id));
-  // The streak's earlier failures point at the same decision.
-  await db.run(db.k.updateTable("nightly_results").set({ decision_id: id }).where("decision_id", "is", null).where("state", "=", "fail").where("check_id", "=", c.id).where("run_id", ">=", start)
-    .where("run_id", "in", (eb) => eb.selectFrom("nightly_runs").select("id").where("repo", "=", run.repo)));
+  return await mark(made);
+}
+
+/** A night that goes on a streak with an issue carries its number, so the streak keeps it however long it lasts. */
+async function carryIssues(db: Db, repo: string, checkIds: string[]): Promise<void> {
+  if (!checkIds.length) return;
+  const runs = (await inference.loadNightlyGrid(db, [repo], { nights: ISSUE_NIGHTS, sparkPoints: 0, window: 0 })).get(repo)?.runs ?? [];
+  for (const checkId of new Set(checkIds)) {
+    const streak = failingStreak(runs, checkId), issue = issueOf(streak);
+    if (issue !== null) await inference.markIssue(db, { repo, checkId, runIds: streak.filter((m) => m.result.issueNumber === null).map((m) => m.run.id), issue });
+  }
 }
 
 async function collect(db: Db, repo: string, deps: NightlyDeps, s: NightlySummary): Promise<void> {
   const at = deps.now().toISOString();
-  const runs = await db.all(db.k.selectFrom("nightly_runs").select(cols("nightly_runs")).$narrowType<{ state: "running" }>().where("repo", "=", repo).where("state", "=", "running").orderBy("id"));
+  const runs = (await inference.loadOpenRuns(db, [repo])).get(repo) ?? [];
+  if (!runs.length) return;
+  const queued = await inference.loadResults(db, runs.map((u) => u.id), "queued");
+  const taskIds = [...new Set([...queued.values()].flatMap((rs) => rs.flatMap((r) => (r.taskId === null ? [] : [r.taskId]))))];
+  const tasks = new Map<number, BuildTask | null>();
+  for (const id of taskIds) tasks.set(id, await getTask(db, id));
+  const set: Parameters<typeof inference.setResults>[1] = [];
   for (const u of runs) {
-    const run: NightlyRun = { id: u.id, repo: u.repo, sha: u.sha, startedAt: u.started_at, state: u.state };
-    for (const r of await db.all(db.k.selectFrom("nightly_results").select(cols("nightly_results")).$narrowType<{ state: ResultState }>().where("run_id", "=", u.id).where("state", "=", "queued").orderBy("check_id"))) {
-      const c = checkOf(r.check_id);
-      const t = r.task_id === null ? null : await getTask(db, r.task_id);
-      if (!c || !t) { await db.run(db.k.updateTable("nightly_results").set({ state: "error", summary: !c ? "check no longer in the catalogue" : "the build task is gone", finished_at: at }).where("run_id", "=", u.id).where("check_id", "=", r.check_id)); s.collected++; continue; }
+    for (const r of queued.get(u.id) ?? []) {
+      const c = checkOf(r.checkId);
+      const t = r.taskId === null ? null : tasks.get(r.taskId) ?? null;
+      if (!c || !t) { set.push({ runId: u.id, checkId: r.checkId, state: "error", summary: !c ? "check no longer in the catalogue" : "the build task is gone", finishedAt: at }); s.collected++; continue; }
       if (!TERMINAL.includes(t.state)) continue;
-      const j = await judge(db, c, t, run, t.endedAt ?? at, deps);
-      await db.run(db.k.updateTable("nightly_results").set({ state: j.state, summary: j.summary, finished_at: at }).where("run_id", "=", u.id).where("check_id", "=", r.check_id));
+      const j = await judge(db, c, t, u, t.endedAt ?? at, deps);
+      set.push({ runId: u.id, checkId: r.checkId, state: j.state, summary: j.summary, finishedAt: at });
       s.collected++;
-      if (j.state === "fail") await afterFailure(db, c, run, j.summary, at, s);
-    }
-    if (!await db.get(db.k.selectFrom("nightly_results").select((eb) => eb.lit(1).as("one")).where("run_id", "=", u.id).where("state", "=", "queued").limit(1))) await db.run(db.k.updateTable("nightly_runs").set({ state: "done" }).where("id", "=", u.id));
-  }
-}
-
-/** Opens the issues operators asked for and records the "not now" answers. */
-async function applyAnswers(db: Db, repo: string, deps: NightlyDeps, log: (l: string) => void, s: NightlySummary, by: By): Promise<void> {
-  for (const a of (await actionable(db)).filter((x) => x.kind === "other" && nightlyDecision(repo, x.id))) {
-    const at = deps.now().toISOString();
-    const done = async (): Promise<void> => void await db.run(db.k.updateTable("main.decisions").set({ applied_at: at }).where("id", "=", a.id).where("applied_at", "is", null));
-    if (a.answer === NOT_NOW) { await done(); continue; }
-    if (a.answer !== OPEN_ISSUE) continue;
-    const rows = await db.all(db.k.selectFrom("nightly_results as r").innerJoin("nightly_runs as u", "u.id", "r.run_id").select([...cols("nightly_results", "r"), "u.sha"]).$narrowType<{ state: ResultState }>()
-      .where("r.decision_id", "=", a.id).orderBy("r.run_id", "desc"));
-    const last = rows[0];
-    const c = last && checkOf(last.check_id);
-    if (!last || !c || rows.some((r) => r.issue_number !== null)) { await done(); continue; }
-    try {
-      const made = await deps.openIssue(db, { repo, title: issueTitle(c), body: nightlyIssueBody(c, last.sha, last.summary), decisionId: a.id, by });
-      await db.run(db.k.updateTable("nightly_results").set({ issue_number: made.number }).where("decision_id", "=", a.id));
-      await done();
-      s.issues++;
-      log(`  ${repo}: opened ${made.url}`);
-    } catch (e) {
-      // A refusal leaves the answer unapplied for the next run; an unclear failure may have left an issue, so it is not retried.
-      const clear = e instanceof IssueError && e.clear;
-      log(`  ${repo}: issue for ${c.id} not opened: ${one(String((e as Error).message ?? e))}`);
-      if (!clear) await done();
     }
   }
+  await db.write(async () => {
+    await inference.setResults(db, set);
+    await inference.closeRuns(db, runs.map((u) => u.id));
+    await carryIssues(db, repo, set.filter((r) => r.state === "fail").map((r) => r.checkId));
+  });
 }
 
 // ---- queueing -----------------------------------------------------------------
 
 /** One run: a row, and per selected check a queued task, or `skipped` when no environment has the toolchain or the selection leaves nothing to run. */
 async function queueRun(db: Db, repo: string, deps: NightlyDeps, s: NightlySummary): Promise<void> {
-  const sha = await headOf(db, repo);
-  const checks = await enabledChecks(db, repo);
-  if (!sha || !checks.length) return;
   const nowMs = deps.now().getTime();
-  if (await recentRun(db, repo, new Date(nowMs - NIGHTLY_EVERY_MS).toISOString(), new Date(nowMs - STALE_RUN_MS).toISOString())) return;
-  const queued = (await db.get(db.k.selectFrom("build_tasks").select((eb) => eb.fn.countAll<number>().as("n")).where("state", "=", "queued")))!.n;
-  if (queued + checks.length > MAX_QUEUED) { s.note = "the build queue is full; tried again at the next run"; return; }
+  const [state, selections, heads] = await db.together(() => Promise.all([
+    inference.loadNightlyState(db, [repo], { since: new Date(nowMs - NIGHTLY_EVERY_MS).toISOString(), staleSince: new Date(nowMs - STALE_RUN_MS).toISOString() }),
+    inference.loadSelections(db, [repo]),
+    loadLatestMainHeads(db, [repo]),
+  ]));
+  const sha = heads.get(repo)?.head_sha ?? null;
+  const checks = enabledOf(selections.get(repo) ?? []);
+  if (!sha || !checks.length || state.get(repo)!.recentRun) return;
   const have = await deps.toolchains(db);
   const at = new Date(nowMs).toISOString();
-  await db.write(async () => {
-    const runId = (await db.get(db.k.insertInto("nightly_runs").values({ repo, sha, started_at: at, state: "running" }).returning("id")))!.id;
-    for (const { check, opts } of checks) {
-      const insert = async (taskId: number | null, state: ResultState, summary: string | null): Promise<void> =>
-        void await db.run(db.k.insertInto("nightly_results").values({ run_id: runId, check_id: check.id, task_id: taskId, state, summary, finished_at: state === "queued" ? null : at }));
-      if (!have.has(check.toolchain)) { await insert(null, "skipped", "no toolchain"); s.skipped++; continue; }
-      const plan = check.steps(opts);
-      if (!plan) { await insert(null, "skipped", check.id === "fuzz" ? "no fuzz targets chosen" : "no crates chosen"); s.skipped++; continue; }
-      const id = await createTask(db, { step: "nightly", repo, headSha: sha, baseSha: sha, requires: { os: "linux", toolchains: [check.toolchain] }, priority: NIGHTLY_PRIORITY, plan });
-      await insert(id, "queued", null);
-      s.queued++;
-    }
-  });
+  const skipped = (check: NightlyCheck, summary: string) => ({ checkId: check.id, taskId: null, state: "skipped" as ResultState, summary, finishedAt: at });
+  try {
+    await db.write(async () => {
+      const runId = await inference.startRun(db, { repo, sha, at });
+      const rows: Parameters<typeof inference.addResults>[1] = [];
+      let queued = 0, skippedN = 0;
+      for (const { check, opts } of checks) {
+        if (!have.has(check.toolchain)) { rows.push({ runId, ...skipped(check, "no toolchain") }); skippedN++; continue; }
+        const plan = check.steps(opts);
+        if (!plan) { rows.push({ runId, ...skipped(check, check.id === "fuzz" ? "no fuzz targets chosen" : "no crates chosen") }); skippedN++; continue; }
+        const id = await createTask(db, { step: "nightly", repo, headSha: sha, baseSha: sha, requires: { os: "linux", toolchains: [check.toolchain] }, priority: NIGHTLY_PRIORITY, plan });
+        rows.push({ runId, checkId: check.id, taskId: id, state: "queued", summary: null, finishedAt: null });
+        queued++;
+      }
+      await inference.addResults(db, rows);
+      s.queued += queued;
+      s.skipped += skippedN;
+    });
+  } catch (e) {
+    // A full build queue refuses a task: the run row and its tasks roll back together and the next run tries again.
+    if (!(e instanceof BuildError) || e.status !== 429) throw e;
+    s.note = "the build queue is full; tried again at the next run";
+  }
 }
 
-/** One repo: answers first, then results of finished tasks, then (once a day) the next run. Nothing at all with the switch off. */
+/** One repo: results of finished tasks first, then (once a day) the next run. Nothing at all with the switch off. */
 export async function runNightly(db: Db, params: { repo: string; by?: By; onHandled?: (n: number) => void }, log: (l: string) => void = console.log, deps: NightlyDeps = defaultDeps()): Promise<NightlySummary> {
   const { repo } = params;
-  const s: NightlySummary = { repo, queued: 0, skipped: 0, collected: 0, asked: 0, issues: 0, note: null };
+  const s: NightlySummary = { repo, queued: 0, skipped: 0, collected: 0, note: null };
   if (!await featureOn(db, "nightly", repo)) {
     s.note = `the Nightly checks feature is off for ${repo}`;
     log(`nightly ${repo}: ${s.note}; nothing done`);
     return s;
   }
-  await applyAnswers(db, repo, deps, log, s, params.by ?? CLI_BY);
   await collect(db, repo, deps, s);
   await queueRun(db, repo, deps, s);
-  params.onHandled?.(s.queued + s.skipped + s.collected + s.issues);
-  log(`nightly ${repo}: queued ${s.queued}, skipped ${s.skipped}, collected ${s.collected}, asked ${s.asked}, issues ${s.issues}`);
+  params.onHandled?.(s.queued + s.skipped + s.collected);
+  log(`nightly ${repo}: queued ${s.queued}, skipped ${s.skipped}, collected ${s.collected}`);
   return s;
 }

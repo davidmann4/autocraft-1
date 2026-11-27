@@ -12,7 +12,6 @@ import { Block } from "../../ui/molecules/Block";
 import { ItemRef } from "../../ui/molecules/ItemRef";
 import { NextStepBlock } from "../../ui/organisms/NextStepBlock";
 import { ErrorLine, Page } from "../admin/parts";
-import { QueueItems } from "../queue/QueueItems";
 import { MergeBoard } from "../queue/MergeBoard";
 import { RecentlyMerged } from "../queue/RecentlyMerged";
 import { RepoSelect } from "../../ui/molecules/RepoSelect";
@@ -96,7 +95,6 @@ export function NextView() {
         </div>
         {tab !== "steps" && (
           <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
-            {tab === "merge" && <QueueItems />}
             <UnlessProject><RepoSelect value={repo} onChange={setRepo} /></UnlessProject>
           </div>
         )}
@@ -106,9 +104,7 @@ export function NextView() {
       ) : tab === "merged" ? (
         <RecentlyMerged repo={repo} />
       ) : (
-        <>
-          <MergeBoard repo={repo} />
-        </>
+        <MergeBoard repo={repo} />
       )}
     </Page>
   );

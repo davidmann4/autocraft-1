@@ -7,7 +7,7 @@ import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 import { elect, type Lease } from "../src/db/leader.ts";
 import { isFenced, setFence } from "../src/db/fence.ts";
-import type { Db } from "../src/db/index.ts";
+import type { Db } from "./helpers/raw-db.ts";
 import { needsPg, testDatabase } from "./test-db.ts";
 
 const FAST = { retryMs: 100, checkMs: 100, leaseMs: 2_000, lossMs: 1_500, beatMs: 200, log: () => {} };

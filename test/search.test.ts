@@ -4,7 +4,7 @@ import { quickSearch } from "../src/dash/api/items.ts";
 import { parseSearch } from "../src/db/search.ts";
 import * as kx from "../src/db/kx.ts";
 import type { Req } from "../src/dash/types.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb } from "./helpers/raw-db.ts";
 
 test("text search finds items by a body word, a comment word and a typed prefix, and leaves out the rest", async () => {
   const db = await connectDb(":memory:");

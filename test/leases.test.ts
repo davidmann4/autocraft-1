@@ -9,7 +9,7 @@ import { endJob } from "../src/runner/jobs.ts";
 import { leaseItem, leaseSkips, take } from "../src/runner/leases.ts";
 import type { StepDef } from "../src/runner/steps.ts";
 import { SCRATCH } from "./scratch.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb } from "./helpers/raw-db.ts";
 import { excluded } from "../src/db/kx.ts";
 
 after(() => setCallContext(null));

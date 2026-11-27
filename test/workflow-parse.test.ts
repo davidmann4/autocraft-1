@@ -1,7 +1,7 @@
 // Maintainer text to workflow actions: the parser and the resolver decide what runs, and anything unclear runs nothing.
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
-import { parse, parseComment } from "../src/workflow/parse.ts";
+import { describe as describe_, parse, parseComment } from "../src/workflow/parse.ts";
 import { resolve, type ItemState } from "../src/workflow/resolve.ts";
 import { recommendationLine, replyLine } from "../src/workflow/status.ts";
 import type { ItemWorkflow, PlanPart, Recommendation } from "../src/workflow/types.ts";
@@ -10,9 +10,9 @@ const SLUG = "autocraft-bot";
 
 const started = (over: Partial<ItemWorkflow> = {}): ItemWorkflow => ({
   id: 1, repo: "storytold/photocraft", number: 812, kind: "pr", entry: "review", weight: 5, state: "running", step: null,
-  startedBy: "mira", startedAt: "2026-11-24T09:02:00Z", startedVia: "github", baseHead: "abc",
-  approvedBy: null, approvedAt: null, approvedVia: null, stoppedBy: null, stoppedAt: null,
-  blocker: null, blockerParams: null, rec: null, recAt: null, recHead: null, plan: [], legacyPreapprovalId: null,
+  startedBy: "mira", startedAt: "2026-11-24T09:02:00Z", startedVia: "github", baseHead: "abc", acceptedHead: null, version: 0,
+  approvedBy: null, approvedAt: null, approvedVia: null, stoppedBy: null, stoppedAt: null, takenBy: null,
+  blocker: null, blockerParams: null, rec: null, recAt: null, recHead: null, plan: [], prNumber: null, reviewAskedAt: null, legacyPreapprovalId: null,
   updatedAt: "2026-11-24T09:02:00Z", ...over,
 });
 const part = (n: number, title: string): PlanPart => ({ n, title, source: "review", state: "planned" });
@@ -20,6 +20,13 @@ const pr = (workflow: ItemWorkflow | null = null): ItemState => ({ kind: "pr", w
 const run = (text: string, state: ItemState) => resolve(parse(text), state);
 
 describe("workflow commands", () => {
+  test("an item named inside words that were not read is not quoted back as a target", () => {
+    const p = parse("please close this, it's related to #12", { repo: "photocraft" });
+    assert.ok(p.kind === "ambiguous");
+    assert.ok(!p.understood.includes("12"));
+    assert.ok(p.rest.includes("#12"));
+  });
+
   test("text that is not fully a command runs nothing and says what was understood", () => {
     const p = parse("fix-up and frobnicate");
     assert.equal(p.kind, "ambiguous");
@@ -27,7 +34,7 @@ describe("workflow commands", () => {
     assert.equal(resolve(p, pr()).kind, "ambiguous");
     assert.equal(run("please merge it soon", pr()).kind, "ambiguous");
     assert.equal(run("weight 12, merge", pr()).kind, "ambiguous");
-    assert.equal(run("review and implement", { kind: "issue", workflow: null }).kind, "ambiguous");
+    assert.equal(run("review and implement", { kind: "pr", workflow: null }).kind, "ambiguous");
   });
 
   test("ordinary phrasing around command words reads as the command; hedged replies stay unread", () => {
@@ -37,11 +44,34 @@ describe("workflow commands", () => {
       ["LGTM, merge", "merge"], ["sounds good, merge it now", "merge"], ["fix-up and merge it", "fix-up,merge"], ["drop 2 and merge the rest", "drop 2,merge"],
       ["thanks, merge", "merge"], ["@autocraft-bot merge the PR", "merge"], ["go ahead", "yes"],
     ] as const) assert.equal(words(text), want, text);
-    for (const text of ["don't merge it", "merge it but not yet", "wait", "no", "merge it later", "merge if CI is green", "hold the merge", "merge it please soon"]) assert.equal(words(text), "ambiguous", text);
+    for (const text of ["don't merge it", "merge it but not yet", "no", "merge it later", "merge if CI is green", "yes?", "go ahead?", "merge it please soon"]) assert.equal(words(text), "ambiguous", text);
     const reply = (text: string, mention?: string) => { const r = resolve(parse(text), pr()); return r.kind === "ambiguous" ? replyLine(r, undefined, mention) : ""; };
     assert.match(reply("merge it but soon", "autocraft-bot"), /couldn't read/);
-    assert.match(reply("let's review sometime", "autocraft-bot"), /I read this as `review`\. Reply `@autocraft-bot yes`/);
+    assert.match(reply("let's review sometime", "autocraft-bot"), /I read this as `review`\. Reply `@autocraft-bot review`/);
     assert.match(reply("don't merge it"), /couldn't read.*Commands: review/);
+  });
+
+  test("a message that only says to hold is a hold; one that asks for something else or sets a condition is not", () => {
+    for (const text of ["no, stop", "hold for now", "let's wait", "wait wait", "hold the merge", "stop. I will look"]) assert.deepEqual(parse(text), { kind: "commands", items: [], parts: [{ word: "hold" }] }, text);
+    for (const text of ["don't stop", "stop. merge", "hold if CI fails", "hold. until Friday", "wait?", "hold, merge"]) assert.notEqual(run(text, pr()).kind, "run", text);
+  });
+
+  test("a yes beside a start word on a held item runs nothing: one goes on with the plan, the other drops it", () => {
+    const held = { kind: "pr" as const, workflow: null, held: started({ state: "stopped", approvedBy: "mira" }) };
+    for (const text of ["yes, merge", "yes and review", "go ahead and merge"]) {
+      const r = run(text, held);
+      assert.ok(r.kind === "ambiguous" && r.ambiguity.why === "conflict", text);
+    }
+    const alone = ["yes", "merge"].map((text) => run(text, held));
+    assert.deepEqual(alone.map((r) => r.kind === "run" && [r.run.resume, r.run.start]), [["steps", null], [null, "merge"]]);
+  });
+
+  test("a comment that goes on with a condition is ambiguous; thanks and reasons don't matter, and a hold stands", () => {
+    const kind = (body: string) => parseComment(body.replace("@", `@${SLUG} `), SLUG)?.kind;
+    for (const body of ["@yes\n\nbut wait for CI", "@merge\nafter #12 merges", "@merge\n\nThanks! Only when Dylan has looked.", "@merge\n\nPlease don't merge it before Friday", "@review\nafter CI"]) assert.equal(kind(body), "ambiguous", body);
+    // A condition every merge meets reads on a later line as it does beside the command.
+    for (const body of ["@merge\nafter CI is green", "@merge\nafter CI", "@merge\n\nThanks! Only when the tests pass."]) assert.equal(kind(body), "commands", body);
+    for (const body of ["@merge\n\nThanks, great work!", "@yes\nIt crashed when a file was empty. This does not.", "@merge\n\nFine.\n\nBut that is another issue.", "@hold\n\nuntil the release is out"]) assert.equal(kind(body), body.startsWith("@yes") ? "yes" : "commands", body);
   });
 
   test("combined commands and a weight word anywhere", () => {
@@ -98,6 +128,40 @@ describe("workflow commands", () => {
     assert.ok(fix.kind === "run" && fix.run.fix.join() === "1,3" && fix.run.drop.join() === "2" && fix.run.approve);
   });
 
+  test("fix with words that name no part is the fix-up's instruction; part words stay parts; a bare fix fixes the review's finding", () => {
+    const rec: Recommendation = { text: "The review says to hold it.", parts: { fix: [], drop: [] }, merges: false, again: "review" };
+    const held = started({ state: "blocked", blocker: "major-finding", approvedBy: "mira", plan: [part(1, "Export dialog title typo")], rec });
+    // What the person wrote after fix, up to where the next command starts, is the instruction; the merge and weight beside it stay commands.
+    for (const [text, said] of [
+      ["fix the UV seam normals, then merge", "the UV seam normals"],
+      ["fix: use the importer's welded normals for exports and merge", "use the importer's welded normals for exports"],
+      ["please fix the normals from `Mesh::compute_normals` and the tangents, urgent", "the normals from `Mesh::compute_normals` and the tangents"],
+      ["fix the crash from #12", "the crash from #12"],
+    ] as const) {
+      const r = run(text, pr(held));
+      assert.ok(r.kind === "run" && r.run.again === "fixup" && r.run.instruction?.text === said && !r.run.instruction.review, `${text}: ${JSON.stringify(r)}`);
+      assert.ok(r.run.merges, "the approval carries on");
+      assert.ok(r.run.fix.includes(1), "with the parts the plan still has");
+    }
+    assert.deepEqual((parse("fix the crash from #12", { repo: "photocraft" }) as { items: unknown[] }).items, [], "an item inside the words is no target");
+    // Words that match a part, part numbers and bare fixes are what they were.
+    const typo = run("fix the title typo", pr(held));
+    assert.ok(typo.kind === "run" && typo.run.instruction === null && typo.run.fix.join() === "1");
+    for (const text of ["fix 1 and 2, drop 3, then merge", "fix the second one and merge", "fix all but 2", "fix it and merge", "fix them"]) {
+      const p = parse(text);
+      assert.ok(p.kind === "commands" && p.parts.every((x) => !("text" in x) || !x.text), text);
+    }
+    // Negations, hedges and questions inside the words leave the message unread.
+    for (const text of ["fix the normals so they don't split", "maybe fix the normals", "fix the normals?", "fix the normals unless it is slow"]) assert.equal(parse(text).kind, "ambiguous", text);
+    // A bare fix where the review lists no fix: its finding is the instruction, and without one nothing runs.
+    const finding = started({ ...held, plan: [], rec: { ...rec, finding: "Exports recompute normals without welding vertices split at UV seams." } });
+    const bare = run("fix it", pr(finding));
+    assert.ok(bare.kind === "run" && bare.run.instruction?.review && /UV seams/.test(bare.run.instruction.text));
+    const none = run("fix", pr(started({ ...held, plan: [] })));
+    assert.ok(none.kind === "ambiguous" && none.ambiguity.why === "nothing-to-fix");
+    assert.match(replyLine(none), /nothing to fix/);
+  });
+
   test("merge is the merge queue on an unstarted pull request and approval on a started item", () => {
     const fresh = run("merge", pr());
     assert.ok(fresh.kind === "run" && fresh.run.start === "merge" && fresh.run.approve);
@@ -106,11 +170,78 @@ describe("workflow commands", () => {
     assert.equal(run("merge", { kind: "issue", workflow: null }).kind, "refused");
   });
 
+  test("the word merge approves a recommendation without the review it would run again; a yes runs it", () => {
+    const rec: Recommendation = { text: "Review it again, then merge.", parts: { fix: [], drop: [] }, merges: true, again: "review" };
+    const wf = started({ state: "blocked", blocker: "failed-twice", rec, recAt: "2026-11-24T10:00:00Z" });
+    const merge = run("merge", pr(wf)), yes = run("yes", pr(wf));
+    assert.ok(merge.kind === "run" && merge.run.again === null && merge.run.approve && merge.run.answers);
+    assert.ok(yes.kind === "run" && yes.run.again === "review" && yes.run.approve);
+    // A question of the implementation is answered as a yes answers it.
+    const answer = { question: { implementation: 1, round: 1 }, option: "retry" };
+    const asked = run("merge", { kind: "issue", workflow: started({ kind: "issue", entry: "implement", state: "recommending", rec: { text: "Try again.", parts: { fix: [], drop: [] }, merges: true, answer } }) });
+    assert.ok(asked.kind === "run" && asked.run.pick?.option === "retry" && asked.run.approve);
+  });
+
+  test("nothing merges past the pre-merge review's defects: merge, and dropping their last part, are refused", () => {
+    const stopped = (parts: number[]) => started({
+      state: "blocked", blocker: "major-finding", blockerParams: { premerge: parts }, plan: [part(1, "a"), part(2, "b")], approvedBy: "mira", recAt: "2026-11-24T10:00:00Z",
+      rec: { text: "Fix them.", parts: { fix: parts, drop: [] }, merges: true, ...(parts.length ? {} : { again: "review" as const }) },
+    });
+    for (const [text, parts] of [["merge", []], ["merge", [1, 2]], ["drop 1 and 2, merge", [1, 2]], ["drop 1 and 2", [1, 2]]] as const) {
+      const r = run(text, pr(stopped([...parts])));
+      assert.ok(r.kind === "refused" && r.refusal.why === "premerge-defects", text);
+    }
+    const one = run("drop 2, merge", pr(stopped([1, 2])));
+    assert.ok(one.kind === "run" && one.run.fix.join() === "1" && one.run.again === "fixup");
+  });
+
   test("yes needs an open recommendation, and a yes to one ending in a merge approves it", () => {
     assert.equal(run("yes", pr(started())).kind, "ambiguous");
     const rec: Recommendation = { text: "Fix both problems, then merge?", parts: { fix: [1, 2], drop: [] }, merges: true };
     const r = run("LGTM, thanks!", pr(started({ state: "recommending", rec, plan: [part(1, "a"), part(2, "b")] })));
     assert.ok(r.kind === "run" && r.run.approve && r.run.answers && r.run.fix.join() === "1,2");
+  });
+
+  test("a close names its reason; the item it duplicates is no item of the command", () => {
+    const of = (text: string, repo?: string) => { const p = parse(text, { slug: SLUG, ...(repo && { repo }) }); return p.kind === "commands" ? [describe_(p.parts, p.items)] : p.kind; };
+    for (const [text, want] of [
+      ["close", "close"], ["close it as completed", "close as completed"], ["close not planned", "close as not planned"], ["@autocraft-bot close this as not planned.", "close as not planned"],
+      ["close duplicate of #12", "close as duplicate of #12"], ["close as a duplicate of storytold/deckcraft#3", "close as duplicate of storytold/deckcraft#3"],
+      ["close as duplicate of https://github.com/storytold/deckcraft/issues/3", "close as duplicate of storytold/deckcraft#3"],
+      ["close photocraft#15 as duplicate of #12", "close as duplicate of #12: photocraft#15"], ["close as duplicate of #12: #15 #16", "close as duplicate of #12: photocraft#15 photocraft#16"],
+    ] as const) {
+      assert.deepEqual(of(text, "photocraft"), [want], text);
+      assert.deepEqual(of(want, "photocraft"), [want], "the canonical text reads back as itself");
+    }
+    for (const text of ["close as duplicate", "close as duplicate of the other one", "close as wontfix", "don't close as completed", "close as completed and not planned", "close as duplicate of #0"]) assert.equal(of(text, "photocraft"), "ambiguous", text);
+    const r = run("close as not planned, merge", pr());
+    assert.equal(r.kind === "ambiguous" && r.ambiguity.why, "conflict");
+    const dup = run("close as duplicate of #12", { kind: "issue", workflow: null });
+    assert.deepEqual(dup.kind === "run" && [dup.run.end, dup.run.close], ["close", { as: "duplicate", of: { repo: null, number: 12 } }]);
+  });
+
+  test("hold works on any item that is not held yet; resume and yes only on a held one", () => {
+    const held: ItemState = { ...pr(), held: started({ state: "stopped", stoppedBy: "mira", stoppedAt: "2026-11-24T09:30:00Z", blockerParams: { held: {} } }) };
+    for (const s of [pr(), pr(started()), { ...held, closing: true }]) assert.equal(run("hold", s).kind, "run");
+    assert.equal(run("hold", held).kind, "refused");
+    for (const text of ["resume", "continue", "yes", "go", "resume, urgent"]) {
+      const r = run(text, held);
+      assert.ok(r.kind === "run" && r.run.resume === "steps", text);
+    }
+    assert.equal(run("resume", pr()).kind, "refused");
+    assert.equal(run("resume, then merge", held).kind, "ambiguous");
+    const start = run("merge", held);
+    assert.ok(start.kind === "run" && start.run.start === "merge", "a start command starts it as ever");
+  });
+
+  test("a message that only says to wait is a hold; one that asks for something else runs nothing", () => {
+    for (const text of ["hold", "stop", "pause", "wait", "Hold on.", "not yet", "ok, wait please", "please stop", "hold off"]) {
+      assert.deepEqual(parse(text), { kind: "commands", items: [], parts: [{ word: "hold" }] }, text);
+    }
+    for (const text of ["merge after CI, wait", "wait for #12, then merge", "don't hold", "hold the merge until Friday", "stop merging, fix 1"]) {
+      const p = parse(text, { repo: "app" });
+      assert.notEqual(p.kind === "ambiguous" ? "nothing" : resolve(p, pr(started())).kind, "run", text);
+    }
   });
 
   test("a weight word alone needs a started item", () => {

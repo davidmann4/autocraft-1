@@ -1,18 +1,15 @@
 import type { FeatureModule } from "../../registry/types";
 import { lazyView } from "../../registry/lazyView";
-import { RobotIcon } from "@phosphor-icons/react";
 
 const AgentsView = lazyView(() => import("./views"), "AgentsView");
 const DetailPanel = lazyView(() => import("./views"), "DetailPanel");
-const FlowRunning = lazyView(() => import("./views"), "FlowRunning");
 const PhoneAgents = lazyView(() => import("./views"), "PhoneAgents");
 const ModelQueueView = lazyView(() => import("./queue"), "ModelQueueView");
+const TranscriptPage = lazyView(() => import("./transcript"), "TranscriptPage");
 
 export const agentsModule: FeatureModule = {
   id: "agents",
   permission: "viewer",
-  nav: { label: "Model calls", icon: RobotIcon, to: "/agents" },
-  slots: [{ slot: "flow.panel", order: 10, component: FlowRunning }],
   routes: [
     {
       path: "agents/:id?",
@@ -25,6 +22,11 @@ export const agentsModule: FeatureModule = {
           { id: "run", title: "Run", component: DetailPanel, defaultSize: 38, minSize: 24, collapsible: true },
         ],
       },
+    },
+    {
+      path: "agents/:id/transcripts/:tid",
+      permission: "staff",
+      view: { id: "agent-transcript", title: "Transcript", panels: [{ id: "main", title: "Transcript", component: TranscriptPage, defaultSize: 100 }] },
     },
     { path: "model-queue", view: { id: "model-queue", title: "Model call queue", panels: [{ id: "main", title: "Model call queue", component: ModelQueueView, defaultSize: 100 }] } },
   ],

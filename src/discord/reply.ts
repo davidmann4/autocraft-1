@@ -5,6 +5,7 @@ import { publicRepoNames } from "../public/status.ts";
 import { formButtonId } from "./issue-draft.ts";
 import { trackedRepos } from "./store.ts";
 import type { Db } from "../db/index.ts";
+import { loadChannelDefaults } from "../data/discord/index.ts";
 
 const TITLE_CHARS = 80;
 /** Discord refuses message content over 2,000 characters; matches that don't fit are left out with their buttons. */
@@ -16,8 +17,7 @@ export const plain = (s: string): string => s.replace(/[[\]()<>*_`~|\\#:@]/g, " 
 
 /** The repo whose new-issue page the button opens: the channel's setting (a thread uses its parent's), else the top result's, else the only public tracked repo. Never a private repo. */
 export async function fileRepoUrl(db: Db, channelId: string | undefined, matches: Match[]): Promise<string | null> {
-  const set = channelId === undefined ? undefined : (await db.get(db.k.selectFrom("discord_channels as c").leftJoin("discord_channels as p", "p.channel_id", "c.parent_id")
-    .select((eb) => eb.fn.coalesce("c.default_repo", "p.default_repo").as("r")).where("c.channel_id", "=", channelId)))?.r;
+  const set = channelId === undefined ? undefined : (await loadChannelDefaults(db, [channelId])).get(channelId)?.defaultRepo;
   const names = new Set(await publicRepoNames(db));
   const tracked = (await trackedRepos(db)).filter((t) => names.has(t.name));
   const name = (set && names.has(set) ? set : null) ?? (matches[0] && names.has(matches[0].repo) ? matches[0].repo : null) ?? (tracked.length === 1 ? tracked[0]!.name : null);

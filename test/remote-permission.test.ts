@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { appPermission, clearPermissionCache } from "../src/remote/permission.ts";
 import { SCRATCH } from "./scratch.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb } from "./helpers/raw-db.ts";
 
 mkdirSync(SCRATCH, { recursive: true });
 

@@ -3,50 +3,40 @@
 // GitHub link. Coverage is read when it is needed (appCovers), never stored. Sync, the pipeline and the bot's search never
 // read this table. The one write such a repo gets is the bot's new issue and its label (guardBotFiling in src/core/guard.ts).
 import { execFile } from "node:child_process";
-import { audit } from "../dash/audit.ts";
 import { OWNER } from "../owners.ts";
 import { listRepoOwner, ownerAllowed } from "../github/allowed-owners.ts";
 import { appCoverage, githubIdentity } from "../github/identity.ts";
 import { AppReadError, readEnv } from "../github/read.ts";
 import { publicRepoNames } from "../public/status.ts";
 import { trackedRepos } from "./store.ts";
+import { loadReleaseAppNames, loadRepos } from "../data/mirror/index.ts";
+import { loadTrackedRepos } from "../data/control/index.ts";
+import { botRepoOf, listFilingRepos, listHiddenRepos, loadFilingState, offeredRepos, removeFilingRepo as removeFiling, saveFilingRepo, setHiddenRepos, type BotRepo, type FilingRepo } from "../data/discord/index.ts";
 import type { Db } from "../db/index.ts";
 
 export class FilingRepoError extends Error {}
 
-export type FilingRepo = { owner: string; name: string; addedBy: string; addedAt: string };
+export type { BotRepo, FilingRepo };
 /** How the bot files into a filing-only repo: "submit" when the GitHub App covers it (Submit for me), else "link" (only the GitHub link). */
 export type FilingMode = "submit" | "link";
-/** A repo the bot offers: a public tracked repo, or a filing-only one. */
-export type BotRepo = { owner: string; name: string; filingOnly: boolean };
 
 const NAME = /^[A-Za-z0-9._-]{1,100}$/;
 /** At most this many, so the bot's app select (25 options) keeps room for the tracked repos. */
 export const FILING_MAX = 10;
 
-export async function filingRepos(db: Db): Promise<FilingRepo[]> {
-  return await db.all(db.k.selectFrom("discord_filing_repos").select(["owner", "name", "added_by as addedBy", "added_at as addedAt"]).orderBy("owner").orderBy("name"));
-}
+export const filingRepos = async (db: Db): Promise<FilingRepo[]> => await listFilingRepos(db);
 
 /** Names of tracked repos an operator hid from the bot's repo select. */
-export async function hiddenRepoNames(db: Db): Promise<Set<string>> {
-  return new Set((await db.all(db.k.selectFrom("discord_hidden_repos").select("name"))).map((r) => r.name));
-}
+export const hiddenRepoNames = async (db: Db): Promise<Set<string>> => await listHiddenRepos(db);
 
 /** The repos the bot offers, by name: the public tracked repos that are not hidden, then the filing-only ones. A tracked repo of the same name wins. */
 export async function botRepos(db: Db): Promise<BotRepo[]> {
-  const hidden = await hiddenRepoNames(db);
-  const pub = new Set((await publicRepoNames(db)).filter((n) => !hidden.has(n)));
-  const tracked = await trackedRepos(db);
-  const names = new Set(tracked.map((t) => t.name.toLowerCase()));
-  return [
-    ...tracked.filter((t) => pub.has(t.name)).map((t) => ({ owner: t.owner, name: t.name, filingOnly: false })),
-    ...(await filingRepos(db)).filter((f) => !names.has(f.name.toLowerCase())).map((f) => ({ owner: f.owner, name: f.name, filingOnly: true })),
-  ].sort((a, b) => a.name.localeCompare(b.name));
+  const [state, publicNames, tracked] = await db.together(() => Promise.all([loadFilingState(db), publicRepoNames(db), trackedRepos(db)]));
+  return offeredRepos({ tracked, publicNames, hidden: state.hidden, filing: state.filing });
 }
 
 export async function botRepo(db: Db, name: string): Promise<BotRepo | null> {
-  return (await botRepos(db)).find((r) => r.name === name) ?? null;
+  return botRepoOf(await botRepos(db), name) ?? null;
 }
 
 /** What adding needs to know of a repo on GitHub; null when it does not exist or cannot be read. */
@@ -97,19 +87,20 @@ export async function addFilingRepo(db: Db, by: string, input: string, deps: { r
   if (!facts.hasIssues) throw new FilingRepoError(`${owner}/${name} has issues turned off.`);
   if (facts.archived) throw new FilingRepoError(`${owner}/${name} is archived.`);
   if (!await ownerAllowed(db, owner)) throw new FilingRepoError(`${owner} is not an allowed owner of the GitHub App.`);
-  const tracked = await db.get(db.k.selectFrom("main.tracked_repos").select("name").where((eb) => eb(eb.fn("lower", ["name"]), "=", name.toLowerCase())));
-  if (tracked) throw new FilingRepoError(`${tracked.name} is a tracked repo; the bot offers it while it is public.`);
-  const known = await db.get(db.k.selectFrom("main.repos").select(["name", "owner"]).where((eb) => eb(eb.fn("lower", ["name"]), "=", name.toLowerCase())));
-  if (known && known.owner.toLowerCase() !== owner.toLowerCase()) throw new FilingRepoError(`${name} is already known under ${known.owner}; repo names are unique across owners.`);
-  const listed = await db.get(db.k.selectFrom("discord_filing_repos").select(["owner", "name"]).where((eb) => eb(eb.fn("lower", ["name"]), "=", name.toLowerCase())));
+  const lower = name.toLowerCase();
+  const [tracked, repos, filing] = await db.together(() => Promise.all([loadTrackedRepos(db), loadRepos(db, { all: true }), listFilingRepos(db)]));
+  const trackedName = [...tracked.keys()].find((n) => n.toLowerCase() === lower);
+  if (trackedName) throw new FilingRepoError(`${trackedName} is a tracked repo; the bot offers it while it is public.`);
+  const known = [...repos.values()].find((r) => r.name.toLowerCase() === lower);
+  if (known && known.owner && known.owner.toLowerCase() !== owner.toLowerCase()) throw new FilingRepoError(`${name} is already known under ${known.owner}; repo names are unique across owners.`);
+  const listed = filing.find((f) => f.name.toLowerCase() === lower);
   if (listed) throw new FilingRepoError(`${listed.owner}/${listed.name} is already on the list.`);
   const c = await appCoverage(owner, name, deps.mint);
   const mode: FilingMode = c.kind === "covered" ? "submit" : "link";
-  const row = { owner, name, added_by: by, added_at: new Date().toISOString() };
-  await db.run(db.k.insertInto("discord_filing_repos").values(row));
-  await audit(db, by, "discord-filing-add", name, { owner, mode, ...(c.kind !== "covered" && { why: c.why }) });
+  const at = new Date().toISOString();
+  await saveFilingRepo(db, { owner, name, by, at, audit: { mode, ...(c.kind !== "covered" && { why: c.why }) } });
   await listRepoOwner(db, by, owner, "filing");
-  return { owner, name, addedBy: by, addedAt: row.added_at, mode, ...(c.kind !== "covered" && { why: c.why }) };
+  return { owner, name, addedBy: by, addedAt: at, mode, ...(c.kind !== "covered" && { why: c.why }) };
 }
 
 /** How long a coverage reading is kept: one Discord session or Settings visit asks GitHub once per repo. */
@@ -141,8 +132,13 @@ export const appCovers = coverageReader();
 
 /** The filing-only repos with how the bot files into each now: Submit for me needs the app identity and the app's coverage; `why` says why a repo is link-only. */
 export async function filingReposWithMode(db: Db, covers: (owner: string, name: string) => Promise<CoverageReading> = appCovers): Promise<(FilingRepo & { mode: FilingMode; why: string | null })[]> {
-  const app = await githubIdentity(db) === "app";
-  return await Promise.all((await filingRepos(db)).map(async (r) => {
+  const [app, filing] = await db.together(() => Promise.all([githubIdentity(db).then((i) => i === "app"), listFilingRepos(db)]));
+  return await modesOf(filing, app, covers);
+}
+
+/** `filingReposWithMode` over a list already loaded. */
+export async function modesOf(filing: FilingRepo[], app: boolean, covers: (owner: string, name: string) => Promise<CoverageReading> = appCovers): Promise<(FilingRepo & { mode: FilingMode; why: string | null })[]> {
+  return await Promise.all(filing.map(async (r) => {
     const c: CoverageReading = app ? await covers(r.owner, r.name) : { covered: false, why: "Filing from Discord needs the GitHub App identity." };
     return { ...r, mode: c.covered ? "submit" as const : "link" as const, why: c.why };
   }));
@@ -150,12 +146,7 @@ export async function filingReposWithMode(db: Db, covers: (owner: string, name: 
 
 /** Removes a filing-only repo (`owner/name` or the bare name). Returns whether it was on the list. Audited as `discord-filing-remove`. */
 export async function removeFilingRepo(db: Db, by: string, input: string): Promise<boolean> {
-  const name = input.trim().split("/").pop() ?? "";
-  const row = await db.get(db.k.selectFrom("discord_filing_repos").select(["owner", "name"]).where((eb) => eb(eb.fn("lower", ["name"]), "=", name.toLowerCase())));
-  if (!row) return false;
-  await db.run(db.k.deleteFrom("discord_filing_repos").where("name", "=", row.name));
-  await audit(db, by, "discord-filing-remove", row.name, { owner: row.owner });
-  return true;
+  return !!await removeFiling(db, by, input.trim().split("/").pop() ?? "");
 }
 
 /** The bot's select holds this many repos. */
@@ -164,19 +155,20 @@ export type OfferRow = { name: string; label: string; offered: boolean };
 
 /** Every public tracked repo (app label else name) with whether the bot offers it, and how many places of the select the offered repos plus the filing-only ones fill. */
 export async function offerState(db: Db): Promise<{ repos: OfferRow[]; used: number; max: number }> {
-  const hidden = await hiddenRepoNames(db);
-  const names = await publicRepoNames(db);
-  const labels = names.length ? await db.all(db.k.selectFrom("release_apps").select(["repo", "name"]).where("repo", "in", names)) : [];
-  const label = new Map(labels.map((l) => [l.repo, l.name]));
-  const repos = names.map((name) => ({ name, label: label.get(name) ?? name, offered: !hidden.has(name) })).sort((a, b) => a.label.localeCompare(b.label));
-  return { repos, used: Math.min(BOT_SELECT_MAX, (await botRepos(db)).length), max: BOT_SELECT_MAX };
+  const [state, names, tracked] = await db.together(() => Promise.all([loadFilingState(db), publicRepoNames(db), trackedRepos(db)]));
+  return offerOf({ ...state, publicNames: names, tracked, labels: await loadReleaseAppNames(db, names) });
+}
+
+/** `offerState` over lists already loaded. */
+export function offerOf(o: { filing: FilingRepo[]; hidden: ReadonlySet<string>; publicNames: string[]; tracked: { name: string; owner: string }[]; labels: ReadonlyMap<string, string> }): { repos: OfferRow[]; used: number; max: number } {
+  const repos = o.publicNames.map((name) => ({ name, label: o.labels.get(name) ?? name, offered: !o.hidden.has(name) })).sort((a, b) => a.label.localeCompare(b.label));
+  const offered = offeredRepos({ tracked: o.tracked, publicNames: o.publicNames, hidden: o.hidden, filing: o.filing });
+  return { repos, used: Math.min(BOT_SELECT_MAX, offered.length), max: BOT_SELECT_MAX };
 }
 
 /** Offers or hides a public tracked repo in the bot's select. Returns false when the name is not one. Audited as `discord-offer-show` / `discord-offer-hide`. */
 export async function setOffered(db: Db, by: string, name: string, offered: boolean): Promise<boolean> {
   if (!(await publicRepoNames(db)).includes(name)) return false;
-  if (offered) await db.run(db.k.deleteFrom("discord_hidden_repos").where("name", "=", name));
-  else await db.run(db.k.insertInto("discord_hidden_repos").values({ name, hidden_by: by, hidden_at: new Date().toISOString() }).onConflict((oc) => oc.column("name").doNothing()));
-  await audit(db, by, offered ? "discord-offer-show" : "discord-offer-hide", name);
+  await setHiddenRepos(db, by, [{ name, hidden: !offered, at: new Date().toISOString() }]);
   return true;
 }

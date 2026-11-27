@@ -1,50 +1,42 @@
-// Stage 6, Integrate (first part): merges the queued PRs that may merge, one
-// at a time, through the configured merge command, and asks a "Merge this PR?"
-// decision for taken PRs the merge rule doesn't cover. No model calls.
+// Stage 6, Integrate (first part): merges the queued PRs that may merge, one at a time, through the configured
+// merge command. No model calls.
 //
 //   autocraft-server merge --repo R [--limit N] [--apply]
 //
-// Without --apply it is a dry run: it reads the local tables only, calls
-// nothing and writes nothing.
-import { scopeRepos } from "../pilot.ts";
-import * as kx from "../db/kx.ts";
-import { FAST_FLOOR, workScores } from "../fasttrack.ts";
-import { mergeHeld } from "./holds.ts";
-import { backlogHeld, duplicateHeld } from "../dupes/held.ts";
+// Without --apply it is a dry run: it reads the local tables only, calls nothing and writes nothing.
 import { baseRefusal, recordLiveBase } from "./base.ts";
-import { mergeApprovalOf } from "./approval.ts";
-import { markReread } from "./ci-approval.ts";
+import { inRepoScope } from "../runner/scope.ts";
+import { mergeVerdicts } from "./approval.ts";
+import { DRAFT_REFUSAL } from "./safe-merge.ts";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { audit } from "../dash/audit.ts";
-import { actionable, ask, factsOf, getDecision } from "../decisions.ts";
+import { mayRun } from "../core/authority.ts";
+import { ciAt, type CiState } from "../core/evidence.ts";
 import { CLI_BY, type By } from "../core/gates.ts";
 import { guard, guardRepo, liveOf } from "../core/guard.ts";
 import { planned } from "../core/select.ts";
+import { NO_WORKFLOW_SCORE } from "../core/work-score.ts";
 import { claimForWork } from "../github/claim.ts";
 import { pipelineMe } from "../github/pipeline-account.ts";
 import { mergeViaCommand, MERGE_RECORDED_ENV, type Writer } from "../github/write.ts";
-import { Client, markMerged, type Querier } from "../mirror.ts";
-import { refreshChecks } from "../review/checks.ts";
+import { Client, type Querier } from "../mirror.ts";
+import { refreshChecks, type PrChecks } from "../review/checks.ts";
 import { readGate } from "./changes-requested.ts";
 import { liveGateChecked } from "../review/discussion.ts";
-import { fillReviewSummaries, reviewText } from "../review/summary.ts";
-import { verificationOf } from "../verify/results.ts";
-import { TIER_LABEL } from "../whitelist.ts";
-import { closeMergedQuestions, withdrawBlockedQuestions, setAsideSupersededQuestions, withdrawGroupedQuestions, withdrawOtherHeadQuestions } from "./withdraw.ts";
-import { buildQueue, UNSURE_REASON, PREMERGE_DEFECT_REASON, PREMERGE_UNSURE_REASON, PREMERGE_FAILED_REASON, ciAllows, countStates, HEAD_FACT, MERGE_OPTIONS, mergeDecisionId, QUEUE_STATES, VERIFY_UNAVAILABLE, verifyAllows, type QueueEntry } from "./queue.ts";
+import { buildQueue, countStates, QUEUE_STATES, ciAllows, verifyAllows, type QueueEntry } from "./queue.ts";
 
 export { buildQueue, countStates, QUEUE_STATES, type QueueEntry, type QueueState } from "./queue.ts";
 import { envVar } from "../env.ts";
-import { effectiveCi, optionalChecks } from "../optional-checks.ts";
+import { optionalChecks } from "../optional-checks.ts";
 import { jobItem } from "../runner/job-items.ts";
-import { sweepStaleAnswers } from "../answers/sweep.ts";
-import { verifyOverride } from "./verify-override.ts";
-import { askHoldDecisions } from "../act/index.ts";
-import { authFailure, isWaiting, laneForDecision, markExecDone, noWriteReason, setExecState, SIGN_IN_REASON, type Lane, type LaneDeps } from "../github/user-lane.ts";
+import { authFailure, laneForOperator, noWriteReason, SIGN_IN_REASON, type Lane, type LaneDeps } from "../github/user-lane.ts";
 import { ownerOf } from "../owners.ts";
 import { readEnvFor } from "../github/read.ts";
-import { filterSeq, forEachSeq, mapSeq } from "../async-seq.ts";
+import { addAudit } from "../data/control/index.ts";
+import { loadRunApprovals, recordAttempts, verificationOf } from "../data/merge/index.ts";
+import type { AttemptInput } from "../data/merge/types.ts";
+import { addStageEventsOnce } from "../data/planner/index.ts";
+import { loadActions, loadPrWorkflows, loadWorkScores, queueActions, saveActions, type ActionState } from "../data/workflow/index.ts";
 import type { Db } from "../db/index.ts";
 import { openDb } from "../db/open.ts";
 
@@ -93,8 +85,6 @@ export type MergeSummary = {
   states: Record<string, number>;
   /** PRs tried (or, in a dry run, that would be). */
   attempted: string[]; merged: string[]; refused: { ref: string; reason: string }[];
-  /** Merge? decisions asked (or that would be). */
-  asked: string[];
 };
 
 export async function spawnRun(cmd: string, args: string[], env?: Record<string, string>, replaceEnv = false): Promise<CommandResult> {
@@ -161,76 +151,10 @@ export async function prInfo(q: Querier, repo: string, n: number): Promise<PrInf
 export const methodOf = (info: PrInfo): "squash" | "merge" => (info.authors > 1 || info.commits > 100 ? "merge" : "squash");
 
 
-// ---- decisions ---------------------------------------------------------------
-
-/** The Merge? question for a take PR outside the rule; its facts carry the head commit. */
-export function mergeQuestion(e: QueueEntry, why: string | null = null): Record<string, unknown> & { id: string } {
-  const fixes = e.fixes ? `; ${e.fixes} fix${e.fixes === 1 ? "" : "es"} listed` : "";
-  const pre = [
-    ...(e.premerge?.defects ?? []).filter(() => e.outsideRule.includes(PREMERGE_DEFECT_REASON)).map((f) => `pre-merge defect: ${f.file}:${f.line} ${f.title}: ${f.scenario}`),
-    ...(e.premerge?.unknownClaims ?? []).filter(() => e.outsideRule.includes(PREMERGE_UNSURE_REASON)).map((c) => `pre-merge could not settle a claim of the description: ${c.claim} (${c.evidence})`),
-    ...(e.outsideRule.includes(PREMERGE_UNSURE_REASON) && !e.premerge?.unknownClaims.length ? ["pre-merge could not check the description's claims list"] : []),
-    ...(e.outsideRule.includes(PREMERGE_FAILED_REASON) ? [`pre-merge review failed: ${(e.premerge?.error ?? "no review stored").replace(/^retry: /, "")}`] : []),
-  ];
-  const where = `size ${e.size}, label ${e.label ?? "not settled"}; author: ${e.author ?? "unknown"}, ${TIER_LABEL[e.tier]}`;
-  const ci = `CI ${e.noCi ? "none: the repo has no CI checks" : e.ci}, mergeable ${e.mergeable.toLowerCase()}`;
-  const verify = e.verify?.state === VERIFY_UNAVAILABLE
-    ? `not verified: ${e.verify.summary ?? "Verify cannot build this repo"}`
-    : `verify: ${e.verify ? `${e.verify.kind ?? "unknown"}, ${e.verify.state}${e.verify.note ? `: ${e.verify.note}` : ""}` : "none"}`;
-  // A question has at most five facts: pre-merge lines take the place of the separate size, CI and verify lines, and defects beyond the first share one fact.
-  const facts = pre.length
-    ? [`${where}; ${ci}; ${verify}`, `review: ${e.verdict}: ${e.reason}${fixes}`, pre[0]!, ...(pre.length > 1 ? [pre.slice(1).join(" | ")] : []), `${HEAD_FACT}${e.head}`]
-    : [where, ci, verify, `review: ${e.verdict}: ${e.reason}${fixes}`, `${HEAD_FACT}${e.head}`];
-  return {
-    id: mergeDecisionId(e.repo, e.number, e.head), kind: "merge", repo: e.repo, number: e.number,
-    question: "Merge this PR?",
-    context: `The review says take, but the merge-without-asking rule doesn't cover it: ${e.outsideRule.join(", ")}.`,
-    facts,
-    options: Object.values(MERGE_OPTIONS).map((o) => ({ ...o })),
-    // A recommendation always comes with the review's reason for it.
-    ...(e.outsideRule.includes(UNSURE_REASON) || e.outsideRule.includes(PREMERGE_UNSURE_REASON) || e.outsideRule.includes(PREMERGE_DEFECT_REASON) || e.outsideRule.includes(PREMERGE_FAILED_REASON) || !why ? {} : { recommended: "merge", recommended_reason: why }),
-    asked_by: ACTOR,
-  };
-}
-
-/** The Merge? question with the review's one-sentence reason as the reason of its recommendation. */
-const questionWithReason = (db: Db) => async (e: QueueEntry) => mergeQuestion(e, (await reviewText(db, e.repo, e.number, e.head))?.why ?? null);
-
-/** The head commit an answered Merge? decision was asked at, from its facts. */
-export async function answeredHead(db: Db, id: string): Promise<string | null> {
-  const d = await getDecision(db, id);
-  const f = d ? factsOf(d).find((x) => x.startsWith(HEAD_FACT)) : undefined;
-  return f ? f.slice(HEAD_FACT.length).trim() : null;
-}
-
-
-/** Asks the Merge? questions of the entries and sets aside the PR's unanswered questions at its other heads. */
-async function askDue(db: Db, due: QueueEntry[], at: string, log: (line: string) => void = console.log): Promise<string[]> {
-  if (!due.length) return [];
-  const qs = await mapSeq(due, questionWithReason(db));
-  await ask(db, qs.map((q) => ({ ...q, asked_at: at })));
-  await forEachSeq(due, async (e, i) => await jobItem(db, e.repo, e.number, "asked Merge?", log, qs[i]!.id));
-  for (const e of due) await withdrawOtherHeadQuestions(db, e.repo, e.number, e.head, at);
-  await setAsideSupersededQuestions(db, at);
-  return qs.map((q) => q.id);
-}
-
-/**
- * Asks the Merge? decisions that are due in the given repos (default: all), whether or not the repo has
- * a merge approval or a PR the rule could merge. Writes decisions only, nothing to GitHub.
- */
-export async function askMergeDecisions(db: Db, opts: { repos?: string[]; run?: string | null; at?: string; log?: (line: string) => void } = {}): Promise<string[]> {
-  const repos = opts.repos && new Set(opts.repos);
-  const queue = await buildQueue(db, { merged: "exclude", ...(opts.run === undefined ? {} : { run: opts.run }) });
-  const asks = new Set((await planned(db, "ask-merge", { ...(opts.run === undefined ? {} : { run: opts.run }) })).filter((p) => !p.action.params?.hold && (!repos || repos.has(p.facts.repo))).map((p) => `${p.facts.repo}#${p.facts.number}`));
-  const due = queue.filter((e) => asks.has(`${e.repo}#${e.number}`));
-  const at = opts.at ?? new Date().toISOString();
-  await withdrawBlockedQuestions(db, queue.filter((e) => !repos || repos.has(e.repo)), at);
-  for (const r of repos ?? new Set(queue.map((e) => e.repo))) await withdrawGroupedQuestions(db, at, r);
-  const ids = await askDue(db, due, at, opts.log);
-  for (const r of repos ?? new Set((await planned(db, "ask-merge", {})).filter((p) => p.action.params?.hold).map((p) => p.facts.repo))) ids.push(...await askHoldDecisions(db, at, r));
-  await fillReviewSummaries(db, at);
-  return ids;
+/** CI of a PR whose checks were just read, by the planner's rule (ciAt): without the repo's optional checks, and pending while runs we approved are unfinished. */
+export async function ciNow(db: Db, repo: string, ch: PrChecks): Promise<CiState> {
+  const [optional, runs] = await db.together(() => Promise.all([optionalChecks(db, repo), loadRunApprovals(db, [{ repo, number: ch.number }])]));
+  return ciAt(ch, ch.head_oid, { optional, approvedRuns: runs.get(`${repo}#${ch.number}@${ch.head_oid}`)?.approved.length ?? 0 });
 }
 
 // ---- the step ----------------------------------------------------------------
@@ -242,71 +166,51 @@ export async function runMerge(db: Db, params: MergeParams, log: (line: string) 
   if (params.limit !== undefined && !(Number.isInteger(params.limit) && params.limit >= 0)) throw new Error("limit must be a whole number ≥ 0");
   const at = () => (deps?.now() ?? new Date()).toISOString();
   const runId = `merge-${repo}-${at().replace(/[-:]/g, "").slice(0, 15)}`;
-  if (!(await scopeRepos(db)).has(repo)) {
+  if (!await inRepoScope(db, repo, "work")) {
     log(`merge ${repo}: not in the pipeline scope; nothing done`);
-    return { runId, repo, dryRun, states: {}, attempted: [], merged: [], refused: [], asked: [] };
+    return { runId, repo, dryRun, states: {}, attempted: [], merged: [], refused: [] };
   }
   const d = deps ?? defaultDeps();
   // A PR in changes-requested is read live again each run: the mirror alone can block wrongly (the association is relative to the viewer) and a blocked PR never reaches the merge-time read.
-  if (!dryRun) {
-    for (const e of await buildQueue(db, { repo, merged: "exclude" })) if (e.state === "changes-requested") await readGate(db, d.querier, ownerOf(repo), repo, e.number, log);
-    // Set aside before the picks are made: a PR whose merge answer goes away here must not be picked and refused.
-    // A Merge? question open for a PR a maintainer has since blocked no longer applies.
-    const withdrawn = await withdrawBlockedQuestions(db, (await buildQueue(db, { repo })).filter((e) => e.state !== "merged"), at());
-    if (withdrawn) log(`  withdrew ${withdrawn} Merge? decision${withdrawn === 1 ? "" : "s"} of PRs with changes requested`);
-    await sweepStaleAnswers(db, at(), repo);
-    const grouped = await withdrawGroupedQuestions(db, at(), repo);
-    if (grouped) log(`  set aside ${grouped} Merge? decision${grouped === 1 ? "" : "s"} of PRs in a duplicate group`);
-  }
+  if (!dryRun) for (const e of await buildQueue(db, { repo, merged: "exclude" })) if (e.state === "changes-requested") await readGate(db, d.querier, ownerOf(repo), repo, e.number, log);
   const queue = await buildQueue(db, { repo });
   const open = queue.filter((e) => e.state !== "merged");
   const states = countStates(queue);
-  const scores = await workScores(db, repo);
-  const fast = (e: QueueEntry) => (scores.get(e.number) ?? 0) >= FAST_FLOOR;
-  const byRank = (a: QueueEntry, b: QueueEntry) => (scores.get(b.number) ?? -1) - (scores.get(a.number) ?? -1) || a.number - b.number;
-  // Fast-tracked PRs first, in the order added (their score falls with the order); then rule merges before answered ones, each by work score, unranked last.
-  const mergeDue = new Map((await planned(db, "merge", { repo })).map((p) => [p.facts.number, p.action.params?.singleOnly === true]));
-  let picks = open.filter((e) => mergeDue.has(e.number) && (!params.only || params.only(e)) && (!params.singleOnly || mergeDue.get(e.number))).sort((a, b) =>
-    fast(a) || fast(b) ? Number(fast(b)) - Number(fast(a)) || byRank(a, b) : a.path === b.path ? byRank(a, b) : a.path === "rule" ? -1 : 1);
-  // An answered merge that waits for its operator's token or access takes no slot of the limit; it comes back when retried.
-  picks = await filterSeq(picks, async (e) => !(e.path === "operator" && await isWaiting(db, e.decisionId)));
+  const by = params.by ?? CLI_BY;
+  const mays = (await planned(db, "merge", { repo, refused: true })).map((p) => ({ p, may: mayRun(p, by) }));
+  const due = mays.flatMap(({ p, may }) => (may.ok ? [p] : []));
+  const mergeDue = new Map(due.map((p) => [p.facts.number, { singleOnly: p.action.params?.singleOnly === true, verifyOverride: p.facts.verifyOverride }]));
+  const scores = await loadWorkScores(db, open.map((e) => ({ repo, number: e.number })));
+  const score = (e: QueueEntry) => scores.get(refOf(e)) ?? NO_WORKFLOW_SCORE;
+  // In work order (src/core/work-score.ts), unstarted PRs by number.
+  let picks = open.filter((e) => mergeDue.has(e.number) && (!params.only || params.only(e)) && (!params.singleOnly || mergeDue.get(e.number)!.singleOnly))
+    .sort((a, b) => score(b) - score(a) || a.number - b.number);
   if (params.limit !== undefined) picks = picks.slice(0, params.limit);
-  const askDueNow = new Set((await planned(db, "ask-merge", { repo })).filter((p) => !p.action.params?.hold).map((p) => p.facts.number));
-  const ask1 = open.filter((e) => askDueNow.has(e.number));
-  const summary: MergeSummary = { runId, repo, dryRun, states, attempted: [], merged: [], refused: [], asked: [] };
+  const summary: MergeSummary = { runId, repo, dryRun, states, attempted: [], merged: [], refused: [] };
   log(`merge ${repo}: ${queue.length} in the queue (${QUEUE_STATES.filter((s) => states[s]).map((s) => `${states[s]} ${s}`).join(", ") || "none"})`);
+  for (const { p, may } of mays) if (!may.ok) log(`  ${refOf(p.facts)}: left out: ${may.why.text}`);
 
   if (dryRun) {
     summary.attempted = picks.map(refOf);
-    summary.asked = ask1.map((e) => mergeDecisionId(e.repo, e.number, e.head));
-    for (const e of picks) log(`  would merge ${refOf(e)} at ${short(e.head)} (${e.path === "rule" ? "by the rule" : "operator answered merge"})`);
-    for (const e of ask1) log(`  would ask Merge? for ${refOf(e)}: ${e.outsideRule.join(", ")}`);
+    for (const e of picks) log(`  would merge ${refOf(e)} at ${short(e.head)} (${e.path === "rule" ? "by the rule" : "approved by a person"})`);
     log(`merge ${repo}: dry run, nothing called or written`);
     return summary;
   }
 
   // Every taken PR in the queue gets one `batched` stage row per head.
-  for (const e of open) {
-    if (!await db.get(db.k.selectFrom("stages").select((eb) => eb.lit(1).as("one")).where("repo", "=", e.repo).where("number", "=", e.number).where("stage", "=", "batched")
-      .where((eb) => kx.like(db, "note", eb.val(`queued at ${short(e.head)}%`))))) await db.run(db.k.insertInto("main.stages").values({ repo: e.repo, number: e.number, stage: "batched", at: at(), actor: ACTOR, note: `queued at ${short(e.head)}: ${e.state}` }));
-  }
-
-  if (ask1.length) {
-    summary.asked = await askDue(db, ask1, at(), log);
-    log(`  asked ${summary.asked.length} Merge? decision${summary.asked.length === 1 ? "" : "s"}`);
-  }
-  const holds = await askHoldDecisions(db, at(), repo);
-  if (holds.length) { summary.asked.push(...holds); log(`  asked ${holds.length} Hold decision${holds.length === 1 ? "" : "s"}`); }
-  await fillReviewSummaries(db, at());
+  const now = at();
+  await addStageEventsOnce(db, open.map((e) => ({ repo: e.repo, number: e.number, stage: "batched", at: now, actor: ACTOR, note: `queued at ${short(e.head)}: ${e.state}`, notePrefix: `queued at ${short(e.head)}` })));
 
   // What GitHub reported for the PR being tried, once known; a refusal records it so the autopilot retries only when it changes.
   let seen: { ci: string; mergeable: string } | null = null;
-  const saveAttempt = async (e: QueueEntry, method: string | null, outcome: "merged" | "refused", reason: string | null) =>
-    await db.run(db.k.insertInto("merges").values({ repo: e.repo, number: e.number, head_oid: e.head, run_id: runId, at: at(), path: e.path!, method, outcome, reason, ci: seen?.ci ?? e.ci, mergeable: seen?.mergeable ?? e.mergeable }));
+  const attempt = (e: QueueEntry, method: string | null, outcome: "merged" | "refused", reason: string | null): AttemptInput => ({
+    repo: e.repo, number: e.number, head: e.head, runId, at: at(), path: e.path === "rule" ? "rule" : "maintainer", method, outcome, reason,
+    ci: seen?.ci ?? e.ci, mergeable: seen?.mergeable ?? e.mergeable,
+    ...(outcome === "merged" ? { note: `${method ?? "merge"} at ${short(e.head)}${e.path === "rule" ? "" : ", approved by a person"}` } : {}),
+  });
   const refuse = async (e: QueueEntry, method: string | null, reason: string) => {
-    await saveAttempt(e, method, "refused", reason);
-    if (/action_required/.test(reason)) await markReread(db, e.repo, e.number, e.head);
-    await audit(db, ACTOR, "merge-refused", refOf(e), { run: runId, head: e.head, path: e.path, method, reason });
+    // A refusal for `action_required` also marks the head for a read of its workflow runs.
+    await recordAttempts(db, [attempt(e, method, "refused", reason)]);
     summary.refused.push({ ref: refOf(e), reason });
     log(`  ${refOf(e)}: refused: ${reason}`);
   };
@@ -314,39 +218,36 @@ export async function runMerge(db: Db, params: MergeParams, log: (line: string) 
   // One PR at a time; any error that isn't a refusal stops the run.
   for (const e of picks) {
     if (params.stopOnRefusal && summary.refused.length) break;
-    if (!await mergeApprovalOf(db, repo)) { log(`  merging in ${repo} is no longer approved; stopping`); break; }
-    if (await mergeHeld(db, repo, e.number)) { log(`  ${refOf(e)}: merge held since the queue was read; skipped`); continue; }
-    if (await backlogHeld(db, repo, e.number) || await duplicateHeld(db, repo, e.number)) { log(`  ${refOf(e)}: held since the queue was read; skipped`); continue; }
-    // An operator's Merge answer in a repo on the app's identity is made as that operator, with their token.
+    // Asked again now: a repo switch turned off or a workflow that stopped since the plan was made leaves the PR alone.
+    const may = (await mergeVerdicts(db, repo, [{ number: e.number, head: e.head }])).get(e.number)!;
+    if (!may.ok) { log(`  ${refOf(e)}: not merged: ${may.why.text}`); continue; }
+    // A merge a person approved is made as that person, with their token, in a repo on the app's identity.
     let lane: Lane | null = null;
-    if (e.path === "operator" && e.decisionId) {
-      const lr = await laneForDecision(db, d.lane, e.decisionId, [repo]);
+    if (may.as !== "app") {
+      const approver = may.as.slice("user:".length);
+      const lr = await laneForOperator(db, d.lane, approver, [repo]);
       if (lr && !("lane" in lr)) {
-        if (!("transient" in lr)) await setExecState(db, e.decisionId, lr.state, lr.reason);
+        if (!("transient" in lr)) await noteMergeAction(db, repo, e, approver, lr.state, lr.reason);
         log(`  ${refOf(e)}: ${"transient" in lr ? `not merged yet: ${lr.transient}` : `waiting: ${lr.reason}`}`);
         continue;
       }
-      if (lr) { lane = lr.lane; await setExecState(db, e.decisionId, "pending"); }
+      if (lr) { lane = lr.lane; await noteMergeAction(db, repo, e, approver, "pending", null); }
     }
     summary.attempted.push(refOf(e));
     seen = null;
     const [ch] = await refreshChecks(db, d.querier, repo, [e.number]);
     // GitHub often has no mergeable state yet right after a merge: end the round without a refusal on record.
     if (params.stopOnRefusal && summary.merged.length && ch?.state === "OPEN" && ch.mergeable === "UNKNOWN") { log(`  ${refOf(e)}: GitHub has not computed its mergeable state yet; left for the next round`); summary.attempted.pop(); break; }
-    if (ch) seen = { ci: await effectiveCi(db, repo, ch.overall ?? "none", ch.checks), mergeable: ch.mergeable ?? "UNKNOWN" };
     if (!ch) { await refuse(e, null, "GitHub returned no such PR"); continue; }
+    const ci = await ciNow(db, repo, ch);
+    seen = { ci, mergeable: ch.mergeable ?? "UNKNOWN" };
     if (ch.state !== "OPEN") { await refuse(e, null, `no longer open on GitHub (${ch.state.toLowerCase()})`); continue; }
     if (ch.head_oid !== e.head) { await refuse(e, null, `head moved from ${short(e.head)} to ${short(ch.head_oid)} since the review`); continue; }
+    // Not a refusal: the PR goes on once it is marked ready for review.
+    if (ch.is_draft) { log(`  ${refOf(e)}: a draft; not merged until it is marked ready for review`); continue; }
     const ver = await verificationOf(db, repo, e.number, ch.head_oid);
-    if (!verifyAllows(e.path, ver?.state, await verifyOverride(db, repo, e.number, ch.head_oid))) { await refuse(e, null, `verification at ${short(ch.head_oid)} is ${ver?.state ?? "missing"}, not passed`); continue; }
-    if (e.path === "operator") {
-      const still = (await actionable(db)).some((a) => a.id === e.decisionId && a.answer === MERGE_OPTIONS.merge.key);
-      if (!still) { await refuse(e, null, "the operator's merge answer is gone"); continue; }
-      const h = await answeredHead(db, e.decisionId!);
-      if (h !== ch.head_oid) { await refuse(e, null, `head moved since the operator's answer (${h ? short(h) : "no head recorded"} → ${short(ch.head_oid)})`); continue; }
-    }
-    const ci = await effectiveCi(db, repo, ch.overall, ch.checks);
-    if (!ciAllows(e.path, ci, e.noCi) || ch.mergeable !== "MERGEABLE") {
+    if (!verifyAllows(e.path, ver?.state, mergeDue.get(e.number)!.verifyOverride)) { await refuse(e, null, `verification at ${short(ch.head_oid)} is ${ver?.state ?? "missing"}, not passed`); continue; }
+    if (!ciAllows(ci) || ch.mergeable !== "MERGEABLE") {
       await refuse(e, null, `not ready at merge time: CI ${ci}, mergeable ${(ch.mergeable ?? "unknown").toLowerCase()}`);
       continue;
     }
@@ -354,60 +255,85 @@ export async function runMerge(db: Db, params: MergeParams, log: (line: string) 
     if (!info) { await refuse(e, null, "GitHub returned no such PR"); continue; }
     if (info.head !== e.head) { await refuse(e, null, `head moved from ${short(e.head)} to ${short(info.head)} since the review`); continue; }
     const baseWhy = await baseRefusal(db, repo, e.head, e.number, info.baseRef);
-    // A retargeted PR is not a refusal either: the mirror takes the new base, which makes the review stale, so it is reviewed again against it.
-    if (baseWhy) { await recordLiveBase(db, repo, e.number, e.head, info.baseRef); log(`  ${refOf(e)}: ${baseWhy}; reviewed again first`); continue; }
+    // A retargeted PR is not a refusal either: the mirror takes the live base. A review that read another one is stale then and made again;
+    // off the default branch the PR waits for a person.
+    if (baseWhy) { await recordLiveBase(db, repo, e.number, e.head, info.baseRef); log(`  ${refOf(e)}: ${baseWhy}; not merged`); continue; }
     // Not a refusal: no merges row, so the queue keeps the PR and takes it up again once it is reviewed again.
     // The same read checks for a maintainer's changes-requested review, whatever merge command runs next.
     const gate = await liveGateChecked(db, d.querier, repo, e.number, e.head, log);
     if (gate === null) continue;
     if (gate.blocked) { log(`  ${refOf(e)}: ${gate.blocked}; not merged`); continue; }
     if (gate.moved) {
-      await audit(db, ACTOR, "merge-held-for-discussion", refOf(e), { run: runId, head: e.head, path: e.path });
+      await addAudit(db, [{ login: ACTOR, action: "merge-held-for-discussion", target: refOf(e), details: { run: runId, head: e.head, path: e.path } }]);
       log(`  ${refOf(e)}: new comments or reviews since the final review; not merged, it is reviewed again first`);
       continue;
     }
-    // A hold may have been set during the calls above.
-    if (await mergeHeld(db, repo, e.number)) { log(`  ${refOf(e)}: merge held meanwhile; skipped`); summary.attempted.pop(); continue; }
-    const ag = await guardRepo(db, repo, "merge", params.by ?? CLI_BY);
+    const ag = await guardRepo(db, repo, "merge", by, undefined, { members: [may] });
     if ("refused" in ag) log(`  ${refOf(e)}: not assigned: ${ag.refused}`);
     else await claimForWork(w, ag, d.querier, repo, e.number, "pr", () => pipelineMe(log), { run: runId }, log);
     const method = methodOf(info);
-    const g = await guard(db, { repo, number: e.number }, { kind: "merge", head: e.head, ...(e.path === "operator" ? { decisionId: e.decisionId ?? undefined } : {}) }, params.by ?? CLI_BY, liveOf(db, d.querier));
+    const g = await guard(db, { repo, number: e.number }, { kind: "merge", head: e.head }, by, liveOf(db, d.querier));
     if ("refused" in g) {
       // Not recorded as a merge attempt: the PR is tried again once the reason is gone.
       summary.refused.push({ ref: refOf(e), reason: g.refused });
       log(`  ${refOf(e)}: not merged: ${g.refused}`);
       continue;
     }
+    // The merge's own audit row is written by mergeViaCommand.
     const r = await mergeViaCommand(w, d.run, d.mergeCommand, g, { method, extra: await allowFailedArgs(db, repo, d.mergeCommand) }, { run: runId, head: e.head, path: e.path }, undefined, lane?.env);
     if (r.code !== 0) {
       const why = oneLine(r.stderr) || oneLine(r.stdout) || `exit code ${r.code}`;
-      const denied = lane && e.decisionId ? authFailure(new Error(why)) : null;
-      if (denied === "transient") { log(`  ${refOf(e)}: not merged yet: ${why}`); summary.attempted.pop(); continue; }
+      const denied = lane ? authFailure(new Error(why)) : null;
       if (denied) {
-        // The user's token may not merge: wait for their access. No refusal is recorded, so the PR stays queued.
-        await setExecState(db, e.decisionId!, denied, denied === "waiting-token" ? SIGN_IN_REASON : noWriteReason(repo));
-        log(`  ${refOf(e)}: waiting: ${why}`);
+        // The approver's token may not merge (or GitHub answered with a transient error): no refusal is recorded, so the PR stays queued.
+        if (denied !== "transient" && lane) await noteMergeAction(db, repo, e, lane.login, denied, denied === "waiting-token" ? SIGN_IN_REASON : noWriteReason(repo));
+        log(`  ${refOf(e)}: ${denied === "transient" ? "not merged yet" : "waiting"}: ${why}`);
         summary.attempted.pop();
         continue;
       }
-      if (lane && e.decisionId) await setExecState(db, e.decisionId, "failed", why);
+      if (why.includes(DRAFT_REFUSAL)) { log(`  ${refOf(e)}: turned into a draft; not merged`); continue; }
       await refuse(e, method, `${d.mergeCommand}: ${why}`);
       continue;
     }
-    await saveAttempt(e, method, "merged", null);
-    await markMerged(db, e.repo, e.number, at());
-    await closeMergedQuestions(db, e.repo, e.number, at());
-    await db.run(db.k.insertInto("main.stages").values({ repo: e.repo, number: e.number, stage: "merged", at: at(), actor: ACTOR, note: `${method} at ${short(e.head)}${e.path === "operator" ? ", operator answered merge" : ""}` }));
+    // The attempt row, the mirror's merged state and the `merged` stage row are written together. The merge already happened on
+    // GitHub, so a failed write is tried once more before the error stops the run (a lost row would repeat the merge command, which `--head` guards).
+    const landed = attempt(e, method, "merged", null);
+    await recordAttempts(db, [landed]).catch(async (err) => {
+      log(`  ${refOf(e)}: merged, but recording it failed (${oneLine(String((err as Error).message ?? err))}); trying again`);
+      await recordAttempts(db, [landed]);
+    });
+    if (lane) await noteMergeAction(db, repo, e, lane.login, "done", null);
     await jobItem(db, e.repo, e.number, `merged by ${method} at ${short(e.head)}`, log);
-    if (e.path === "operator") await db.run(db.k.updateTable("main.decisions").set({ applied_at: at() }).where("id", "=", e.decisionId!).where("applied_at", "is", null));
     summary.merged.push(refOf(e));
     params.onMerged?.(summary.merged.length);
     log(`  ${refOf(e)}: merged (${method})`);
   }
-  await markExecDone(db);
-  log(`merge ${repo}: ${summary.merged.length} merged, ${summary.refused.length} refused, ${summary.asked.length} asked; run ${runId}`);
+  log(`merge ${repo}: ${summary.merged.length} merged, ${summary.refused.length} refused; run ${runId}`);
   return summary;
+}
+
+/**
+ * The merge made as its approver, as the workflow's person action: it waits while the approver has no usable sign-in or no write
+ * access (the workflow's state line shows it), and a waiting row goes back to pending once the lane opens and to done after the merge.
+ * Only a wait creates the row; the other states update an existing one.
+ */
+async function noteMergeAction(db: Db, repo: string, e: QueueEntry, by: string, state: ActionState, reason: string | null): Promise<void> {
+  const ref = { repo, number: e.number };
+  const [workflows, actions] = await db.together(() => Promise.all([loadPrWorkflows(db, [ref]), loadActions(db, { refs: [ref] })]));
+  const wf = workflows.get(`${repo}#${e.number}`);
+  if (!wf) return;
+  const at = new Date().toISOString();
+  const row = actions.get(`${repo}#${e.number}`)?.find((a) => a.kind === "merge" && a.workflow_id === wf.id);
+  if (state === "waiting-token" || state === "waiting-permission") {
+    await db.write(async () => {
+      // A row of an earlier head, approver or approval is stopped first, so the upsert takes it over.
+      if (row && (row.head !== e.head || row.by !== by || row.updated_at < (wf.approvedAt ?? ""))) await saveActions(db, [{ id: row.id, state: "stopped", at }]);
+      const id = (await queueActions(db, [{ workflowId: wf.id, repo, number: e.number, kind: "merge", by, head: e.head, state, at }])).get(`${repo}#${e.number}:merge`);
+      if (id !== undefined) await saveActions(db, [{ id, state, reason, at }]);
+    });
+  } else if (row && row.state !== state && row.state !== "done") {
+    await saveActions(db, [{ id: row.id, state, reason, at }]);
+  }
 }
 
 function parseArgs(args: string[]): { repo: string; limit?: number; apply: boolean } {
@@ -427,15 +353,8 @@ function parseArgs(args: string[]): { repo: string; limit?: number; apply: boole
 }
 
 export const commands = {
-  "merge-ask": {
-    summary: "merge-ask: ask the Merge? decisions that are due in every repo (writes decisions only)",
-    async run(): Promise<void> {
-      const ids = await askMergeDecisions(await openDb());
-      console.log(`Asked Merge? on ${ids.length} PR${ids.length === 1 ? "" : "s"}`);
-    },
-  },
   merge: {
-    summary: "merge --repo R [--limit N] [--apply]: merge queued PRs that may merge, ask Merge? for the rest (dry run unless --apply)",
+    summary: "merge --repo R [--limit N] [--apply]: merge queued PRs that may merge (dry run unless --apply)",
     async run(args: string[]): Promise<void> {
       const f = parseArgs(args);
       await runMerge(await openDb(), { repo: f.repo, limit: f.limit, dryRun: !f.apply });

@@ -3,7 +3,7 @@
 import { refOf, parseHaikuReply, jevVerdict, type Item, type JevAnswers, type Verdict } from "../classify/parse.ts";
 import { jevAreaChoice, parseAreaReply, settles, type AreaAnswer } from "../areas/parse.ts";
 import type { Area, AreaItem } from "../areas/types.ts";
-import { parsePairReply, type DupePair, type PairAnswer } from "../dupes/pair.ts";
+import { askKey, parsePairReply, type DupeAsk, type DupePair, type PairAnswer } from "../dupes/pair.ts";
 import { carryTexts, lintComparison, parseIssueComparison, parsePrComparison, type CompareIssues, type ComparePrs, type IssueComparison, type PrComparison } from "../dupes/group.ts";
 import { jevImpact, parseHaikuImpacts, SURE, type Impact, type JevImpactAnswers } from "../priority/score.ts";
 import { renderAreaJev, renderClassifyJev, renderReferenceJev, type ClassifyExtras } from "../prompts/index.ts";
@@ -13,8 +13,9 @@ import { parseRefereeReply, type Referee } from "../classify/parse.ts";
 import { lintOpusReply, parseOpusReply, publicTexts as opusTexts, rawReason, type OpusPr, type OpusReview } from "../review/opus-parse.ts";
 import { lintPremerge, parsePremerge, premergeTexts, type PremergeReview } from "../premerge/parse.ts";
 import { lintReply, parseFindings, publicTexts as postmergeTexts, type Finding, type PostmergePr } from "../postmerge/parse.ts";
-import { commentTexts } from "../conversations/cards.ts";
-import { choicesTexts, parseTurn, type TurnReply as ConversationReply } from "../decide/choices-parse.ts";
+import { lintEvalReply, parseEvalReply, type EvalFinding, type EvalInput } from "../eval/prompt.ts";
+import { lintIssueReview, parseIssueReview, type IssueReview, type IssueReviewInput } from "../issuereview/prompt.ts";
+import { commentTexts, parseReply, type Parsed as ConversationReply } from "../conversations/cards.ts";
 import type { ConversationInput } from "../conversations/types.ts";
 import { parseCompareReply, parsePlanReply, parseScreenshotReply, type CompareParsed, type Parsed as PlanReply, type ScreenshotParsed } from "../verify/plan.ts";
 import type { ScreenshotConfigBody } from "../verify/screenshot-config.ts";
@@ -109,10 +110,21 @@ export const AREAS: TieredStep<AreaItem, AreaAnswer, string | null, AreasCtx, Ar
 };
 
 // Duplicate pairs: Jev's probability, Haiku for the unsure pairs (the bands are in src/dupes/pair.ts).
-export const DUPES_JEV: JevStep<DupePair, number> = {
+// One request per item: Jev's yes-probability for each candidate, by pair ref. A candidate without a valid answer is asked again.
+export const DUPES_JEV: JevStep<DupeAsk, Record<string, number>> = {
   provider: "jev", id: "dupes.jev",
-  request: (pair) => ({ item: pair }),
-  parse: (answers) => single(probability((answers as { same?: { noul?: unknown } } | undefined)?.same?.noul)),
+  request: (ask) => ({ item: ask }),
+  parse: (answers, ask) => {
+    const a = answers as Record<string, { noul?: unknown } | undefined> | undefined;
+    const value: Record<string, number> = {};
+    const left: DupeAsk["candidates"] = [];
+    for (const c of ask.candidates) {
+      const p = probability(a?.[askKey(c)]?.noul);
+      if (p === null) left.push(c); else value[c.ref] = p;
+    }
+    if (!left.length) return { value };
+    return Object.keys(value).length ? { value, rest: { ...ask, candidates: left } } : null;
+  },
 };
 export const DUPES_HAIKU: ClaudeStep<DupePair[], PairAnswer[]> = {
   provider: "claude", id: "dupes.haiku",
@@ -178,7 +190,7 @@ export const REVIEW_OPUS: ClaudeStep<OpusPr, OpusValue, ReferenceCtx> = {
   provider: "claude", id: "review.opus",
   toPrompt: (x) => [x], size: () => 1,
   lint: { fields: ["summary", "why", "public texts", "claims", "fixes"], make: (x, c) => async (text, stage) => {
-    const own = lintOpusReply(text, x.ref, x.unapplied_fixes, x.body);
+    const own = lintOpusReply(text, x.ref, x.unapplied_fixes, x.body, x.workflow === true);
     if (own === null) return null;
     // The review's public text and fixes reach GitHub without a person reading them: they may not carry the owner statements it was shown.
     const texts = opusTexts(text), stated = statementProblems(texts, x.statements);
@@ -214,13 +226,29 @@ export const POSTMERGE_OPUS: ClaudeStep<PostmergePr, Finding[], ReferenceCtx> = 
   parse: async (text, _x, ctx) => { const r = parseFindings(text, dropTexts(ctx.problems)); return r === null ? null : { value: r }; },
 };
 
+/** The self-evaluation's investigation of one candidate group: evidence without path:line goes back as one fix turn. */
+export const EVAL_INVESTIGATE: ClaudeStep<EvalInput, EvalFinding> = {
+  provider: "claude", id: "eval.investigate",
+  toPrompt: (x) => [x], size: () => 1,
+  lint: { fields: ["evidence"], make: () => (text) => lintEvalReply(text) },
+  parse: async (text) => { const r = parseEvalReply(text); return r === null ? null : { value: r }; },
+};
+
+/** The review of one issue a maintainer started: a claim without path:line goes back as one fix turn. */
+export const ISSUE_REVIEW: ClaudeStep<IssueReviewInput, IssueReview> = {
+  provider: "claude", id: "review.issue",
+  toPrompt: (x) => [x], size: () => 1,
+  lint: { fields: ["claims"], make: () => (text) => lintIssueReview(text) },
+  parse: async (text) => { const r = parseIssueReview(text); return r === null ? null : { value: r }; },
+};
+
 /** Comment cards are public text: a reference mention or quote goes back to the model as one fix turn. A reply without text is not linted and keeps the whole-call retry. */
 export type ConversationCtx = ReferenceCtx & { db: Db; repo: string; n: number };
 export const CONVERSATION: ClaudeStep<ConversationInput, ConversationReply, ConversationCtx> = {
   provider: "claude", id: "conversation.turn",
   toPrompt: (x) => [x], size: () => 1,
-  lint: { fields: ["cards[].text", "cards[].steps[].body", "cards[].steps[].title", "cores[].reason", "cores[].extras[].text", "cores[].extras[].title", "cores[].extras[].body", "add[].extras[].text", "add[].extras[].title", "add[].extras[].body", "ask.text"], make: (_x, c) => async (text, stage) => (await parseTurn(c.db, c.repo, c.n, text) ? referenceProblems([...commentTexts(text), ...choicesTexts(text)], c.dir, c.semantic, { stage }) : null) },
-  parse: async (text, _x, ctx, c) => { const r = await parseTurn(c.db, c.repo, c.n, text, dropTexts(ctx.problems)); return r === null ? null : { value: r }; },
+  lint: { fields: ["cards[].text", "cards[].steps[].body", "cards[].steps[].title"], make: (_x, c) => async (text, stage) => (await parseReply(c.db, c.repo, c.n, text) ? referenceProblems(commentTexts(text), c.dir, c.semantic, { stage }) : null) },
+  parse: async (text, _x, ctx, c) => { const r = await parseReply(c.db, c.repo, c.n, text, dropTexts(ctx.problems)); return r === null ? null : { value: r }; },
 };
 
 /** The plan reply as parsed, valid or not: an invalid plan is asked for again (the last reading stands after the last attempt). */

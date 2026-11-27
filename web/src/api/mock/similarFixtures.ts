@@ -1,7 +1,7 @@
 // Similar items and semantic search for the mockup: word overlap between titles
 // stands in for embedding similarity.
 import type { SimilarHit } from "../types";
-import { SEARCH_POOL, itemFor } from "./fixtures";
+import { SEARCH_POOL } from "./fixtures";
 
 const LABELS = ["bugfix", "missing feature", "small extra", "plugin candidate", "performance"];
 const words = (s: string) => new Set(s.toLowerCase().match(/[a-z]{3,}/g) ?? []);
@@ -34,5 +34,4 @@ function rank(text: string, limit: number, skip?: string): SimilarHit[] {
     .slice(0, limit);
 }
 
-export const similarFor = (repo: string, n: number, limit = 10) => rank(itemFor(repo, n).title, limit, `${repo}#${n}`);
 export const semanticHits = (q: string) => (q.trim() ? rank(q, 20) : []);

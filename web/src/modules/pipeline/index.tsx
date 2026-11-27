@@ -1,6 +1,5 @@
 import type { FeatureModule } from "../../registry/types";
 import { lazyView } from "../../registry/lazyView";
-import { TreeStructureIcon } from "@phosphor-icons/react";
 
 const JobPanel = lazyView(() => import("./views"), "JobPanel");
 const PhonePipeline = lazyView(() => import("./views"), "PhonePipeline");
@@ -9,7 +8,6 @@ const PipelineView = lazyView(() => import("./views"), "PipelineView");
 export const pipelineModule: FeatureModule = {
   id: "pipeline",
   permission: "viewer",
-  nav: { label: "Pipeline controls", icon: TreeStructureIcon, to: "/pipeline" },
   routes: [
     {
       path: "pipeline/:id?",

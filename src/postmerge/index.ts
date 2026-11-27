@@ -1,7 +1,9 @@
 // CLI of the post-merge review stage: `autocraft-server postmerge review <repo>#<n> [--again]`,
 // `autocraft-server postmerge file <repo>#<n> <finding>` and `autocraft-server postmerge backfill --since <ISO date> [--yes]`.
 // Operator only: the box's shell is the operator's.
-import { audit } from "../dash/audit.ts";
+import { addAudit } from "../data/control/index.ts";
+import { isRunning } from "../data/jobs/index.ts";
+import { loadPostmerge } from "../data/review/index.ts";
 import { mergedPr } from "./select.ts";
 import type { Db } from "../db/index.ts";
 import { openDb } from "../db/open.ts";
@@ -15,10 +17,10 @@ export async function reviewOne(db: Db, ref: string, again: boolean, log: (line:
   if (!m) throw new Error(`not a repo#number: ${ref}`);
   const repo = m[1]!, number = Number(m[2]);
   if (!await mergedPr(db, repo, number)) throw new Error(`${ref} was not merged by the pipeline`);
-  if (!again && await db.get(db.k.selectFrom("postmerge_reviews").select((eb) => eb.lit(1).as("one")).where("repo", "=", repo).where("number", "=", number).where("error", "is", null))) throw new Error(`${ref} has a post-merge review; add --again to review it again`);
+  if (!again && (await loadPostmerge(db, [{ repo, number }])).get(ref)?.error === null) throw new Error(`${ref} has a post-merge review; add --again to review it again`);
   // The runner's job reviews any candidate of its repo; two reviews of one PR at once would replace each other's rows.
-  if (await db.get(db.k.selectFrom("jobs").select((eb) => eb.lit(1).as("one")).where("step", "=", "postmerge").where("state", "=", "running").where("repo", "=", repo).limit(1))) throw new Error(`a postmerge job is running for ${repo}; try again when it has finished`);
-  await audit(db, ACTOR, "postmerge-review", ref, { again });
+  if ((await isRunning(db, [{ step: "postmerge", repo }])).size) throw new Error(`a postmerge job is running for ${repo}; try again when it has finished`);
+  await addAudit(db, [{ login: ACTOR, action: "postmerge-review", target: ref, details: { again } }]);
   const { runPostmerge } = await import("./review.ts");
   await runPostmerge(db, { repo, only: [number] }, log);
 }
@@ -28,7 +30,6 @@ export const commands = {
     summary: `${USAGE}: post-merge review of pipeline merges`,
     async run(args: string[]): Promise<void> {
       const [sub, ...rest] = args;
-      const { connect } = await import("../db.ts");
       if (sub === "review") {
         const again = rest.includes("--again");
         const refs = rest.filter((a) => a !== "--again");

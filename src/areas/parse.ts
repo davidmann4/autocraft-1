@@ -1,7 +1,25 @@
 // Reading model answers for the area prompts. Pure functions: tests feed them fake replies.
-import { AREAS_MAX, AREAS_MIN, AREA_SURE, NONE_OF_THESE, SUGGEST_MAX, type Area } from "./types.ts";
-import { lenientAreas } from "./store.ts";
+import { AREAS_MAX, AREAS_MIN, AREA_DESCRIPTION_MAX, AREA_NAME_MAX, AREA_SURE, NONE_OF_THESE, SUGGEST_MAX, type Area } from "./types.ts";
 import { wholeReplyJson } from "../core/reply-json.ts";
+
+const same = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
+// "none" names the items without an area in item filters (`area=none`), so no area may take it.
+const reserved = (name: string) => same(name, NONE_OF_THESE) || same(name, "none");
+const cleanName = (v: unknown): string => (typeof v === "string" ? v.replace(/\s+/g, " ").trim().slice(0, AREA_NAME_MAX) : "");
+const cleanDescription = (v: unknown): string => (typeof v === "string" ? v.replace(/\s+/g, " ").trim().slice(0, AREA_DESCRIPTION_MAX) : "");
+
+/** A list with unusable and repeated entries dropped. Used on model output; operator edits go through `editAreas`, which refuses them. */
+export function lenientAreas(v: unknown, max = AREAS_MAX): Area[] {
+  const out: Area[] = [];
+  if (!Array.isArray(v)) return out;
+  for (const o of v as Record<string, unknown>[]) {
+    const name = cleanName(o?.name), description = cleanDescription(o?.description);
+    if (!name || !description || reserved(name) || out.some((a) => same(a.name, name))) continue;
+    out.push({ name, description });
+    if (out.length >= max) break;
+  }
+  return out;
+}
 
 /** The list's own spelling of `choice`, null for "none of these", undefined when it is neither. */
 export function canonicalArea(choice: unknown, areas: Area[]): string | null | undefined {

@@ -19,7 +19,7 @@ import { workspacePass, WorkspaceState } from "../src/build/workspace-launch.ts"
 import { LAYOUT_CI, WARM_CHANGED_FILES, warmOf, workspaceEnvHash } from "../src/build/workspace-layout.ts";
 import { WS_POD_PATH } from "../src/build/workspace.ts";
 import { createWorkspace, getWorkspace } from "../src/build/workspaces.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb } from "./helpers/raw-db.ts";
 import { STATUS_DATA_KEY, STATUS_LABEL } from "../src/warm/sync-agent.ts";
 import { SCRATCH } from "./scratch.ts";
 

@@ -1,27 +1,20 @@
 // The questions a plan asks before an issue is implemented (implement.plan with ready false). A fact only the reporter
 // knows goes to the author as one comment on the issue from the bot, when the repo approves comments; a product, design or
-// scope choice (or a size split) goes to the maintainers as a decision with the plan's options, Backlog and a free-text note,
-// which the prepare step summarises and recommends. Every question is one `question` round with its audience, so the planner
-// waits on the newest one and plans again on its answer (issue-facts.ts). After QUESTION_ROUNDS_MAX rounds of questions the
-// maintainers decide instead whether to go on with stated assumptions, hold it or close the issue.
+// scope choice (or a size split) goes to the maintainers as the issue's workflow recommendation, with the plan's options as
+// its numbered parts and its recommended option. Every question is one `question` round with its audience, so the planner
+// waits on the newest one and plans again on the answer after it (an `answer` round, written when a maintainer answers the
+// recommendation, or the author's comment). After QUESTION_ROUNDS_MAX rounds of questions the maintainers are asked instead
+// whether to go on with stated assumptions; closing the issue or leaving it in the backlog are commands of their own.
 import type { Db } from "../db/index.ts";
-import { ask, BACKLOG, getDecision, optionsOf, type DecisionRow, type Option } from "../decisions.ts";
-import { WITHDRAWN } from "../merge/withdraw.ts";
-import { addRound, roundsOf, setImplementationState } from "./store.ts";
+import { addRounds, attemptNow, writeStep, type NewRound } from "./attempt.ts";
 import { PLAN_QUESTION_CHARS, QUESTION_ROUNDS_MAX, type PlanAsked } from "./plan-types.ts";
-import type { Implementation, PlanQuestion, PlanReply, QuestionRound } from "./types.ts";
+import type { AnswerRound, Implementation, ImplementationRound, PlanQuestion, PlanReply, QuestionRound } from "./types.ts";
 
-/** `asked_by` of the decisions an implementation asks. */
+/** The audit and GitHub writer login of the implement stage's own writes. */
 export const IMPLEMENT_ASKER = "implement";
-/** The options of the decision asked after QUESTION_ROUNDS_MAX rounds of questions. */
-export const LIMIT_IMPLEMENT: Option = { key: "implement", label: "Implement with the stated assumptions", hint: "Plan again without asking; the plan states each assumption it makes and the PR lists them." };
-export const LIMIT_CLOSE: Option = { key: "close", label: "Close issue", hint: "AutoCraft comments that the issue lacks the detail to implement and closes it as not planned." };
-export const LIMIT_CLOSE_COMMENT = "Closing this for now: it does not have the detail needed to implement it. Reopen it with the missing details and it can be picked up again.";
-
-export const questionDecisionId = (repo: string, number: number, attempt: number, round: number): string => `${repo}#${number}:implement-q${attempt}-${round}`;
-export const limitDecisionId = (repo: string, number: number, attempt: number): string => `${repo}#${number}:implement-limit-${attempt}`;
-export const isLimitDecision = (id: string | null): boolean => id !== null && /:implement-limit-\d+$/.test(id);
-const isQuestionDecision = (id: string | null): id is string => id !== null && /:implement-(q\d+-\d+|limit-\d+)$/.test(id);
+export type QuestionOption = NonNullable<QuestionRound["options"]>[number];
+/** The option of the question asked after QUESTION_ROUNDS_MAX rounds of questions. */
+export const LIMIT_IMPLEMENT: QuestionOption = { key: "implement", label: "Implement with the stated assumptions", hint: "Plan again without asking; the plan states each assumption it makes and the PR lists them." };
 
 const cut = (s: string, n: number): string => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
 
@@ -41,66 +34,39 @@ export type QuestionDeps = {
   now?: () => string;
 };
 
-/**
- * Sets the attempt's question decisions aside, all but `keep`: an open one is answered withdrawn by the pipeline and an
- * answered one is marked applied, since the plan round that follows has read its answer.
- */
-export async function settleQuestions(db: Db, impl: Implementation, keep: string | null, at: string): Promise<void> {
-  const ids = new Set<string>();
-  for (const r of await roundsOf(db, impl.id)) {
-    const id = r.kind === "question" ? (r.result as Partial<QuestionRound> | null)?.decisionId ?? null : null;
-    if (isQuestionDecision(id)) ids.add(id);
-  }
-  if (isQuestionDecision(impl.decisionId)) ids.add(impl.decisionId);
-  if (keep !== null) ids.delete(keep);
-  if (!ids.size) return;
-  const list = [...ids];
-  await db.write(async () => {
-    await db.run(db.k.updateTable("main.decisions").set({ answer: WITHDRAWN, answered_by: "pipeline", answered_at: at, applied_at: at, answer_note: "superseded by a later plan round", adopted_opinion: null })
-      .where("id", "in", list).where("answer", "is", null));
-    await db.run(db.k.updateTable("main.decisions").set({ applied_at: at }).where("id", "in", list).where("answer", "is not", null).where("applied_at", "is", null));
-  });
+/** The maintainers' question as a round: its options keyed o1..o3 (none for a question that only words answer) and the recommended one. */
+function maintainerRound(q: PlanQuestion): QuestionRound {
+  const options = q.options.slice(0, 3).map((o, i) => ({ key: `o${i + 1}`, label: cut(o.label, 80), hint: cut(o.hint, 200) }));
+  const usable = options.length >= 2 ? options : [];
+  const rec = q.recommended === null ? -1 : q.options.findIndex((o) => o.label === q.recommended);
+  return { audience: "maintainer", text: cut(q.text, PLAN_QUESTION_CHARS), options: usable, recommended: rec >= 0 && rec < usable.length ? usable[rec]!.key : null };
 }
 
 /**
  * Asks what the reply's questions need and moves the attempt to `asked`. `planRound` is the id of the plan round the reply
  * is stored in (its questions are counted with the earlier ones). Running it again on the same plan round writes only what
- * an earlier run did not: a comment or decision already recorded in a question round after the plan round is not made again.
+ * an earlier run did not: a comment or question already recorded in a question round after the plan round is not made again.
  * Returns the rounds written.
  */
 export async function askQuestions(db: Db, impl: Implementation, reply: PlanReply, deps: QuestionDeps, planRound: number): Promise<QuestionRound[]> {
   const at = deps.now?.() ?? new Date().toISOString();
   const ref = `${impl.repo}#${impl.number}`;
-  const rounds = await roundsOf(db, impl.id);
+  const rounds = (await attemptNow(db, impl))?.rounds ?? [];
   const asked = rounds.filter((r) => r.kind === "plan" && r.id <= planRound && (r.result as { ready?: unknown } | null)?.ready === false).length;
   const before = rounds.filter((r) => r.kind === "question" && r.id > planRound).map((r) => r.result as Partial<QuestionRound> | null);
   const did = (audience: QuestionRound["audience"]): boolean => before.some((q) => q?.audience === audience);
   const written: QuestionRound[] = [];
-  const round = async (q: QuestionRound): Promise<void> => {
-    await addRound(db, impl.id, "question", { callId: impl.planCallId, result: q }, at);
-    written.push(q);
-  };
-  // The attempt moves on, and records which plan round it moved on from (plan_call_id), in one write.
-  const moveOn = async (decisionId: string | null): Promise<void> => {
-    await settleQuestions(db, impl, decisionId, at);
-    await setImplementationState(db, impl.id, "asked", { decisionId, planCallId: impl.planCallId }, at);
+  // The attempt moves on, and records which plan round it moved on from (plan_call_id), with the maintainers' rounds in one write.
+  const moveOn = async (maintainer: QuestionRound[]): Promise<void> => {
+    await writeStep(db, impl, { to: "asked", patch: { planCallId: impl.planCallId }, rounds: maintainer.map((q): NewRound => ({ kind: "question", callId: impl.planCallId, result: q })), at });
+    written.push(...maintainer);
   };
 
-  // Past the limit (this reply's round included): the maintainers choose how to go on.
+  // Past the limit (this reply's round included): the maintainers choose whether to go on.
   if (asked > QUESTION_ROUNDS_MAX) {
-    const id = limitDecisionId(impl.repo, impl.number, impl.attempt);
     const text = `Implement ${ref} with the stated assumptions? The plan still has open questions after ${QUESTION_ROUNDS_MAX} rounds.`;
-    if (!did("maintainer")) {
-      await ask(db, [{
-        id, kind: "other", repo: impl.repo, number: impl.number, question: text,
-        context: `The plan so far: ${cut(reply.summary, 400)}\n\nStill open:\n${reply.questions.map((q) => `- ${cut(q.text, 300)}`).join("\n")}`,
-        facts: [`attempt: ${impl.attempt}`, `question rounds: ${asked - 1}`],
-        options: [LIMIT_IMPLEMENT, BACKLOG, LIMIT_CLOSE], asked_by: IMPLEMENT_ASKER, asked_at: at,
-      }]);
-      await round({ audience: "maintainer", text, decisionId: id });
-    }
-    await moveOn(id);
-    deps.log(`${ref}: ${asked - 1} rounds of questions; asked the maintainers whether to go on (${id})`);
+    await moveOn(did("maintainer") ? [] : [{ audience: "maintainer", text, options: [LIMIT_IMPLEMENT], recommended: LIMIT_IMPLEMENT.key, limit: true }]);
+    deps.log(`${ref}: ${asked - 1} rounds of questions; asked the maintainers whether to go on`);
     return written;
   }
 
@@ -115,58 +81,51 @@ export async function askQuestions(db: Db, impl: Implementation, reply: PlanRepl
   if (author.length && !did("author")) {
     const text = authorComment(author);
     const commentId = await deps.postComment(text);
-    for (const q of author) await round({ audience: "author", text: q.text, ...(commentId !== null && { commentId }) });
+    // Recorded at once: a rerun after the post does not post again.
+    const qs = author.map((q): QuestionRound => ({ audience: "author", text: q.text, ...(commentId !== null && { commentId }) }));
+    await addRounds(db, impl.id, qs.map((q) => ({ kind: "question", callId: impl.planCallId, result: q })), at);
+    written.push(...qs);
     deps.log(`${ref}: asked the author${commentId !== null ? ` (comment ${commentId})` : ""}`);
   }
 
-  let decisionId: string | null = null;
-  if (maintainer.length) {
-    decisionId = questionDecisionId(impl.repo, impl.number, impl.attempt, asked);
-    if (!did("maintainer")) {
-      const [first, ...rest] = maintainer;
-      await ask(db, [maintainerDecision(impl, reply, first!, rest, decisionId, at)]);
-      for (const q of maintainer) await round({ audience: "maintainer", text: q.text, decisionId });
-      deps.log(`${ref}: asked the maintainers (${decisionId})`);
-    }
-  }
-  await moveOn(decisionId);
+  // The question with options is the newest round, so it is the one the recommendation shows; the others are also open.
+  const [first, ...rest] = maintainer;
+  const toAsk = first && !did("maintainer") ? [...rest.map((q): QuestionRound => ({ audience: "maintainer", text: cut(q.text, PLAN_QUESTION_CHARS), options: [], recommended: null })), maintainerRound(first)] : [];
+  await moveOn(toAsk);
+  if (toAsk.length) deps.log(`${ref}: asked the maintainers`);
   return written;
 }
 
-/** The decision of a maintainer question: its options, Backlog and the plan's recommendation; further open questions in the context. */
-function maintainerDecision(impl: Implementation, reply: PlanReply, q: PlanQuestion, rest: PlanQuestion[], id: string, at: string): Record<string, unknown> {
-  const options: Option[] = q.options.slice(0, 3).map((o, i) => ({ key: `o${i + 1}`, label: cut(o.label, 80), ...(o.hint && { hint: cut(o.hint, 200) }) }));
-  // A question without two options (an author question rerouted here) gets one answer to give in the note.
-  if (options.length < 2) options.splice(0, options.length, { key: "answer", label: "Answer in the note", hint: "Write the answer in the note; the plan runs again with it." });
-  const rec = q.recommended === null ? -1 : q.options.findIndex((o) => o.label === q.recommended);
-  const also = rest.length ? `\n\nAlso open (answer in the note):\n${rest.map((x) => `- ${cut(x.text, 300)}`).join("\n")}` : "";
-  return {
-    id, kind: reply.size === "XL" ? "split" : "other", repo: impl.repo, number: impl.number, question: cut(q.text, PLAN_QUESTION_CHARS),
-    context: `The plan so far: ${cut(reply.summary, 400)}${also}`,
-    facts: [`size: ${reply.size}`, `kind: ${reply.kind}`, `attempt: ${impl.attempt}`],
-    options: [...options, BACKLOG],
-    ...(rec >= 0 && rec < options.length && { recommended: options[rec]!.key, recommended_reason: "The plan recommends it." }),
-    asked_by: IMPLEMENT_ASKER, asked_at: at,
-  };
+/** The newest question round and the newest answer after it, or nulls. */
+export function openQuestion(rounds: readonly ImplementationRound[]): { question: ImplementationRound | null; answer: AnswerRound | null } {
+  const question = rounds.filter((r) => r.kind === "question").at(-1) ?? null;
+  const a = rounds.filter((r) => r.kind === "answer" && r.id > (question?.id ?? 0)).at(-1);
+  return { question, answer: a?.result && typeof a.result === "object" ? a.result as AnswerRound : null };
 }
 
-/** The attempt's earlier questions with what answered them: the decision's answer and note; an author question's answer is in the comments. */
-export async function askedSoFar(db: Db, impl: Implementation): Promise<PlanAsked[]> {
-  const decisions = new Map<string, DecisionRow | undefined>();
+/** An answer as the plan reads it: the option's label, then the words the person wrote. */
+function answerText(a: AnswerRound, q: Partial<QuestionRound> | null): string | null {
+  const label = a.option !== undefined ? q?.options?.find((o) => o.key === a.option)?.label ?? a.option : null;
+  const words = a.text?.trim() || null;
+  return label && words ? `${label}: ${words}` : label ?? words;
+}
+
+/**
+ * The attempt's earlier questions with what answered them: a maintainers' question carries the first answer after it (one
+ * answer settles every question of one ask); an author question's answer is in the comments.
+ */
+export function askedSoFar(rounds: readonly ImplementationRound[]): PlanAsked[] {
   const out: PlanAsked[] = [];
-  for (const r of await roundsOf(db, impl.id)) {
+  for (const r of rounds) {
     if (r.kind !== "question") continue;
     const q = r.result as Partial<QuestionRound> | null;
     if (!q || (q.audience !== "author" && q.audience !== "maintainer") || typeof q.text !== "string") continue;
     let answer: string | null = null;
-    if (q.decisionId) {
-      if (!decisions.has(q.decisionId)) decisions.set(q.decisionId, await getDecision(db, q.decisionId));
-      const d = decisions.get(q.decisionId);
-      // A question set aside unanswered (settleQuestions) has no answer to show.
-      if (d?.answer && d.answer !== WITHDRAWN) {
-        const label = optionsOf(d).find((o) => o.key === d.answer)?.label ?? d.answer;
-        answer = `${label}${d.answer_note ? `: ${d.answer_note}` : ""}`;
-      }
+    if (q.audience === "maintainer") {
+      const a = rounds.find((x) => x.kind === "answer" && x.id > r.id);
+      // The answer's label comes from the options of the question round it names.
+      const named = a ? rounds.find((x) => x.id === (a.result as Partial<AnswerRound> | null)?.question) : undefined;
+      if (a?.result && typeof a.result === "object") answer = answerText(a.result as AnswerRound, (named?.result ?? q) as Partial<QuestionRound> | null);
     }
     out.push({ audience: q.audience, text: q.text, at: r.at, answer });
   }

@@ -166,7 +166,7 @@ COPY --from=deps --chown=10001:10001 /app/node_modules /app/node_modules
 COPY --from=app --chown=10001:10001 /app /app
 
 # Every writable path is under /data (database, caches, job logs, HOME) or /config
-# (secrets, accounts, Claude config directories); mount volumes there.
+# (secrets); mount volumes there.
 ENV HOME=/data/home \
     XDG_CACHE_HOME=/data/cache \
     DISABLE_AUTOUPDATER=1 \
@@ -175,9 +175,6 @@ ENV HOME=/data/home \
     AUTOCRAFT_LISTEN=0.0.0.0:3005 \
     AUTOCRAFT_WORKER_LISTEN=0.0.0.0:8981 \
     AUTOCRAFT_SECRETS_FILE=/config/secrets.json \
-    AUTOCRAFT_ACCOUNTS=/config/accounts.json \
-    AUTOCRAFT_ACCOUNTS_ROOT=/config/claude \
-    AUTOCRAFT_USAGE_DIR=/data/cache/autocraft/usage \
     AUTOCRAFT_LOCK_DIR=/data/cache/autocraft/locks \
     AUTOCRAFT_RUNNER_LOGS=/data/cache/autocraft/jobs \
     AUTOCRAFT_DIFF_CACHE=/data/cache/autocraft/diffs \

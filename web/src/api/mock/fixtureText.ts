@@ -204,13 +204,6 @@ Uses curl noise so particles don't bunch up. No new dependencies.`,
   },
 };
 
-export const BATCH_SUMMARY: Record<string, string> = {
-  pdfcraft:
-    "Twelve small PRs from nine authors, each adding one or two keyboard shortcuts the reference app doesn't have (page rotation, bookmark cycling, focus mode). None changes an existing binding or default behaviour, and all pass CI. They differ only in which keys they bind; labelling them all as small extras keeps them reviewable together.",
-  "craft-libs":
-    "Nine PRs from seven authors fix the same IME bug: composed text is lost when the text field loses focus mid-composition. #1188 is the smallest fix and the only one with a test; the others patch the same function in slightly different ways, and two fail CI.",
-};
-
 const FIRST: Record<string, string> = {
   "Brush engine: pressure curve per stylus": "Lets each stylus keep its own pressure curve instead of one global curve, stored with the device ID.",
   "Add Content-aware scale for layers": "Adds content-aware scaling that keeps marked subjects intact while stretching the background.",

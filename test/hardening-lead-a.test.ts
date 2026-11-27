@@ -9,7 +9,7 @@ import { addLogin, checkGithubId } from "../src/access.ts";
 import { setGithubIdentity } from "../src/github/identity.ts";
 import { parseWorkerConfig } from "../src/worker/config.ts";
 import { SCRATCH } from "./scratch.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb } from "./helpers/raw-db.ts";
 
 const KEY = "hardening-session-key-hardening-0";
 

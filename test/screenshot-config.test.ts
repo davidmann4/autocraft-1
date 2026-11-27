@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { ScreenshotConfigError, deleteConfig, getConfig, paramValueError, parseScreenshotConfig, putConfig } from "../src/verify/screenshot-config.ts";
 import { SCRATCH } from "./scratch.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb } from "./helpers/raw-db.ts";
 
 mkdirSync(SCRATCH, { recursive: true });
 const fresh = async () => await connectDb(join(mkdtempSync(join(SCRATCH, "sc-")), "t.db"));

@@ -35,7 +35,7 @@ const TABS = [
 export function ConnectView({ user }: ViewProps) {
   const { tab = "" } = useParams();
   const [sp] = useSearchParams();
-  const local = user.role !== "viewer" && user.inference === "user-local";
+  const local = user.role !== "viewer";
   const runners = useQuery("runners", (a) => a.runners.list(), { enabled: local });
   if (!TABS.some(([t]) => t === tab) || (tab && !local)) return <Navigate to="/connect" replace />;
   if (local && !runners.data && !runners.error) return <Page title="Connect your Agents"><></></Page>;
@@ -86,7 +86,7 @@ export function Connector({ user, agent = false }: Pick<ViewProps, "user"> & { a
   const tokens = data?.tokens.filter((t) => t.kind === "connector") ?? [];
   const full = !!data && tokens.length >= data.max;
   const viewer = user.role === "viewer";
-  const settles = user.role === "operator" || (user.role === "maintainer" && user.maintainerWrites);
+  const settles = user.role !== "viewer";
 
   const close = () => {
     setForm(false);
@@ -132,8 +132,8 @@ export function Connector({ user, agent = false }: Pick<ViewProps, "user"> & { a
           <Input autoFocus value={label} onChange={(e) => setLabel(e.target.value)} maxLength={60} placeholder="Label, e.g. laptop" aria-label="Token label" className="min-w-[12rem] flex-1 sm:max-w-xs" />
           {settles && data?.answering && (
             <span className="flex items-center gap-2 text-sm text-ink/80">
-              <Switch on={answer} onChange={setAnswer} label="Can answer decisions" />
-              Can answer decisions
+              <Switch on={answer} onChange={setAnswer} label="Can send commands" />
+              Can send commands
             </span>
           )}
           <span className="flex gap-2 max-sm:ml-auto">
@@ -197,7 +197,7 @@ function Tokens({ tokens, write, fresh, agent }: { tokens: McpToken[]; write: Re
             <span className="flex items-center gap-2 font-medium">
               {t.label ?? <span className="text-ink/40">no label</span>}
               {agent && <Badge>{tr("Read")}</Badge>}
-              {t.canAnswer && <Badge>{agent ? tr("Answer") : "answers decisions"}</Badge>}
+              {t.canAnswer && <Badge>{agent ? tr("Answer") : "sends commands"}</Badge>}
               {t.id === fresh && <Badge tone="accent">new</Badge>}
             </span>
             <span className="text-xs text-ink/55">

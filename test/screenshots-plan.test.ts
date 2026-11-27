@@ -7,9 +7,11 @@ import { parseScreenshotReply } from "../src/verify/plan.ts";
 import { putConfig, type ScreenshotConfigBody } from "../src/verify/screenshot-config.ts";
 import { queueScreenshotTasks, screenshotTasks } from "../src/verify/tasks.ts";
 import { runVerify, type VerifyDeps } from "../src/verify/index.ts";
+import { acting } from "./acting.ts";
+import { reportingTaskRunner } from "./fake-runner.ts";
 import { SCRATCH } from "./scratch.ts";
-import type { Db } from "../src/db/index.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb, type Db } from "./helpers/raw-db.ts";
+import { insertWorkflow } from "../src/workflow/store.ts";
 import * as kx from "../src/db/kx.ts";
 
 mkdirSync(SCRATCH, { recursive: true });
@@ -90,6 +92,9 @@ async function fresh(): Promise<Db> {
   await db.run(db.k.insertInto("tracked_repos").values({ name: "app", added_by: "op", added_at: T0, pipeline: 1 }));
   await db.run(db.k.insertInto("repos").values({ name: "app", visibility: "public" }));
   await putConfig(db, "op", "app", ARGS);
+  await insertWorkflow(db, { repo: "app", number: 7, kind: "pr", entry: "review", state: "running", startedBy: "op", startedAt: T0, startedVia: "dashboard" });
+  await acting(db, ["op"]);
+  await reportingTaskRunner(db);
   return db;
 }
 const UI_DIFF = "diff --git a/crates/ui/src/dialog.rs b/crates/ui/src/dialog.rs\n--- a/crates/ui/src/dialog.rs\n+++ b/crates/ui/src/dialog.rs\n@@ -1,1 +1,2 @@\n fn a() {}\n+fn b() {}\n";

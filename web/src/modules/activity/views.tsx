@@ -8,10 +8,14 @@ import { ErrorLine } from "../../ui/atoms/ErrorLine";
 import { ActivityRow } from "../../ui/molecules/ActivityRow";
 import { RepoSelect } from "../../ui/molecules/RepoSelect";
 import { TraceFilters } from "../../ui/molecules/TraceFilters";
+import { TRACE_KINDS } from "../../lib/trace";
 import { Page } from "../../ui/organisms/Page";
 import { useScrollAnchor } from "../../lib/useScrollAnchor";
-import { TraceEventBody } from "../item/TraceEventBody";
+import { TraceEventBody } from "./TraceEventBody";
 import { usePageProject, withProject } from "../../api/scope";
+
+/** Discord mentions are listed per item only. */
+const ACTIVITY_KINDS = TRACE_KINDS.filter((k) => k !== "discord");
 
 const PAGE = 50;
 const keyOf = (e: ActivityEvent) => `${e.item.repo}#${e.item.number}:${e.id}`;
@@ -84,7 +88,7 @@ export function ActivityView() {
     <Page title="Activity">
       <div className="mt-3 flex flex-col gap-2">
         <UnlessProject><RepoSelect value={repo} onChange={setRepo} className="self-start" /></UnlessProject>
-        <TraceFilters kinds={kinds} onKinds={setKinds} autocraftOnly={autocraftOnly} onAutocraftOnly={setAutocraftOnly} />
+        <TraceFilters kinds={kinds} onKinds={setKinds} autocraftOnly={autocraftOnly} onAutocraftOnly={setAutocraftOnly} choices={ACTIVITY_KINDS} />
       </div>
       <ErrorLine error={q.error?.message} className="mt-3" />
       {first ? (

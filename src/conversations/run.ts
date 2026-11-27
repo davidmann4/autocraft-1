@@ -5,7 +5,7 @@ import { jobItem } from "../runner/job-items.ts";
 import { referenceDir } from "../reference.ts";
 import { REPO_PATH } from "../sandbox/command.ts";
 import { NoTakerError, WaitLimitError, poolRoom, takersFirst, type PoolRoom } from "../agents/call.ts";
-import { inferenceMode, tierOfModel } from "../remote/mode.ts";
+import { tierOfModel } from "../remote/mode.ts";
 import { scaled } from "../remote/time-scale.ts";
 import type { PersonKind } from "./types.ts";
 import { ownTaker } from "../remote/takers.ts";
@@ -16,7 +16,6 @@ import { PROGRESS_KEEP, coalesce } from "../classify/progress.ts";
 import { CLAUDE_PROMPTS } from "../prompts/index.ts";
 import { defaultSemanticDeps, type SemanticDeps } from "../reference-lint.ts";
 import { sweepRunningCards } from "./act.ts";
-import { decisionStamp, openDecision } from "./cards.ts";
 import { claimPending, failTurn, pendingConversations, promptParts, refreshItem, releaseTurn, setTurnProgress, storeReply, type DiffSource } from "./store.ts";
 import type { Db } from "../db/index.ts";
 
@@ -70,7 +69,6 @@ export async function answerPending(db: Db, p: ConversationParams): Promise<numb
     try {
     if (await p.cancelled?.()) return;
     const { repo, number: n } = c;
-    const start = now();
     // The item may have changed since the message was written; the update goes in front of the message.
     await refreshItem(db, repo, n, { diff: p.diff });
     // One run holds the message; another run or a second start skips it.
@@ -84,8 +82,7 @@ export async function answerPending(db: Db, p: ConversationParams): Promise<numb
     if (forLogin === undefined) p.onHandled?.(++handled);
     try {
       if (forLogin !== undefined) {
-        const why = await inferenceMode(db) !== "user-local" ? "a maintainer's message runs only on their own Task Runner, and model calls run on the server's accounts now"
-          : !await ownTaker(db, forLogin, { prompt_id: CONVERSATION_PROMPT.id, repos: [repo], tier }) ? ownRunnerGone(forLogin) : null;
+        const why = !await ownTaker(db, forLogin, { prompt_id: CONVERSATION_PROMPT.id, repos: [repo], tier }) ? ownRunnerGone(forLogin) : null;
         if (why) { await failTurn(db, repo, n, claim, why); return; }
       }
       const parts = await promptParts(db, repo, n, wait);
@@ -99,7 +96,6 @@ export async function answerPending(db: Db, p: ConversationParams): Promise<numb
         recent = [...recent, line].slice(-PROGRESS_KEEP);
         await shown.push(recent);
       };
-      const bound = await openDecision(db, repo, n), stampThen = bound ? await decisionStamp(db, bound) : null;
       const dir = referenceDir(repo);
       // A maintainer's reference check runs on their own Task Runner too.
       const semantic = dir ? p.semantic ?? defaultSemanticDeps(db, `${repo}#${n}`, forLogin === undefined ? {} : { forLogin }) : undefined;
@@ -121,7 +117,7 @@ export async function answerPending(db: Db, p: ConversationParams): Promise<numb
       await shown.flush();
       const parsed = r.ok ? r.value : null;
       if (parsed) {
-        if (await storeReply(db, repo, n, claim, parsed.text, parsed.cards, parsed.notes, undefined, parts.seen, parsed.choices && parsed.decision ? { decision: parsed.decision, parsed: parsed.choices, source: "conversation", by: model, stampThen, askedBy: wait.login } : undefined) !== null) { answered++; await jobItem(db, repo, n, "answered a message", p.log); }
+        if (await storeReply(db, repo, n, claim, parsed.text, parsed.cards, parsed.notes, parts.seen) !== null) { answered++; await jobItem(db, repo, n, "answered a message", p.log); }
       } else {
         await failTurn(db, repo, n, claim, "Opus gave no usable reply; send the message again");
         await jobItem(db, repo, n, "no usable reply to a message", p.log);
@@ -141,6 +137,8 @@ const ownFirst = (shared: PoolRoom, own: (i: number) => boolean, busy: (i: numbe
   round: () => shared.round(),
   room: async (i) => (own(i) ? (busy(i) ? 0 : 1) : await shared.room(i)),
   taker: async (i) => own(i) || await shared.taker(i),
+  changed: (pollMs, signal) => shared.changed(pollMs, signal),
+  ...(shared.untaken && { untaken: (i: number) => shared.untaken!(i) }),
 });
 
 /** PR diffs from the diff cache or GitHub; null when unavailable. */

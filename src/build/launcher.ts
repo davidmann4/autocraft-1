@@ -13,13 +13,13 @@
 // same volume without using one of the task's attempts.
 import { randomBytes } from "node:crypto";
 import { setTimeout as sleep } from "node:timers/promises";
-import type { Capabilities, Requires, SandboxEnv, TaskResult, TaskStep } from "../../web/src/api/types.ts";
+import type { Requires, SandboxEnv, TaskResult, TaskStep } from "../../web/src/api/types.ts";
 import { envVar } from "../env.ts";
-import { hashKey, kubeReport, newPodKey, type EnvHealth } from "./envs.ts";
+import { envSettings, hashKey, newPodKey, type EnvHealth } from "./envs.ts";
 import { computeCapacity, feedbackCapacity, overQuota, quotaHard, quotaRoom, toCapNode, type Capacity, type CapNode, type Res } from "./capacity.ts";
 import { classifyPodEnd, disruptionPolicy, MAX_DISRUPTIONS, pendingKind } from "./disruption.ts";
 import { guardedApi, inClusterApi, KubeError, type CapacityApi, type KResourceQuota, type ConfigMapApi, type ContainerStatus, type KPod, type KubeApi } from "./kube-api.ts";
-import { gib, raiseAfterOom, repoMemory, repoSizing, repoWarmTarget } from "./sizing.ts";
+import { gib, memoryOf, raiseAfterOom, repoMemory, repoSizing } from "./sizing.ts";
 import { decideWarm, WARM_COPY_CONTAINER, type WarmUse } from "./warm-mount.ts";
 import { TOOLCHAIN_ID_CONTAINER } from "../warm/toolchain.ts";
 import { STATUS_NAMESPACE, WarmStatus } from "./warm-status.ts";
@@ -28,14 +28,18 @@ import { WarmPlacer } from "./warm-place.ts";
 import { CacheReporter } from "./caches.ts";
 import {
   ARCH_LABEL, DISK_CONTAINER, MIRROR_WAIT_CONTAINER, envSelector, FIRST_GROUP, groupsOf, CREATE_TRIES, kubeCapabilities, LIST_GRACE_MS, PACKAGES_CONTAINER, parsePrepared, PENDING_LIMIT_MS, PENDING_WARN_MS, PULL_LIMIT_MS,
-  ciCheckout, PULL_REASONS, pvcSpec, stepMemory, warmEnvHash, quantity, settingsOf, sourcePod, STAGE_SOURCE, STAGE_TASK, stepCap, stepContainer, stepPod, STUCK_MS, taskLimits, taskPod, taskRequest, toolchainImage, uploadPod, uploadStage,
+  ciCheckout, PULL_REASONS, pvcSpec, stepMemory, warmEnvHash, quantity, sourcePod, STAGE_SOURCE, STAGE_TASK, stepCap, stepContainer, stepPod, STUCK_MS, taskLimits, taskPod, taskRequest, toolchainImage, uploadPod, uploadStage,
   stepPeak, WARM_GC_CONTAINER, WARM_PUBLISH_CONTAINER, WARM_RESTORE_CONTAINER, type Group, type KubeSettings, type PodCtx, type Prepared, type StepMemory, type WarmPod, warmCopyMemory, warmMemory,
 } from "./pods.ts";
-import { recordTrimmedPublish, recordWarmBytes, releaseGc, takeGc, warmBytes } from "./warm-queue.ts";
+import { autocraftVersion, recordTrimmedPublish, recordWarmBytes, releaseGc, takeGc, WARM_PRODUCER_REV, warmBytes } from "./warm-queue.ts";
 import { workspacePass, WorkspaceState } from "./workspace-launch.ts";
-import { appendLog, claim, finishTask, satisfies, type ClaimFit, loseTask, MAX_CHUNK_BYTES, MAX_LOG_BYTES, releaseClaim, startTask, touchTask, WARM_STEP, warmKeyOf } from "./tasks.ts";
+import { claimConfigKeys } from "./choose.ts";
+import { readConfig } from "../data/control/index.ts";
+import { appendLog, finishTask, loseTask, pickTasks, satisfies, type ClaimFit, MAX_CHUNK_BYTES, MAX_LOG_BYTES, WARM_STEP, warmKeyOf } from "./tasks.ts";
+import { appendTaskLogs, claimRun, failQueuedTasks, loadClaimInputs, loadEnvPass, loadEnvTasks, loadTasks, reportKubeEnv, releaseClaims, removePodRuns, savePodRuns, touchTasks } from "../data/build/index.ts";
+import type { ClaimInputs, EnvRecord, PodRun, PodRunPatch } from "../data/build/index.ts";
 import type { Db } from "../db/index.ts";
-import { cols } from "../db/kx.ts";
+import { effect } from "../db/effects.ts";
 
 export const PASS_MS = 5000;
 /** Beyond a deadline Kubernetes should have enforced, the runner gives up on the pod itself. */
@@ -55,13 +59,9 @@ const QUOTA_RETRY_MS = 60_000;
 /** A first pod no node had room for is placed again at most this often; after that it is lost as before. */
 const MAX_REPLACES = 2;
 
-type Run = {
-  task_id: number; env_id: string; key_hash: string; pvc: string; stage: number; pod: string | null; pod_created_at: string | null;
-  prepared: string | null; results: string; failed: string | null; ran: number; logged: string; create_tries: number; failing_since: string | null;
-  retry_at: string | null; started_at: string; node: string | null; reserved_cpu_m: number | null; reserved_mem_bytes: number | null; disruptions: number; replaces: number; log_positions: string;
-};
+type Run = PodRun;
 type TaskRow = { id: number; step: string; state: string; env_id: string | null; repo: string; plan: string; requires: string; log_bytes: number; warm_key: string | null };
-type EnvRow = { id: string; enabled: number; slots: number; settings: string | null };
+type EnvRow = { id: string; enabled: boolean; slots: number; settings: unknown; health: EnvRecord["health"] };
 type Kept = Prepared & { image: string };
 
 export type LauncherDeps = {
@@ -131,7 +131,8 @@ const statusOf = (pod: KPod, name: string): ContainerStatus | undefined =>
 const clean = (s: string | undefined): string => (s ?? "").replace(/[\u0000-\u001f\u007f]+/g, " ").trim().slice(0, 300);
 
 export async function launcherPass(d: LauncherDeps, state: LauncherState): Promise<void> {
-  const envs = await d.db.all(d.db.k.selectFrom("build_envs").select(["id", "enabled", "slots", "settings"]).where("kind", "=", "kubernetes").orderBy("id"));
+  const pass = await loadEnvPass(d.db, "kubernetes");
+  const envs = pass.envs.map((e): EnvRow => ({ id: e.id, enabled: e.enabled, slots: e.operatorSlots, settings: e.settings, health: e.health }));
   state.reads = new PassReads();
   if (envs.length && d.configMaps) {
     state.warm ??= new WarmStatus(d.configMaps, { namespace: envVar("WARM_STATUS_NAMESPACE"), now: d.now, log: d.log });
@@ -142,14 +143,14 @@ export async function launcherPass(d: LauncherDeps, state: LauncherState): Promi
     }
     state.caches ??= new CacheReporter(d.caches ?? null, d.now);
     try {
-      await state.caches.pass(d.db, state.warm, state.placer, envs.some((e) => e.enabled && settingsOf(e.settings).crateMirror));
+      await state.caches.pass(d.db, state.warm, state.placer, envs.some((e) => e.enabled && envSettings(e).crateMirror));
     } catch (e) {
       d.log(`caches report: ${(e as Error).message}`);
     }
   }
   for (const env of envs) {
     try {
-      await envPass(d, state, env);
+      await envPass(d, state, env, pass.tasks.get(env.id)?.runs ?? []);
     } catch (e) {
       d.log(`pod launcher: ${env.id}: ${(e as Error).stack ?? e}`);
     }
@@ -160,23 +161,36 @@ type EnvCtx = {
   d: LauncherDeps; state: LauncherState; api: KubeApi | null; env: EnvRow; s: KubeSettings; image: string | null; pods: KPod[]; pending: string[]; now: () => number;
   /** Capacity `cluster` with node and quota reads available. */
   cluster: boolean;
+  /** What this pass's claim read: the sizings of the queued tasks' repos and the other environments. */
+  inputs: ClaimInputs | null;
 };
 
-async function envPass(d: LauncherDeps, state: LauncherState, env: EnvRow): Promise<void> {
+async function envPass(d: LauncherDeps, state: LauncherState, env: EnvRow, firstRuns: Run[]): Promise<void> {
   const { db } = d;
   const now = d.now ?? Date.now;
-  const s = settingsOf(env.settings);
+  const s = envSettings(env);
   const warm = state.warm?.summary() ?? [];
   const warmErrors = state.warm?.nodeErrors() ?? [];
   const caps = { ...kubeCapabilities(s), ...(warm.length ? { warm } : {}), ...(warmErrors.length ? { warmErrors } : {}) };
   const cluster = s.capacity === "cluster" && !!d.capacity;
   // Under cluster capacity the slots offered come from this pass's capacity reads; undefined keeps the last figure.
   let slots: number | undefined = cluster ? undefined : env.slots;
-  const report = async (health: Omit<EnvHealth, "since"> | null, reachable: boolean) => await kubeReport(db, env.id, caps, slots, health, reachable);
+  const report = async (health: Omit<EnvHealth, "since"> | null, reachable: boolean) =>
+    await reportKubeEnv(db, { id: env.id, caps, slots, health, priorHealth: env.health, reachable, at: new Date(now()).toISOString() });
   const image = s.image ?? d.defaultImage;
-  const ctx: EnvCtx = { d, state, api: d.api, env, s, image, pods: [], pending: [], now, cluster };
-  const runs = async () => await db.all(db.k.selectFrom("build_pod_runs").select(cols("build_pod_runs")).where("env_id", "=", env.id).orderBy("task_id"));
-  for (const run of await runs()) await touchTask(db, env.id, run.task_id);
+  const ctx: EnvCtx = { d, state, api: d.api, env, s, image, pods: [], pending: [], now, cluster, inputs: null };
+  let first: Run[] | null = firstRuns;
+  const runs = async (): Promise<Run[]> => {
+    if (first) {
+      const r = first;
+      first = null;
+      return r;
+    }
+    return (await loadEnvTasks(db, env.id)).runs;
+  };
+  const started = await runs();
+  if (started.length) await touchTasks(db, env.id, started.map((r) => r.task_id), new Date(now()).toISOString());
+  first = started;
 
   const api = d.api;
   // Without the API, runs past their deadline are still given up, so their slots come back.
@@ -193,7 +207,7 @@ async function envPass(d: LauncherDeps, state: LauncherState, env: EnvRow): Prom
     return offline(`The Kubernetes API did not answer: ${(e as Error).message}`);
   }
   // Claims need the capabilities, before any health is known.
-  await kubeReport(db, env.id, caps, slots, undefined, true);
+  await reportKubeEnv(db, { id: env.id, caps, slots, reachable: true, at: new Date(now()).toISOString() });
 
   let access = state.access.get(env.id);
   if (!access || now() - access.at > ACCESS_EVERY_MS) {
@@ -213,8 +227,11 @@ async function envPass(d: LauncherDeps, state: LauncherState, env: EnvRow): Prom
     const unschedulable = cluster ? ctx.pods.find((p) => live.has(p.metadata.name) && feedbackCapacity(null, p).stop) : undefined;
     let active = current.length;
     // Read before claiming, outside its write transaction, and only when a task waits.
-    const view: CapView | null = cluster && !unschedulable && active < env.slots && await db.get(db.k.selectFrom("build_tasks").select("id").where("state", "=", "queued").limit(1))
-      ? await capacityView(ctx) : null;
+    const writer = s.warmWriter ? { version: autocraftVersion(), rev: WARM_PRODUCER_REV, image: toolchainImage(s, ["rust-stable"]) } : undefined;
+    const inputs = !unschedulable && active < env.slots ? await loadClaimInputs(db, env.id, now(), writer) : null;
+    const cfg = await readConfig(db, [...(inputs ? claimConfigKeys(inputs) : []), "warm_min_interval_minutes"]);
+    ctx.inputs = inputs;
+    const view: CapView | null = cluster && inputs && inputs.candidates.length ? await capacityView(ctx) : null;
     let waiting: Res | null = null, quotaFull = false;
     const fit: ClaimFit | undefined = cluster ? async (t) => {
       // No task was queued at the read: one queued since waits for the next pass's read.
@@ -236,10 +253,23 @@ async function envPass(d: LauncherDeps, state: LauncherState, env: EnvRow): Prom
     } : undefined;
     if (unschedulable) ctx.pending.push(`New tasks wait for build pod capacity: no node has room for pod ${unschedulable.metadata.name} yet`);
     // One at a time: a claim that cannot start goes back to the queue before the next is taken.
-    else for (; active < env.slots; active++) {
-      const t = (await claim(db, env.id, 1, now(), fit)).tasks[0];
-      if (!t) break;
-      const r = await start(ctx, t.id, view);
+    else if (inputs) while (active < env.slots) {
+      // Claimed one at a time: a claim that cannot start goes back to the queue before the next is taken.
+      const { picks, failed } = await pickTasks(db, env.id, 1, now(), { fit, inputs, config: cfg, warmMinIntervalMinutes: cfg.warmMinIntervalMinutes });
+      if (failed.length) await failQueuedTasks(db, failed, new Date(now()).toISOString());
+      const gone = new Set([...failed.map((f) => f.id), ...picks.map((p) => p.id)]);
+      inputs.candidates = inputs.candidates.filter((t) => !gone.has(t.id));
+      const pick = picks[0];
+      if (!pick) break;
+      const key = newPodKey(pick.id);
+      const claimed = await claimRun(db, {
+        envId: env.id, taskId: pick.id, keyHash: hashKey(key), pvc: `acb-${pick.id}-${randomBytes(3).toString("hex")}`, stage: STAGE_TASK, at: new Date(now()).toISOString(),
+        ...(pick.head ? { heads: { head: pick.head, base: pick.base ?? null, plan: pick.plan } } : {}),
+      });
+      // Another process claimed it first.
+      if (!claimed) continue;
+      inputs.running++;
+      const r = await start(ctx, claimed.run, claimed.task.id, key, view);
       if (r?.quota) {
         // The quota counts what the model may not (another quota key, pods outside AutoCraft): the next try waits a minute.
         state.backoff.set(env.id, { until: now() + CREATE_BACKOFF_MS, why: r.err, capacity: true });
@@ -251,6 +281,7 @@ async function envPass(d: LauncherDeps, state: LauncherState, env: EnvRow): Prom
         break;
       }
       state.backoff.delete(env.id);
+      active++;
     }
     const v = view;
     if (v && "error" in v) {
@@ -283,7 +314,12 @@ async function envPass(d: LauncherDeps, state: LauncherState, env: EnvRow): Prom
   await report(health, true);
 }
 
-const taskOf = async (db: Db, id: number) => await db.get(db.k.selectFrom("build_tasks").select(["id", "step", "state", "env_id", "repo", "plan", "requires", "log_bytes", "warm_key"]).where("id", "=", id));
+const taskOf = async (db: Db, id: number): Promise<TaskRow | undefined> => {
+  const t = (await loadTasks(db, [id])).get(id);
+  return t && { id: t.id, step: t.step, state: t.state, env_id: t.envId, repo: t.repo, plan: JSON.stringify(t.plan), requires: JSON.stringify(t.requires), log_bytes: t.logBytes, warm_key: t.warmKey };
+};
+/** Patches the pod run of a task. */
+const patchRun = async (db: Db, taskId: number, patch: PodRunPatch): Promise<void> => void await savePodRuns(db, [{ taskId, patch }]);
 /** Whether group `index` is a warm producer's build pod: the last group of a warm task, offline, on a warm writer. */
 const isWarmGroup = (c: EnvCtx, t: TaskRow, groups: Group[], index: number): boolean =>
   t.step === WARM_STEP && c.s.warmWriter && index === groups.length - 1 && groups[index]!.network === "none";
@@ -321,15 +357,17 @@ const cpuText = (m: number): string => String(Math.round(m / 100) / 10);
 /** A pod create the namespace's ResourceQuota refused: a wait for capacity, not a failure. */
 const quotaRefused = (e: unknown): boolean => e instanceof KubeError && e.status === 403 && /exceeded quota/i.test(e.message);
 
+/** The repository's sizing: from this pass's claim read when it covers the repository, else read now. */
+const sizingOf = async (c: EnvCtx, repo: string) => c.inputs?.sizings.get(repo) ?? await repoSizing(c.d.db, repo);
+
 /**
  * The repository's step memory and what one of its runs reserves on its node (pods.ts taskRequest), with an in-memory warm
  * target: a producer's, or a consumer's sized from the key's last published version (decideWarm checks the node's version
  * against what was reserved).
  */
 async function requestOf(c: EnvCtx, repo: string, step: string): Promise<{ res: Res; memory: StepMemory }> {
-  const { db } = c.d;
-  const sizing = await repoSizing(db, repo);
-  const memory = sizing.memory ?? { requestBytes: quantity(c.s.memoryRequest), limitBytes: quantity(c.s.memoryLimit) };
+  const sizing = await sizingOf(c, repo);
+  const memory = memoryOf(sizing, c.s);
   const key = warmKeyOf(repo);
   let extra = 0;
   if (step === WARM_STEP && c.s.warmWriter) extra = warmMemory({ key, gc: false, bytes: sizing.warmBytes }) ?? 0;
@@ -365,11 +403,11 @@ async function readView(c: EnvCtx): Promise<CapView> {
     const archLabel = ARCH_LABEL[c.s.arch];
     // Every environment's runs reserve on the nodes they were placed on, whatever their namespace.
     const reservations = new Map<string, Res>();
-    for (const r of await c.d.db.all(c.d.db.k.selectFrom("build_pod_runs").select(["node", "reserved_cpu_m", "reserved_mem_bytes"]).where("node", "is not", null))) {
-      const u = reservations.get(r.node!) ?? { cpu: 0, mem: 0 };
-      u.cpu += Number(r.reserved_cpu_m ?? 0);
-      u.mem += Number(r.reserved_mem_bytes ?? 0);
-      reservations.set(r.node!, u);
+    for (const r of (await loadEnvPass(c.d.db, "kubernetes")).reservations) {
+      const u = reservations.get(r.node) ?? { cpu: 0, mem: 0 };
+      u.cpu += r.cpuM;
+      u.mem += r.memBytes;
+      reservations.set(r.node, u);
     }
     // Other pods are not visible to the runner (capacity.ts): only our own reservations are taken off.
     const cap = computeCapacity({ nodes, pods: [], quota, reservations, settings: { archLabel, nodeReserve: reserve, buildPriority: 0 } });
@@ -396,12 +434,10 @@ async function readView(c: EnvCtx): Promise<CapView> {
  * in the same namespace shares the quota).
  */
 async function otherEnvMayRun(c: EnvCtx, requires: Requires, by: "nodes" | "quota"): Promise<boolean> {
-  const others = await c.d.db.all(c.d.db.k.selectFrom("build_envs").select(["id", "kind", "capabilities", "settings"]).where("enabled", "=", 1).where("id", "!=", c.env.id));
-  return others.some((e) => {
-    const caps = json<Capabilities | null>(e.capabilities, null);
-    if (!caps || !satisfies(caps, requires)) return false;
+  return (c.inputs?.otherEnvs ?? []).some((e) => {
+    if (!e.capabilities || !satisfies(e.capabilities, requires)) return false;
     if (e.kind !== "kubernetes") return true;
-    const s = settingsOf(e.settings);
+    const s = envSettings(e);
     return by === "nodes" ? s.arch !== c.s.arch : s.namespace !== c.s.namespace;
   });
 }
@@ -415,7 +451,7 @@ const nodeWarm = (c: EnvCtx, repo: string, node: string | null) =>
 
 /** Whether a task of this environment may start warm at all: not a warm producer's, and its repository has a warm target. */
 async function warmTargetOf(c: EnvCtx, t: TaskRow) {
-  return t.step === WARM_STEP || c.s.warmWriter ? "none" as const : await repoWarmTarget(c.d.db, t.repo);
+  return t.step === WARM_STEP || c.s.warmWriter ? "none" as const : (await sizingOf(c, t.repo)).warmTarget;
 }
 
 /**
@@ -434,22 +470,17 @@ async function place(c: EnvCtx, run: Run, t: TaskRow, view: CapView | null, avoi
     node = view.cap.take(res, [...warm, ...others]);
   }
   Object.assign(run, { node, reserved_cpu_m: res.cpu, reserved_mem_bytes: res.mem });
-  await c.d.db.run(c.d.db.k.updateTable("build_pod_runs").set({ node, reserved_cpu_m: res.cpu, reserved_mem_bytes: res.mem }).where("task_id", "=", run.task_id));
+  await patchRun(c.d.db, run.task_id, { node, reserved_cpu_m: res.cpu, reserved_mem_bytes: res.mem });
 }
 
 /**
  * Starts a claimed task: its run, volume and task pod. Anything that fails undoes the claim and returns the error;
  * `quota` when the namespace's quota had no room, which is a wait for capacity rather than a fault.
  */
-async function start(c: EnvCtx, taskId: number, view: CapView | null): Promise<{ err: string; quota: boolean } | null> {
+async function start(c: EnvCtx, run: Run, taskId: number, key: string, view: CapView | null): Promise<{ err: string; quota: boolean } | null> {
   const { db } = c.d;
-  const key = newPodKey(taskId);
-  const pvc = `acb-${taskId}-${randomBytes(3).toString("hex")}`;
+  const pvc = run.pvc;
   try {
-    await db.run(db.k.insertInto("build_pod_runs")
-      .values({ task_id: taskId, env_id: c.env.id, key_hash: hashKey(key), pvc, stage: STAGE_TASK, started_at: new Date(c.now()).toISOString() }));
-    await startTask(db, c.env.id, taskId);
-    const run = (await db.get(db.k.selectFrom("build_pod_runs").select(cols("build_pod_runs")).where("task_id", "=", taskId)))!;
     const t = (await taskOf(db, taskId))!;
     await place(c, run, t, c.cluster ? view : null);
     await c.api!.createPvc(c.s.namespace, pvcSpec(c.s, c.env.id, taskId, pvc));
@@ -460,8 +491,8 @@ async function start(c: EnvCtx, taskId: number, view: CapView | null): Promise<{
     const msg = (e as Error).message;
     c.d.log(`pod launcher: task ${taskId}: could not start: ${msg}`);
     await c.api!.deletePvc(c.s.namespace, pvc).catch(() => {});
-    await db.run(db.k.deleteFrom("build_pod_runs").where("task_id", "=", taskId));
-    await releaseClaim(db, c.env.id, taskId);
+    await removePodRuns(db, [taskId]);
+    await releaseClaims(db, c.env.id, [taskId]);
     return { err: msg, quota: quotaRefused(e) };
   }
 }
@@ -473,8 +504,9 @@ async function createPod(c: EnvCtx, run: Run, stage: number, spec: (ctx: PodCtx)
   const name = `acb-${run.task_id}-${stage}-${randomBytes(3).toString("hex")}`;
   const ctx: PodCtx = { s: c.s, envId: c.env.id, taskId: run.task_id, stage, name, pvc: run.pvc, deadlineSec: Math.min(deadlineSec, left), memory, node: run.node };
   const at = new Date(now).toISOString();
-  await c.d.db.run(c.d.db.k.updateTable("build_pod_runs").set({ stage, pod: name, pod_created_at: at }).where("task_id", "=", run.task_id));
+  await patchRun(c.d.db, run.task_id, { stage, pod: name, pod_created_at: at });
   Object.assign(run, { stage, pod: name, pod_created_at: at });
+  effect("build-launch");
   await c.api!.createPod(c.s.namespace, spec(ctx));
 }
 
@@ -484,7 +516,7 @@ async function removeRun(c: EnvCtx, run: Run): Promise<void> {
     if (run.pod) await c.api.deletePod(c.s.namespace, run.pod).catch(() => {});
     await c.api.deletePvc(c.s.namespace, run.pvc).catch(() => {});
   }
-  await c.d.db.run(c.d.db.k.deleteFrom("build_pod_runs").where("task_id", "=", run.task_id));
+  await removePodRuns(c.d.db, [run.task_id]);
 }
 
 async function lose(c: EnvCtx, run: Run, reason: string): Promise<void> {
@@ -536,18 +568,17 @@ async function podLog(c: EnvCtx, run: Run, container: string, step: string, live
       took = takeLog(text, pos, true);
     }
     const done = await db.write(async () => {
-      let truncated = false;
       // A quarter of the chunk cap in characters stays under it in bytes.
-      for (let i = 0; i < took.text.length && !truncated; i += MAX_CHUNK_BYTES / 4) {
-        truncated = (await appendLog(db, c.env.id, run.task_id, step, took.text.slice(i, i + MAX_CHUNK_BYTES / 4))).truncated;
-      }
+      const pieces: string[] = [];
+      for (let i = 0; i < took.text.length; i += MAX_CHUNK_BYTES / 4) pieces.push(took.text.slice(i, i + MAX_CHUNK_BYTES / 4));
+      const truncated = pieces.length ? (await appendTaskLogs(db, c.env.id, run.task_id, step.slice(0, 64), pieces)).truncated : false;
       const finished = end || truncated || budget >= MAX_LOG_BYTES || t.log_bytes >= MAX_LOG_BYTES;
       // Positions are kept only for the run's current pod.
       const kept = Object.fromEntries(Object.entries(positions).filter(([k]) => k !== id && k.startsWith(`${run.pod}/`)));
       if (!finished && took.pos) kept[id] = took.pos;
       run.log_positions = JSON.stringify(kept);
       if (finished) run.logged = JSON.stringify([...json<string[]>(run.logged, []), id]);
-      await db.run(db.k.updateTable("build_pod_runs").set({ logged: run.logged, log_positions: run.log_positions }).where("task_id", "=", run.task_id));
+      await patchRun(db, run.task_id, { logged: run.logged, log_positions: run.log_positions });
       return finished;
     });
     if (done || live) return;
@@ -611,7 +642,7 @@ async function advance(c: EnvCtx, run: Run): Promise<void> {
   // A run the scheduler placed (fixed capacity, or no node fitted) reserves on the node its pod went to.
   if (!run.node && pod.spec?.nodeName) {
     run.node = pod.spec.nodeName;
-    await db.run(db.k.updateTable("build_pod_runs").set({ node: run.node }).where("task_id", "=", run.task_id));
+    await patchRun(db, run.task_id, { node: run.node });
   }
   const phase = pod.status?.phase;
   const deleting = pod.metadata.deletionTimestamp;
@@ -684,7 +715,7 @@ async function disrupted(c: EnvCtx, run: Run, t: TaskRow, pod: KPod | null, why:
   await appendLog(db, c.env.id, run.task_id, "environment", `The cluster stopped the build pod (${why}); the stage runs again on the same volume.\n`);
   if (run.pod) await c.api!.deletePod(c.s.namespace, run.pod).catch(() => {});
   const disruptions = run.disruptions + 1;
-  await db.run(db.k.updateTable("build_pod_runs").set({ pod: null, disruptions, create_tries: 0, failing_since: null, retry_at: null }).where("task_id", "=", run.task_id));
+  await patchRun(db, run.task_id, { pod: null, disruptions, create_tries: 0, failing_since: null, retry_at: null });
   Object.assign(run, { pod: null, disruptions, create_tries: 0, failing_since: null, retry_at: null });
   return createStage(c, run, t, run.stage);
 }
@@ -701,7 +732,7 @@ async function replace(c: EnvCtx, run: Run, t: TaskRow, why: string): Promise<vo
     view.cap.release({ ...res, cpu: run.reserved_cpu_m ?? res.cpu, mem: run.reserved_mem_bytes ?? res.mem }, avoid);
   }
   const replaces = run.replaces + 1;
-  await c.d.db.run(c.d.db.k.updateTable("build_pod_runs").set({ replaces }).where("task_id", "=", run.task_id));
+  await patchRun(c.d.db, run.task_id, { replaces });
   run.replaces = replaces;
   await place(c, run, t, view, avoid);
   return next(c, run, t, STAGE_TASK);
@@ -717,7 +748,7 @@ async function endStage(c: EnvCtx, run: Run, t: TaskRow, pod: KPod): Promise<voi
     await podLog(c, run, "task", "source");
     if (statusOf(pod, "task")?.state?.terminated?.exitCode !== 0) return lose(c, run, `The task pod could not read its task: ${podFailure(pod)}`);
     // No key is valid while repository code runs; the upload pod gets a new one.
-    await db.run(db.k.updateTable("build_pod_runs").set({ key_hash: hashKey(randomBytes(32).toString("hex")) }).where("task_id", "=", run.task_id));
+    await patchRun(db, run.task_id, { key_hash: hashKey(randomBytes(32).toString("hex")) });
     return next(c, run, t, STAGE_SOURCE);
   }
   if (run.stage === STAGE_SOURCE) {
@@ -731,7 +762,7 @@ async function endStage(c: EnvCtx, run: Run, t: TaskRow, pod: KPod): Promise<voi
     if (!image) return finish(c, run, `no toolchain image for ${json<Requires>(t.requires, {}).toolchains?.join(", ") || "this task"}`);
     const kept: Kept = { ...r.prepared, image };
     run.prepared = JSON.stringify(kept);
-    await db.run(db.k.updateTable("build_pod_runs").set({ prepared: run.prepared }).where("task_id", "=", run.task_id));
+    await patchRun(db, run.task_id, { prepared: run.prepared });
     return next(c, run, t, FIRST_GROUP);
   }
   if (run.stage >= FIRST_GROUP && run.stage < up) {
@@ -805,7 +836,7 @@ async function endStage(c: EnvCtx, run: Run, t: TaskRow, pod: KPod): Promise<voi
       }
     }
     if (!failed && !gcFailed && pod.status?.phase === "Failed") return lose(c, run, podFailure(pod));
-    await db.run(db.k.updateTable("build_pod_runs").set({ results: JSON.stringify(results), ran, failed }).where("task_id", "=", run.task_id));
+    await patchRun(db, run.task_id, { results: JSON.stringify(results), ran, failed });
     Object.assign(run, { results: JSON.stringify(results), ran, failed });
     const nextGroup = run.stage - FIRST_GROUP + 1;
     if (!failed && nextGroup < groups.length) return next(c, run, t, FIRST_GROUP + nextGroup);
@@ -823,7 +854,7 @@ async function endStage(c: EnvCtx, run: Run, t: TaskRow, pod: KPod): Promise<voi
 /** Deletes the stage's pod and starts `stage`. */
 async function next(c: EnvCtx, run: Run, t: TaskRow, stage: number): Promise<void> {
   if (run.pod) await c.api!.deletePod(c.s.namespace, run.pod).catch(() => {});
-  await c.d.db.run(c.d.db.k.updateTable("build_pod_runs").set({ stage, pod: null, create_tries: 0, failing_since: null, retry_at: null }).where("task_id", "=", run.task_id));
+  await patchRun(c.d.db, run.task_id, { stage, pod: null, create_tries: 0, failing_since: null, retry_at: null });
   Object.assign(run, { stage, pod: null, create_tries: 0, failing_since: null, retry_at: null });
   return createStage(c, run, t, stage);
 }
@@ -846,7 +877,7 @@ async function createStage(c: EnvCtx, run: Run, t: TaskRow, stage: number): Prom
   if (stage === STAGE_TASK) {
     // Recreated after a disruption or a replace: the task pod reads its task with a new key.
     const key = newPodKey(run.task_id);
-    await db.run(db.k.updateTable("build_pod_runs").set({ key_hash: hashKey(key) }).where("task_id", "=", run.task_id));
+    await patchRun(db, run.task_id, { key_hash: hashKey(key) });
     spec = (ctx) => taskPod(ctx, c.image!, key);
   } else if (stage === STAGE_SOURCE) {
     // The source pod lists what changed since the version the node holds now; a later version means touching every file.
@@ -891,13 +922,13 @@ async function createStage(c: EnvCtx, run: Run, t: TaskRow, stage: number): Prom
     spec = (ctx) => stepPod(ctx, kept.image, c.image!, plan, g, kept, index === 0, t.repo, warm, use);
   } else if (stage === uploadStage(plan)) {
     const key = newPodKey(run.task_id);
-    await db.run(db.k.updateTable("build_pod_runs").set({ key_hash: hashKey(key) }).where("task_id", "=", run.task_id));
+    await patchRun(db, run.task_id, { key_hash: hashKey(key) });
     spec = (ctx) => uploadPod(ctx, c.image!, key, run.ran);
   } else return lose(c, run, `The build pod run is at an unknown stage ${stage}`);
   try {
     await createPod(c, run, stage, spec, deadline, memory);
     c.state.quotaWait.delete(run.task_id);
-    await db.run(db.k.updateTable("build_pod_runs").set({ create_tries: 0, failing_since: null, retry_at: null }).where("task_id", "=", run.task_id));
+    await patchRun(db, run.task_id, { create_tries: 0, failing_since: null, retry_at: null });
   } catch (e) {
     if (gcTaken) await releaseGc(db, c.now());
     const now = c.now();
@@ -905,7 +936,7 @@ async function createStage(c: EnvCtx, run: Run, t: TaskRow, stage: number): Prom
       // The quota is the build budget: wait for room until the task's deadline, without counting a failed create.
       const retry = new Date(now + QUOTA_RETRY_MS).toISOString();
       Object.assign(run, { pod: null, retry_at: retry });
-      await db.run(db.k.updateTable("build_pod_runs").set({ pod: null, retry_at: retry }).where("task_id", "=", run.task_id));
+      await patchRun(db, run.task_id, { pod: null, retry_at: retry });
       const wait = `Task ${run.task_id} waits for build pod capacity: the namespace's quota has no room for its next pod`;
       c.state.quotaWait.set(run.task_id, wait);
       c.pending.push(wait);
@@ -919,7 +950,7 @@ async function createStage(c: EnvCtx, run: Run, t: TaskRow, stage: number): Prom
     Object.assign(run, { pod: null, create_tries: tries, failing_since: since });
     if (tries >= CREATE_TRIES || now - Date.parse(since) > CREATE_GIVE_UP_MS) return lose(c, run, why);
     const retry = new Date(now + Math.min(15_000 * 2 ** (tries - 1), 5 * 60_000)).toISOString();
-    await db.run(db.k.updateTable("build_pod_runs").set({ pod: null, create_tries: tries, failing_since: since, retry_at: retry }).where("task_id", "=", run.task_id));
+    await patchRun(db, run.task_id, { pod: null, create_tries: tries, failing_since: since, retry_at: retry });
     run.retry_at = retry;
     c.d.log(`pod launcher: task ${run.task_id}: ${why} (try ${tries}, again at ${retry})`);
   }

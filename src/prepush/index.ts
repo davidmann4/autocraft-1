@@ -4,7 +4,8 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import type { TaskStep } from "../../web/src/api/types.ts";
 import { absolute } from "../build/artifacts.ts";
-import { createTask, getTask, warmKeyOf, type Warm } from "../build/tasks.ts";
+import { createTask, warmKeyOf, type Warm } from "../build/tasks.ts";
+import { loadArtifactFiles, loadTasks } from "../data/build/index.ts";
 import { FORMAT_ARTIFACT, FORMAT_SCRIPT, gitFormatDiff } from "../cifix/index.ts";
 import { formattingOnly } from "../cifix/guard.ts";
 import type { Git } from "../fixup/git.ts";
@@ -152,20 +153,20 @@ export function formatErrorFindings(text: string): Finding[] {
 }
 
 export const artifactText = async (db: Db, taskId: number, name: string): Promise<string | null> => {
-  const row = await db.get(db.k.selectFrom("build_artifacts").select("file").where("task_id", "=", taskId).where("name", "=", name));
-  const path = row ? absolute(row.file) : null;
+  const file = (await loadArtifactFiles(db, [{ taskId, name }])).get(`${taskId}/${name}`);
+  const path = file ? absolute(file) : null;
   return path ? readFileSync(path, "utf8") : null;
 };
 
 /** The lint task's state, and once it is done the formatter diff (git format) and the findings on the patch's own lines. */
 export async function readLint(db: Db, taskId: number, o: { /** A diff whose added lines count; default: the task's own patch. */ against?: string } = {}): Promise<LintRead> {
-  const t = await getTask(db, taskId);
+  const t = (await loadTasks(db, [taskId])).get(taskId);
   if (!t) return { kind: "infra-failed", reason: "the lint task is gone" };
   if (t.state === "queued" || t.state === "claimed" || t.state === "running") return { kind: "pending" };
   // A tests step that timed out fails the task, but everything before it finished: its output is read as an inconclusive test run.
   const testsTimedOut = t.state === "failed" && t.plan.some((p) => p.name === TESTS_STEP) && t.results.some((r) => r.step === TESTS_STEP && r.timedOut) && t.results.filter((r) => r.step !== TESTS_STEP).every((r) => r.exitCode === 0 && !r.timedOut);
   if (t.state !== "done" && !testsTimedOut) return { kind: "infra-failed", reason: `the lint task ${t.state}${t.summary ? `: ${t.summary.slice(0, 200)}` : ""}` };
-  const patch = (await db.get(db.k.selectFrom("build_tasks").select("patch").where("id", "=", taskId)))?.patch ?? "";
+  const patch = (await loadTasks(db, [taskId], { patch: true })).get(taskId)?.patch ?? "";
   const fmt = await artifactText(db, taskId, FORMAT_ARTIFACT);
   const clippy = await artifactText(db, taskId, CLIPPY_ARTIFACT);
   if (clippy === null) return { kind: "infra-failed", reason: "the lint task returned no clippy output" };

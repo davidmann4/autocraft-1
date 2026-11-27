@@ -1,20 +1,23 @@
-// Screenshots, collect side: the switch gates every step, and only a clear regression on an unchanged head holds a merge.
+// Screenshots, collect side: the switch gates every step, and only a clear regression on an unchanged head keeps it from merging.
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, test } from "node:test";
 import { storeArtifact, tempPath } from "../src/build/artifacts.ts";
 import { setFeature } from "../src/build/features.ts";
+import { loadMergeFacts } from "../src/data/merge/index.ts";
 import { createEnv, hello } from "../src/build/envs.ts";
 import { claim, createTask, getTask } from "../src/build/tasks.ts";
 import { parseCompareReply, parseScreenshotReply, type CompareParsed } from "../src/verify/plan.ts";
 import { runCollect, collectDue, type CollectDeps } from "../src/verify/results.ts";
 import { putConfig, type ScreenshotConfigBody } from "../src/verify/screenshot-config.ts";
 import { runVerify, type VerifyDeps } from "../src/verify/index.ts";
+import { acting } from "./acting.ts";
+import { reportingTaskRunner } from "./fake-runner.ts";
 import { SCRATCH } from "./scratch.ts";
-import type { Db } from "../src/db/index.ts";
+import { connectDb, type Db } from "./helpers/raw-db.ts";
 import { cols, excluded, like } from "../src/db/kx.ts";
-import { connectDb } from "../src/db/open.ts";
+import { insertWorkflow } from "../src/workflow/store.ts";
 
 mkdirSync(SCRATCH, { recursive: true });
 const dir = mkdtempSync(join(SCRATCH, "shots-collect-"));
@@ -45,6 +48,9 @@ async function fresh(): Promise<Db> {
   await db.run(db.k.insertInto("tracked_repos").values({ name: "app", added_by: "op", added_at: T0, pipeline: 1 }));
   await db.run(db.k.insertInto("repos").values({ name: "app", visibility: "public" }));
   await putConfig(db, "op", "app", CFG);
+  await insertWorkflow(db, { repo: "app", number: 7, kind: "pr", entry: "review", state: "running", startedBy: "op", startedAt: T0, startedVia: "dashboard" });
+  await acting(db, ["op"]);
+  await reportingTaskRunner(db);
   return db;
 }
 const verifyDeps: VerifyDeps = {
@@ -54,7 +60,9 @@ const verifyDeps: VerifyDeps = {
 };
 const tasks = async (db: Db, step?: string, state?: string): Promise<number> => (await db.all(db.k.selectFrom("build_tasks").select("id")
   .$if(!!step, (q) => q.where("step", "=", step!)).$if(!!state, (q) => q.where("state", "=", state!)))).length;
-const count = async (db: Db, table: "screenshot_runs" | "merge_holds"): Promise<number> => (await db.all(db.k.selectFrom(table).select((eb) => eb.lit(1).as("one")))).length;
+const count = async (db: Db, table: "screenshot_runs"): Promise<number> => (await db.all(db.k.selectFrom(table).select((eb) => eb.lit(1).as("one")))).length;
+/** Heads of the PR that the planner reads a clear regression at. */
+const regressions = async (db: Db): Promise<number> => (await loadMergeFacts(db, [{ repo: "app", number: 7 }])).regressions.size;
 const runRow = async <C extends "state" | "reason" | "verdict" | "clear" | "held">(db: Db, ...columns: C[]) => await db.get(db.k.selectFrom("screenshot_runs").select(columns));
 const switchOn = async (db: Db): Promise<void> => await setFeature(db, "screenshots", true, "op", "app");
 
@@ -101,19 +109,19 @@ describe("screenshots switch off (test A)", () => {
     assert.equal(compareCalls, 0);
     assert.deepEqual({ ...await runRow(db, "state", "reason") }, { state: "skipped", reason: "screenshots switched off" });
     assert.equal((await getTask(db, t.head))!.state, "cancelled");
-    assert.equal(await count(db, "merge_holds"), 0);
+    assert.equal(await regressions(db), 0);
   });
 });
 
 describe("screenshots collect (test B)", () => {
-  test("a clear regression holds the merge and leaves the verification alone", async () => {
+  test("a clear regression is kept as a fact of the head and leaves the verification alone", async () => {
     const db = await fresh(); await switchOn(db);
     await rendered(db, { head: "broken", base: "fine" });
     const before = await db.all(db.k.selectFrom("verifications").select(cols("verifications")));
     await collect(db, reply("regression", true));
     assert.equal(compareCalls, 1);
     assert.deepEqual({ ...await runRow(db, "state", "verdict", "clear", "held") }, { state: "compared", verdict: "regression", clear: 1, held: 1 });
-    assert.equal(await (await db.all(db.k.selectFrom("merge_holds").select((eb) => eb.lit(1).as("one")).where("repo", "=", "app").where("number", "=", 7))).length, 1);
+    assert.equal(await regressions(db), 1);
     assert.deepEqual((await db.all(db.k.selectFrom("stages").select("stage").where((eb) => eb.or([like(db, "stage", eb.val("%hold%")), like(db, "stage", eb.val("screenshot%"))])))).map((r) => r.stage), ["hold"]);
     assert.deepEqual(await db.all(db.k.selectFrom("verifications").select(cols("verifications"))), before);
   });
@@ -122,7 +130,7 @@ describe("screenshots collect (test B)", () => {
     let db = await fresh(); await switchOn(db);
     await rendered(db, { head: "broken", base: "fine" });
     await collect(db, reply("regression", false));
-    assert.equal(await count(db, "merge_holds"), 0);
+    assert.equal(await regressions(db), 0);
     assert.equal((await runRow(db, "verdict"))!.verdict, "regression");
 
     db = await fresh(); await switchOn(db);
@@ -130,20 +138,20 @@ describe("screenshots collect (test B)", () => {
     await collect(db, reply("regression", true));
     assert.equal(compareCalls, 0);
     assert.equal((await runRow(db, "state"))!.state, "error");
-    assert.equal(await count(db, "merge_holds"), 0);
+    assert.equal(await regressions(db), 0);
 
     db = await fresh(); await switchOn(db);
     await rendered(db, { head: "broken", base: "fine" });
     await collect(db, async () => { await db.run(db.k.updateTable("items").set({ head_oid: "c".repeat(40) }).where("repo", "=", "app")); await db.run(db.k.updateTable("pr_checks").set({ head_oid: "c".repeat(40) }).where("repo", "=", "app")); });
     assert.deepEqual({ ...await runRow(db, "state", "held") }, { state: "compared", held: 0 });
-    assert.equal(await count(db, "merge_holds"), 0);
+    assert.equal(await regressions(db), 0);
 
     db = await fresh(); await switchOn(db);
     await rendered(db, { head: "same", base: "same" });
     await collect(db, reply("regression", true));
     assert.equal(compareCalls, 0);
     assert.equal((await runRow(db, "verdict"))!.verdict, "unchanged");
-    assert.equal(await count(db, "merge_holds"), 0);
+    assert.equal(await regressions(db), 0);
   });
 });
 
@@ -178,7 +186,7 @@ describe("screenshots review fixes", () => {
     await db.run(db.k.updateTable("build_tasks").set({ state: "lost", results: "[]" }).where("state", "=", "queued"));
     await collect(db, reply("regression", true));
     assert.equal((await runRow(db, "state"))!.state, "error");
-    assert.equal(await count(db, "merge_holds"), 0);
+    assert.equal(await regressions(db), 0);
   });
 
   test("switching the feature off cancels render tasks and skips open runs; the claim skips them while off", async () => {

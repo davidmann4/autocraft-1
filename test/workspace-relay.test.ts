@@ -9,14 +9,13 @@ import { allocation } from "../src/agents/call.ts";
 import { addLogin } from "../src/access.ts";
 import { queueWorkspaceCall } from "../src/build/workspace-call.ts";
 import { createHash } from "node:crypto";
-import { IMAGE_KEEP_MS, KEPT_IMAGES, pruneWorkspaceImages, relayWorkspaceCall, type ToolSession } from "../src/build/workspace-relay.ts";
+import { IMAGE_KEEP_MS, KEPT_IMAGES, pruneWorkspaceImages, relayWorkspaceCall, WorkspaceServer, type ToolSession } from "../src/build/workspace-relay.ts";
 import { calls, image } from "../src/dash/api/workspaces.ts";
 import type { Req } from "../src/dash/types.ts";
 import { mcpReply } from "../src/dash/mcp/index.ts";
 import { createToken } from "../src/dash/mcp/tokens.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb } from "./helpers/raw-db.ts";
 import { awaitCall, claimCall, submitCall, type Caller } from "../src/remote/calls.ts";
-import { setInferenceMode } from "../src/remote/mode.ts";
 import { PROTOCOL_VERSION, type TaskBundle } from "../src/remote/protocol.ts";
 import { SCRATCH } from "./scratch.ts";
 
@@ -31,7 +30,6 @@ describe("workspace relay", async () => {
 
   before(async () => {
     allocation.pollMs = 10;
-    await setInferenceMode(db, "user-local", "test");
     await addLogin(db, "cli", "bob", "maintainer", null);
     const now = new Date().toISOString();
     await db.run(db.k.insertInto("repos").values({ name: "photocraft", owner: "storytold", visibility: "public" }));
@@ -50,7 +48,7 @@ describe("workspace relay", async () => {
     const now = new Date().toISOString();
     const ws = Number((await db.get(db.k.insertInto("workspaces").values({ repo: "photocraft", base_sha: "a".repeat(40), env_id: "k", state: "ready", state_at: now, created_at: now, updated_at: now }).returning("id")))!.id);
     await queueWorkspaceCall(db, request(ws));
-    const r = await claimCall(db, caller, { requestId: `ws-relay-claim-${++claims}`, protocol: PROTOCOL_VERSION, helperVersion: "1.3.6", harness: "claude", harnessVersion: "2", tiers: { top: "opus" } }, async () => true);
+    const r = await claimCall(db, caller, { requestId: `ws-relay-claim-${++claims}`, protocol: PROTOCOL_VERSION, helperVersion: "1.3.7", harness: "claude", harnessVersion: "2", tiers: { top: "opus" } }, async () => true);
     assert.ok(r.lease, JSON.stringify(r));
     const lease = r.lease;
     const runId = (await db.get(db.k.selectFrom("remote_calls").select("run_id").where("id", "=", lease.id)))!.run_id;
@@ -135,6 +133,29 @@ describe("workspace relay", async () => {
     assert.ok(await pruneWorkspaceImages(db) >= KEPT_IMAGES);
     assert.equal((await image(db, op({ id: String(s.ws), call: String(kept!.id) }))).status, 404, "kept bytes are dropped once the workspace has long ended");
     assert.ok((await calls(db, op({ id: String(s.ws) }))).calls.every((c) => c.notKept !== null));
+  });
+
+  test("a tool call whose claim fails half way stays queued and runs at the next poll", { timeout: 20_000 }, async (t) => {
+    const s = await session();
+    const fake: ToolSession = { call: async () => ({ text: "ran" }) };
+    const server = (await WorkspaceServer.open(db, s.id, () => fake))!;
+    const write = db.write.bind(db);
+    let failed = false;
+    t.mock.method(db, "write", (async (fn: () => Promise<unknown>) => {
+      if (!failed && new Error().stack!.includes("markCalls")) {
+        failed = true;
+        throw new Error("the second write failed");
+      }
+      return await write(fn);
+    }) as typeof db.write);
+    const relayed = relayWorkspaceCall(db, s, "shell", { command: "ls" }, { live: async () => true });
+    while (!await db.get(db.k.selectFrom("workspace_calls").select("id").where("workspace_id", "=", s.ws))) await new Promise((r) => setTimeout(r, 5));
+    for (let i = 0; i < 100 && !failed; i++) await server.serve().catch(() => new Promise((r) => setTimeout(r, 5)));
+    assert.ok(failed);
+    await server.serve();
+    assert.equal((await relayed).text, "ran");
+    await server.end();
+    await submitCall(db, s.secret, { ok: false, error: "done", durationMs: 1 });
   });
 
   test("a tool call still queued when the remote call ends is refused", { timeout: 20_000 }, async () => {

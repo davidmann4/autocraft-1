@@ -1,30 +1,32 @@
 // The item page: one GET with everything the two-sided page draws (status, header, Opus reviews, result cards, AutoCraft's history and
 // the GitHub side). Built from the item API (`itemCore`), the item trace and the write records. Redaction follows the helpers it reuses:
 // viewers get no review text, card details or job errors; a quiet pull request is veiled by the trace context; costs stay visible.
-import { filtered, isHiddenRepo } from "../../hidden-sql.ts";
-import { prBuildView } from "../../prbuild/view.ts";
+import { isHiddenRepo } from "../../hidden-sql.ts";
 import { createHash } from "node:crypto";
 import type { CiState, TimelineEntry, DiscordInfo, ItemBar, ItemImplementation, ItemKind, ItemPrBuild, ItemRef, ItemReleases, ItemState, Preapproval, QueueSlot, RepoName, ScreenshotRun, Tier } from "../../../web/src/api/types.ts";
 import { statusFromItem, type ItemStatus } from "../../core/item-status.ts";
 import { triggerWhy } from "../../review/trigger.ts";
 import { GITHUB_ACTIONS } from "../../github/actions.ts";
-import { fingerprint, rowValuesOf, context, gather, obj, arr, type Ctx, type Ev, hiddenExpr } from "./trace.ts";
+import { context, contextScope, eventsFrom, shape, traceScope, visibleItem, writeActions, obj, arr, type Ctx, type Ev } from "./trace.ts";
 import { timelineOf } from "./item-timeline.ts";
-import { implementationData, implementationView } from "./item-implementation.ts";
+import { implementationFrom, implementationView } from "./item-implementation.ts";
 import { barOf } from "./item-bar.ts";
 import { discordOf } from "./discord.ts";
-import { itemCore } from "./index.ts";
-import { pushedCommits, writesOf, MATCH_WINDOW_MS, type WriteRow } from "./github-writes.ts";
+import { matchWrites, pushedIn, MATCH_WINDOW_MS, type WriteRow } from "./github-writes.ts";
 import { actionsOf as releasesOf } from "../../operator-actions.ts";
-import { preapprovalOf, preapprovalsOf } from "../../preapproval/index.ts";
-import { queueSlots } from "../../rank/position.ts";
+import { computeStages, slotsOf } from "../../rank/position.ts";
 import { visibleRepos } from "./visible.ts";
 import { itemReader, statusFor } from "./reader.ts";
 import type { Req } from "../types.ts";
-import { backlogHeld } from "../../dupes/held.ts";
-import { canSettleCached } from "../../settlers.ts";
+import { contributors } from "../../whitelist.ts";
+import { mayRunRepo } from "../repo-access.ts";
+import { featureOn } from "../../build/features.ts";
+import { loadItemPage, loadItemStamp, type ItemPageFacts } from "../../data/views/item-page.ts";
+import { loadItems } from "../../data/mirror/index.ts";
+import { itemState } from "./shown.ts";
 import type { Db } from "../../db/index.ts";
-import { cols, exprOf, groupConcat, jsonNum, least, rowid, type Eb } from "../../db/kx.ts";
+import type { Preapproval as Leg } from "../../data/workflow/types.ts";
+import { isOwnLogin } from "../../github/identity.ts";
 
 export type ItemPhase = ItemStatus["phase"];
 export type { ItemStatus };
@@ -49,7 +51,7 @@ export interface GithubSide {
 }
 export interface ItemPageHeader {
   labels: string[]; assignees: string[]; autocraftAssigned: boolean; pipelineOn: boolean; discord: DiscordInfo | null; queue: QueueSlot | null;
-  fastTracked: boolean; held: boolean; preapproval: Preapproval | null; releases: ItemReleases; tier: Tier; size: "S" | "M" | "L" | "XL" | null;
+  held: boolean; preapproval: Preapproval | null; releases: ItemReleases; tier: Tier; size: "S" | "M" | "L" | "XL" | null;
   /** `held`: a Backlog answer holds the item; `canSettle`: the viewer may put it on the Backlog. */
   backlog: { held: boolean; canSettle: boolean };
 }
@@ -66,7 +68,6 @@ export interface ItemPageData {
 export type ItemPageUnchanged = { unchanged: true; stamp: string };
 
 type Json = Record<string, any>;
-type Item = Awaited<ReturnType<typeof itemCore>>;
 
 const short = (s: string | null | undefined): string => (s ?? "").slice(0, 7);
 
@@ -76,89 +77,62 @@ const clean = (s: string, max = 1500): string => {
   return t.length > max ? `${t.slice(0, max)}...` : t;
 };
 
-// ---- stamp ---------------------------------------------------------------------------------------------------------
+// ---- the item as the page reads it ------------------------------------------------------------------------------------------------
 
-/** What the page reads beyond the trace's fingerprint: header parts, comment edits, commits, checks, files and the plan view. */
-const extraQueries = (db: Db, repo: string, n: number) => {
-  const flag = (eb: Eb, col: string) => eb.fn.sum<number | null>(eb.case().when(col, "is not", null).then(eb.lit(1)).else(eb.lit(0)).end());
-  const length = (eb: Eb, col: string) => eb.fn<number>("length", [eb.fn.coalesce(col, eb.val(""))]);
-  const queued = (eb: Eb, j: string) => eb(jsonNum(db, `${j}.params`, "$.number"), "=", n);
-  return [
-    db.k.selectFrom("items").select((eb) => ["title", "labels", length(eb, "body").as("body_length"), "ci_state", "mergeable", "additions", "deletions", "url", "closing_issues"])
-      .where("repo", "=", repo).where("number", "=", n),
-    db.k.selectFrom("item_reads").select("synced_at").where("repo", "=", repo).where("number", "=", n),
-    db.k.selectFrom("item_plans").select("view").where("repo", "=", repo).where("number", "=", n),
-    db.k.selectFrom("comments").select((eb) => [eb.fn.countAll<number>().as("n"), eb.fn.sum<number | null>(length(eb, "body")).as("length"), flag(eb, "url").as("urls"),
-      groupConcat(db, eb.fn.coalesce("review_state", eb.val("")), ",", rowid("comments")).as("states")]).where("repo", "=", repo).where("number", "=", n),
-    db.k.selectFrom("pr_commits").select((eb) => [eb.fn.countAll<number>().as("n"), eb.fn.max<string | null>("first_seen_at").as("newest"), eb.fn.sum<number | null>(length(eb, "message")).as("length")])
-      .where("repo", "=", repo).where("number", "=", n),
-    db.k.selectFrom("pr_checks").select(["head_oid", "fetched_at", "checks"]).where("repo", "=", repo).where("number", "=", n),
-    db.k.selectFrom("pr_files").select((eb) => [eb.fn.countAll<number>().as("n"), eb.fn.sum<number | null>(eb("additions", "+", eb.ref("deletions"))).as("lines")]).where("repo", "=", repo).where("number", "=", n),
-    db.k.selectFrom("item_activity").select((eb) => [eb.fn.countAll<number>().as("n"), eb.fn.max<string | null>("at").as("newest")]).where("repo", "=", repo).where("number", "=", n),
-    db.k.selectFrom("classifications").select((eb) => [eb.fn.countAll<number>().as("n"), eb.fn.max<string | null>("at").as("newest")]).where("repo", "=", repo).where("number", "=", n),
-    db.k.selectFrom("postmerge_followups").select(groupConcat(db, "state", ",", rowid("postmerge_followups")).as("states")).where("repo", "=", repo).where("number", "=", n),
-    db.k.selectFrom("preapprovals").select(["id", "state", "updated_at"]).where("repo", "=", repo).where("number", "=", n).orderBy("id", "desc").limit(1),
-    db.k.selectFrom("fast_track").select("id").where("repo", "=", repo).where("number", "=", n),
-    db.k.selectFrom("screenshot_runs").select((eb) => groupConcat(db, eb(eb(eb("head_sha", "||", eb.ref("state")), "||", eb.fn.coalesce("verdict", eb.val(""))), "||", exprOf(eb, "held")), ",", "head_sha").as("states"))
-      .where("repo", "=", repo).where("number", "=", n),
-    db.k.selectFrom("tracked_repos").select("pipeline").where("name", "=", repo),
-    db.k.selectFrom("implementations").select(["id", "state", "updated_at"]).where("repo", "=", repo).where("number", "=", n),
-    db.k.selectFrom("implementation_rounds as r").innerJoin("implementations as m", "m.id", "r.implementation_id")
-      .select((eb) => [eb.fn.countAll<number>().as("n"), eb.fn.max<number | null>("r.id").as("newest"), eb.fn.sum<number | null>(length(eb, "r.result")).as("length")])
-      .where("m.repo", "=", repo).where("m.number", "=", n),
-    db.k.selectFrom("jobs").select((eb) => [eb.fn.countAll<number>().as("n"), eb.fn.max<number | null>("id").as("newest"), groupConcat(db, "state", ",", "id").as("states")])
-      .where("state", "in", ["queued", "running"]).where("repo", "=", repo).where((eb) => queued(eb, "jobs")),
-    db.k.selectFrom("jobs as j").select((eb) => groupConcat(db, eb.selectFrom("jobs as q").select((e) => e.fn.countAll<number>().as("n"))
-      .where("q.state", "=", "queued").whereRef("q.step", "=", "j.step").whereRef("q.id", "<", "j.id"), ",", "j.id").as("ahead"))
-      .where("j.state", "=", "queued").where("j.repo", "=", repo).where((eb) => queued(eb, "j")),
-  ];
+const CI: Record<string, CiState> = { SUCCESS: "passing", FAILURE: "failing", ERROR: "failing", PENDING: "pending", EXPECTED: "pending" };
+const TIER: Record<string, Tier> = { whitelisted: "whitelisted", not: "not", allow: "override-allow", deny: "override-deny" };
+
+type Item = {
+  kind: ItemKind; state: ItemState; title: string; body: string; author: string; additions: number; deletions: number; labels: string[];
+  createdAt: string; updatedAt: string; closedAt: string | null; mergedAt: string | null; mergedBy: string | null; pipelineOn: boolean;
+  ciChecks: { name: string; state: CiState }[]; files: { path: string; additions: number; deletions: number }[]; tier: Tier;
+  discord: DiscordInfo; releases: ItemReleases; queue: QueueSlot | null; preapproval: Preapproval | null;
 };
 
-const prBuildOf = async (c: Ctx): Promise<ItemPrBuild | null> => {
-  const r = await c.db.get(c.db.k.selectFrom("items").select(["kind", "head_oid"]).where("repo", "=", c.repo).where("number", "=", c.n));
-  return r?.kind === "pr" ? await prBuildView(c.db, c.repo, c.n, r.head_oid, c.staff) : null;
-};
+/** The pre-approval of the page's shape from a merge leg row. */
+const legView = (l: Leg): Preapproval => ({ id: l.id, by: l.by, at: l.at, instructions: l.instructions, state: l.state, fromHead: l.from_head, head: l.head, reason: l.reason, updatedAt: l.updated_at });
 
-async function stampOf(c: Ctx, req: Req): Promise<string> {
-  const { db, repo, n, ref } = c;
-  const [print, extra, slots, discord, releases, prBuild, backlog] = await Promise.all([fingerprint(c, "page"), rowValuesOf(db, extraQueries(db, repo, n)),
-    visibleRepos(db, req).then((v) => queueSlots(db, v)), discordOf(db, repo, n), releasesOf(db, repo, n), prBuildOf(c), backlogOf(c, req)]);
-  const parts: unknown[] = [print, c.veiled, ...extra, slots.get(ref) ?? null, discord, releases, prBuild, backlog];
-  return createHash("sha1").update(JSON.stringify(parts)).digest("hex").slice(0, 16);
+const labelsOf = (s: string | null): string[] => arr<unknown>(s).filter((x): x is string => typeof x === "string");
+
+/** The head's check contexts as the checks sync stored them; empty when they belong to an older head. */
+function ciChecksOf(f: ItemPageFacts): Item["ciChecks"] {
+  const r = f.trace.detail.checks, head = f.trace.detail.item?.head_oid ?? null;
+  if (!r || (head !== null && head !== r.head_oid)) return [];
+  return arr<{ name?: unknown; state?: unknown } | null>(r.checks).flatMap((c) => (c && typeof c.name === "string" ? [{ name: c.name, state: CI[typeof c.state === "string" ? c.state.toUpperCase() : ""] ?? "none" }] : []));
+}
+
+function itemOf(c: Ctx, f: ItemPageFacts, extra: { tier: Tier; discord: DiscordInfo; releases: ItemReleases; slot: QueueSlot | null }, staff: boolean): Item {
+  const it = f.trace.detail.item!;
+  const pr = it.kind === "pr";
+  const leg = pr ? f.legs[f.legs.length - 1] : undefined;
+  const pre = leg ? legView(leg) : null;
+  return {
+    kind: pr ? "pr" : "issue", state: itemState(it.state), title: it.title ?? "", body: it.body ?? "", author: it.author ?? "", additions: it.additions ?? 0, deletions: it.deletions ?? 0,
+    labels: labelsOf(it.labels), createdAt: it.created_at ?? "", updatedAt: it.updated_at ?? "", closedAt: it.closed_at, mergedAt: it.merged_at, mergedBy: it.merged_by,
+    pipelineOn: f.tracked?.pipeline === true, ciChecks: pr ? ciChecksOf(f) : [], files: pr ? f.trace.detail.files.map((x) => ({ path: x.path, additions: x.additions, deletions: x.deletions })) : [],
+    tier: extra.tier, discord: extra.discord, releases: extra.releases, queue: extra.slot,
+    // The operator's instructions are shown to those who see the internals only.
+    preapproval: pre && !staff ? { ...pre, instructions: "" } : pre,
+  };
 }
 
 // ---- header and status -----------------------------------------------------------------------------------------------
 
-const backlogOf = async (c: Ctx, req: Req): Promise<ItemPageHeader["backlog"]> => {
-  const [held, canSettle] = await Promise.all([backlogHeld(c.db, c.repo, c.n), canSettleCached(c.db, req.user.login, req.user.role, [c.repo])]);
-  return { held, canSettle };
-};
-
-async function headerOf(c: Ctx, it: Item, queue: QueueSlot | null, req: Req): Promise<ItemPageHeader> {
-  const { db, repo, n } = c;
+function headerOf(c: Ctx, f: ItemPageFacts, it: Item, backlog: ItemPageHeader["backlog"]): ItemPageHeader {
   const lines = it.additions + it.deletions;
-  const [row, fast, hold, backlog] = await Promise.all([
-    db.get(db.k.selectFrom("items").select("assignees").where("repo", "=", repo).where("number", "=", n)),
-    db.get(db.k.selectFrom("main.fast_track").select((eb) => eb.lit(1).as("one")).where("repo", "=", repo).where("number", "=", n)),
-    db.get(db.k.selectFrom("main.merge_holds").select((eb) => eb.lit(1).as("one")).where("repo", "=", repo).where("number", "=", n)),
-    backlogOf(c, req),
-  ]);
-  const assignees = arr<string>(row!.assignees).filter((x) => typeof x === "string");
-  const pre = it.kind === "pr" ? (it as { preapproval?: Preapproval | null }).preapproval ?? null : null;
+  const assignees = arr<string>(f.trace.detail.item?.assignees).filter((x) => typeof x === "string");
   return {
     labels: it.labels, assignees,
-    autocraftAssigned: c.box !== "" && assignees.includes(c.box), pipelineOn: it.pipelineOn === true, discord: it.discord ?? null, queue,
-    fastTracked: fast !== undefined,
-    held: hold !== undefined,
-    preapproval: pre, releases: it.releases, tier: it.tier,
+    autocraftAssigned: c.box !== "" && assignees.includes(c.box), pipelineOn: it.pipelineOn, discord: it.discord, queue: it.queue,
+    held: f.trace.header.hold !== null,
+    preapproval: it.kind === "pr" ? it.preapproval : null, releases: it.releases, tier: it.tier,
     size: it.kind !== "pr" ? null : lines < 50 ? "S" : lines < 300 ? "M" : lines < 1000 ? "L" : "XL",
     backlog,
   };
 }
 
-async function statusOf(c: Ctx, it: Item): Promise<ItemStatus> {
-  const row = await c.db.get(c.db.k.selectFrom("item_plans").select("view").where("repo", "=", c.repo).where("number", "=", c.n));
-  const stored = obj(row?.view).status as Partial<ItemStatus> | undefined;
+function statusOf(c: Ctx, f: ItemPageFacts, it: Item): ItemStatus {
+  const stored = obj(f.trace.header.plan?.view).status as Partial<ItemStatus> | undefined;
   const since = it.mergedAt ?? it.closedAt ?? it.updatedAt ?? it.createdAt;
   const s = stored && typeof stored.phase === "string" ? ({ waiting: null, next: null, since, ...stored } as ItemStatus) : statusFromItem({ merged_at: it.mergedAt, closed_at: it.closedAt }, since);
   // A quiet pull request shows its viewers the phase only: the wait and next step quote the planner's reasons. A wait naming a hidden repo's item does not name it.
@@ -168,22 +142,18 @@ async function statusOf(c: Ctx, it: Item): Promise<ItemStatus> {
 // ---- Opus reviews ------------------------------------------------------------------------------------------------------
 
 const VERDICTS = new Set<string>(["take", "take-fix", "hold", "close"]);
-type ReviewRow = { key: string; head_oid: string; at: string; model: string | null; verdict: string | null; sure: number | null; reason: string | null; summary: string | null; risks: string | null; fixes: string | null; claims: string | null; blocked_by: string | null; trigger: string | null };
+type ReviewRow = { key: string; head_oid: string; at: string; model: string | null; verdict: string | null; sure: number | null; reason: string | null; summary: string | null; risks: unknown; fixes: unknown; claims: unknown; blocked_by: unknown; trigger: string | null };
 
-async function reviewsOf(c: Ctx, headNow: string | null, events: Ev[]): Promise<ReviewHistory> {
-  const { db, repo, n } = c;
-  const [history, latest] = await Promise.all([
-    db.all(db.k.selectFrom("opus_review_history")
-      .select([rowid("opus_review_history").as("rowid"), "head_oid", "at", "model", "verdict", "sure", "reason", "summary", "risks", "fixes", "claims", "blocked_by", "trigger"])
-      .where("repo", "=", repo).where("number", "=", n).where("verdict", "is not", null)),
-    db.all(db.k.selectFrom("opus_reviews").select(["head_oid", "at", "model", "verdict", "sure", "reason", "risks", "fixes", "claims"])
-      .where("repo", "=", repo).where("number", "=", n).where("verdict", "is not", null).orderBy("head_oid")),
-  ]);
-  const rows: (ReviewRow & { rowid: number })[] = history.map((r) => ({ ...r, key: `opus:${r.rowid}` }));
+function reviewsOf(c: Ctx, f: ItemPageFacts, headNow: string | null, events: Ev[]): ReviewHistory {
+  const rec = f.trace.review;
+  const rows: (ReviewRow & { rowid: number })[] = (rec?.history ?? []).filter((h) => h.verdict !== null).map((h) => ({
+    key: `opus:${h.rowid}`, head_oid: h.head, at: h.at, model: h.model, verdict: h.verdict, sure: h.sure ? 1 : 0, reason: h.reason, summary: h.summary, risks: h.risks, fixes: h.fixes,
+    claims: h.claims, blocked_by: h.blocked_by, trigger: h.trigger, rowid: h.rowid,
+  }));
   // Reviews stored before the history table existed.
   const seen = new Set(rows.map((r) => `${r.head_oid}|${r.at}`));
-  for (const r of latest)
-    if (!seen.has(`${r.head_oid}|${r.at}`)) rows.push({ ...r, key: `opus-latest:${r.head_oid}`, summary: null, blocked_by: null, trigger: null, rowid: 0 });
+  for (const l of rec?.reviews ?? [])
+    if (l.verdict !== null && !seen.has(`${l.head}|${l.at}`)) rows.push({ key: `opus-latest:${l.head}`, head_oid: l.head, at: l.at, model: l.model, verdict: l.verdict, sure: l.sure ? 1 : 0, reason: l.reason, summary: null, risks: l.risks, fixes: l.fixes, claims: l.claims, blocked_by: null, trigger: null, rowid: 0 });
   rows.sort((a, b) => (a.at < b.at ? 1 : a.at > b.at ? -1 : b.rowid - a.rowid));
   const costs = new Map(events.filter((e) => e.kind === "review").map((e) => [e.id, e.costUsd ?? 0]));
   const staff = c.staff;
@@ -191,7 +161,7 @@ async function reviewsOf(c: Ctx, headNow: string | null, events: Ev[]): Promise<
     const older = rows[i + 1];
     // Rows from before the trigger was stored: the same head as the review before means the discussion moved.
     const trigger = (r.trigger && ["new-head", "discussion", "operator", "base"].includes(r.trigger) ? r.trigger : older && older.head_oid === r.head_oid ? "discussion" : "new-head") as ReviewTrigger;
-    const fixes = arr<unknown>(r.fixes).map((f) => (typeof f === "string" ? f : `${(f as Json).file}: ${(f as Json).change}`));
+    const fixes = arr<unknown>(r.fixes).map((x) => (typeof x === "string" ? x : `${(x as Json).file}: ${(x as Json).change}`));
     const claims = arr<Json>(r.claims).map((cl) => {
       // Claims are { claim, status, evidence }; the file and line sit in the evidence text.
       const m = /([\w./-]+\.\w+):(\d+)/.exec(String(cl.evidence ?? cl.claim ?? ""));
@@ -219,22 +189,14 @@ const asOf = (w: WriteRow | undefined): string => IDENTITY[w?.identity ?? "legac
 const writeType = (action: string): GithubEvent["type"] =>
   action === "merge" ? "merged" : /-push$/.test(action) ? "push" : /^(labels-apply|act-unlabel|assign|unassign|label-create)$/.test(action) ? "label" : /^review-/.test(action) ? "review" : /close/.test(action) ? "closed" : "comment";
 
-async function githubOf(c: Ctx, it: Item, ev: Ev[], url: string, syncedAt: string | null): Promise<GithubSide> {
-  const { db, repo, n } = c;
+function githubOf(c: Ctx, f: ItemPageFacts, it: Item, ev: Ev[], url: string, syncedAt: string | null, ours: Set<string>): GithubSide {
   const events: GithubEvent[] = [];
-  // The GitHub side's reads do not depend on each other, so they run together.
-  const [allWrites, comments, acts, pushed, commitRows] = await Promise.all([
-    writesOf(db, repo, n),
-    db.all(db.k.selectFrom("comments").select(["id", "kind", "author", "created_at", "body", "review_state"]).where("repo", "=", repo).where("number", "=", n)
-      .where("created_at", "is not", null).$narrowType<{ created_at: string }>()
-      .where((eb) => eb.not(eb.and([eb("kind", "=", "review"), eb(eb.fn.coalesce(eb.fn<string | null>("trim", ["body"]), eb.val("")), "=", "")])))),
-    db.all(db.k.selectFrom("item_activity").select(["id", "kind", "at", "actor", "label", "before_oid", "after_oid"]).where("repo", "=", repo).where("number", "=", n).orderBy("id")),
-    pushedCommits(db, repo, n),
-    db.all(db.k.selectFrom("pr_commits")
-      .select((eb) => ["oid", "message", "author", least<string>(db, ["committed_at", eb.fn.coalesce("first_seen_at", "committed_at")], "text").as("at")])
-      .$narrowType<{ at: string }>().where("repo", "=", repo).where("number", "=", n).orderBy("at").orderBy("oid")),
-  ]);
+  const d = f.trace.detail;
+  const log = f.writeLog;
+  const allWrites = matchWrites(log.filter((w) => w.action in GITHUB_ACTIONS), d.comments, ours);
   const writes = allWrites.filter((w) => w.state !== "failed");
+  const pushed = pushedIn(log);
+  const comments = d.comments.filter((m) => m.created_at !== null && !(m.kind === "review" && (m.body ?? "").trim() === ""));
   const summaryOf = new Map(ev.filter((e) => e.kind === "write").map((e) => [e.id, e.summary]));
   const byComment = new Map(writes.filter((w) => w.comment).map((w) => [w.comment!.id, w]));
   const used = new Set<number>();
@@ -242,22 +204,22 @@ async function githubOf(c: Ctx, it: Item, ev: Ev[], url: string, syncedAt: strin
   if (it.createdAt) events.push({ id: "gh:opened", type: "opened", at: it.createdAt, actor: it.author, body: clean(it.body, 1500), autocraft: null });
   for (const m of comments) {
     const w = byComment.get(m.id);
-    const ours = !!w || (!!m.author && own.has(m.author));
+    const mine = !!w || isOwnLogin(own, m.author);
     if (w) used.add(w.rowid);
     events.push({
-      id: `comment:${m.id}`, type: m.kind === "review" ? "review" : "comment", at: m.created_at, actor: ours ? "autocraft" : m.author ?? "unknown",
-      body: clean(m.body ?? ""), autocraft: ours ? { as: asOf(w), historyId: w ? `audit:${w.rowid}` : `comment:${m.id}` } : null,
+      id: `comment:${m.id}`, type: m.kind === "review" ? "review" : "comment", at: m.created_at!, actor: mine ? "autocraft" : m.author ?? "unknown",
+      body: clean(m.body ?? ""), autocraft: mine ? { as: asOf(w), historyId: w ? `audit:${w.rowid}` : `comment:${m.id}` } : null,
     });
   }
   const labelWrites = writes.filter((w) => w.action === "labels-apply" || w.action === "act-unlabel");
-  for (const a of acts) {
-    const ours = !!a.actor && own.has(a.actor);
-    const w = ours && a.kind !== "force-push" ? labelWrites.find((x) => Math.abs(Date.parse(x.at) - Date.parse(a.at)) <= MATCH_WINDOW_MS) : undefined;
+  for (const a of d.activity) {
+    const mine = isOwnLogin(own, a.actor);
+    const w = mine && a.kind !== "force-push" ? labelWrites.find((x) => Math.abs(Date.parse(x.at) - Date.parse(a.at)) <= MATCH_WINDOW_MS) : undefined;
     if (w) used.add(w.rowid);
     events.push({
-      id: `activity:${a.id}`, type: a.kind === "force-push" ? "push" : "label", at: a.at, actor: ours ? "autocraft" : a.actor ?? "unknown",
+      id: `activity:${a.id}`, type: a.kind === "force-push" ? "push" : "label", at: a.at, actor: mine ? "autocraft" : a.actor ?? "unknown",
       body: a.kind === "force-push" ? `Force-pushed ${short(a.before_oid)} → ${short(a.after_oid)}` : `${a.kind === "labeled" ? "Added" : "Removed"} label ${a.label ?? ""}`,
-      autocraft: ours ? { as: asOf(w), historyId: w ? `audit:${w.rowid}` : `activity:${a.id}` } : null,
+      autocraft: mine ? { as: asOf(w), historyId: w ? `audit:${w.rowid}` : `activity:${a.id}` } : null,
     });
   }
   const merged = writes.find((w) => w.action === "merge");
@@ -270,67 +232,78 @@ async function githubOf(c: Ctx, it: Item, ev: Ev[], url: string, syncedAt: strin
     events.push({ id: `audit:${w.rowid}`, type: writeType(w.action), at: w.at, actor: "autocraft", body: summaryOf.get(`audit:${w.rowid}`) ?? GITHUB_ACTIONS[w.action] ?? w.action, autocraft: { as: asOf(w), historyId: `audit:${w.rowid}` } });
   }
   events.sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : a.id < b.id ? -1 : 1));
-  const commits = commitRows
-    .map((m) => ({ sha: short(m.oid), message: clean(m.message ?? "", 500), author: m.author ?? "unknown", at: m.at, byAutoCraft: (!!m.author && own.has(m.author)) || pushed.has(m.oid) }));
+  const commits = d.commits.map((m) => ({ oid: m.oid, message: m.message, author: m.author, at: m.committed_at < (m.first_seen_at ?? m.committed_at) ? m.committed_at : m.first_seen_at ?? m.committed_at }))
+    .sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : a.oid < b.oid ? -1 : 1))
+    .map((m) => ({ sha: short(m.oid), message: clean(m.message ?? "", 500), author: m.author ?? "unknown", at: m.at, byAutoCraft: isOwnLogin(own, m.author) || pushed.has(m.oid) }));
   return {
     description: clean(it.body, 6000), events, checks: it.ciChecks.filter((x) => x.state !== "none").map((x) => ({ name: x.name, state: x.state })), commits,
-    files: it.files.map((f) => ({ path: f.path, additions: f.additions, deletions: f.deletions })), url, syncedAt,
+    files: it.files.map((x) => ({ path: x.path, additions: x.additions, deletions: x.deletions })), url, syncedAt,
   };
 }
 
 // ---- screenshots -----------------------------------------------------------------------------------------------------
 
 /** The latest screenshot run of the PR: one entry for staff, none for anyone else or a veiled PR. Images are served by the task artifact route. */
-async function screenshotsOf(c: Ctx, headNow: string | null): Promise<ScreenshotRun[]> {
-  if (!c.staff || c.veiled) return [];
-  const r = await c.db.get(c.db.k.selectFrom("screenshot_runs").select(cols("screenshot_runs")).where("repo", "=", c.repo).where("number", "=", c.n)
-    .orderBy("created_at", "desc").orderBy(rowid("screenshot_runs"), "desc").limit(1));
-  if (!r) return [];
-  const names = async (id: number | null): Promise<Set<string>> => new Set(id === null ? [] : (await c.db.all(c.db.k.selectFrom("build_artifacts").select("name").where("task_id", "=", id).where("content_type", "=", "image/png"))).map((x) => x.name));
-  const [before, after] = await Promise.all([names(r.base_task_id), names(r.head_task_id)]);
+function screenshotsOf(c: Ctx, f: ItemPageFacts, headNow: string | null): ScreenshotRun[] {
+  const r = f.screenshots[f.screenshots.length - 1];
+  if (!c.staff || c.veiled || !r) return [];
+  const names = (id: number | null): Set<string> => new Set(id === null ? [] : (f.screenshotArtifacts.get(id) ?? []).map((x) => x.name));
+  const before = names(r.baseTaskId), after = names(r.headTaskId);
   const shots = [...after].filter((n) => before.has(n)).sort((a, b) => parseInt(a.slice(1), 10) - parseInt(b.slice(1), 10))
-    .map((name) => ({ name, before: { taskId: r.base_task_id!, name }, after: { taskId: r.head_task_id!, name } }));
+    .map((name) => ({ name, before: { taskId: r.baseTaskId!, name }, after: { taskId: r.headTaskId!, name } }));
   return [{
-    head: short(r.head_sha), current: r.head_sha === headNow, state: r.state as ScreenshotRun["state"], verdict: r.verdict as ScreenshotRun["verdict"], clear: r.clear === null ? null : r.clear === 1,
-    comparison: r.comparison, held: r.held === 1, reason: r.reason, model: r.model, at: r.finished_at ?? r.created_at, shots,
+    head: short(r.headSha), current: r.headSha === headNow, state: r.state as ScreenshotRun["state"], verdict: r.verdict as ScreenshotRun["verdict"], clear: r.clear,
+    comparison: r.comparison === null ? null : String(r.comparison), held: r.held, reason: r.reason, model: r.model, at: r.finishedAt ?? r.createdAt, shots,
   }];
 }
+
+/** Our build of the newest head, as the page shows it: states only for viewers, hidden while the repo's switch is off. */
+const prBuildOf = (c: Ctx, f: ItemPageFacts, on: boolean): ItemPrBuild | null => {
+  const r = f.prBuild;
+  if (!r || !on) return null;
+  const state = r.state === "queued" ? (r.taskState === "claimed" || r.taskState === "running" ? "running" : "queued") : r.state;
+  return { headSha: r.headSha, current: r.headSha === (f.trace.detail.item?.head_oid ?? null), state: state as ItemPrBuild["state"], summary: c.staff ? r.summary : null, disagree: r.disagree, ci: r.ciOverall, createdAt: r.createdAt, finishedAt: r.finishedAt };
+};
 
 // ---- the route -------------------------------------------------------------------------------------------------------------
 
 export async function itemPage(db: Db, req: Req): Promise<ItemPageData | ItemPageUnchanged> {
-  const c = await context(db, req);
+  const ref = await visibleItem(db, req);
   // The stamp is read before the page, so it is never newer than the data it goes with, and an unchanged page costs only the stamp.
-  const stamp = await stampOf(c, req);
-  if (req.query.get("since") === stamp) return { unchanged: true, stamp };
-  // The parts read independently, so each starts as soon as what it needs is read.
-  const core = itemCore(db, req);
-  const events = gather(c, null);
-  const row = db.get(db.k.selectFrom("items").select(["url", "head_oid", (eb) => eb.selectFrom("item_reads as r").select("r.synced_at").whereRef("r.repo", "=", "items.repo").whereRef("r.number", "=", "items.number").as("synced_at")])
-    .where("repo", "=", c.repo).where("number", "=", c.n)).then((r) => r!);
-  const impl = implementationData(c);
-  const status = core.then((it) => statusOf(c, it));
-  const pr = core.then((it) => it.kind === "pr");
-  const [it, cost, statusNow, bar, header, reviews, timeline, github, prBuild, screenshots, implementation] = await Promise.all([
-    core,
-    db.get(db.k.selectFrom("agent_run_items as i").innerJoin("agent_runs as r", "r.id", "i.run_id").select((eb) => eb.fn.coalesce(eb.fn.sum<number>("r.cost_usd"), eb.lit(0)).as("cost"))
-      .where("i.repo", "=", c.repo).where("i.number", "=", c.n).$if(filtered(c.hidden), (q) => q.where((eb) => hiddenExpr(db, eb, c.hidden)!))).then((r) => r!.cost),
-    status,
-    Promise.all([core, status]).then(([i, s]) => barOf(c, { kind: i.kind, state: i.state, mergedAt: i.mergedAt, pipelineOn: i.pipelineOn === true }, s)),
-    core.then((i) => headerOf(c, i, i.queue ?? null, req)),
-    Promise.all([pr, row, events]).then(([isPr, r, ev]) => (isPr ? reviewsOf(c, r.head_oid, ev) : { latest: null, earlier: [] })),
-    Promise.all([pr.then((isPr) => (isPr ? preapprovalsOf(db, c.repo, c.n) : [])), events, impl]).then(([pre, ev, im]) => timelineOf(c, ev, pre, im)),
-    Promise.all([core, events, row]).then(([i, ev, r]) => githubOf(c, i, ev, r.url ?? "", r.synced_at)),
-    prBuildOf(c), row.then((r) => screenshotsOf(c, r.head_oid)), impl.then((im) => implementationView(c, im)),
+  // It and the parts the view does not read (the Discord counts, the releases, the queue slot) go out with the context, which decides whether they count.
+  const stamped = Promise.all([
+    contextScope(db, req).then((s) => loadItemStamp(db, s, ref)), discordOf(db, ref.repo, ref.number), releasesOf(db, ref.repo, ref.number),
+    Promise.all([visibleRepos(db, req), computeStages(db)]).then(([v, stages]) => slotsOf(stages, v)), loadItems(db, [ref], "card"),
   ]);
+  void stamped.catch(() => {});
+  const c = await context(db, req);
+  const scope = traceScope(c);
+  const [[digest, discord0, releases0, slots0, card], canSettle] = await Promise.all([stamped, req.user.role === "viewer" ? false : mayRunRepo(req.user, c.repo)]);
+  const stamp = createHash("sha1").update(JSON.stringify([c.staff, c.operator, c.hidden, c.veiled, ...digest, slots0.get(c.ref) ?? null, discord0, releases0, canSettle])).digest("hex").slice(0, 16);
+  if (req.query.get("since") === stamp) return { unchanged: true, stamp };
+  const author = card.get(c.ref)?.author;
+  const [facts, cs] = await Promise.all([loadItemPage(db, scope, ref, writeActions(c.staff, c.operator)), author ? contributors(db, { login: author }) : []]);
+  const detail = facts.trace.detail;
+  const row = detail.item!;
+  const it = itemOf(c, facts, { tier: TIER[cs.find((x) => x.login === author)?.tier ?? "not"] ?? "not", discord: discord0, releases: releases0, slot: slots0.get(c.ref) ?? null }, c.staff);
+  const events = eventsFrom(c, facts.trace);
+  const ev = shape(c, events, null);
+  const status = statusOf(c, facts, it);
+  const prBuildsOn = (facts.prBuild !== null || row.kind === "pr") && await featureOn(db, "pr-builds", c.repo);
+  const headNow = row.head_oid;
+  const backlog = { held: facts.workflow[facts.workflow.length - 1]?.state === "backlog", canSettle };
+  const impl = implementationFrom(facts.implementation);
+  const pre = it.kind === "pr" ? facts.legs.map(legView).map((p) => (c.staff ? p : { ...p, instructions: "" })) : [];
+  const costUsd = facts.trace.runs.reduce((s, r) => s + (r.costUsd ?? 0), 0);
+  const ours = c.own;
   return {
     repo: c.repo, number: c.n, kind: it.kind, state: it.state, title: it.title, author: it.author, stamp,
-    header, status: statusNow, bar, costUsd: cost,
-    reviews,
-    timeline: timeline.slice(-200),
-    github,
-    prBuild,
-    screenshots,
-    implementation,
+    header: headerOf(c, facts, it, backlog), status, bar: barOf(c, { kind: it.kind, state: it.state, mergedAt: it.mergedAt, pipelineOn: it.pipelineOn }, status, facts), costUsd,
+    reviews: it.kind === "pr" ? reviewsOf(c, facts, headNow, ev) : { latest: null, earlier: [] },
+    timeline: timelineOf(c, ev, pre, impl, facts, prBuildsOn).slice(-200),
+    github: githubOf(c, facts, it, ev, row.url ?? "", detail.read, ours),
+    prBuild: row.kind === "pr" ? prBuildOf(c, facts, prBuildsOn) : null,
+    screenshots: screenshotsOf(c, facts, headNow),
+    implementation: implementationView(c, impl, facts.implementationPr),
   };
 }

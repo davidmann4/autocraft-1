@@ -1,11 +1,13 @@
-// Nightly checks per repo: the last 14 nights of each check, benchmark trends, and (operators) which checks run.
+// Nightly checks per repo: the last 14 nights of each check, the issue of a failing one, benchmark trends, and (for those who may run the repo) which checks run.
 import { useState } from "react";
 import { Link } from "react-router-dom";
 import { useApi, useQuery } from "../../api/client";
 import type { NightlyBench, NightlyCell, NightlyCheckRow, NightlyGrid, NightlyRepo, NightlyState } from "../../api/types";
 import { Badge } from "../../ui/atoms/Badge";
+import { Button } from "../../ui/atoms/Button";
 import { Switch } from "../../ui/atoms/Switch";
 import { TimeAgo } from "../../ui/atoms/TimeAgo";
+import { ItemRef } from "../../ui/molecules/ItemRef";
 import { cn } from "../../ui/cn";
 import { Block, ErrorLine, Page, TextInput, useWrite } from "../admin/parts";
 import { Sparkline } from "./Sparkline";
@@ -48,9 +50,11 @@ function Names({ repo, check, busy, onSave }: { repo: string; check: NightlyChec
   );
 }
 
-function CheckRow({ repo, check, nights, operator, write, onSelect }: {
+const issueKey = (repo: string, c: NightlyCheckRow) => `${repo}:${c.id}:issue`;
+
+function CheckRow({ repo, check, nights, operator, write, onSelect, onIssue }: {
   repo: NightlyRepo; check: NightlyCheckRow; nights: NightlyRepo["nights"]; operator: boolean;
-  write: ReturnType<typeof useWrite>; onSelect: (c: NightlyCheckRow, enabled: boolean, names?: string[]) => void;
+  write: ReturnType<typeof useWrite>; onSelect: (c: NightlyCheckRow, enabled: boolean, names?: string[]) => void; onIssue: (c: NightlyCheckRow) => void;
 }) {
   const busy = write.busy === `${repo.repo}:${check.id}`;
   const names = check.takes === "targets" ? check.targets : check.crates;
@@ -69,6 +73,13 @@ function CheckRow({ repo, check, nights, operator, write, onSelect }: {
           ))}
         </div>
       </div>
+      {(check.issue !== null || check.canOpenIssue) && (
+        <div className="mt-1.5">
+          {check.issue !== null
+            ? <ItemRef repo={repo.repo} number={check.issue} kind="issue" title={null} size="sm" className="inline-flex" />
+            : <Button size="sm" className="max-md:h-11" loading={write.busy === issueKey(repo.repo, check)} aria-label={`Open issue for ${check.label} on ${repo.repo}`} onClick={() => onIssue(check)}>Open issue</Button>}
+        </div>
+      )}
       {operator && check.takes && (
         <div className="mt-1.5 flex flex-wrap items-center gap-2 text-xs text-ink/55">
           <Names repo={repo.repo} check={check} busy={busy} onSave={(n) => onSelect(check, check.enabled, n)} />
@@ -102,14 +113,17 @@ function Benches({ benches }: { benches: NightlyBench[] }) {
   );
 }
 
-function RepoBlock({ repo, operator, write, onSelect }: { repo: NightlyRepo; operator: boolean; write: ReturnType<typeof useWrite>; onSelect: (repo: string, c: NightlyCheckRow, enabled: boolean, names?: string[]) => void }) {
+function RepoBlock({ repo, operator, write, onSelect, onIssue }: {
+  repo: NightlyRepo; operator: boolean; write: ReturnType<typeof useWrite>;
+  onSelect: (repo: string, c: NightlyCheckRow, enabled: boolean, names?: string[]) => void; onIssue: (repo: string, c: NightlyCheckRow) => void;
+}) {
   const last = repo.nights[0];
   return (
     <Block title={repo.repo} aside={<div className="flex items-center gap-2">{!repo.on && <Badge>Off</Badge>}{last && <span>Last run <TimeAgo iso={last.startedAt} /></span>}</div>}>
       {repo.nights.length === 0 && <p className="mb-1 text-sm text-ink/55">No nights recorded.</p>}
       <ul className="divide-y divide-line">
         {repo.checks.filter((c) => operator || c.enabled || c.cells.some(Boolean)).map((c) => (
-          <CheckRow key={c.id} repo={repo} check={c} nights={repo.nights} operator={operator} write={write} onSelect={(ch, on, n) => onSelect(repo.repo, ch, on, n)} />
+          <CheckRow key={c.id} repo={repo} check={c} nights={repo.nights} operator={operator} write={write} onSelect={(ch, on, n) => onSelect(repo.repo, ch, on, n)} onIssue={(ch) => onIssue(repo.repo, ch)} />
         ))}
       </ul>
       {repo.benches.length > 0 && <Benches benches={repo.benches} />}
@@ -123,12 +137,13 @@ export function NightlyView() {
   const write = useWrite();
   const select = (repo: string, c: NightlyCheckRow, enabled: boolean, names?: string[]) =>
     void write.run(`${repo}:${c.id}`, () => api.nightly.select({ repo, check: c.id, enabled, ...(names ? (c.takes === "targets" ? { targets: names } : { crates: names }) : {}) })).then(() => q.refetch());
+  const openIssue = (repo: string, c: NightlyCheckRow) => void write.run(issueKey(repo, c), () => api.nightly.openIssue({ repo, check: c.id })).then(() => q.refetch());
   const repos = q.data?.repos ?? [];
   return (
     <Page title="Nightly">
       <ErrorLine error={q.error?.message ?? write.error} />
       <div className="grid gap-4">
-        {repos.map((r) => <RepoBlock key={r.repo} repo={r} operator={r.canSelect} write={write} onSelect={select} />)}
+        {repos.map((r) => <RepoBlock key={r.repo} repo={r} operator={r.canSelect} write={write} onSelect={select} onIssue={openIssue} />)}
         {q.data && repos.length === 0 && <p className="text-sm text-ink/55">No repo has nightly checks on.</p>}
       </div>
     </Page>

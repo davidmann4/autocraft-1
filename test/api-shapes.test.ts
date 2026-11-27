@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
-import type { AccessOverview, BatchList, CostReport, Flow, Item, MainCi, PipelineState, Progress, PromptsReport, QueuePage, User, WorkList } from "../web/src/api/types.ts";
+import type { AccessOverview, CostReport, Item, MainCi, MaintainHome, MaintainItems, PipelineState, Progress, PromptsReport, QueuePage, User } from "../web/src/api/types.ts";
 import type { ItemPageData } from "../src/dash/api/item-page.ts";
 import { apiRoutes } from "../src/dash/api/index.ts";
 import { loadConfig } from "../src/dash/server/config.ts";
@@ -35,24 +35,19 @@ async function get(path: string): Promise<{ status: number; json: unknown }> {
 /** [path, fields of the object, or of the first row of the array]. */
 const OBJECTS: [string, string[]][] = [
   ["/api/me", keys<User>()("login", "role", "writeRepos")],
-  ["/api/progress", keys<Progress>()("funnel", "repos", "decisionsOpen", "mainCi")],
+  ["/api/progress", keys<Progress>()("funnel", "repos", "mainCi")],
   ["/api/items/app/1", keys<Item>()("repo", "number", "title", "state", "author", "additions", "deletions", "ci", "mergeable", "classifications", "reviews", "premerge", "stages", "queue")],
   ["/api/security/findings", ["groups"]],
-  ["/api/security/findings/app/1/page", ["finding", "decision", "choices", "status", "attempts", "rounds", "history", "costUsd"]],
+  ["/api/security/findings/app/1/page", ["finding", "question", "status", "attempts", "rounds", "history", "costUsd"]],
   ["/api/items/app/1/page", keys<ItemPageData>()("repo", "number", "kind", "state", "title", "author", "stamp", "header", "status", "costUsd", "reviews", "timeline", "github")],
-  ["/api/items", ["total", "byStatus", "rows"]],
+  ["/api/maintain/items", keys<MaintainItems>()("rows")],
   ["/api/queue/page", keys<QueuePage>()("tab", "repos", "counts", "rows", "mergeRows", "batches", "total", "next")],
-  ["/api/queue", ["rows", "counts", "total", "next"]],
-  ["/api/queue/batches", keys<BatchList>()("batches", "total", "next")],
-  ["/api/decisions", ["decisions", "total", "byKind", "next"]],
   ["/api/pipeline", ["stages", "steps", "runner", "sync", "counts"]],
-  ["/api/pipeline/state", keys<PipelineState>()("enabled", "changedBy", "limits", "pilot")],
+  ["/api/pipeline/state", keys<PipelineState>()("enabled", "changedBy", "limits")],
   ["/api/pipeline/jobs", ["jobs", "total"]],
-  ["/api/flow", keys<Flow>()("repo", "nodes", "edges")],
-  ["/api/work", keys<WorkList>()("rows", "total", "next")],
   ["/api/cost", keys<CostReport>()("runs", "total", "stages", "repos", "series")],
   ["/api/agents", ["runs", "nextCursor"]],
-  ["/api/rates", ["window", "bucket", "stages", "accounts"]],
+  ["/api/rates", ["window", "bucket", "stages"]],
   ["/api/prompts", keys<PromptsReport>()("commit", "prompts")],
   ["/api/main-ci", keys<MainCi>()("summary", "repos")],
   ["/api/tasks", ["tasks", "next"]],
@@ -62,8 +57,7 @@ const OBJECTS: [string, string[]][] = [
   ["/api/classifiers", ["runs", "run", "overall", "confusion"]],
   ["/api/build/summary", ["queued", "running", "slots", "free", "online"]],
   ["/api/repos/all", ["name", "tracked", "openPrs", "openIssues", "pipeline", "merging", "pushing", "commenting"]],
-  ["/api/home", ["needs", "problems", "phases", "running", "progress", "done"]],
-  ["/api/items/status", ["rows", "byPhase", "total", "nextCursor"]],
+  ["/api/maintain/home", keys<MaintainHome>()("mine", "mineTotal", "recent", "runner", "attention")],
   ["/api/search?q=PR", ["repo", "number", "kind", "title", "state"]],
 ];
 

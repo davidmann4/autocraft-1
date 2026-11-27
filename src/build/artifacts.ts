@@ -8,7 +8,7 @@ import { createHash } from "node:crypto";
 import { dataDir } from "../db.ts";
 import { envVar } from "../env.ts";
 import type { Db } from "../db/index.ts";
-import * as kx from "../db/kx.ts";
+import { addArtifact, removeArtifactRows } from "../data/build/index.ts";
 
 export const MAX_ARTIFACT_BYTES = 50 * 1024 * 1024;
 export const MAX_TASK_ARTIFACT_BYTES = 200 * 1024 * 1024;
@@ -81,21 +81,15 @@ export async function storeArtifact(db: Db, taskId: number, name: string, tmp: s
     if (!NAME_RE.test(name)) throw new ArtifactError(400, "artifact names are 1 to 100 letters, digits, dots, underscores or hyphens");
     const bytes = statSync(tmp).size;
     if (bytes === 0) throw new ArtifactError(400, "the artifact is empty");
-    const t = await db.get(db.k.selectFrom("build_tasks").select("artifact_bytes").where("id", "=", taskId));
-    if (!t) throw new ArtifactError(404, "no such task");
-    const old = await db.get(db.k.selectFrom("build_artifacts").select("bytes").where("task_id", "=", taskId).where("name", "=", name));
-    const count = (await db.get(db.k.selectFrom("build_artifacts").select((eb) => eb.fn.countAll<number>().as("n")).where("task_id", "=", taskId)))!.n;
-    if (!old && count >= MAX_ARTIFACTS_PER_TASK) throw new ArtifactError(413, `at most ${MAX_ARTIFACTS_PER_TASK} artifacts per task`);
-    if (t.artifact_bytes - (old?.bytes ?? 0) + bytes > MAX_TASK_ARTIFACT_BYTES) throw new ArtifactError(413, "the task's artifacts would exceed 200 MB");
     const type = sniff(readFileSync(tmp));
     if (!type) throw new ArtifactError(415, "only PNG, JSON, JUnit XML and UTF-8 text artifacts are accepted");
     const rel = fileFor(taskId, name);
+    const stored = await addArtifact(db, { taskId, name, bytes, contentType: type, file: rel }, { maxCount: MAX_ARTIFACTS_PER_TASK, maxBytes: MAX_TASK_ARTIFACT_BYTES });
+    if ("refused" in stored) {
+      if (stored.refused === "missing") throw new ArtifactError(404, "no such task");
+      throw new ArtifactError(413, stored.refused === "count" ? `at most ${MAX_ARTIFACTS_PER_TASK} artifacts per task` : "the task's artifacts would exceed 200 MB");
+    }
     renameSync(tmp, join(artifactDir(), rel));
-    await db.write(async () => {
-      await db.run(db.k.insertInto("build_artifacts").values({ task_id: taskId, name, bytes, content_type: type, file: rel })
-        .onConflict((oc) => oc.columns(["task_id", "name"]).doUpdateSet(kx.excluded(["bytes", "content_type", "file"]))));
-      await db.run(db.k.updateTable("build_tasks").set((eb) => ({ artifact_bytes: eb(eb("artifact_bytes", "-", old?.bytes ?? 0), "+", bytes) })).where("id", "=", taskId));
-    });
     return { bytes, contentType: type };
   } catch (e) {
     try {
@@ -107,9 +101,12 @@ export async function storeArtifact(db: Db, taskId: number, name: string, tmp: s
 
 /** Deletes the artifact files and rows of tasks. */
 export async function removeArtifacts(db: Db, taskIds: number[]): Promise<void> {
+  removeArtifactDirs(await removeArtifactRows(db, taskIds));
+}
+
+/** Deletes the artifact directories of tasks whose rows are gone. */
+export function removeArtifactDirs(taskIds: number[]): void {
   for (const id of taskIds) {
-    await db.run(db.k.deleteFrom("build_artifacts").where("task_id", "=", id));
-    await db.run(db.k.updateTable("build_tasks").set({ artifact_bytes: 0 }).where("id", "=", id));
     const dir = absolute(String(id));
     if (dir) rmSync(dir, { recursive: true, force: true });
   }

@@ -1,12 +1,13 @@
 // CI and merge state of PR heads: one GraphQL query per chunk of PRs, stored in pr_checks.
 import { ownerOf } from "../owners.ts";
-import { keepKnownMergeableExpr, type Querier } from "../mirror.ts";
-import { pilotExpr } from "../pilot.ts";
-import { resolvePushes } from "../push-outcomes.ts";
-import { overallAt, recordRuns, type Suite } from "../merge/ci-approval.ts";
-import { noteMergeable } from "../merge/mergeable.ts";
+import type { Querier } from "../mirror.ts";
+import { overallsAt, type Suite } from "../merge/ci-approval.ts";
 import type { Db } from "../db/index.ts";
-import * as kx from "../db/kx.ts";
+import { resolvePushes } from "../data/control/index.ts";
+import { recordRuns } from "../data/merge/index.ts";
+import { noteMergeable } from "../merge/mergeable.ts";
+import { settlePushing } from "../prepush/settle.ts";
+import { listItems, loadChecks, saveChecks as saveCheckRows, SAVE_CHECKS_ROWS } from "../data/mirror/index.ts";
 
 /** PRs per query: 100 check contexts each keeps a query well under GitHub's node limit. */
 export const CHECKS_PER_QUERY = 40;
@@ -112,25 +113,19 @@ export function parseChecks(repo: string, repository: Record<string, PrNode | nu
 export async function saveChecks(db: Db, rows: PrChecks[], at = new Date().toISOString()): Promise<void> {
   // A PR read twice keeps its last reading: a multi-row upsert cannot touch one row twice.
   rows = [...new Map(rows.map((r) => [`${r.repo}#${r.number}`, r])).values()];
-  if (rows.length) await db.write(async () => {
-    for (const part of kx.batches(rows))
-      await db.run(db.k.insertInto("pr_checks").values(part.map((r) => ({
-        repo: r.repo, number: r.number, head_oid: r.head_oid, state: r.state, is_draft: r.is_draft ? 1 : 0, overall: r.overall, checks: JSON.stringify(r.checks),
-        mergeable: r.mergeable, maintainer_can_modify: r.maintainer_can_modify ? 1 : 0, fetched_at: at,
-      }))).onConflict((oc) => oc.columns(["repo", "number"]).doUpdateSet((eb) => ({
-        ...kx.excluded(["head_oid", "state", "is_draft", "overall", "checks", "maintainer_can_modify", "fetched_at"])(eb),
-        mergeable: keepKnownMergeableExpr(eb, "pr_checks"),
-      }))));
-  });
+  await saveCheckRows(db, rows.map((r) => ({
+    repo: r.repo, number: r.number, head_oid: r.head_oid, state: r.state, is_draft: r.is_draft ? 1 : 0, overall: r.overall, checks: JSON.stringify(r.checks),
+    mergeable: r.mergeable, maintainer_can_modify: r.maintainer_can_modify ? 1 : 0, fetched_at: at,
+  })), at);
   await recordRuns(db, rows, at);
-  await resolvePushes(db, rows, at);
+  await settlePushing(db, rows, at);
+  await resolvePushes(db, rows.map((r) => ({ repo: r.repo, number: r.number, head_oid: r.head_oid, checks: JSON.stringify(r.checks) })), at);
   await noteMergeable(db, rows, at);
 }
 
 /** Fetches and stores the checks of the given PRs (all open PRs of the repo when none are given). */
 export async function refreshChecks(db: Db, client: Querier, repo: string, numbers?: number[], log: (line: string) => void = () => {}): Promise<PrChecks[]> {
-  const list = numbers ?? (await db.all(db.k.selectFrom("items as i").select("i.number").where("i.repo", "=", repo).where("i.kind", "=", "pr").where("i.state", "=", "OPEN")
-    .where((eb) => pilotExpr(db, eb, "i")).orderBy("i.number"))).map((r) => r.number);
+  const list = numbers ?? (await listItems(db, { repos: [repo], kind: "pr", states: ["OPEN"], inScope: true }, "ref")).map((r) => r.number);
   const all: PrChecks[] = [];
   // Rows are stored once BATCH_ROWS are read (and at the end), so the statements per PR stay a fraction of one.
   let unsaved: PrChecks[] = [];
@@ -147,7 +142,7 @@ export async function refreshChecks(db: Db, client: Querier, repo: string, numbe
     }
     unsaved.push(...rows);
     all.push(...rows);
-    if (unsaved.length >= kx.BATCH_ROWS) { await saveChecks(db, unsaved); unsaved = []; }
+    if (unsaved.length >= SAVE_CHECKS_ROWS) { await saveChecks(db, unsaved); unsaved = []; }
   }
   if (unsaved.length) await saveChecks(db, unsaved);
   log(`checks: ${repo}: ${all.length} PRs (${(["success", "failure", "pending", "none"] as const).map((o) => `${all.filter((r) => r.overall === o).length} ${o}`).join(", ")})`);
@@ -155,7 +150,17 @@ export async function refreshChecks(db: Db, client: Querier, repo: string, numbe
 }
 
 /** The stored checks of a PR; `overall` reads "pending" while workflow runs wait for approval at that head (see overallAt). */
-export async function checksOf(db: Db, repo: string, number: number): Promise<{ head_oid: string; overall: Overall; mergeable: string | null; maintainer_can_modify: number | null } | undefined> {
-  const r = await db.get(db.k.selectFrom("pr_checks").select(["head_oid", "overall", "mergeable", "maintainer_can_modify"]).$narrowType<{ overall: Overall }>().where("repo", "=", repo).where("number", "=", number));
-  return r && { ...r, overall: await overallAt(db, repo, number, r.head_oid, r.overall) as Overall };
+export async function checksOf(db: Db, repo: string, number: number): Promise<StoredChecks | undefined> {
+  return (await checksOfAll(db, [{ repo, number }])).get(`${repo}#${number}`);
+}
+
+export type StoredChecks = { head_oid: string; overall: Overall; mergeable: string | null; maintainer_can_modify: number | null };
+
+/** checksOf for many PRs, by `repo#number`, in two waves whatever their number; a PR without stored checks has no entry. */
+export async function checksOfAll(db: Db, refs: readonly { repo: string; number: number }[]): Promise<Map<string, StoredChecks>> {
+  if (!refs.length) return new Map();
+  const rows = await loadChecks(db, [...refs]);
+  const found = refs.flatMap((ref) => { const r = rows.get(`${ref.repo}#${ref.number}`); return r ? [{ ...ref, r }] : []; });
+  const overall = await overallsAt(db, found.map(({ repo, number, r }) => ({ repo, number, head: r.head_oid, overall: r.overall })));
+  return new Map(found.map(({ repo, number, r }) => [`${repo}#${number}`, { head_oid: r.head_oid, overall: overall.get(`${repo}#${number}`) as Overall, mergeable: r.mergeable, maintainer_can_modify: r.maintainer_can_modify }]));
 }

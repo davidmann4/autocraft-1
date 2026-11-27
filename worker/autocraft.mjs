@@ -19,7 +19,7 @@
 //   autocraft update                  replaces this file with the server's current runner
 //   autocraft service install | uninstall | status  runs `work` as a systemd user unit or launchd agent
 //   autocraft runner status | logs | pause | resume | reserve  readiness and plan usage, the service log, pausing, the usage reserve
-//   autocraft inbox | queue | calls | settings | repos | fixups ...  the server's tools as commands (MCP over HTTP); `call <tool>` reaches any tool
+//   autocraft queue | calls | settings | repos | fixups ...  the server's tools as commands (MCP over HTTP); `call <tool>` reaches any tool
 //   autocraft work [--parallel N] [--no-auto-update]  claims, runs and submits in a loop; updates itself when the server has a newer runner
 //   autocraft claim                   claims one call; prints its lease id
 //   autocraft run [--detach] [<lease>]  runs a claimed lease (claims one when none is given)
@@ -42,7 +42,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { gzipSync } from "node:zlib";
 import { fileURLToPath } from "node:url";
 
-export const HELPER_VERSION = "1.4.2";
+export const HELPER_VERSION = "1.5.4";
 
 // ---------------------------------------------------------------------------
 // Wire format: a copy of src/remote/protocol.ts (the helper is served alone, so it keeps its own).
@@ -61,6 +61,7 @@ export const ROUTES = {
   bundle: "/api/remote/bundle",
   heartbeat: "/api/remote/heartbeat",
   submit: "/api/remote/submit",
+  transcript: "/api/remote/transcript",
   release: "/api/remote/release",
   tarball: "/api/remote/tarball",
   tool: "/api/remote/tool",
@@ -146,6 +147,7 @@ const capacity = { slots: 1, busy: 0 };
  * @property {Mount[]} mounts
  * @property {string[]} mcpServers
  * @property {boolean} keepSession  keep the harness session after the call, for follow-up turns
+ * @property {boolean} [transcriptAfter]  the server stores the full session: send it to ROUTES.transcript once the submit is accepted
  * @property {{ parentCallId: number }} [resume]
  * @property {{ claude?: { args: string[], agents?: string } }} hints
  */
@@ -174,10 +176,10 @@ const HEARTBEAT_MS = scaled(HEARTBEAT_S * 1000), PREPARE_MAX_MS = scaled(PREPARE
 /** @typedef {{ name: string, args: string, resultBytes: number | null, isError: boolean, startedAt?: string, endedAt?: string }} SubmitTool */
 /**
  * @typedef {{ ok: true, text: string, model: string, usage: Usage, modelUsage?: Record<string, Usage>, costUsd?: number, turns?: number, sessionId?: string, tools?: SubmitTool[], durationMs: number }
- *   | { ok: false, error: string, usage?: Usage, durationMs: number, refused?: boolean }} Submit
+ *   | { ok: false, error: string, usage?: Usage, durationMs: number, refused?: boolean, stopReason?: string, subtype?: string }} Submit
  */
 /** @typedef {{ accepted: boolean, reason?: string }} SubmitReply */
-/** @typedef {{ reason: string }} Release */
+/** @typedef {{ reason: string, setup?: boolean }} Release */
 
 // ---------------------------------------------------------------------------
 // Harness adapters: `claudeAdapter` and `codexAdapter`, listed in ADAPTERS.
@@ -210,6 +212,8 @@ const HEARTBEAT_MS = scaled(HEARTBEAT_S * 1000), PREPARE_MAX_MS = scaled(PREPARE
  * @property {string} [sessionId]
  * @property {string} [error]
  * @property {boolean} [refused]  the model's safety filter declined the request
+ * @property {string} [stopReason]  a failed run: the harness's last stop reason (Claude: the result's `stop_reason`, such as refusal or max_tokens)
+ * @property {string} [subtype]  a failed run: the harness's kind of result (Claude: the result's `subtype`, such as error_max_turns)
  */
 /**
  * @typedef {object} Adapter
@@ -411,6 +415,11 @@ function events(stdout) {
   }
 }
 
+/** How much of a failed run's own text (the refusal or error the harness printed) a failure report carries. */
+const FAILURE_TEXT_MAX = 1500;
+/** A stop reason or result subtype as the harness wrote it: a short snake_case word, or nothing. @param {unknown} v @returns {v is string} */
+const stopWord = (v) => typeof v === "string" && /^[a-z][a-z0-9_]{0,39}$/.test(v);
+
 /** The CLI's text for a request the model's safety filter declined (as src/remote/calls.ts SAFETY_REFUSAL). */
 const SAFETY_REFUSAL = /safeguards flagged this message|appears to violate our usage policy/i;
 
@@ -458,11 +467,12 @@ export function parseClaudeOutput(stdout, model) {
   const base = { model: reported, usage, ...(per.length > 0 && { modelUsage }), ...(typeof result?.total_cost_usd === "number" && { costUsd: result.total_cost_usd }),
     ...(typeof result?.num_turns === "number" && { turns: result.num_turns }), ...(sessionId && { sessionId }) };
   if (!result) return { ok: false, text: "", ...base, error: evs.length ? "no result" : "unreadable output" };
-  if (result.subtype === "error_max_turns") return { ok: false, text: "", ...base, error: "turn limit: the model used every turn the prompt allows without an answer" };
+  const stop = { ...(stopWord(result.stop_reason) && { stopReason: result.stop_reason }), ...(stopWord(result.subtype) && { subtype: result.subtype }) };
+  if (result.subtype === "error_max_turns") return { ok: false, text: "", ...base, ...stop, error: "turn limit: the model used every turn the prompt allows without an answer" };
   if (result.is_error || typeof result.result !== "string") {
     const said = typeof result.result === "string" ? result.result : "";
     const refused = result.stop_reason === "refusal" || SAFETY_REFUSAL.test(said);
-    return { ok: false, text: "", ...base, error: `model error ${said}`.trim().slice(0, 400), ...(refused && { refused: true }) };
+    return { ok: false, text: "", ...base, ...stop, error: `model error ${said}`.trim().slice(0, FAILURE_TEXT_MAX), ...(refused && { refused: true }) };
   }
   return { ok: true, text: result.result, ...base };
 }
@@ -2146,7 +2156,12 @@ export const holdRetryDelay = (rand = Math.random) => Math.round(HOLD_RETRY_MS *
 const USAGE_ERROR_RETRY_MS = scaled(30_000);
 /** The last good reading keeps counting this long when a new read fails or is refused, while every window keeps the reserve plus LAST_GOOD_MARGIN free. */
 export const LAST_GOOD_MS = 15 * 60_000;
-export const LAST_GOOD_MARGIN = 10;
+export const LAST_GOOD_MARGIN = 3;
+/**
+ * The Claude usage endpoint is asked at most this often per user, whatever the answer: it answers 429 to more, and every helper
+ * process of the user shares the asking time and the reading through usage.json.
+ */
+export const CLAUDE_ASK_EVERY_MS = scaled(5 * 60_000);
 /** The longest a process waits for another process's usage read. */
 const USAGE_LOCK_WAIT_MS = 20_000;
 export const STATUS_EVERY_MS = scaled(5 * 60_000);
@@ -2304,7 +2319,7 @@ export function parseCodexRateLimits(res, models, now = Date.now()) {
   return { at: now, windows, ...(blocked && { blocked }) };
 }
 
-/** Reads Claude Code's plan usage with the harness credential: no model call. @param {string} token @param {string[]} models @returns {Promise<{ reading: QuotaReading, retryAt?: number }>} */
+/** Reads Claude Code's plan usage with the harness credential: no model call. `raw`: the good reply, parsed again for other models. @param {string} token @param {string[]} models @returns {Promise<{ reading: QuotaReading, raw?: unknown, retryAt?: number }>} */
 async function claudeQuota(token, models) {
   const now = Date.now();
   let res;
@@ -2328,13 +2343,13 @@ async function claudeQuota(token, models) {
   if (!res.ok) return { reading: { at: now, error: `the usage endpoint answered HTTP ${res.status}` } };
   let body;
   try { body = await res.json(); } catch { return { reading: { at: now, error: "unreadable usage reply" } }; }
-  return { reading: parseClaudeUsage(body, models, now) };
+  return { reading: parseClaudeUsage(body, models, now), raw: body };
 }
 
 /**
  * Asks the Codex app-server (`codex app-server`, JSON-RPC lines on stdio) for `account/rateLimits/read`, with the helper's
  * own CODEX_HOME. It may refresh the login, so it holds the Codex lock that calls hold; while a call runs there is no reading.
- * @param {string} bin @param {string} home @param {string[]} models @returns {Promise<{ reading: QuotaReading }>}
+ * @param {string} bin @param {string} home @param {string[]} models @returns {Promise<{ reading: QuotaReading, raw?: unknown }>}
  */
 async function codexQuota(bin, home, models) {
   const now = Date.now();
@@ -2372,7 +2387,7 @@ async function codexQuota(bin, home, models) {
       send({ id: 1, method: "initialize", params: { clientInfo: { name: "autocraft", title: null, version: HELPER_VERSION } } });
     });
     const r = /** @type {{ error?: string, result?: unknown }} */ (result);
-    return { reading: r.error ? { at: now, error: r.error } : parseCodexRateLimits(r.result, models, now) };
+    return r.error ? { reading: { at: now, error: r.error } } : { reading: parseCodexRateLimits(r.result, models, now), raw: r.result };
   } finally {
     unlock();
   }
@@ -2387,13 +2402,32 @@ function withLastGood(failed, good, now) {
   return { ...good, lastGood: failed.error };
 }
 
-/** @typedef {{ harness: string, models: string[], reading: QuotaReading, good?: QuotaReading, retryAt?: number }} UsageCache */
+/**
+ * `goodRaw`: the provider's reply behind `good`, so another model list (a config or helper update) reads it again instead of
+ * dropping it. `askedAt`: when the Claude usage endpoint was last asked (CLAUDE_ASK_EVERY_MS).
+ * @typedef {{ harness: string, models: string[], reading: QuotaReading, good?: QuotaReading, goodRaw?: unknown, retryAt?: number, askedAt?: number }} UsageCache
+ */
 
-/** The usage cache when it belongs to this harness and these models. @param {Adapter} adapter @param {string[]} models @returns {UsageCache | null} */
+/** @param {string} harness @param {unknown} raw @param {string[]} models @param {number} at @returns {QuotaReading} */
+const parseUsageRaw = (harness, raw, models, at) => (harness === "claude" ? parseClaudeUsage(raw, models, at) : parseCodexRateLimits(raw, models, at));
+
+/**
+ * The usage cache of this harness, its readings for these models. Readings taken for other models are parsed again from the
+ * reply behind them; without that reply (an older cache) the cache does not count.
+ * @param {Adapter} adapter @param {string[]} models @returns {UsageCache | null}
+ */
 function usageCache(adapter, models) {
   /** @type {UsageCache | null} */
   const c = readJson(usageFile());
-  return c && c.harness === adapter.id && JSON.stringify(c.models) === JSON.stringify(models) && c.reading ? c : null;
+  if (!c || c.harness !== adapter.id || !c.reading) return null;
+  if (JSON.stringify(c.models) === JSON.stringify(models)) return c;
+  /** @param {QuotaReading} r */
+  const again = (r) => ("error" in r || c.goodRaw === undefined ? null : parseUsageRaw(c.harness, c.goodRaw, models, r.at));
+  const reading = "error" in c.reading ? c.reading : again(c.reading);
+  const good = c.good && again(c.good);
+  if (!reading) return null;
+  const { good: _old, ...rest } = c;
+  return { ...rest, models, reading, ...(good && !("error" in good) && { good }) };
 }
 
 /** What the cache answers without asking the provider, or null when a new read is due. @param {UsageCache | null} c @param {number} now @returns {QuotaReading | null} */
@@ -2402,6 +2436,7 @@ function usageFromCache(c, now) {
   if (c.retryAt && now < c.retryAt) return withLastGood({ at: now, error: `${"error" in c.reading ? c.reading.error : "the provider asked to wait"}; asking again after ${clock(c.retryAt)}` }, c.good, now);
   const age = now - c.reading.at;
   if (age < 0) return null;
+  if (c.askedAt !== undefined && now >= c.askedAt && now - c.askedAt < CLAUDE_ASK_EVERY_MS) return withLastGood(c.reading, c.good, now);
   if ("error" in c.reading) return age < USAGE_ERROR_RETRY_MS ? withLastGood(c.reading, c.good, now) : null;
   return age < USAGE_REUSE_MS ? c.reading : null;
 }
@@ -2432,6 +2467,7 @@ const usageFlights = new Map();
  * The harness's plan usage, one read at a time per machine: slots of this process share one promise, other processes a
  * lock file and the cached reading. A reading of the last USAGE_REUSE_MS is reused; a failed or refused read is shared
  * only for USAGE_ERROR_RETRY_MS (or the provider's own wait), and the last good reading stands in for it for LAST_GOOD_MS.
+ * Claude's endpoint is asked at most every CLAUDE_ASK_EVERY_MS, whatever it answered.
  * @param {Config} cfg @param {Adapter} adapter @param {string} bin @param {string[]} models @returns {Promise<QuotaReading>}
  */
 export function readQuota(cfg, adapter, bin, models) {
@@ -2454,21 +2490,25 @@ async function readQuotaShared(cfg, adapter, bin, models) {
     const again = usageFromCache(usageCache(adapter, models), Date.now());
     if (again) return again;
   }
-  if (!unlock) return { at: Date.now(), error: "another helper process is reading the usage" };
+  if (!unlock) return withLastGood({ at: Date.now(), error: "another helper process is reading the usage" }, usageCache(adapter, models)?.good, Date.now());
   try {
     const now = Date.now();
     const prev = usageCache(adapter, models);
     const raced = usageFromCache(prev, now);
     if (raced) return raced;
     const good = prev && !("error" in prev.reading) ? prev.reading : prev?.good;
-    /** @type {{ reading: QuotaReading, retryAt?: number }} */
+    /** @type {{ reading: QuotaReading, raw?: unknown, retryAt?: number }} */
     let r;
+    let askedAt = prev?.askedAt;
     if (adapter.id === "claude") {
       const token = adapter.token(cfg);
+      if (token) askedAt = now;
       r = token ? await claudeQuota(token, models) : { reading: { at: now, error: "no Claude login" } };
     } else r = await codexQuota(bin, codexHome(), models);
-    const keep = "error" in r.reading ? good : r.reading;
-    writePrivate(usageFile(), { harness: adapter.id, models, reading: r.reading, ...(keep && { good: keep }), ...(r.retryAt && { retryAt: r.retryAt }) });
+    const fresh = !("error" in r.reading);
+    const keep = fresh ? r.reading : good;
+    const keepRaw = fresh ? r.raw : prev?.goodRaw;
+    writePrivate(usageFile(), { harness: adapter.id, models, reading: r.reading, ...(keep && { good: keep }), ...(keep && keepRaw !== undefined && { goodRaw: keepRaw }), ...(r.retryAt && { retryAt: r.retryAt }), ...(askedAt !== undefined && { askedAt }) });
     return withLastGood(r.reading, good, Date.now());
   } finally {
     unlock();
@@ -2851,14 +2891,21 @@ async function gitTree(m) {
     utimesSync(bare, now, now);
     const has = async () => (await run("git", ["-C", bare, "cat-file", "-e", `${m.sha}^{commit}`])).code === 0;
     if (await has()) return;
-    const bySha = await run("git", ["-C", bare, "fetch", "-q", "--depth", "1", "origin", m.sha]);
+    const fetchSha = () => run("git", ["-C", bare, "fetch", "-q", "--depth", "1", "origin", m.sha]);
+    let bySha = await fetchSha();
+    // A gc that an older helper left running detached rewrites `shallow` under a fetch; it finishes within seconds.
+    if (bySha.code !== 0 && bySha.stderr.includes("shallow file has changed")) {
+      await new Promise((r) => setTimeout(r, 5000));
+      bySha = await fetchSha();
+    }
     if (bySha.code !== 0 && m.ref) await run("git", ["-C", bare, "fetch", "-q", "--depth", "1", "origin", m.ref]);
     if (!(await has())) throw new Error(`could not fetch ${m.owner}/${m.repo}@${m.sha.slice(0, 12)}: ${bySha.stderr.trim().slice(0, 200)}`);
-    // Each fetch adds a pack; `gc --auto` packs them once enough piled up, checked at most once a day per repo.
+    // Each fetch adds a pack; `gc --auto` packs them once enough piled up, checked at most once a day per repo. It runs in the
+    // foreground: detached, it would outlive the lock and rewrite `shallow` under the next fetch.
     const stamp = join(bare, "autocraft-gc");
     let gcAt = 0;
     try { gcAt = statSync(stamp).mtimeMs; } catch { /* never */ }
-    if (Date.now() - gcAt > GC_EVERY_MS) { await run("git", ["-C", bare, "gc", "--auto", "--quiet"]); writeFileSync(stamp, ""); }
+    if (Date.now() - gcAt > GC_EVERY_MS) { await run("git", ["-C", bare, "-c", "gc.autoDetach=false", "gc", "--auto", "--quiet"]); writeFileSync(stamp, ""); }
   }));
   return cachedTree(tree, (tmp) => untar(tmp, (stdin) => new Promise((resolve, reject) => {
     const a = spawn("git", ["-C", bare, "archive", "--format=tar", m.sha], { env: GIT_ENV, stdio: ["ignore", "pipe", "ignore"] });
@@ -3072,21 +3119,23 @@ async function runLease(cfg, id, opt = {}) {
   const lost = () => end("lost", `lost: ${lease.title}: the lease was withdrawn`);
   /** @param {string} what @param {unknown} e */
   const undelivered = (what, e) => (e instanceof Gone ? lost() : end("lost", `lost: ${lease.title}: ${what} did not reach the server: ${msg(e)}`));
-  /** @param {string} error @param {Usage} [usage] @param {boolean} [refused] */
-  const fail = async (error, usage, refused) => {
+  /** @param {string} error @param {Usage} [usage] @param {boolean} [refused] @param {{ stopReason?: string, subtype?: string }} [stop] the harness's stop reason and result subtype @param {string} [transcript] */
+  const fail = async (error, usage, refused, stop, transcript) => {
     /** @type {Submit} */
-    const body = { ok: false, error: redact(error).slice(0, 2000), ...(usage && { usage }), durationMs: Date.now() - started, ...(refused && { refused: true }) };
+    const body = { ok: false, error: redact(error).slice(0, 2000), ...(usage && { usage }), durationMs: Date.now() - started, ...(refused && { refused: true }), ...(stop?.stopReason && { stopReason: stop.stopReason }), ...(stop?.subtype && { subtype: stop.subtype }) };
     try { await call(ROUTES.submit, body); } catch (e) { return undelivered(`the failure (${error})`, e); }
+    if (transcript) sendTranscript(lease, transcript);
     noteError(`${lease.title}: ${error}`, "call");
     return end("failed", `failed: ${lease.title}: ${error}`);
   };
   /**
    * The helper's own fault, not the call's: the call goes back to the queue without using an attempt.
    * @param {string} reason @param {RunHold} [hold] the helper can take no call for a while @param {boolean} [noStrike] RunStatus.noStrike
+   * @param {boolean} [setup] setting up the files or the slot failed here (Release.setup): this helper may take the call again soon
    */
-  const giveBack = async (reason, hold, noStrike) => {
+  const giveBack = async (reason, hold, noStrike, setup) => {
     /** @type {Release} */
-    const body = { reason: redact(reason).slice(0, 300) };
+    const body = { reason: redact(reason).slice(0, 300), ...(setup && { setup: true }) };
     try { await call(ROUTES.release, body); } catch (e) { return undelivered(`the release (${reason})`, e); }
     return end("released", `released: ${lease.title}: ${reason}`, hold, noStrike);
   };
@@ -3146,11 +3195,12 @@ async function runLease(cfg, id, opt = {}) {
     taskDir = mkdtempSync(join(cacheDir(), "tasks", `${b.callId}-`));
     const late = adapter.tokenFor && (() => { const t = adapter.tokenFor?.(cfg, b.timeoutSeconds); return t && "problem" in t && t.problem === CLAUDE_LOGIN_EXPIRES ? t.problem : null; });
     const out = await execute(b, { adapter, bin: d.bin, token: runToken, model, taskDir, lease, root: lease.root ?? "", ...(lease.slot !== undefined && { slot: lease.slot }), ...(opt.signal && { signal: opt.signal }), prep, beat, ...(late && { late }) });
-    if ("giveBack" in out) { const stopped = prepStopped(); return await giveBack(stopped ?? out.giveBack, undefined, !stopped && out.noStrike); }
+    if ("giveBack" in out) { const stopped = prepStopped(); return await giveBack(stopped ?? out.giveBack, undefined, !stopped && out.noStrike, !stopped && out.setup); }
     if ("fail" in out) return await fail(out.fail, out.usage);
     const { r, reply, tools } = out;
     if (r.gone) return lost();
-    if (r.timedOut) return await fail(`timed out after ${b.timeoutSeconds} s`, reply.usage);
+    const transcript = b.transcriptAfter && r.events ? transcriptOf(r.events) : undefined;
+    if (r.timedOut) return await fail(`timed out after ${b.timeoutSeconds} s`, reply.usage, false, reply, transcript);
     if (r.stopped) return await giveBack("stopped on the helper");
     if (!reply.ok) {
       // The provider's usage limit: the call goes back without using an attempt, and the helper parks until the reset.
@@ -3161,7 +3211,7 @@ async function runLease(cfg, id, opt = {}) {
         try { await checkReady(cfg); } catch { /* reported with the next check */ }
         return await giveBack(`the provider refused the run for its usage limit: ${refusal.line}`);
       }
-      return await fail(`${reply.error ?? "no result"} (exit ${r.code}) ${r.stderr.trim().slice(-300)}`.trim(), reply.usage, reply.refused);
+      return await fail(`${reply.error ?? "no result"} (exit ${r.code}) ${r.stderr.trim().slice(-300)}`.trim(), reply.usage, reply.refused, reply, transcript);
     }
     const usage = reply.usage ?? { inputTokens: 0, outputTokens: 0 };
     /** @type {Submit} */
@@ -3177,12 +3227,13 @@ async function runLease(cfg, id, opt = {}) {
       throw e;
     });
     try { s = await withRetry(submit, { deadline: deadline() + SUBMIT_OUTAGE_MS }); } catch (e) { return undelivered("the reply", e); }
+    if (transcript) sendTranscript(lease, transcript);
     if (!s.accepted) return end("failed", `rejected: ${lease.title}: ${s.reason ?? "no reason given"}`);
     clearError("call");
     return end("submitted", `submitted: ${lease.title}, ${kTokens(tokensOf(usage))} tokens`);
   } catch (e) {
     if (e instanceof Gone || beat.gone.aborted) return lost();
-    if (beat.runStart === null) return await giveBack(prepStopped() ?? `preparing failed: ${msg(e)}`);
+    if (beat.runStart === null) { const stopped = prepStopped(); return await giveBack(stopped ?? `preparing failed: ${msg(e)}`, undefined, undefined, !stopped); }
     return await fail(msg(e));
   } finally {
     beat.stop();
@@ -3201,7 +3252,7 @@ async function runLease(cfg, id, opt = {}) {
  * @param {TaskBundle} b
  * `late`: why the call may no longer start once its files are ready (its login no longer outlasts it), or null.
  * @param {{ adapter: Adapter, bin: string, token: string, model: string, taskDir: string, lease: LeaseRecord | null, root: string, slot?: number, signal?: AbortSignal, prep?: AbortSignal, beat?: ReturnType<typeof heartbeats>, late?: () => string | null }} x
- * @returns {Promise<{ giveBack: string, noStrike?: boolean } | { fail: string, usage?: Usage } | { r: Awaited<ReturnType<typeof harness>>, reply: Reply, tools: SubmitTool[] }>}
+ * @returns {Promise<{ giveBack: string, noStrike?: boolean, setup?: boolean } | { fail: string, usage?: Usage } | { r: Awaited<ReturnType<typeof harness>>, reply: Reply, tools: SubmitTool[] }>}
  */
 async function execute(b, x) {
   const { adapter } = x;
@@ -3209,7 +3260,7 @@ async function execute(b, x) {
   let mounts;
   try { mounts = await prepareMounts(server, secret, b, x.taskDir, x.prep); } catch (e) {
     if (e instanceof Gone || x.prep?.aborted) throw e;
-    return { giveBack: `setting up the files failed: ${msg(e)}` };
+    return { giveBack: `setting up the files failed: ${msg(e)}`, setup: true };
   }
   for (const n of b.mcpServers) if (!NAME.test(n)) return { fail: `bad MCP server name ${n}` };
   const mcp = b.mcpServers.length ? JSON.stringify(mcpConfig(server, b.mcpServers, secret)) : "";
@@ -3279,6 +3330,65 @@ async function execute(b, x) {
 
 /** Bytes of the harness's plain-text output (lines that are no event) kept for the error line. */
 const STDOUT_TAIL = 4000;
+/** Characters of event lines kept for the transcript: the start of the session up to the first, its end up to the second. */
+const EVENTS_HEAD = 24 * 1024 * 1024;
+const EVENTS_TAIL = 24 * 1024 * 1024;
+/** The server's limit on a submitted transcript (src/remote/protocol.ts TRANSCRIPT_MAX). */
+const TRANSCRIPT_MAX = 16 * 1024 * 1024;
+
+/** @typedef {{ head: string[], tail: string[], omitted: number }} Events  the harness's event lines as transcript lines, `{"at","event"}` */
+
+/** @param {unknown} v @param {string} root @returns {unknown} */
+const unrootedValue = (v, root) => {
+  if (typeof v === "string") return v.includes(root) ? v.split(root).join("") : v;
+  if (Array.isArray(v)) return v.map((x) => unrootedValue(x, root));
+  if (!v || typeof v !== "object") return v;
+  return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, unrootedValue(x, root)]));
+};
+
+/**
+ * An event line with the slot's root taken out of its string values: parsed, so the root's escaped form in the JSON text
+ * (a Windows path's doubled backslashes) goes too. Lines that name neither form are kept as they are.
+ * @param {string} l @param {string} root
+ */
+export function unrootedEvent(l, root) {
+  if (!l.includes(root) && !l.includes(JSON.stringify(root).slice(1, -1))) return l;
+  try { return JSON.stringify(unrootedValue(JSON.parse(l), root)); } catch { return l.split(root).join(""); }
+}
+
+/** How long the server takes a transcript after the submit (src/remote/protocol.ts TRANSCRIPT_WAIT_S). */
+const TRANSCRIPT_WAIT_MS = scaled(10 * 60_000);
+
+/**
+ * Sends a submitted attempt's transcript in the background: the reply is already in, so a slow or failed upload costs
+ * only the transcript. Retried within the server's window; a 410 (too late, or not awaited) ends it quietly.
+ * @param {LeaseRecord} lease @param {string} transcript
+ */
+function sendTranscript(lease, transcript) {
+  const deadline = Date.now() + TRANSCRIPT_WAIT_MS;
+  void withRetry(() => api(lease.server, ROUTES.transcript, lease.secret, { transcript }, { timeoutMs: Math.max(1000, deadline - Date.now()) }), { deadline })
+    .catch((e) => { if (!(e instanceof Gone)) console.log(`${lease.title}: the transcript did not reach the server: ${msg(e)}`); });
+}
+
+/**
+ * The attempt's transcript: the event lines as gzip JSONL, base64, with known secrets redacted. A session too large for
+ * TRANSCRIPT_MAX keeps its start and end, with a line counting the events left out between them.
+ * @param {Events} ev @returns {string | undefined}
+ */
+export function transcriptOf(ev) {
+  let head = ev.head, tail = ev.tail, omitted = ev.omitted;
+  for (let i = 0; i < 6; i++) {
+    if (head.length + tail.length === 0) return undefined;
+    const mark = omitted > 0 ? [JSON.stringify({ at: new Date().toISOString(), omitted })] : [];
+    const b64 = gzipSync(redact([...head, ...mark, ...tail].join("\n"))).toString("base64");
+    if (b64.length <= TRANSCRIPT_MAX) return b64;
+    const keep = Math.floor((head.length + tail.length) * (TRANSCRIPT_MAX / b64.length) * 0.8 / 2);
+    const h = Math.min(head.length, keep), t = Math.min(tail.length, keep);
+    omitted += head.length - h + tail.length - t;
+    head = head.slice(0, h); tail = t > 0 ? tail.slice(-t) : [];
+  }
+  return undefined;
+}
 
 /**
  * Runs the sandboxed harness: stdin in, stopped at the bundle's timeout, when the lease is gone or when `signal` aborts.
@@ -3304,6 +3414,16 @@ function harness(c, b, beat, signal, adapter, root) {
     const kept = [];
     /** @type {string[]} the arrival time of each kept line */
     const stamps = [];
+    /** @type {Events} */
+    const events = { head: [], tail: [], omitted: 0 };
+    let headChars = 0, tailChars = 0;
+    /** One event line for the transcript, the slot's root taken off. @param {string} l @param {string} at */
+    const record = (l, at) => {
+      const line = `{"at":"${at}","event":${root ? unrootedEvent(l, root) : l}}`;
+      if (events.tail.length === 0 && headChars + line.length <= EVENTS_HEAD) { events.head.push(line); headChars += line.length; return; }
+      events.tail.push(line); tailChars += line.length;
+      while (tailChars > EVENTS_TAIL && events.tail.length > 1) { tailChars -= /** @type {string} */ (events.tail.shift()).length; events.omitted++; }
+    };
     /** @type {string | undefined} */
     let unexpected;
     /** @param {NodeJS.Signals} sig */
@@ -3311,6 +3431,7 @@ function harness(c, b, beat, signal, adapter, root) {
     const kill = () => { signalRun("SIGTERM"); setTimeout(() => signalRun("SIGKILL"), 5000).unref(); };
     /** @param {string} l @param {string} at */
     const keep = (l, at) => {
+      if (b.transcriptAfter && l.startsWith("{") && l.trimEnd().endsWith("}")) record(l.trimEnd(), at);
       const k = adapter.compact(l);
       if (k !== null) { kept.push(k); stamps.push(at); }
       else if (!l.startsWith("{") && l.trim()) tail = `${tail}${l}\n`.slice(-STDOUT_TAIL);
@@ -3344,7 +3465,7 @@ function harness(c, b, beat, signal, adapter, root) {
       if (group) rmSync(groupFile, { force: true });
       if (partial) keep(partial, new Date().toISOString());
       const text = tail ? `${stderr}${stderr && !stderr.endsWith("\n") ? "\n" : ""}stdout: ${tail}` : stderr;
-      resolve({ code, stdout: kept.join("\n"), stamps, stderr: redact(text), gone, timedOut, stopped, unexpected });
+      resolve({ code, stdout: kept.join("\n"), stamps, events, stderr: redact(text), gone, timedOut, stopped, unexpected });
     };
     p.on("error", (e) => { stderr += String(e); done(-1); });
     p.on("close", done);
@@ -3833,7 +3954,11 @@ async function cmdWork(argv) {
   /** @type {Promise<void>[]} */
   const interactiveRuns = [];
   /** @param {number} want */
-  const startInteractive = (want) => { while (interactiveLoops < want) { interactiveLoops++; interactiveRuns.push(loop(false, false, true).then(() => {})); } };
+  const startInteractive = (want) => { while (interactiveLoops < want) { interactiveLoops++; interactiveRuns.push(loop(false, false, true).catch((e) => {
+    // The server's next reply starts another.
+    interactiveLoops--;
+    console.log(`an interactive lane ended: ${msg(e)}`);
+  })); } };
   /** @param {number | undefined} slot @param {boolean} fastLane @param {boolean} ownLane @param {boolean} [interactiveLane] */
   const claimLoop = async (slot, fastLane, ownLane, interactiveLane = false) => {
     let claimId = newClaimId();
@@ -4865,7 +4990,7 @@ function migrateAtStart() {
 }
 
 // ---------------------------------------------------------------------------
-// Server commands: the server's MCP tools (/mcp, Streamable HTTP, JSON-RPC) behind command groups (inbox, queue, calls, ...),
+// Server commands: the server's MCP tools (/mcp, Streamable HTTP, JSON-RPC) behind command groups (queue, calls, ...),
 // with the runner's own credential. CLI_COMMANDS maps each command to its tool; `call` reaches any tool by its name.
 // Arguments are typed by the tool's inputSchema.
 
@@ -4873,14 +4998,8 @@ function migrateAtStart() {
 class UsageError extends Error {}
 
 /** @param {Set<string>} has */
-const answerWhy = (has) => (has.has("set_weight")
-  ? "this Task Runner cannot approve merges: tick \"Can answer decisions and approve merges\" for it on the Connect page (the server must offer answering)"
-  : "only operators, and maintainers who answer decisions (an answering Task Runner while maintainer writes are on), approve merges");
-/** Withdrawing an approved merge stays with operators, also where a maintainer may approve one. @param {Set<string>} has */
-const cancelWhy = (has) => (has.has("set_weight") ? answerWhy(has) : "only operators withdraw an approved merge");
-/** @param {Set<string>} has */
 const commandWhy = (has) => (has.has("my_items")
-  ? "this Task Runner cannot send commands: tick \"Can answer decisions and approve merges\" for it on the Connect page (the server must offer answering), and use a maintainer or operator login"
+  ? "this Task Runner cannot send commands: allow commands for it on the Connect page, and use a maintainer or operator login"
   : "the server did not offer it");
 const LOCAL_WHY = "model calls run on the server's accounts here: the server is not in the user-local inference mode";
 /** @param {Set<string>} has */
@@ -4893,34 +5012,28 @@ const pickWhy = (has) => (has.has("list_model_calls") ? "only maintainers and op
  */
 /** @type {readonly CliCommand[]} */
 export const CLI_COMMANDS = [
-  { path: ["inbox"], tool: "list_inbox", usage: "[--repo R] [--kind K] [--limit N] [--cursor C]", summary: "open decisions, oldest first" },
-  { path: ["inbox", "show"], tool: "get_inbox_item", args: ["id"], usage: "<id>", summary: "one decision: question, options, summary, item text, feedback" },
-  { path: ["inbox", "feedback"], tool: "send_feedback", args: ["id"], flags: { pick: "option", note: "text" }, usage: "<id> --pick <key> --note \"...\"", summary: "your pick of one option and/or a note; an operator answers" },
   { path: ["queue"], tool: "list_merge_queue", usage: "[--repo R] [--limit N] [--cursor C]", summary: "each PR's state, weight and what it waits for" },
-  { path: ["queue", "add"], tool: "queue_pr", args: ["item"], usage: "<pr> [--weight N]", summary: "approve a PR's merge ahead and fast-track it", why: answerWhy },
-  { path: ["queue", "weight"], tool: "set_weight", args: ["item", "weight"], usage: "<item> <N>", summary: "set an item's fast-track weight; --remove takes it off", why: () => "only operators steer the merge queue" },
-  { path: ["queue", "remove"], tool: "cancel_queued", args: ["item"], usage: "<pr>", summary: "withdraw a PR's approved merge", why: cancelWhy },
   { path: ["calls"], tool: "list_model_calls", usage: "", summary: "model calls waiting for a Task Runner, and why each waits", why: () => LOCAL_WHY },
   { path: ["calls", "pick"], tool: "pick_model_call", args: ["id"], usage: "<id>", summary: "reserve a call for your own Task Runners", why: pickWhy },
   { path: ["calls", "unpick"], tool: "unpick_model_call", args: ["id"], usage: "<id>", summary: "end a pick", why: pickWhy },
   { path: ["calls", "mine"], tool: "my_work", usage: "", summary: "today's calls on your machine, and your Task Runners", why: () => "needs one of your Task Runners reporting in, while the server is in the user-local inference mode" },
-  { path: ["settings"], tool: "my_settings", usage: "", summary: "your reserve, repos, calls at once and interactive slots", why: () => "only maintainers and operators have settings" },
-  { path: ["settings", "set"], tool: "set_my_settings", usage: "[--reserve <5h> <weekly>] [--max-calls N | --no-max-calls] [--repos <a,b>|all] [--interactive-slots N]", summary: "change them, as the Connect page does", why: () => "only maintainers and operators have settings" },
+  { path: ["settings"], tool: "my_settings", usage: "", summary: "your reserve, repos, calls at once, interactive slots and manual only", why: () => "only maintainers and operators have settings" },
+  { path: ["settings", "set"], tool: "set_my_settings", usage: "[--reserve <5h> <weekly>] [--max-calls N | --no-max-calls] [--repos <a,b>|all] [--interactive-slots N] [--manual-only on|off]", summary: "change them, as the Connect page does", why: () => "only maintainers and operators have settings" },
   { path: ["do"], tool: "command", args: ["item", "text"], usage: "<item> \"<command>\"", summary: "send AutoCraft a command on an item, as on GitHub: \"fix-up and merge\", \"yes\", \"stop\"", why: commandWhy },
   { path: ["item"], tool: "get_item", args: ["item"], usage: "<item>", summary: "an item's workflow: state, open recommendation, who started and approved it" },
   { path: ["items"], tool: "my_items", usage: "", summary: "items waiting for your answer, and the ones you started or approved" },
   { path: ["commands"], tool: "help", usage: "", summary: "the commands AutoCraft takes, what each does and when it comes back to you" },
-  { path: ["repos"], tool: "list_repos", usage: "", summary: "tracked repositories with their open decisions and fix-ups" },
+  { path: ["repos"], tool: "list_repos", usage: "", summary: "tracked repositories with their fix-ups waiting" },
   { path: ["fixups"], tool: "list_fixups", usage: "[--repo R] [--limit N]", summary: "PRs whose review fixes the pipeline could not apply" },
   { path: ["items", "search"], tool: "search_items", usage: "[--query Q] [--repo R] [--kind K] [--state S] [--author A] [--since D] [--limit N] [--cursor C]", summary: "issues and PRs from AutoCraft's copy of GitHub" },
   { path: ["items", "show"], tool: "read_item", args: ["item"], usage: "<item>", summary: "one issue or PR from AutoCraft's copy of GitHub" },
 ];
 
 /**
- * Server tools without a command: the task tools tell an MCP agent to run this runner's own commands, and answering is
- * the operator's call on the dashboard until it opens to agents. `autocraft call <tool>` still reaches each one.
+ * Server tools without a command: the task tools tell an MCP agent to run this runner's own commands.
+ * `autocraft call <tool>` still reaches each one.
  */
-export const MCP_ONLY = ["next_task", "task_status", "answer_decision", "undo_answer"];
+export const MCP_ONLY = ["next_task", "task_status"];
 
 const SERVER_GROUPS = new Set(CLI_COMMANDS.map((c) => c.path[0]));
 
@@ -5093,8 +5206,8 @@ export function parseToolArgs(tool, argv, cmd) {
         if (spec.minimum !== undefined && out < spec.minimum) throw bad(`${v} is below the minimum ${spec.minimum}`);
         if (spec.maximum !== undefined && out > spec.maximum) throw bad(`${v} is above the maximum ${spec.maximum}`);
       } else if (st === "boolean") {
-        if (!/^(true|false)$/.test(v)) throw bad(`${JSON.stringify(v)} is not true or false`);
-        out = v === "true";
+        if (!/^(true|false|on|off)$/.test(v)) throw bad(`${JSON.stringify(v)} is not on or off`);
+        out = v === "true" || v === "on";
       } else if (st === "object" || st === "array") {
         try { out = JSON.parse(v); } catch { throw bad("not valid JSON"); }
       }
@@ -5108,6 +5221,18 @@ export function parseToolArgs(tool, argv, cmd) {
     }
     return one(p, raw);
   };
+  // A boolean flag may take a separate on/off value; such a word is the flag's value only while there are more bare words than
+  // positional arguments, so `<cmd> --flag on` sets the flag and a positional on/off after a boolean flag stays positional.
+  const slots = cmd ? (cmd.args?.length ?? 0) : positionalOf(tool.inputSchema) ? 1 : 0;
+  let spare = -slots;
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--") { spare += argv.length - i - 1; break; }
+    if (a === "--json") continue;
+    if (!a.startsWith("--")) { spare++; continue; }
+    const k = a.includes("=") ? undefined : byFlag.get(toolKey(a.slice(2)));
+    if (k && typeOf(props[k]) !== "boolean") i++;
+  }
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--") { positional.push(...argv.slice(i + 1)); break; }
@@ -5124,7 +5249,7 @@ export function parseToolArgs(tool, argv, cmd) {
     if (!key) throw new UsageError(`unknown option ${a.slice(0, eq < 0 ? undefined : eq)} for ${name}; valid: ${valid()}`);
     const t = typeOf(props[key]);
     if (t === "boolean") {
-      if (inline === undefined && /^(true|false)$/.test(argv[i + 1] ?? "")) inline = argv[++i];
+      if (inline === undefined && spare > 0 && /^(true|false|on|off)$/.test(argv[i + 1] ?? "")) { inline = argv[++i]; spare--; }
       args[key] = inline === undefined ? true : typed(key, inline);
       continue;
     }
@@ -5164,7 +5289,7 @@ function printResult(r, json) {
   return r?.isError ? 1 : 0;
 }
 
-/** `inbox`, `queue`, `calls`, `repos`, `fixups` and their subcommands. @param {string} group @param {string[]} argv */
+/** `queue`, `calls`, `repos`, `fixups` and their subcommands. @param {string} group @param {string[]} argv */
 async function cmdServer(group, argv) {
   if (argv.includes("--help") || argv.includes("-h")) { console.log(groupHelp(group)); return 0; }
   const sub = CLI_COMMANDS.find((c) => c.path[0] === group && c.path[1] !== undefined && c.path[1] === argv[0]);
@@ -5281,7 +5406,7 @@ const TASK_HELP = [
   ["autocraft config reserve <5h> <weekly> | off", "runner reserve"],
 ];
 
-const GROUP_TITLES = /** @type {const} */ ({ inbox: "Inbox", queue: "Merge queue", calls: "Model calls", settings: "Settings" });
+const GROUP_TITLES = /** @type {const} */ ({ queue: "Merge queue", calls: "Model calls", settings: "Settings" });
 
 /** The workflow commands: send a command, read an item, list your items, list the commands. */
 const ITEM_GROUPS = ["do", "item", "items", "commands"];
@@ -5313,18 +5438,18 @@ const section = (title, lines) => [title, ...lines.map(([c, s]) => {
   return c.length < HELP_COLUMN ? `  ${c.padEnd(HELP_COLUMN)}${text}` : `  ${c}${pad}${text}`;
 })].join("\n");
 
-const SERVER_NOTE = `Inbox, merge queue, model call and other server commands need Agent access for this Task Runner (the dashboard's Connect page).
+const SERVER_NOTE = `Item, merge queue, model call and other server commands need Agent access for this Task Runner (the dashboard's Connect page).
 Options of a command's tool that are not shown pass through as --<argument>; \`autocraft call <tool> --help\` lists them.
 Add --json for the raw result. Exit 0 done, 1 refused or failed, 2 wrong command line.`;
 
 /** `help [--all]`: the groups and two lines; `--all` adds the task commands and the details. @param {boolean} all */
 function helpText(all) {
   const intro = `autocraft ${HELPER_VERSION}: the AutoCraft Task Runner runs AutoCraft model calls under your own harness subscription,
-and gives you AutoCraft's inbox, merge queue and model calls on the command line.`;
+and gives you AutoCraft's merge queue and model calls on the command line.`;
   const sections = helpSections(all).map(([t, l]) => section(t, l));
   if (!all) return [intro, ...sections, "Server commands need Agent access for this Task Runner (Connect page).\n--json prints the raw result; `autocraft help --all` lists everything."].join("\n\n");
   return [intro, ...sections,
-    `login --answer also asks to answer decisions and approve merges; --no-agent asks for no agent access.
+    `login --answer also asks to send commands; --no-agent asks for no agent access.
 ${SERVER_NOTE}`,
     `The runner claims only while every plan window keeps more than the reserve free (set per user on the
 dashboard, default 20%), and holds whenever it cannot read the usage.

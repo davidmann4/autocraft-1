@@ -1,54 +1,44 @@
 // Runs the classifiers: Jev (one `jev ask` per item) and Haiku (batches through `claude -p`).
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
-import { homedir } from "node:os";
-import { basename, join } from "node:path";
+import { readFileSync } from "node:fs";
+import { basename } from "node:path";
 import type { ItemRef } from "../../web/src/api/types.ts";
 import { createHash } from "node:crypto";
-import { jevParallel } from "../agents/accounts.ts";
+import { loadLiveConfig } from "../data/control/index.ts";
 import { askJevCloudflare, jevCloudflareConfig } from "../agents/jev-cloudflare.ts";
 import { JEV_UNREADABLE_SUMMARY, jevAvailable, jevEnv, jevFailure, markJevUnavailable, markJevUnreadable, markJevWorking, jevStatus } from "../agents/jev.ts";
-import { accountConfigDir, itemRepos, NoTakerError, poolRoom, repoBatches, startClaudeRun, type PoolRoom, startJevRun, tryStartFollowUp, isHalt, type Started } from "../agents/call.ts";
-import { touchStore, type KeptSession, type SessionAsk } from "../prepush/resume.ts";
-import { finishRun, packText, setRunProgress } from "../agents/runs.ts";
-import { clockLine, saveTools, type ToolClock } from "../agents/tools.ts";
+import { allocation, itemRepos, NoTakerError, poolRoom, repoBatches, runAsUnit, type PoolRoom, type PoolUnit, startJevRun, isHalt } from "../agents/call.ts";
+import { type KeptSession, type SessionAsk } from "../prepush/resume.ts";
+import { finishRun } from "../agents/runs.ts";
 import { fixTurnMessage, mergeFixFields, needsFixTurn, type Lint, type LintProblem } from "../replylint.ts";
-import { coalesce, lineFeed } from "./progress.ts";
 import { scrubError } from "../agents/text.ts";
-import { registerGroup, unregisterGroup } from "../runner/groups.ts";
 import { hasFixedCredential, scrub } from "../runner/scrub.ts";
 import { itemTools } from "../itemtools/index.ts";
-import { startBridge, CHECK_SERVER, type Bridge } from "../checktool/bridge.ts";
+import { CHECK_SERVER } from "../checktool/bridge.ts";
 import type { CheckTool } from "../checktool/index.ts";
 import { CHECK_MAX_WALL_MS } from "../core/rules.ts";
-import { agentsFile, mcpFile } from "../sandbox/agent-files.ts";
 import { agentsDefinition, MCP_PATH } from "../sandbox/agents.ts";
-import { levelBand } from "../rank/level.ts";
-import { inferenceMode, tierOfModel } from "../remote/mode.ts";
+import { callLevel } from "../remote/level.ts";
+import { tierOfModel } from "../remote/mode.ts";
 import { awaitCall, enqueueCall, REFUSED_PREFIX, type Outcome } from "../remote/calls.ts";
 import { bundleMounts, checkoutCommit, REFERENCE_SERVER } from "../remote/bundle.ts";
-import { resolveClaudeBin, sandboxCommand, TOKEN_MARGIN_MS } from "../sandbox/index.ts";
-import { childEnv } from "../agents/status.ts";
-import { cliErrorText, credentialsNearExpiry, isAuthFailure, markTokenRejected, readToken, tokenEnv, usesToken } from "../agents/token.ts";
-import { REFERENCE_PATH, REPO_DOCS_PATH, type SandboxSpec } from "../sandbox/command.ts";
 import { repoDocsFor, repoOfCheckout } from "../sandbox/repo-docs.ts";
-import { holdCheckouts } from "../sandbox/checkout.ts";
-import { sessionStore } from "../sandbox/session-store.ts";
 import { defaultWorkspace } from "../sandbox/workspace.ts";
 import { runModelStep } from "../agents/step.ts";
 import { CLASSIFY_HAIKU, CLASSIFY_JEV, type ClassifyAnswer, type JevImpact } from "../agents/steps.ts";
 import type { AreaAnswer } from "../areas/parse.ts";
-import { CLAUDE_PROMPTS, JEV_ARGS, JEV_USD_PER_INPUT_TOKEN, JEV_PROMPTS, claudeArgs, claudeParts, claudePromptOf, jevPromptOf, joinParts, renderAreaJev, renderClaude, renderJev, type ClassifyExtras, type ClaudeInput, type ClaudePromptId, type JevPromptId } from "../prompts/index.ts";
+import { CLAUDE_PROMPTS, JEV_ARGS, JEV_USD_PER_INPUT_TOKEN, JEV_PROMPTS, claudeArgs, claudeParts, claudePromptOf, jevPromptOf, renderAreaJev, renderJev, withoutTaskBudget, type ClassifyExtras, type ClaudeInput, type ClaudePromptId, type JevPromptId } from "../prompts/index.ts";
 import { stripMarks } from "../prompts/harness.ts";
-import type { DupePair } from "../dupes/pair.ts";
-import { flagsOf, jevVerdict, parseHaikuReply, parseRef, refOf, type Item, type JevAnswers, type Verdict } from "./parse.ts";
-import { envVar } from "../env.ts";
+import type { DupeAsk, DupePair } from "../dupes/pair.ts";
+import { flagsOf, parseRef, refOf, type Item, type Verdict } from "./parse.ts";
 import { wholeReplyJson } from "../core/reply-json.ts";
-import { findSeq, mapSeq } from "../async-seq.ts";
+import { findSeq } from "../async-seq.ts";
+import { NO_TAKER_SKIP, skipItem, unitRan } from "../runner/leases.ts";
 import type { Db } from "../db/index.ts";
-import * as kx from "../db/kx.ts";
-import type { DB } from "../db/types.ts";
-import type { InsertObject } from "kysely";
+import { loadItems as loadMirrorItems, loadRepos } from "../data/mirror/index.ts";
+import { keepEarlierUsage, loadRunsById, recordUsage, type UsageRow } from "../data/inference/index.ts";
+import { saveJevChunk, saveVerdicts as saveVerdictRows, type JevFailed, type VerdictInput } from "../data/triage/index.ts";
+import { effect } from "../db/effects.ts";
 
 export function loadRefs(file: string): { repo: string; number: number }[] {
   const out: { repo: string; number: number }[] = [];
@@ -61,50 +51,27 @@ export function loadRefs(file: string): { repo: string; number: number }[] {
   return out;
 }
 
+/** The items of `refs` as classify prompts see them, in the order of `refs`; throws for a ref that is not in the database. */
 export async function loadItems(db: Db, refs: { repo: string; number: number }[]): Promise<Item[]> {
-  return await mapSeq(refs, async (r) => {
-    const row = await db.get(db.k.selectFrom("items").select((eb) => ["repo", "number", "kind", eb.fn.coalesce("title", eb.val("")).as("title"), eb.fn.coalesce("body", eb.val("")).as("body"),
-      eb("additions", "+", eb.ref("deletions")).as("lines_changed"), "changed_files as files_changed", "author_association"])
-      .$narrowType<{ kind: "pr" | "issue" }>().where("repo", "=", r.repo).where("number", "=", r.number));
+  const rows = await loadMirrorItems(db, refs, "text");
+  return refs.map((r) => {
+    const row = rows.get(`${r.repo}#${r.number}`);
     if (!row) throw new Error(`${refOf(r)} is not in the database`);
-    return row;
+    return { repo: row.repo, number: row.number, kind: row.kind as Item["kind"], title: row.title ?? "", body: row.body ?? "",
+      lines_changed: row.additions === null || row.deletions === null ? null : row.additions + row.deletions, files_changed: row.changed_files, author_association: row.author_association };
   });
 }
 
-/** `idleMs` is how long the process may stay silent (the time since its last output, counted as zero while `busy()` is true) before it is stopped. */
-export type IdleWatch = { idleMs: number; busy?: () => boolean };
-type Proc = { code: number | null; stdout: string; stderr: string; /** The idle watchdog stopped the process. */ idle?: boolean };
-
-/** How long a model call may produce no output before it is stopped: `AUTOCRAFT_CALL_IDLE_MIN` minutes, default 15. */
-export function callIdleMs(env: NodeJS.ProcessEnv = process.env): number {
-  const n = Number(envVar("CALL_IDLE_MIN", env));
-  return (Number.isFinite(n) && n > 0 ? n : 15) * 60_000;
-}
-/** Time between SIGTERM and SIGKILL when the watchdog stops a process. */
-export const IDLE_KILL_GRACE_MS = 10_000;
+type Proc = { code: number | null; stdout: string; stderr: string };
 /** `env` is added to the process environment of the child, or with `exactEnv` is the child's whole environment. `onLine` gets each complete line of stdout as it arrives (the whole stdout is still returned). */
-export type Runner = (cmd: string, args: string[], input: string, cwd?: string, timeoutMs?: number, env?: Record<string, string>, onLine?: (line: string) => Promise<void>, exactEnv?: boolean, watch?: IdleWatch) => Promise<Proc>;
+export type Runner = (cmd: string, args: string[], input: string, cwd?: string, timeoutMs?: number, env?: Record<string, string>, onLine?: (line: string) => Promise<void>, exactEnv?: boolean) => Promise<Proc>;
 
-export function exec(cmd: string, args: string[], input: string, cwd?: string, timeoutMs = 600_000, env?: Record<string, string>, onLine?: (line: string) => void, exactEnv = false, watch?: IdleWatch): Promise<Proc> {
+export function exec(cmd: string, args: string[], input: string, cwd?: string, timeoutMs = 600_000, env?: Record<string, string>, onLine?: (line: string) => void, exactEnv = false): Promise<Proc> {
   return new Promise((resolve) => {
-    // With a watchdog the child leads its own process group, so the stop reaches everything it started.
-    const p = spawn(cmd, args, { cwd, stdio: ["pipe", "pipe", "pipe"], timeout: timeoutMs, windowsHide: true, ...(watch && { detached: true }), ...(env && { env: exactEnv ? env : { ...process.env, ...env } }) });
-    if (watch) registerGroup(p.pid);
+    const p = spawn(cmd, args, { cwd, stdio: ["pipe", "pipe", "pipe"], timeout: timeoutMs, windowsHide: true, ...(env && { env: exactEnv ? env : { ...process.env, ...env } }) });
     let stdout = "", stderr = "";
     let partial = "";
-    let last = Date.now(), idle = false, ended = false;
-    const signal = (sig: NodeJS.Signals) => { try { process.kill(-p.pid!, sig); } catch { try { p.kill(sig); } catch { /* gone */ } } };
-    const timer = watch && setInterval(() => {
-      if (watch.busy?.()) last = Date.now();
-      if (idle || Date.now() - last < watch.idleMs) return;
-      idle = true;
-      signal("SIGTERM");
-      setTimeout(() => { if (!ended) signal("SIGKILL"); }, IDLE_KILL_GRACE_MS).unref();
-    }, Math.max(10, Math.min(30_000, Math.floor(watch.idleMs / 4))));
-    timer?.unref();
-    const done = (r: Proc) => { ended = true; if (timer) clearInterval(timer); if (watch) unregisterGroup(p.pid); resolve(idle ? { ...r, idle: true } : r); };
     p.stdout.on("data", (d) => {
-      last = Date.now();
       stdout += d;
       if (!onLine) return;
       partial += d;
@@ -112,9 +79,9 @@ export function exec(cmd: string, args: string[], input: string, cwd?: string, t
       partial = lines.pop()!;
       for (const l of lines) try { onLine(l); } catch { /* progress is best effort */ }
     });
-    p.stderr.on("data", (d) => { last = Date.now(); stderr += d; });
-    p.on("error", (e) => done({ code: -1, stdout, stderr: String(e) }));
-    p.on("close", (code) => done({ code, stdout, stderr }));
+    p.stderr.on("data", (d) => { stderr += d; });
+    p.on("error", (e) => resolve({ code: -1, stdout, stderr: String(e) }));
+    p.on("close", (code) => resolve({ code, stdout, stderr }));
     p.stdin.on("error", () => {});
     p.stdin.end(input);
   });
@@ -128,12 +95,14 @@ export const POOL_MAX = { fixup: 3, cifix: 3, mainfix: 2, verify: 4, verifyColle
 export type PoolOptions = {
   /** Run the first job alone and the rest after it returns, so the rest read the prompt cache the first one wrote. */
   first?: boolean;
-  /** How long to wait before asking `room` again when nothing finished (default POOL_POLL_MS). */
+  /** How long to wait before asking `width` again when nothing finished (default POOL_POLL_MS); for a PoolRoom, how often to read whether the room changed (PoolRoom.changed; default allocation.pollMs). */
   pollMs?: number;
   /** Upper bound on running jobs, also when `width` is a function. */
   max?: number;
   /** Told the index of each job a PoolRoom left unstarted (no Task Runner may take it) when the pool ends, and of each job whose model call was withdrawn for lack of a taker (NoTakerError). */
   skipped?: (i: number) => void;
+  /** Where the skip of a job a PoolRoom left unstarted is logged (default console.log, the job's log). */
+  log?: (line: string) => void;
 };
 
 /**
@@ -143,9 +112,18 @@ export type PoolOptions = {
  * account is enabled.
  *
  * A PoolRoom (poolRoom: the model queue's room for each job's repos) starts the first job in order that has room, so a job
- * whose repos have no room does not hold back later ones. When none has room and none runs, the first job whose repos have a
+ * whose repos have no room does not hold back later ones. It reads the room when a job ends or the room may have changed
+ * (PoolRoom.changed), so a pool whose calls wait long for a Task Runner reads the room only when the queue or the Task Runners
+ * change. A reading does not yet count the calls of jobs still preparing theirs (running, no call queued: PoolUnit), and the
+ * jobs started after it: both are taken off it, so a room of N starts N jobs. The jobs counted are taken off the room of every
+ * repo: the Task Runner a call will take is not known, and the runners of one repo may serve others (the runner's startJobs
+ * counts its starts the same way); a fresh reading counts queued calls by their takers again. A PoolRoom whose units may
+ * finish without a model call (`mayNotCall`) starts jobs up to `max` whatever the room: a call one of them makes waits in the
+ * model queue. When none has room and none runs, the first job whose repos have a
  * Task Runner that may take them starts regardless; jobs no Task Runner may take never start, and once only they are left the
- * pool ends without them (a later pass picks them again). With `first`, the first job that has such a Task Runner runs alone first.
+ * pool ends without them. Each is recorded as a skip for want of a taker (skipItem, NO_TAKER_SKIP), like a withdrawn call, so a
+ * step job that only left such units counts as idle until the Task Runners change (src/runner/autopilot.ts unchangedSinceIdle).
+ * With `first`, the first job that has such a Task Runner runs alone first.
  * A job whose model call was withdrawn because no Task Runner could take it (NoTakerError) is skipped the same way; the others go on.
  *
  * The first failure is thrown once the running jobs have ended.
@@ -156,29 +134,49 @@ export async function pool<T>(jobs: (() => Promise<T>)[], width: number | ((next
   // Indices of the jobs not started yet, in order; a PoolRoom may start them out of order.
   const pending = jobs.map((_, i) => i);
   let failed: { e: unknown } | null = null;
+  // The running jobs' units, and the room the last reading left: its value minus the jobs started or preparing since.
+  const units = new Set<PoolUnit>();
+  let fresh = true, used = 0;
   const launch = (i: number): Promise<void> => {
     pending.splice(pending.indexOf(i), 1);
-    const p: Promise<void> = jobs[i]!().then((r) => void (results[i] = r), (e) => void (e instanceof NoTakerError ? opts.skipped?.(i) : (failed ??= { e }))).finally(() => running.delete(p));
+    const u: PoolUnit = { called: false };
+    units.add(u);
+    const p: Promise<void> = runAsUnit(u, jobs[i]!).then((r) => { results[i] = r; unitRan(); }, (e) => { if (e instanceof NoTakerError) opts.skipped?.(i); else { unitRan(); failed ??= { e }; } }).finally(() => { running.delete(p); units.delete(u); });
     running.add(p);
     return p;
   };
   const roomy = typeof width === "object" ? width : null;
+  // The jobs left unstarted once the pool ends: only those no Task Runner may take (a failure throws first).
+  const leftUntaken = (): void => {
+    for (const x of pending) {
+      if (roomy?.untaken) {
+        const what = roomy.untaken(x) || `unit ${x + 1}`;
+        skipItem(`${NO_TAKER_SKIP}${what}`, opts.log ?? console.log, "no Task Runner takes it", what);
+      }
+      opts.skipped?.(x);
+    }
+  };
   const takenBy = async (i: number): Promise<boolean> => !roomy || await roomy.taker(i);
   if (opts.first && jobs.length > 1) {
     roomy?.round();
     const i = await findSeq(pending, takenBy);
-    if (i === undefined) { for (const x of pending) opts.skipped?.(x); return results; }
+    if (i === undefined) { leftUntaken(); return results; }
     await launch(i);
   }
   while (pending.length && !failed) {
     const free = (opts.max ?? Infinity) - running.size;
     if (typeof width === "object") {
-      width.round();
-      const i = free > 0 ? await findSeq(pending, async (x) => await width.room(x) > 0) : undefined;
-      if (i !== undefined) { launch(i); continue; }
+      if (fresh) {
+        width.round();
+        fresh = false;
+        used = [...units].filter((u) => !u.called).length;
+      }
+      const i = free <= 0 ? undefined : width.mayNotCall ? pending[0] : await findSeq(pending, async (x) => await width.room(x) - used > 0);
+      if (i !== undefined) { used++; launch(i); continue; }
       if (!running.size) {
         const any = await findSeq(pending, takenBy);
         if (any === undefined) break;
+        used++;
         launch(any);
         continue;
       }
@@ -189,11 +187,21 @@ export async function pool<T>(jobs: (() => Promise<T>)[], width: number | ((next
         continue;
       }
     }
-    await Promise.race([...running, new Promise((r) => setTimeout(r, opts.pollMs ?? POOL_POLL_MS))]);
+    if (roomy) {
+      // With `max` jobs running only an end can start another; the room is not read then, so there is no reading to wait on.
+      const full = running.size >= (opts.max ?? Infinity);
+      const stop = new AbortController();
+      try {
+        await Promise.race(!full ? [...running, roomy.changed(opts.pollMs ?? allocation.pollMs, stop.signal)] : [...running]);
+      } finally {
+        stop.abort();
+        fresh = true;
+      }
+    } else await Promise.race([...running, new Promise((r) => setTimeout(r, opts.pollMs ?? POOL_POLL_MS))]);
   }
   await Promise.all(running);
   if (failed) throw (failed as { e: unknown }).e;
-  for (const x of pending) opts.skipped?.(x);
+  leftUntaken();
   return results;
 }
 
@@ -232,85 +240,26 @@ export function resultUsage(j: { usage?: Record<string, number>; total_cost_usd?
   return { usage: { ...main, ...(extra.length > 0 && { extra }) }, all: { input: sum("input"), output: sum("output"), cacheRead: sum("cacheRead"), cacheWrite: sum("cacheWrite") } };
 }
 
-export async function saveVerdict(db: Db, classifier: string, runId: string, v: Verdict, inputHash?: string): Promise<void> {
-  await saveVerdicts(db, classifier, runId, [{ v, ...(inputHash !== undefined && { hash: inputHash }) }]);
-}
-
-/**
- * Stores the verdicts of one chunk in one write: a multi-row delete of the old rows of the same keys, then a multi-row insert
- * (the rows get new rowids, in the order given). `hash` is written as the row's input_hash. If the batch fails, each verdict is
- * stored on its own so one bad verdict does not lose the others; the first error is thrown after the rest are stored.
- * Returns the refs stored.
- */
+/** Stores the verdicts of one chunk (`hash` is written as the row's input_hash); returns the refs stored. See triage.saveVerdicts. */
 export async function saveVerdicts(db: Db, classifier: string, runId: string, list: readonly { v: Verdict; hash?: string }[]): Promise<Set<string>> {
-  const stored = new Set<string>();
-  if (!list.length) return stored;
+  return await saveVerdictRows(db, verdictRows(classifier, runId, list));
+}
+
+function verdictRows(classifier: string, runId: string, list: readonly { v: Verdict; hash?: string }[]): VerdictInput[] {
   const at = now();
-  const byRef = new Map<string, { v: Verdict; hash?: string }>();
-  for (const x of list) byRef.set(x.v.ref, x);
-  const rows = [...byRef.values()].map(({ v, hash }) => {
+  return list.map(({ v, hash }) => {
     const [repo, num] = v.ref.split("#");
-    return { repo: repo!, number: Number(num), classifier, run_id: runId, at, type_label: v.type_label ?? null, flags: flagsOf(v), reason: v.reason ?? null, probs: v.probs ?? null, ...(hash !== undefined && { input_hash: hash }) };
-  });
-  try {
-    await db.write(async () => {
-      for (const chunk of kx.batches(rows)) {
-        await db.run(db.k.deleteFrom("main.classifications").where("classifier", "=", classifier).where("run_id", "=", runId)
-          .where((eb) => eb.or(chunk.map((r) => eb.and([eb("repo", "=", r.repo), eb("number", "=", r.number)])))));
-        await db.run(db.k.insertInto("main.classifications").values(chunk));
-      }
-    });
-    for (const r of rows) stored.add(`${r.repo}#${r.number}`);
-    return stored;
-  } catch (e) {
-    let first: unknown = e;
-    for (const r of rows) {
-      try {
-        await replaceClassification(db, [r.repo, r.number, classifier, runId, at, r.type_label, r.flags, r.reason, r.probs]);
-        if (r.input_hash !== undefined) await db.run(db.k.updateTable("main.classifications").set({ input_hash: r.input_hash }).where("repo", "=", r.repo).where("number", "=", r.number).where("classifier", "=", classifier).where("run_id", "=", runId));
-        stored.add(`${r.repo}#${r.number}`);
-      } catch (err) {
-        console.error(`classify: could not save the verdict of ${r.repo}#${r.number}: ${String((err as Error).message ?? err)}`);
-        if (first === e) first = err;
-      }
-    }
-    if (first !== e) throw first;
-    return stored;
-  }
-}
-
-/**
- * Stores one verdict (repo, number, classifier, run_id, at, type_label, flags, reason, probs), replacing the row for the
- * same key with a new one: a new rowid, which src/classify/settled.ts reads as "changed since".
- */
-export async function replaceClassification(db: Db, row: [string, number, string, string, string, string | null, string, string | null, string | null]): Promise<void> {
-  const [repo, number, classifier, run_id, at, type_label, flags, reason, probs] = row;
-  await db.write(async () => {
-    await db.run(db.k.deleteFrom("main.classifications").where("repo", "=", repo).where("number", "=", number).where("classifier", "=", classifier).where("run_id", "=", run_id));
-    await db.run(db.k.insertInto("main.classifications").values({ repo, number, classifier, run_id, at, type_label, flags, reason, probs }));
+    return { repo: repo!, number: Number(num), classifier, run_id: runId, at, type_label: v.type_label ?? null, flags: flagsOf(v), reason: v.reason ?? null, probs: v.probs ?? null, input_hash: hash ?? null };
   });
 }
 
-const USAGE_COLS = ["stage", "model", "items", "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "started_at", "ended_at", "cost_usd"] as const;
-
-export type UsageRow = { runId: string; agent: string; stage: string; model: string; items: number; u: Usage; start: string; end: string };
+export type { UsageRow };
 
 export async function saveUsage(db: Db, runId: string, agent: string, stage: string, model: string, items: number, u: Usage, start: string, end: string): Promise<void> {
-  await saveUsages(db, [{ runId, agent, stage, model, items, u, start, end }]);
+  await recordUsage(db, [{ runId, agent, stage, model, items, u, start, end }]);
 }
 
-/** Saves usage rows in one upsert per slice; subagent models get their own rows (same run and stage), so the Cost page splits by model and its totals stay whole. */
-export async function saveUsages(db: Db, list: readonly UsageRow[]): Promise<void> {
-  const rows = new Map<string, InsertObject<DB, "main.token_usage">>();
-  for (const { runId, agent, stage, model, items, u, start, end } of list) {
-    const row = (a: string, m: string, n: number, x: Usage) => ({ run_id: runId, agent: a, stage, model: m, items: n, input_tokens: x.input, output_tokens: x.output, cache_read_tokens: x.cacheRead, cache_write_tokens: x.cacheWrite, started_at: start, ended_at: end, cost_usd: x.cost });
-    rows.set(`${runId}\0${agent}`, row(agent, model, items, u));
-    for (const e of u.extra ?? []) rows.set(`${runId}\0${agent}+${e.model}`, row(`${agent}+${e.model}`, e.model, 0, e.usage));
-  }
-  for (const chunk of kx.batches([...rows.values()])) {
-    await db.run(db.k.insertInto("main.token_usage").values(chunk).onConflict((oc) => oc.columns(["run_id", "agent"]).doUpdateSet(kx.excluded(USAGE_COLS))));
-  }
-}
+export const saveUsages = recordUsage;
 
 let runner: Runner = exec;
 
@@ -336,7 +285,11 @@ export function promptVersion(id: ClaudePromptId | JevPromptId): string {
 function refsOf(input: readonly unknown[]): ItemRef[] {
   const out: ItemRef[] = [];
   for (const x of input as { repo?: string; number?: number; ref?: string; a?: { number: number }; b?: { number: number }; items?: unknown[] }[]) {
-    if (typeof x.repo === "string" && typeof x.number === "number") out.push({ repo: x.repo, number: x.number });
+    // A duplicate request: the item and each of its candidates.
+    if (typeof x.repo === "string" && (x as { item?: { number: number } }).item && Array.isArray((x as { candidates?: unknown }).candidates)) {
+      const ask = x as unknown as DupeAsk;
+      out.push({ repo: ask.repo, number: ask.item.number }, ...ask.candidates.map((c) => ({ repo: ask.repo, number: c.other.number })));
+    } else if (typeof x.repo === "string" && typeof x.number === "number") out.push({ repo: x.repo, number: x.number });
     // An area batch: one repo's list and its items.
     else if (typeof x.repo === "string" && Array.isArray((x as { items?: unknown }).items)) out.push(...refsOf((x as { items: unknown[] }).items));
     // A duplicate pair: both items.
@@ -365,47 +318,7 @@ function replySummary(text: string, asked: number): string {
   return `${arr.length} of ${asked} answered${parts.length ? `: ${parts.join(", ")}` : ""}`;
 }
 
-/** The result of a `--output-format json` run: with a subagent the event list holds several `result` events and the last one is final. */
-export const lastResult = <T extends { type?: string }>(parsed: T[] | T): T | undefined => (Array.isArray(parsed) ? parsed.findLast((e) => e.type === "result") : parsed);
-
-function parseOutput(stdout: string): { type?: string }[] | { type?: string } {
-  try {
-    return JSON.parse(stdout) as { type?: string }[] | { type?: string };
-  } catch {
-    const events = stdout.split("\n").filter((l) => l.startsWith("{")).flatMap((l) => { try { return [JSON.parse(l) as { type?: string }]; } catch { return []; } });
-    if (!events.length) throw new Error("no events");
-    return events;
-  }
-}
-
-/** Tokens of the assistant messages seen so far (each message id once), for a call that ended without a result. */
-function streamTokens(events: { type?: string }[]): { input: number; output: number; cacheRead: number; cacheWrite: number } | undefined {
-  const seen = new Map<string, Record<string, number>>();
-  for (const e of events as { type?: string; message?: { id?: string; usage?: Record<string, number> } }[]) {
-    if (e.type === "assistant" && e.message?.usage) seen.set(e.message.id ?? `#${seen.size}`, e.message.usage);
-  }
-  if (!seen.size) return undefined;
-  const t = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
-  for (const u of seen.values()) { t.input += u.input_tokens ?? 0; t.output += u.output_tokens ?? 0; t.cacheRead += u.cache_read_input_tokens ?? 0; t.cacheWrite += u.cache_creation_input_tokens ?? 0; }
-  return t;
-}
-
 const exitClass = (code: number | null): string => (code === null ? "timed out or killed" : code === -1 ? "could not start" : `exit code ${code}`);
-
-const madeDirs = new Set<string>();
-/**
- * The working directory of every `claude` call: one empty directory under the app's cache, never inside a
- * git repository or below a CLAUDE.md. The CLI puts its working directory into its system prompt, so a
- * directory per call would give each call its own prompt prefix and no call would read the prompt cache.
- */
-export function claudeCwd(): string {
-  const dir = envVar("CLAUDE_CWD") ?? join(homedir(), ".cache/autocraft/claude-cwd");
-  if (!madeDirs.has(dir)) {
-    mkdirSync(dir, { recursive: true });
-    madeDirs.add(dir);
-  }
-  return dir;
-}
 
 /**
  * `onProgress`: called with a short plain line for each tool call of a sandboxed call, as it happens; the latest line is also kept on the agent run.
@@ -433,7 +346,7 @@ export type AskOptions = {
 async function docsOf(db: Db, checkout: string): Promise<string | undefined> {
   const repo = repoOfCheckout(checkout);
   if (!repo) return undefined;
-  const branch = (await db.get(db.k.selectFrom("main.repos").select("default_branch").where("name", "=", repo)))?.default_branch ?? "main";
+  const branch = (await loadRepos(db, { names: [repo] })).get(repo)?.default_branch ?? "main";
   return (await repoDocsFor(repo, branch)) ?? undefined;
 }
 
@@ -529,213 +442,19 @@ async function lintTail(reply: Reply, lint: Lint, canFix: boolean, fixTurn: (mes
 }
 
 export async function askClaude<K extends ClaudePromptId>(id: K, model: string, input: ClaudeInput[K], db: Db, opts: AskOptions = {}): Promise<LintedReply | null> {
+  effect("model-call", id);
   const ses = opts.session;
   if (ses?.resume) {
-    const r = await askOnce(id, model, input, db, opts);
+    const r = await askRemote(id, model, input, db, opts);
     if (r) return r;
     // No resume was possible or the resumed turn failed: a new call, whose input carries the earlier patch and the findings.
     const fresh: SessionAsk = {};
-    const again = await askOnce(id, model, input, db, { ...opts, session: fresh });
+    const again = await askRemote(id, model, input, db, { ...opts, session: fresh });
     ses.kept = fresh.kept;
     delete ses.resume;
     return again ?? null;
   }
-  return (await askOnce(id, model, input, db, opts)) ?? null;
-}
-
-async function askOnce<K extends ClaudePromptId>(id: K, model: string, input: ClaudeInput[K], db: Db, opts: AskOptions): Promise<LintedReply | null | undefined> {
-  if (await inferenceMode(db) === "user-local") return askRemote(id, model, input, db, opts);
-  if (opts.forLogin !== undefined) return null;
-  const ses = opts.session;
-  const sandboxed = opts.checkout !== undefined && CLAUDE_PROMPTS[id].sandbox !== undefined;
-  const reference = sandboxed && CLAUDE_PROMPTS[id].sandbox?.reference ? opts.reference : undefined;
-  if (reference) input = input.map((x) => ({ ...x, reference: true })) as ClaudeInput[K];
-  // The maintainers' AGENTS.md and ROADMAP.md of the default branch, never the checkout's own (src/sandbox/repo-docs.ts).
-  const docs = sandboxed && CLAUDE_PROMPTS[id].sandbox?.docs ? await docsOf(db, opts.checkout!) : undefined;
-  if (docs) input = input.map((x) => ({ ...x, repo_docs: true })) as ClaudeInput[K];
-  const parts = claudeParts(id, input, sandboxed);
-  const items = refsOf(input);
-  const resume = ses?.resume;
-  let run: Started | undefined;
-  if (resume) {
-    // The session lives in one account's config directory and in a store bound to the same checkout path; without either, or with no room on that account, the caller asks anew.
-    const dir = await accountConfigDir(db, resume.session.account);
-    const margin = TOKEN_MARGIN_MS + (opts.check !== undefined && CLAUDE_PROMPTS[id].sandbox?.check === true ? CHECK_MAX_WALL_MS : 0);
-    if (!sandboxed || !dir || resume.session.checkout !== opts.checkout || !existsSync(resume.session.dir) || await credentialsNearExpiry(db, resume.session.account, dir, Date.now(), margin)) return undefined;
-    const runId = await tryStartFollowUp(db, resume.session.account, { promptId: id, promptVersion: promptVersion(id), provider: "claude", model, items, prompt: resume.message });
-    if (runId === null) return undefined;
-    run = { runId, configDir: dir, accountId: resume.session.account };
-    touchStore(resume.session.dir);
-  }
-  // A sandboxed call never runs without its sandbox, and the sandbox cannot refresh the token: the call waits for an account with enough token lifetime left (the host-side usage reading refreshes it).
-  const checkTool = opts.check !== undefined && CLAUDE_PROMPTS[id].sandbox?.check === true ? opts.check : undefined;
-  const needMs = sandboxed ? TOKEN_MARGIN_MS + (checkTool ? CHECK_MAX_WALL_MS : 0) : undefined;
-  while (!run) {
-    const started = await startClaudeRun(db, { promptId: id, promptVersion: promptVersion(id), provider: "claude", model, items, prompt: joinParts(parts) }, undefined, opts.maxWaitMs, needMs);
-    // The token can expire between the choice and the claim.
-    if (needMs !== undefined && await credentialsNearExpiry(db, started.accountId, started.configDir, Date.now(), needMs)) {
-      console.log("sandbox call not started: token near expiry; waiting");
-      await finishRun(db, started.runId, { state: "failed", summary: "skipped: token near expiry" });
-    } else run = started;
-  }
-  const end = async (e: Parameters<typeof finishRun>[2]) => await finishRun(db, run.runId, e);
-  let sessions: string | undefined, kept = false;
-  let bridge: Bridge | undefined, bridgeConfig: string | undefined;
-  try {
-    const workspace = sandboxed && CLAUDE_PROMPTS[id].sandbox?.workspace === true;
-    const shared = workspace ? opts.shared ?? await workspaceOf(db) : undefined;
-    const it = workspace ? opts.itemTools === undefined ? itemTools() : opts.itemTools : null;
-    if (sandboxed && checkTool) bridge = await startBridge(checkTool, run.runId);
-    const servers = { ...(it?.mcpServers ?? {}), ...(bridge ? { [CHECK_SERVER]: bridge.mcpServer } : {}) };
-    const tools = it || bridge ? { mounts: [...(it?.mounts ?? []), ...(bridge ? [bridge.mount] : [])], servers: Object.keys(servers).sort(), file: mcpFile(servers) } : undefined;
-    if (bridge && tools) bridgeConfig = tools.file;
-    // Only a sandboxed call can be continued: its session store is a directory of ours. A call on the host keeps no session (it would land in the account's own config directory).
-    const persist = sandboxed && ((opts.lint !== undefined && CLAUDE_PROMPTS[id].lint === true) || bridge !== undefined || ses !== undefined);
-    if (persist) sessions = resume?.session.dir ?? sessionStore();
-    const args = claudeArgs(id, model, sandboxed, tools && { config: MCP_PATH, servers: tools.servers }, parts.system, reference !== undefined, persist, docs !== undefined);
-    const cwd = claudeCwd();
-    // Whether this call's account uses its long-lived token (asked again per turn: a rejection ends its use).
-    const withToken = async () => await usesToken(db, run.accountId, run.configDir);
-    const timeoutMs = CLAUDE_PROMPTS[id].limits.timeoutSeconds * 1000 + (bridge ? CHECK_MAX_WALL_MS : 0);
-    let spec: SandboxSpec | undefined;
-    if (sandboxed) {
-      const claudeBin = resolveClaudeBin(), credentials = join(run.configDir, ".credentials.json");
-      // With a long-lived token the sandbox gets the token instead of the credentials file (read when the command is built).
-      if (!claudeBin || (!existsSync(credentials) && !await withToken())) throw new Error("sandboxed call: claude binary or the account's credentials file not found");
-      spec = { claudeBin, checkout: opts.checkout!, ...(existsSync(credentials) && { credentials }), claudeArgs: args, shared, ...(workspace && { agentsFile: agentsFile(Object.keys(it?.mcpServers ?? {}).sort()) }), ...(sessions && { sessionDir: sessions }), extraMounts: tools || reference || docs ? [...(tools ? [...tools.mounts, { host: tools.file, path: MCP_PATH }] : []), ...(reference ? [{ host: reference, path: REFERENCE_PATH }] : []), ...(docs ? [{ host: docs, path: REPO_DOCS_PATH }] : [])] : undefined };
-    }
-
-    /** One `claude -p` process on the run `runId`: the first message, or with `resume` a follow-up on the same session. Never throws for a failed call. */
-    const turn = async (runId: number, stdin: string, resume?: string, lean = false): Promise<(Reply & { sessionId?: string }) | null> => {
-      const finish = async (e: Parameters<typeof finishRun>[2]) => await finishRun(db, runId, e);
-      const extra = resume ? ["--resume", resume] : [];
-      const usedToken = await withToken();
-      bridge?.setRun(runId);
-      let r: Proc;
-      const clock: ToolClock = { start: new Map(), end: new Map() };
-      // The sandbox has no credentials mount for a call without a token; with neither, the turn is not run unauthenticated.
-      if (spec && !usedToken && !spec.credentials) {
-        await finish({ state: "failed", error: "no token or credentials for the account", summary: "no credentials" });
-        return null;
-      }
-      if (spec) {
-        const tok = usedToken ? readToken(run.configDir) : null;
-        const c = sandboxCommand({ ...spec, ...(tok && { oauthToken: tok }), claudeArgs: [...(lean ? noToolArgs(args) : args), ...extra] });
-        const runProgress = coalesce(async (line: string) => await setRunProgress(db, runId, line));
-        const progress = lineFeed(async (line) => { opts.onProgress?.(line); await runProgress.push(line); });
-        const feed = async (raw: string) => { clockLine(clock, raw); await progress(raw); };
-        const release = holdCheckouts([opts.checkout!, ...(shared ?? []).map((x) => x.dir)]);
-        try {
-          r = await runner(c.cmd, c.args, stdin, cwd, timeoutMs, c.env, feed, true, { idleMs: callIdleMs(), busy: () => (checkTool?.active ?? 0) > 0 });
-        } finally {
-          release();
-        }
-        await runProgress.flush();
-      } else r = await runner("claude", [...args, ...extra], stdin, cwd, timeoutMs, childEnv(run.configDir, usedToken ? await tokenEnv(db, run.accountId, run.configDir) : {}), undefined, true);
-      // Stderr is scrubbed up front. The reply text is scrubbed after parsing, so a match cannot break the JSON.
-      r = { ...r, stderr: scrub(r.stderr) };
-      // Stopped by the idle watchdog: a failed call with the tokens the stream showed, so the usual failure and retry path applies.
-      if (r.idle) {
-        let tokens: ReturnType<typeof streamTokens>;
-        try { const p = parseOutput(r.stdout); await saveTools(db, runId, p, clock); tokens = streamTokens(Array.isArray(p) ? p : [p]); } catch { tokens = undefined; }
-        await finish({ state: "failed", ...(tokens && { tokens }), error: `no output for ${Math.round(callIdleMs() / 60_000 * 10) / 10} min; stopped`, summary: "no output; stopped", output: scrub(r.stdout) });
-        return null;
-      }
-      // A call that used the long-lived token and failed with an authentication error: the token is marked rejected; this call fails as before and later calls take the regular sign-in path. Only stderr and the CLI's own error fields are tested, never assistant or tool text.
-      const authFailed = async (text: string) => { if (usedToken && isAuthFailure(text)) await markTokenRejected(db, run.accountId); };
-      try {
-        // `--output-format json` prints the event list (older CLI versions only the final result object); stream-json prints one event per line.
-        const parsed = parseOutput(r.stdout);
-        // Before the result is looked at: a call that timed out or ended without a result still shows the tools it used.
-        try { await saveTools(db, runId, parsed, clock); } catch (e) { console.log(`tool uses not stored: ${(e as Error).message}`); }
-        const j = lastResult(parsed) as { result?: string; subtype?: string; is_error?: boolean; session_id?: string; total_cost_usd?: number; num_turns?: number; usage?: Record<string, number>; modelUsage?: ModelUsage } | undefined;
-        if (!j) {
-          await authFailed(`${r.stderr} ${cliErrorText(parsed)}`);
-          await finish({ state: "failed", error: `no result (${exitClass(r.code)}) ${r.stderr}`.slice(0, 400), summary: "no result", output: scrub(r.stdout) });
-          return null;
-        }
-        const { usage, all: tokens } = resultUsage(j, model);
-        const costUsd = typeof j.total_cost_usd === "number" ? j.total_cost_usd : usage.cost;
-        if (j.is_error || typeof j.result !== "string") {
-          if (j.is_error) await authFailed(typeof j.result === "string" ? j.result : "");
-          await finish({ state: "failed", tokens, costUsd, error: await scrubError(modelError(j)), summary: j.subtype === "error_max_turns" ? "turn limit" : "model error", output: scrub(r.stdout) });
-          return null;
-        }
-        const turns = sandboxed ? j.num_turns : undefined;
-        const { text, stored, refused } = screenReply(id, j.result);
-        if (refused) {
-          await finish({ state: "failed", tokens, costUsd, error: "the reply holds a credential; refused", summary: "unreadable output", output: stored });
-          return null;
-        }
-        const sessionId = typeof j.session_id === "string" ? j.session_id : (Array.isArray(parsed) ? parsed.find((e) => typeof (e as { session_id?: unknown }).session_id === "string") as { session_id?: string } | undefined : undefined)?.session_id;
-        await finish({ state: "done", tokens, costUsd, summary: (resume ? "fix turn answered" : turns === undefined ? replySummary(stored, items.length) : `answered in ${turns} turns`) + (!resume && checkTool && checkTool.calls ? `, ${checkTool.calls} checks (${Math.round(checkTool.usedMs / 1000)} s)` : ""), output: stored });
-        return { text, usage, ...(turns !== undefined && { turns }), ...(sessionId && { sessionId }) };
-      } catch {
-        await authFailed(r.stderr);
-        await finish({ state: "failed", error: await scrubError(`unreadable output (${exitClass(r.code)}) ${r.stderr}`), summary: r.code === 0 ? "unreadable output" : exitClass(r.code), output: scrub(r.stdout) });
-        return null;
-      }
-    };
-
-    const first = await turn(run.runId, resume ? resume.message : parts.stdin, resume?.session.id);
-    if (!first) return null;
-    let { sessionId, ...reply } = first;
-    // The prompt tells the model to run clippy on its final diff, and a model may skip it: one follow-up message on the same session asks for it.
-    if (bridge && sessions && sessionId && checkTool && needsClippy(checkTool, reply.text) && !(spec && await credentialsNearExpiry(db, run.accountId, run.configDir, Date.now(), timeoutMs + TOKEN_MARGIN_MS))) {
-      const message = CHECK_REMINDER;
-      let started: number | null = null;
-      try { started = await tryStartFollowUp(db, run.accountId, { promptId: id, promptVersion: promptVersion(id), provider: "claude", model, items, prompt: message }); } catch (e) { console.log(`check reminder not started: ${(e as Error).message}`); }
-      if (started !== null) {
-        let again: (Reply & { sessionId?: string }) | null = null;
-        try { again = await turn(started, message, sessionId); } catch (e) { await finishRun(db, started, { state: "failed", error: await scrubError(String((e as Error).message ?? e)), summary: "failed before the call" }); }
-        if (again) {
-          reply = { text: again.text, usage: add(reply.usage, again.usage), ...(reply.turns !== undefined && { turns: reply.turns }) };
-          sessionId = again.sessionId ?? sessionId;
-        }
-      }
-    }
-    if (ses && sessions && sessionId && sandboxed) {
-      ses.kept = { id: sessionId, dir: sessions, account: run.accountId, checkout: opts.checkout! };
-      kept = true;
-    }
-    if (!opts.lint) return reply;
-    return await lintTail(reply, opts.lint, !!(sessions && sessionId), async (message) => {
-      // The fix turn can run as long as the call's own limit; with less token life than that (plus the sandbox's margin) it is skipped, because the sandbox never refreshes the token.
-      if (spec && await credentialsNearExpiry(db, run.accountId, run.configDir, Date.now(), timeoutMs + TOKEN_MARGIN_MS)) {
-        console.log("fix turn skipped: token near expiry");
-        return "skipped";
-      }
-      // One fix turn on the same session and account; its own agent run, so its tokens and outcome show on the Agents page.
-      let fixRun: number;
-      try {
-        const started = await tryStartFollowUp(db, run.accountId, { promptId: id, promptVersion: promptVersion(id), provider: "claude", model, items, prompt: message });
-        if (started === null) {
-          console.log("fix turn skipped: the account has no free slot or headroom");
-          return "skipped";
-        }
-        fixRun = started;
-      } catch (e) {
-        console.log(`fix turn not started: ${(e as Error).message}`);
-        return "skipped";
-      }
-      try {
-        return await turn(fixRun, message, sessionId, true);
-      } catch (e) {
-        await finishRun(db, fixRun, { state: "failed", error: await scrubError(String((e as Error).message ?? e)), summary: "failed before the call" });
-        return null;
-      }
-    });
-  } catch (e) {
-    await end({ state: "failed", error: await scrubError(String((e as Error).message ?? e)), summary: "failed before the call" });
-    throw e;
-  } finally {
-    if (sessions && !kept) rmSync(sessions, { recursive: true, force: true });
-    bridge?.close();
-    // Check tasks still open when the call ends (killed, timed out, parallel leftovers) are cancelled.
-    await opts.check?.close();
-    // The config of a bridged call holds that call's token.
-    if (bridgeConfig) rmSync(bridgeConfig, { force: true });
-  }
+  return (await askRemote(id, model, input, db, opts)) ?? null;
 }
 
 /** The account of a kept session of the user-local mode: the session lives with the helper of the call that `dir` names. */
@@ -786,7 +505,7 @@ async function askRemote<K extends ClaudePromptId>(id: K, model: string, input: 
     const mounts = at ? await bundleMounts(db, at, items, shared, docs) : [];
     const timeoutSeconds = p.limits.timeoutSeconds + (checkTool ? CHECK_MAX_WALL_MS / 1000 : 0);
     const tier = tierOfModel(model);
-    const level = await levelBand(db, items[0]?.repo, items[0]?.number);
+    const level = await callLevel(db, items[0]);
 
     /** One remote turn: the first message, or with `after` a follow-up on the session of that call. The reference folder is named after its repo (referenceDir). */
     const turn = async (stdin: string, after: number | null, lean = false, first = false): Promise<{ reply: Turned; callId: number } | "failed" | "unclaimed"> => {
@@ -796,13 +515,14 @@ async function askRemote<K extends ClaudePromptId>(id: K, model: string, input: 
         bundle: {
           promptId: id, promptVersion: promptVersion(id), tier, effort: p.effort, timeoutSeconds, maxTurns: sandboxed ? (lean ? FIX_TURN_MAX_TURNS : p.sandbox!.maxTurns) : null,
           stdin: stdin === parts.stdin ? stdin : stripMarks(stdin), system: parts.system, mounts, mcpServers: servers, keepSession: persist, ...(after !== null && { resume: { parentCallId: after } }),
-          hints: { claude: { args: lean ? noToolArgs(args) : args, ...(agents && { agents }) } },
+          // The task budget is added when a Task Runner takes the call, for a Claude Code that takes the flag (forHarness).
+          hints: { claude: { args: withoutTaskBudget(lean ? noToolArgs(args) : args), ...(agents && { agents }) } },
         },
       });
       const o = await awaitCall(db, callId, { ...(opts.onProgress && { onProgress: opts.onProgress }), ...(maxWaitMs !== undefined && { maxWaitMs }), ...(checkTool && { check: checkTool }) });
       if (o.state === "unclaimed") return "unclaimed";
       if (o.state === "failed") {
-        if (o.runId !== null) await finishRun(db, o.runId, { state: "failed", ...(o.tokens && { tokens: o.tokens }), error: await scrubError(o.error), summary: "failed" });
+        if (o.runId !== null) await finishRun(db, o.runId, { state: "failed", ...(o.tokens && { tokens: o.tokens }), error: scrubError(o.error), summary: "failed" });
         if (o.error.startsWith(REFUSED_PREFIX)) opts.onRefused?.(o.error);
         return "failed";
       }
@@ -814,7 +534,7 @@ async function askRemote<K extends ClaudePromptId>(id: K, model: string, input: 
       }
       const turns = sandboxed && o.turns !== null ? o.turns : undefined;
       if (o.runId !== null) await finishRun(db, o.runId, { state: "done", tokens, costUsd: o.costUsd, summary: (after !== null ? "fix turn answered" : turns === undefined ? replySummary(stored, items.length) : `answered in ${turns} turns`) + (after === null && checkTool && checkTool.calls ? `, ${checkTool.calls} checks (${Math.round(checkTool.usedMs / 1000)} s)` : ""), output: stored });
-      const ran = o.runId !== null ? (await db.get(db.k.selectFrom("main.agent_runs").select("reported_model").where("id", "=", o.runId)))?.reported_model ?? null : null;
+      const ran = o.runId !== null ? (await loadRunsById(db, [o.runId])).get(o.runId)?.reportedModel ?? null : null;
       return { reply: { text, usage, ...(turns !== undefined && { turns }), ...(ran && { model: ran }), ...(o.sessionId && { sessionId: o.sessionId }) }, callId };
     };
 
@@ -854,7 +574,8 @@ async function askRemote<K extends ClaudePromptId>(id: K, model: string, input: 
 }
 
 /** Sends a registered Jev request (src/prompts) for one item to `jev ask`; the same rule as `askClaude`. Recorded as an agent run without an account. */
-export async function askJev(id: JevPromptId, item: Item | DupePair | { ref: string }, db: Db, body: string = renderJev(id, item as Item | DupePair), perCallUsage = true): Promise<Proc> {
+export async function askJev(id: JevPromptId, item: Item | DupePair | DupeAsk | { ref: string }, db: Db, body: string = renderJev(id, item as Item | DupeAsk), perCallUsage = true): Promise<Proc> {
+  effect("model-call", id);
   const runId = await startJevRun(db, { promptId: id, promptVersion: promptVersion(id), provider: "jev", model: "jev", items: refsOf([item]), prompt: body });
   const start = now();
   try {
@@ -872,11 +593,11 @@ export async function askJev(id: JevPromptId, item: Item | DupePair | { ref: str
     if (outage) await markJevUnavailable(db, outage.kind, outage.reason);
     else if (r.code === 0 && tokens) await markJevWorking(db, Date.parse(start));
     if (r.code === 0 && tokens) await finishRun(db, runId, { state: "done", tokens, costUsd: tokens.input * JEV_USD_PER_INPUT_TOKEN, summary: "answered", output: r.stdout });
-    else await finishRun(db, runId, { state: "failed", error: await scrubError(`${exitClass(r.code)} ${r.stderr}`), summary: r.code === 0 ? JEV_UNREADABLE_SUMMARY : exitClass(r.code), output: r.stdout });
+    else await finishRun(db, runId, { state: "failed", error: scrubError(`${exitClass(r.code)} ${r.stderr}`), summary: r.code === 0 ? JEV_UNREADABLE_SUMMARY : exitClass(r.code), output: r.stdout });
     if (r.code === 0 && !tokens) await markJevUnreadable(db);
     return r;
   } catch (e) {
-    await finishRun(db, runId, { state: "failed", error: await scrubError(String((e as Error).message ?? e)), summary: "failed before the call" });
+    await finishRun(db, runId, { state: "failed", error: scrubError(String((e as Error).message ?? e)), summary: "failed before the call" });
     throw e;
   }
 }
@@ -915,9 +636,6 @@ export type JevExtraAnswers = { impact: Map<string, JevImpact>; area: Map<string
 /** `statuses`: the API statuses of the chunk's calls that were not OK, with their counts. */
 export type JevRun = { saved: Set<string>; statuses: Map<string, number> } & JevExtraAnswers;
 
-/** Usage agent names of an item's classify request: classify's row, and the rows of the extra steps it asks for. */
-export const jevAgents = (ref: string, extra?: ClassifyExtras): string[] => [`jev-${ref}`, ...(extra?.impact ? [`priority-jev-${ref}`] : []), ...(extra?.areas ? [`areas-jev-${ref}`] : [])];
-
 /**
  * The usage row of a classify request split into one row per step it asked for, each step's share in proportion to the length of
  * the request it would have sent alone; the classify row keeps the rounding remainder and the cache counts, so the rows add up to the call. A share's
@@ -947,13 +665,14 @@ function splitUsage(row: UsageRow, item: Item, extra: ClassifyExtras, a: Classif
 /**
  * Jev classifies `items`, one request per item. `extras`: the questions of priority.jev and areas.jev due for an item, asked in
  * the same request; their valid answers are returned for the caller to settle and store, and the request's usage is split over
- * the steps (splitUsage).
+ * the steps (splitUsage). `keepEarlier`: usage rows of an earlier pass under the same names are renamed, so their cost stays on
+ * record. The chunk's usage and verdicts are stored in one transaction.
  */
-export async function runJev(db: Db, runId: string, items: Item[], width?: number, hashes?: ReadonlyMap<string, string>, extras?: ReadonlyMap<string, ClassifyExtras>): Promise<JevRun> {
-  if (width === undefined) width = await jevParallel(db);
+export async function runJev(db: Db, runId: string, items: Item[], width?: number, hashes?: ReadonlyMap<string, string>, extras?: ReadonlyMap<string, ClassifyExtras>, o: { keepEarlier?: boolean } = {}): Promise<JevRun> {
+  if (width === undefined) width = (await loadLiveConfig(db)).jevParallel;
   // Read once per chunk; a failed call reads it again, since a call that fails is how an outage shows.
   let up = await jevAvailable(db);
-  const sinkUsage: UsageRow[] = [], verdicts: { v: Verdict; hash?: string }[] = [], failed: [string, number, string][] = [];
+  const sinkUsage: UsageRow[] = [], verdicts: { v: Verdict; hash?: string }[] = [], failed: JevFailed[] = [];
   const out: JevRun = { saved: new Set(), impact: new Map(), area: new Map(), statuses: new Map() };
   try {
     await pool(items.map((item) => async () => {
@@ -969,20 +688,19 @@ export async function runJev(db: Db, runId: string, items: Item[], width?: numbe
         if (r.value.area) out.area.set(ref, r.value.area);
       } else if (up = await jevAvailable(db)) {
         console.error(`jev: no valid answer for ${ref}`);
-        if (hashes?.has(ref)) failed.push([item.repo, item.number, hashes.get(ref)!]);
+        if (hashes?.has(ref)) failed.push({ repo: item.repo, number: item.number, hash: hashes.get(ref)! });
       }
     }), width);
   } finally {
-    await saveUsages(db, sinkUsage);
-    out.saved = await saveVerdicts(db, "jev", runId, verdicts);
-    // The Plan stops holding the prioritize step for these items until their input changes (src/core/decide-item.ts).
-    for (const [repo, number, hash] of failed) await db.run(db.k.updateTable("main.items").set({ jev_failed_hash: hash }).where("repo", "=", repo).where("number", "=", number));
+    // The Plan stops holding the prioritize step for the failed items until their input changes (src/core/decide-item.ts).
+    const kept = await db.write(async () => {
+      if (o.keepEarlier) await keepEarlierUsage(db, runId, sinkUsage.map((r) => r.agent));
+      await recordUsage(db, sinkUsage);
+      return await saveJevChunk(db, { verdicts: verdictRows("jev", runId, verdicts), failed });
+    });
+    out.saved = kept.stored;
+    // Thrown after the commit, so one verdict that cannot be stored costs neither the others nor the usage of calls already paid for.
+    if (kept.error !== undefined) throw kept.error;
   }
   return out;
-}
-
-/** A failed CLI result in words: the turn limit by name, else the CLI's text. */
-export function modelError(j: { result?: string; subtype?: string }): string {
-  if (j.subtype === "error_max_turns") return "turn limit: the model used every turn the prompt allows without an answer";
-  return `model error ${typeof j.result === "string" ? j.result : ""}`.trim();
 }

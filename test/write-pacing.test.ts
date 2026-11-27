@@ -7,7 +7,7 @@ import { SCRATCH } from "./scratch.ts";
 import { addLabels, closeItem, commentOn, PACE_PER_MINUTE, WritePacedError, type Writer } from "../src/github/write.ts";
 import type { Grant } from "../src/core/guard.ts";
 import type { Querier } from "../src/mirror.ts";
-import { connectDb } from "../src/db/open.ts";
+import { connectDb } from "./helpers/raw-db.ts";
 
 mkdirSync(SCRATCH, { recursive: true });
 

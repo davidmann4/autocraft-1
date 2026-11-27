@@ -3,14 +3,14 @@
 // the query text of a search, and an item that has no vector yet, are embedded
 // here with the same model.
 import type { SimilarHit } from "../../../web/src/api/types.ts";
-import type { Embedder } from "../../embed/model.ts";
 import { itemText } from "../../embed/text.ts";
 import { VectorIndex, type Hit } from "../../embed/vectors.ts";
 import { Semaphore } from "../server/limits.ts";
 import { HttpError } from "../server/util.ts";
-import { latestRun, settledOf } from "../../classify/settled.ts";
+import { classifyRun, loadSettled } from "../../data/triage/index.ts";
+import { loadItems } from "../../data/mirror/index.ts";
 import type { Req } from "../types.ts";
-import { itemState } from "./decisions.ts";
+import { itemState } from "./shown.ts";
 import { needVisible, visibleRepos } from "./visible.ts";
 import type { Db } from "../../db/index.ts";
 
@@ -31,16 +31,19 @@ async function visibleHits(db: Db, req: Req, index: VectorIndex, q: Float32Array
 }
 
 async function describe(db: Db, hits: Hit[]): Promise<SimilarHit[]> {
-  const run = await latestRun(db);
+  const run = await classifyRun(db);
+  const refs = hits.map((h) => ({ repo: h.repo, number: h.number }));
+  const [items, settled] = await db.together(() => Promise.all([loadItems(db, refs, "card"), loadSettled(db, refs, run)]));
   const out: SimilarHit[] = [];
   for (const h of hits) {
-    const r = await db.get(db.k.selectFrom("items").select(["kind", "title", "author", "state", "state_reason"]).where("repo", "=", h.repo).where("number", "=", h.number));
+    const key = `${h.repo}#${h.number}`;
+    const r = items.get(key);
     if (!r) continue;
-    const l = await settledOf(db, h.repo, h.number, run);
+    const l = settled.get(key);
     out.push({
       repo: h.repo, number: h.number, kind: r.kind === "pr" ? "pr" : "issue", title: r.title ?? "", author: r.author ?? "",
       state: itemState(r.state), score: Math.round(h.score * 1000) / 1000,
-      stateReason: REASON[r.state_reason ?? ""] ?? null, label: l.label, labelBy: l.source,
+      stateReason: REASON[r.state_reason ?? ""] ?? null, label: l?.label ?? null, labelBy: l?.source ?? null,
     });
   }
   return out;
@@ -79,7 +82,7 @@ export async function similar(db: Db, req: Req, index: VectorIndex, gate?: Semap
   const n = Number(req.params.n);
   if (!Number.isInteger(n)) throw new HttpError(400, "not an item number");
   await needVisible(db, req, repo);
-  const it = await db.get(db.k.selectFrom("items").select(["title", "body"]).where("repo", "=", repo).where("number", "=", n));
+  const it = (await loadItems(db, [{ repo, number: n }], "text")).get(`${repo}#${n}`);
   if (!it) throw new HttpError(404, `no item ${repo}#${n} in the mirror`);
   await needVectors(db, index);
   const q = await index.vectorOf(db, repo, n) ?? await embedOne(index, itemText(it.title, it.body), "item", gate);
